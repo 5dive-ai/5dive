@@ -86,7 +86,7 @@ No broker, no protocol, no framework. Shared filesystem, shared CLI.
 | Type | Model family | Auth | Channels |
 |------|-------------|------|----------|
 | `claude`      | Anthropic Claude, or any Anthropic-compatible endpoint | OAuth / API key / `--provider` | Telegram, Discord |
-| `codex`       | OpenAI Codex           | OAuth / API key | Telegram |
+| `codex`       | OpenAI Codex, or any model on OpenRouter | OAuth / API key / `--provider=openrouter` | Telegram |
 | `antigravity` | Google Antigravity     | Google OAuth | Telegram |
 | `grok`        | xAI Grok               | OAuth (xAI) / API key | Telegram |
 | `devin`       | Cognition Devin        | OAuth (Devin account) | — |
@@ -119,6 +119,14 @@ sudo 5dive agent set-account cheap-coder kimi        # rebinds + restarts the ag
 # provider serves (OpenRouter translates every family); the background model
 # stays on the provider's cheap default. Omit it to use the per-provider default.
 sudo 5dive agent create glm-coder --type=claude --provider=openrouter --api-key=<key> --auth-profile=openrouter --model=z-ai/glm-5.2
+```
+
+The `codex` type can run on any OpenRouter model the same way. The key goes to the agent's
+environment, and the agent's Codex config names the variable, never the key:
+
+```sh
+printf '%s' "$OPENROUTER_API_KEY" | sudo 5dive agent create or-codex --type=codex --provider=openrouter --api-key=- --model=openai/gpt-6-luna
+# no --model: openai/<the current GPT Sol>
 ```
 
 Prefer to save the key once and hand it to agents by name? `account set` configures the account with no agent involved; every later `agent create --auth-profile=<name>` or `agent set-account` reuses it (more under [Accounts](#accounts-shared-auth-profiles)):

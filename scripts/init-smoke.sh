@@ -19,7 +19,7 @@
 #   init           `5dive init` stopped, asked something unexpected, or failed
 #   pin            the seat could not be put on the cheapest model
 #   reply          the agent's own answer never arrived, or was wrong
-#   webchat        (hermes, openclaw) a 5dive app chat message got no answer, or a wrong one,
+#   webchat        (openclaw) a 5dive app chat message got no answer, or a wrong one,
 #                  or one was answered while the web chat was still off (negative control)
 #   readme         (claude on 24.04) a command the README shows failed on this box
 #                  (DIVE-7370, scripts/init-smoke-readme.py; it runs on a skipped
@@ -43,8 +43,10 @@ list_cells() { printf '%s\n' "${CELLS[@]}"; }
 cell_type() { printf '%s' "${1%%-*}"; }
 
 # The key family each cell's provider bills: the workflow passes the matching
-# repo secret.
-cell_key() { case "$1" in codex) printf openai ;; *) printf anthropic ;; esac; }
+# repo secret. DIVE-7417: Hermes and Codex run on the capped OpenRouter test
+# key, on OR_MODEL (never a Claude model through OpenRouter).
+cell_key() { case "$1" in codex|hermes-*) printf openrouter ;; *) printf anthropic ;; esac; }
+OR_MODEL=openai/gpt-6-luna
 
 json_str() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 
@@ -62,30 +64,31 @@ step() { STEP="$1"; echo; echo "=== [$CELL / $OS] $STEP"; }
 
 # init's answers, as a person picks them: by the label on the menu line.
 steps_json() {
-  local cell="$1" type label auth="" provider="" channel=1 iso=""
+  local cell="$1" type label auth="" provider="" key="" model="" channel=1 iso=""
   type=$(cell_type "$cell")
   case "$type" in
-    claude)   label="Claude Code"; auth="Anthropic API key" ;;
-    codex)    label="Codex"; auth="OpenAI API key"; channel=0 ;;
-    openclaw) label="OpenClaw"; provider="Anthropic" ;;
-    hermes)   label="Hermes"; provider="Anthropic" ;;
+    claude)   label="Claude Code"; auth="Anthropic API key"; key="Anthropic API key" ;;
+    codex)    label="Codex"; auth="OpenRouter"; key="openrouter API key"; model="$OR_MODEL"; channel=0 ;;
+    openclaw) label="OpenClaw"; provider="Anthropic"; key="anthropic API key" ;;
+    hermes)   label="Hermes"; provider="OpenRouter"; key="openrouter API key" ;;
   esac
   case "$cell" in
     hermes-sandboxed) iso="Sandboxed" ;;
     hermes-standard)  iso="Standard" ;;
   esac
-  python3 - "$label" "$auth" "$provider" "$channel" "$iso" <<'PY'
-import json, sys
-label, auth, provider, channel, iso = sys.argv[1:6]
+  python3 - "$label" "$auth" "$provider" "$key" "$model" "$channel" "$iso" <<'PY'
+import json, re, sys
+label, auth, provider, key, model, channel, iso = sys.argv[1:8]
 menu = r'[\s\S]*?Choose \[\d+\]: '
 s = [{'wait': 'Pick an agent type:' + menu, 'pick': label}]
 # The agent tool installs between the type pick and the next prompt.
 if auth:
     s.append({'wait': 'How should ' + label + ' authenticate\\?' + menu, 'pick': auth, 'secs': 1500})
-    s.append({'wait': auth + ': ', 'secret': True})
 else:
     s.append({'wait': 'Choose a provider for ' + label + ':' + menu, 'pick': provider, 'secs': 1500})
-    s.append({'wait': provider.lower() + ' API key: ', 'secret': True})
+s.append({'wait': re.escape(key) + ': ', 'secret': True})
+if model:
+    s.append({'wait': r'Model \[[^\]]*\]: ', 'send': model + '\n'})
 s.append({'wait': r'Agent name \[my-agent\]: ', 'send': '\n', 'secs': 600})
 if channel == '1':
     s.append({'wait': r'Where do you want to talk to [a-z0-9-]+\?' + menu, 'pick': 'Terminal only'})
@@ -143,7 +146,8 @@ pin_model() {
           || { out+=$'\n'"the seat was not restarted within 90s of the model pin"; rc=1; }
       fi ;;
     codex)
-      out=$(5dive agent config "$NAME" set "model=${INIT_SMOKE_CODEX_MODEL:-gpt-5-mini}" 2>&1) || rc=$? ;;
+      # init already chose OR_MODEL; pinned again the way a person switches models.
+      out=$(5dive agent config "$NAME" set "model=$OR_MODEL" 2>&1) || rc=$? ;;
     openclaw)
       # `agent config set model=` refuses openclaw (init QA defect 6), so
       # openclaw's own CLI, as the seat user, as a person would.
@@ -155,9 +159,10 @@ pin_model() {
       # copy from it on every boot (bin/5dive-agent-start, seed_one content).
       # Edited as text, so a hermes that cannot run still gets its pin and the
       # reply step, not this one, names what is wrong.
-      out=$(python3 - "/home/claude/.hermes/config.yaml" "$haiku" <<'PY' 2>&1
+      out=$(python3 - "/home/claude/.hermes/config.yaml" "$OR_MODEL" <<'PY' 2>&1
 import re, sys
 p, m = sys.argv[1:3]
+# DIVE-7417: the Hermes cells run on OpenRouter.
 lines = open(p).read().split('\n')
 inm, done = False, False
 for i, l in enumerate(lines):
@@ -177,7 +182,7 @@ PY
   esac
   printf '%s\n' "$out" | tail -5
   (( rc == 0 )) || { DETAIL="$type model pin exited $rc: $(printf '%s' "$out" | tail -1)"; return 1; }
-  echo "pinned $type to the cheapest model ($haiku for Anthropic)"
+  echo "pinned $type to the cheapest model ($haiku for Anthropic, $OR_MODEL on OpenRouter)"
 }
 
 # DIVE-7349: the 5dive app chat on hermes and openclaw seats. A message is left
@@ -186,7 +191,12 @@ PY
 # in the container, so a stand-in on loopback answers the bridge's calls and
 # records the reply: everything from the inbox to the outbound POST is real,
 # the seat's gateway and model included.
-cell_has_webchat() { case "$(cell_type "$1")" in hermes|openclaw) return 0 ;; *) return 1 ;; esac; }
+# DIVE-7417: openclaw only. The app has the Hermes web chat OFF (DIVE-7349 scope
+# cut: no Hermes turn had ever answered), and this arm on hermes, first reached
+# once its cells answered on OpenRouter, found the gateway up but loading no
+# 5dive platform ("No messaging platforms enabled"). Turning Hermes on in the app
+# and here is one follow-up; until then the cell says so instead of grading it.
+cell_has_webchat() { case "$(cell_type "$1")" in openclaw) return 0 ;; *) return 1 ;; esac; }
 
 FAKE_API_PORT=18999
 start_fake_api() {
@@ -259,6 +269,8 @@ webchat_arm() {
   done
   echo "--- web chat replies ---"; cat /tmp/webchat-replies.jsonl
   if ! grep -q . /tmp/webchat-replies.jsonl; then
+    # DIVE-7417: on hermes the answer comes from its gateway; show why it is not up.
+    [[ -r "$home/.hermes/gateway-fallback.log" ]] && { echo "--- hermes gateway (run by the seat) ---"; tail -20 "$home/.hermes/gateway-fallback.log"; }
     DETAIL="a web chat message got no reply in 300s"; return 1
   fi
   if ! jq -r '.body // empty' /tmp/webchat-replies.jsonl | grep -qw -- "$want"; then
@@ -342,6 +354,8 @@ run_arm() {
     if cell_has_webchat "$CELL"; then
       step webchat
       webchat_arm || { show_seat; finish fail; }
+    elif [[ "$(cell_type "$CELL")" == hermes ]]; then
+      echo "webchat: not graded on hermes, its web chat is off in the app (DIVE-7349 follow-up)"
     fi
     if cell_has_readme "$CELL" "$OS"; then readme_arm || finish fail; fi
     STEP="" DETAIL=""
@@ -349,7 +363,9 @@ run_arm() {
   fi
   # DIVE-7355: an empty balance on the CI test key is funding, not the product:
   # skip (neutral, like no key) until it is topped up. Anything else stays red.
-  if grep -qi 'credit balance is too low' <<<"$out"; then
+  # DIVE-7417: OpenRouter says it as a 402, "Insufficient credits" or
+  # "requires more credits" (the $5-capped test key).
+  if grep -qiE 'credit balance is too low|insufficient credits|requires more credits' <<<"$out"; then
     DETAIL="the $(cell_key "$CELL") test key is out of credit (the seat's AI account refused the turn): install, init and pin ran; the reply was not graded"
     show_seat
     if cell_has_readme "$CELL" "$OS"; then

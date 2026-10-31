@@ -10,14 +10,16 @@ name: init-smoke
 # `agent list` blind on 22.04 (DIVE-7331). Both the self-check and `agent
 # list` said "ready" on the dead agent; only its reply could not lie.
 #
-# One cell per (agent type with a key path, OS): Claude Code, OpenClaw and
-# Hermes (sandboxed and standard) on the Anthropic test key, Codex on the
-# OpenAI one. Sign-in-only paths (ChatGPT, Grok) stay manual. Every seat is
-# pinned to the cheapest model before its first message: about 10 short turns
-# a night. A red cell is named "<cell> / ubuntu-<os>" and its log ends with
+# One cell per (agent type with a key path, OS): Claude Code and OpenClaw on
+# the Anthropic test key; Hermes (sandboxed and standard) and Codex on the
+# capped OpenRouter test key, on openai/gpt-6-luna (DIVE-7417; never a Claude
+# model through OpenRouter). Sign-in-only paths (ChatGPT, Grok) stay manual.
+# Every seat is pinned to the cheapest model before its first message: about
+# 10 short turns a night. A red cell is named "<cell> / ubuntu-<os>" and its log ends with
 #   INIT-SMOKE FAIL cell=<cell> os=<os> step=<step>: <what failed>
 #
-# KEYS: repo secrets INIT_SMOKE_ANTHROPIC_API_KEY and INIT_SMOKE_OPENAI_API_KEY.
+# KEYS: repo secrets INIT_SMOKE_ANTHROPIC_API_KEY and INIT_SMOKE_OPENROUTER_API_KEY
+# (the $5-capped OpenRouter test key; about 1 cent a night on gpt-6-luna).
 # The Claude cells take INIT_SMOKE_CLAUDE_CODE_OAUTH_TOKEN (a `claude
 # setup-token`) when it is set: the Anthropic test key works headless, which is
 # all OpenClaw and Hermes need, but interactive Claude Code refuses it ("Credit
@@ -190,10 +192,10 @@ jobs:
           # Pull requests never get a key (they run the rig on a placeholder).
           ANTHROPIC_KEY: ${{ github.event_name != 'pull_request' && secrets.INIT_SMOKE_ANTHROPIC_API_KEY || '' }}
           CLAUDE_TOKEN: ${{ github.event_name != 'pull_request' && secrets.INIT_SMOKE_CLAUDE_CODE_OAUTH_TOKEN || '' }}
-          OPENAI_KEY: ${{ github.event_name != 'pull_request' && secrets.INIT_SMOKE_OPENAI_API_KEY || '' }}
+          OPENROUTER_KEY: ${{ github.event_name != 'pull_request' && secrets.INIT_SMOKE_OPENROUTER_API_KEY || '' }}
         run: |
           case "$CELL" in
-            codex) key="$OPENAI_KEY" ;;
+            codex|hermes-*) key="$OPENROUTER_KEY" ;;
             claude) key="${CLAUDE_TOKEN:-$ANTHROPIC_KEY}" ;;
             *) key="$ANTHROPIC_KEY" ;;
           esac

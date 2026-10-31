@@ -379,7 +379,7 @@ USAGE
 
   # --- Step 3: auth ---
   local auth_ok=0 auth_summary="Existing credentials"
-  local byo_provider="" byo_key="" pi_model="" pi_provider="" pi_key=""
+  local byo_provider="" byo_key="" create_model="" create_provider="" create_key=""
   # Probe current auth state — cmd_auth_status returns 0 if any creds exist.
   if 5dive agent auth status --probe --type="$type" --json 2>/dev/null | jq -e '.ok and (.data | any(.status == "ok"))' >/dev/null 2>&1; then
     _init_ok "${type_label[$type]} is already authenticated"
@@ -432,7 +432,8 @@ USAGE
         local auth_choice
         _init_pick auth_choice "How should Codex authenticate?" 1 \
           "chatgpt|Sign in with ChatGPT|Use a one-time device code · recommended" \
-          "api-key|OpenAI API key|Usage-based API billing"
+          "api-key|OpenAI API key|Usage-based API billing" \
+          "openrouter|OpenRouter|Any model on OpenRouter, with an OpenRouter key"
         case "$auth_choice" in
           chatgpt)
             _init_note "Opening Codex device-code sign-in…"
@@ -447,6 +448,16 @@ USAGE
               || fail "$E_AUTH_REQUIRED" "auth failed"
             _init_ok "OpenAI API key saved"
             auth_summary="OpenAI API key"
+            ;;
+          openrouter)
+            # DIVE-7417: provider, key and model are wired at create (the
+            # path pi takes below), which also writes Codex's provider table.
+            create_provider="openrouter"
+            _init_secret create_key "openrouter API key"
+            [[ -n "$create_key" ]] || fail "$E_VALIDATION" "empty API key"
+            _init_text create_model "Model" "openai/$(codex_model_default)"
+            [[ -n "$create_model" ]] || fail "$E_VALIDATION" "openrouter needs a model (none given)"
+            auth_summary="openrouter API key"
             ;;
         esac
         ;;
@@ -539,8 +550,8 @@ USAGE
         # model, so require one here and pin it at create via --model.
         if [[ "$provider" == "openrouter" ]]; then
           _init_note "OpenRouter routes many models; enter the exact model slug."
-          _init_text pi_model "Model (for example deepseek/deepseek-v4.1-flash)"
-          [[ -n "$pi_model" ]] || fail "$E_VALIDATION" "openrouter needs a model (none given)"
+          _init_text create_model "Model (for example deepseek/deepseek-v4.1-flash)"
+          [[ -n "$create_model" ]] || fail "$E_VALIDATION" "openrouter needs a model (none given)"
         fi
         # Defer the key to `agent create` (below) so it takes the SAME wiring
         # path as `agent create --provider/--api-key`: pi_apply_provider_key
@@ -549,9 +560,9 @@ USAGE
         # the key to the default connector but left the created agent with
         # defaultProvider="" → pi errored "No API key found for the selected
         # model" on openrouter. DIVE-1269.
-        pi_provider="$provider"
-        _init_secret pi_key "$provider API key"
-        [[ -n "$pi_key" ]] || fail "$E_VALIDATION" "empty API key"
+        create_provider="$provider"
+        _init_secret create_key "$provider API key"
+        [[ -n "$create_key" ]] || fail "$E_VALIDATION" "empty API key"
         auth_summary="$provider API key"
         ;;
     esac
@@ -705,7 +716,7 @@ USAGE
   else
     _init_review_row "Channel" "Terminal only"
   fi
-  [[ -n "$pi_model" ]] && _init_review_row "Model" "$pi_model"
+  [[ -n "$create_model" ]] && _init_review_row "Model" "$create_model"
   echo >&2
 
   local create_choice
@@ -719,8 +730,9 @@ USAGE
 
   # --- Step 6: create ---
   local -a create_args=("$name" "--type=$type" "--isolation=$isolation")
-  # pi + a gateway provider (openrouter) needs its model pinned at create -> pi_apply_model_default.
-  [[ -n "$pi_model" ]] && create_args+=("--model=$pi_model")
+  # pi + a gateway provider (openrouter) needs its model pinned at create -> pi_apply_model_default;
+  # so does codex on openrouter (DIVE-7417: seed_codex_model).
+  [[ -n "$create_model" ]] && create_args+=("--model=$create_model")
   if [[ "$channels" != "none" ]]; then
     create_args+=("--channels=$channels")
     [[ -n "$telegram_token" ]] && create_args+=("--telegram-token=$telegram_token")
@@ -732,14 +744,14 @@ USAGE
     # provider. Key on stdin so it never lands in argv/history.
     create_args+=("--provider=$byo_provider" "--api-key=-" "--auth-profile=$byo_provider")
     printf '%s' "$byo_key" | _init_run "Creating $name" 5dive agent create "${create_args[@]}" || create_rc=$?
-  elif [[ -n "$pi_provider" ]]; then
-    # pi BYO: provider + key (+ model for gateways like openrouter, already
+  elif [[ -n "$create_provider" ]]; then
+    # pi BYO, and Codex on OpenRouter (DIVE-7417): provider + key (+ model for gateways like openrouter, already
     # appended above) wired at create so it runs pi_apply_provider_key AND
     # pi_apply_model_default — same path `agent create --provider` uses, so the
     # agent boots with defaultProvider set and the key persisted. Key on stdin
     # so it never lands in argv/history. DIVE-1269.
-    create_args+=("--provider=$pi_provider" "--api-key=-")
-    printf '%s' "$pi_key" | _init_run "Creating $name" 5dive agent create "${create_args[@]}" || create_rc=$?
+    create_args+=("--provider=$create_provider" "--api-key=-")
+    printf '%s' "$create_key" | _init_run "Creating $name" 5dive agent create "${create_args[@]}" || create_rc=$?
   else
     _init_run "Creating $name" 5dive agent create "${create_args[@]}" || create_rc=$?
   fi

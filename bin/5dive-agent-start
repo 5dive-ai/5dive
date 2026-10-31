@@ -568,6 +568,31 @@ TOML
     rm -f "$seed"
   }
   apply_codex_model_seed "$AGENT_CODEX_HOME"
+  # DIVE-7417: the third-party provider `agent create --provider` chose (three
+  # seed lines: id, base_url, env var). Same one-shot rules as the model seed:
+  # the top-level `model_provider` is prepended only when config.toml names
+  # none, and the [model_providers.<id>] table is appended, whole, only when it
+  # is absent (an appended whole table is TOML-safe; a bare key is not). The key
+  # stays in the environment: env_key names the variable, never its value.
+  apply_codex_provider_seed() {   # apply_codex_provider_seed <codex-home>
+    local seed="$1/.5dive-provider-seed" cfg="$1/config.toml" id url var tmp
+    [[ -f "$seed" ]] || return 0
+    { read -r id; read -r url; read -r var; } < "$seed"
+    if [[ "$id" =~ ^[a-z][a-z0-9-]*$ && "$url" =~ ^https://[A-Za-z0-9._/:-]+$ && "$var" =~ ^[A-Z][A-Z0-9_]*$ && -f "$cfg" ]]; then
+      if ! awk '/^[ \t]*\[/ { exit } /^[ \t]*model_provider[ \t]*=/ { found = 1; exit } END { exit !found }' "$cfg"; then
+        tmp="$cfg.seed.$$"
+        { printf 'model_provider = "%s"\n' "$id"; cat "$cfg"; } > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$cfg" \
+          || { rm -f "$tmp"; echo "warn: could not write the seeded codex provider ($id)" >&2; }
+      fi
+      grep -q "^[[:space:]]*\[model_providers\.${id}\][[:space:]]*\$" "$cfg" \
+        || printf '\n[model_providers.%s]\nname = "%s"\nbase_url = "%s"\nenv_key = "%s"\nwire_api = "responses"\n' \
+             "$id" "$id" "$url" "$var" >> "$cfg"
+    else
+      echo "warn: ignoring a malformed codex provider seed ($seed)" >&2
+    fi
+    rm -f "$seed"
+  }
+  apply_codex_provider_seed "$AGENT_CODEX_HOME"
   # Wire the telegram-codex MCP server + lifecycle hooks into config.toml when
   # this agent has the telegram channel. We append complete [sections] only
   # when [mcp_servers.telegram] isn't already present — appending whole tables
@@ -2486,6 +2511,30 @@ if [[ "$TYPE" == "hermes" || "$TYPE" == "openclaw" ]] && [[ ",${CHANNELS}," == *
         "$DASH_BUN" "$DASH_PLUGIN_DIR/server.ts" "--runtime=$TYPE" </dev/null || true
         echo "warn: $TYPE web chat bridge exited; restarting in 5s" >&2
         sleep 5
+      done
+    ) &
+  fi
+  # DIVE-7417: on hermes the answers come from the messaging gateway, which
+  # ensure_hermes_gateway runs as a `systemctl --user` service. A box with no
+  # per-user service manager (a container: measured on every init-smoke hermes
+  # cell, "hermes gateway start failed") never gets one, so every web chat
+  # message went unanswered. When no gateway is up once the user service has
+  # had its chance, run one here for as long as the session lives. hermes
+  # refuses a second gateway on the same home by itself, so this cannot double
+  # one that the user service starts later.
+  if [[ "$TYPE" == "hermes" && -x "${BIN:-}" ]]; then
+    (
+      sleep 20
+      while /usr/bin/tmux has-session -t "$SESSION" 2>/dev/null; do
+        _gw=""
+        for _p in "${FIVE_PROC_ROOT:-/proc}"/[0-9]*; do   # no procps on a minimal box; the root is overridable for tests
+          [[ -O "$_p" ]] && tr '\0' ' ' <"$_p/cmdline" 2>/dev/null | grep -q 'hermes_cli[.]main gateway run' && { _gw=1; break; }
+        done
+        if [[ -z "$_gw" ]]; then
+          echo "dashboard channel: no hermes gateway is running; starting one beside the seat" >&2
+          "$BIN" gateway run </dev/null >>"$HOME/.hermes/gateway-fallback.log" 2>&1 || true
+        fi
+        sleep 15
       done
     ) &
   fi

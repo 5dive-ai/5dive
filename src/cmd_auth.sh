@@ -1679,6 +1679,37 @@ opencode_apply_provider_key() {
   fi
 }
 
+# codex_provider_var <provider> — the env var Codex reads a third-party
+# provider's key from (CODEX_PROVIDER_VAR). Non-zero + empty for a provider
+# Codex has no route for. DIVE-7417.
+codex_provider_var() {
+  local var="${CODEX_PROVIDER_VAR[${1:-}]:-}"
+  [[ -n "$var" ]] || return 1
+  echo "$var"
+}
+
+# codex_apply_provider_key <provider> <api_key> [profile] — write the key into
+# the codex connector (openai.env, which every seat's unit loads) or the auth
+# profile's combined.env. Only seats whose config.toml names the provider read
+# the variable; an OpenAI-key or ChatGPT seat ignores it. DIVE-7417.
+codex_apply_provider_key() {
+  local provider="$1" api_key="$2" profile="${3:-}"
+  local var
+  var=$(codex_provider_var "$provider") \
+    || fail "$E_VALIDATION" "codex provider '$provider' not supported (known: ${!CODEX_PROVIDER_VAR[*]})"
+  require_root
+  if [[ -z "$profile" ]]; then
+    step "Writing ${var} to /etc/5dive/connectors/${TYPE_API_FILE[codex]}"
+    printf '%s' "$api_key" | write_default_connector "${TYPE_API_FILE[codex]}" "$var"
+  else
+    valid_profile_name "$profile" \
+      || fail "$E_VALIDATION" "invalid --auth-profile (lowercase letters/digits/_-, start letter, <=32 chars)"
+    ensure_profile_dir "$profile" >/dev/null
+    step "Writing ${var} to auth profile '${profile}'"
+    printf '%s' "$api_key" | profile_set_var "$profile" "$var"
+  fi
+}
+
 # OpenCode persists its default as provider_id/model_id. Keep the small merge
 # primitive separate so the preservation contract can be unit-tested without a
 # real agent user or /home write.
