@@ -90,6 +90,8 @@ if iso:
 else:
     s.append({'wait': 'Pick isolation:' + menu, 'send': '\n'})
 s.append({'wait': r'Ready to create [a-z0-9-]+\?' + menu, 'pick': 'Create agent'})
+# DIVE-7369: the last question, after the agent is made (so behind the create).
+s.append({'wait': r'Turn on nightly updates\?' + menu, 'pick': 'Turn on', 'secs': 1200})
 print(json.dumps(s, indent=1))
 PY
 }
@@ -275,6 +277,9 @@ run_arm() {
   [[ -n "$DETAIL" ]] || DETAIL="the init driver exited $rc without a result"
   (( rc == 0 )) || { show_seat; finish fail; }
   echo "init: $DETAIL in $(jq -r .secs /tmp/init-drive.json)s"
+  # DIVE-7369: init's last answer was Yes to nightly updates.
+  systemctl is-enabled --quiet 5dive-self-update.timer \
+    || { DETAIL="init was told Yes to nightly updates, but 5dive-self-update.timer is not enabled"; finish fail; }
   DETAIL=""
   seat_up || { DETAIL="init said ready, but the seat's unit or tmux session is not up"; show_seat; finish fail; }
 

@@ -259,6 +259,39 @@ _init_run() {
   return "$rc"
 }
 
+# DIVE-7369: nightly updates stay OFF by default on a self-hosted box (lodar
+# 10-23), but install.sh's one "Recommended" line scrolls away under this very
+# wizard, so self-hosters never saw it. Ask once, as the last question. Not
+# asked where it would be noise or a guess: a box 5dive runs (it updates from
+# 5dive's side), a box where it is already on, no systemd, or no terminal to
+# answer on. Every path that does not ask leaves it OFF; only a Yes turns it on.
+_init_stdin_tty() { [[ -t 0 ]]; }
+_init_nightly_ask() {
+  [[ "${FIVEDIVE_SELF_UPDATE_HINT:-1}" == "0" ]] && return 0
+  _init_stdin_tty || return 0
+  _su_nightly_managed && return 0
+  _su_nightly_is_on && return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  local nightly
+  _init_note "5dive updates itself at night and keeps your agents."
+  _init_pick nightly "Turn on nightly updates?" 1 \
+    "on|Turn on|Recommended: you get fixes without doing anything" \
+    "off|Not now|You update by hand with: sudo 5dive self-update"
+  if [[ "$nightly" == "on" ]]; then
+    # Its own subshell: _su_nightly_on ends in fail() on a write error, and
+    # the agent is already made, so that must not turn init's exit red.
+    ( _su_nightly_on ) >/dev/null 2>&1 || true
+    if _su_nightly_is_on; then
+      _init_ok "Nightly updates are on. Turn off any time: sudo 5dive self-update --off"
+    else
+      _init_warn "Nightly updates could not be turned on. Try: sudo 5dive self-update --on"
+    fi
+  else
+    _init_note "Nightly updates stay off. Turn them on any time: sudo 5dive self-update --on"
+  fi
+  echo >&2
+}
+
 cmd_init() {
   # --- Flags: --quiet/--demo suppress sub-process noise (see _init_run) ---
   local _arg
@@ -273,6 +306,8 @@ cmd_init() {
   --quiet, --demo   Hide install/create sub-process output behind a spinner
                     (a clean capture for demos); full logs go to
                     /tmp/5dive-init-<ts>.log. Default streams everything.
+  Last, on a self-hosted box, it asks once whether to turn on nightly
+  updates (recommended; off unless you say yes).
 USAGE
         return 0 ;;
       *) fail "$E_USAGE" "unknown flag '$_arg' (see: 5dive init --help)" ;;
@@ -800,4 +835,7 @@ TEAMS
 MANAGE
 
   cmd_app_hint >&2
+
+  # DIVE-7369: last, so the answer is the last thing on screen.
+  _init_nightly_ask
 }
