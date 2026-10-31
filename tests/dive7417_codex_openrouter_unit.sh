@@ -212,5 +212,9 @@ grep -qE '^ *"\$BIN" gateway run </dev/null' "$AS" && ! grep -qE '"\$BIN" gatewa
   && ok_t "start: the fallback runs the gateway without --replace, so it never kills a service-run one" \
   || bad_t "start: the fallback gateway run is missing or uses --replace"
 
+_wc() { bash -c "source <(sed -n '/^cell_type()/p;/^cell_has_webchat()/p' $SM); cell_has_webchat $1 && echo yes || echo no"; }
+eq_t "smoke: openclaw still grades its web chat" "yes" "$(_wc openclaw)"
+eq_t "smoke: hermes web chat is not graded while the app has it off" "no no" "$(_wc hermes-standard) $(_wc hermes-sandboxed)"
+grep -q 'webchat: not graded on hermes' "$SM" && ok_t "smoke: a hermes cell says its web chat was not graded" || bad_t "smoke: a hermes cell drops the web chat silently"
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

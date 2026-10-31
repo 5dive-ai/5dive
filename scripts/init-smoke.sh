@@ -19,7 +19,7 @@
 #   init           `5dive init` stopped, asked something unexpected, or failed
 #   pin            the seat could not be put on the cheapest model
 #   reply          the agent's own answer never arrived, or was wrong
-#   webchat        (hermes, openclaw) a 5dive app chat message got no answer, or a wrong one,
+#   webchat        (openclaw) a 5dive app chat message got no answer, or a wrong one,
 #                  or one was answered while the web chat was still off (negative control)
 #   readme         (claude on 24.04) a command the README shows failed on this box
 #                  (DIVE-7370, scripts/init-smoke-readme.py; it runs on a skipped
@@ -191,7 +191,12 @@ PY
 # in the container, so a stand-in on loopback answers the bridge's calls and
 # records the reply: everything from the inbox to the outbound POST is real,
 # the seat's gateway and model included.
-cell_has_webchat() { case "$(cell_type "$1")" in hermes|openclaw) return 0 ;; *) return 1 ;; esac; }
+# DIVE-7417: openclaw only. The app has the Hermes web chat OFF (DIVE-7349 scope
+# cut: no Hermes turn had ever answered), and this arm on hermes, first reached
+# once its cells answered on OpenRouter, found the gateway up but loading no
+# 5dive platform ("No messaging platforms enabled"). Turning Hermes on in the app
+# and here is one follow-up; until then the cell says so instead of grading it.
+cell_has_webchat() { case "$(cell_type "$1")" in openclaw) return 0 ;; *) return 1 ;; esac; }
 
 FAKE_API_PORT=18999
 start_fake_api() {
@@ -349,6 +354,8 @@ run_arm() {
     if cell_has_webchat "$CELL"; then
       step webchat
       webchat_arm || { show_seat; finish fail; }
+    elif [[ "$(cell_type "$CELL")" == hermes ]]; then
+      echo "webchat: not graded on hermes, its web chat is off in the app (DIVE-7349 follow-up)"
     fi
     if cell_has_readme "$CELL" "$OS"; then readme_arm || finish fail; fi
     STEP="" DETAIL=""
