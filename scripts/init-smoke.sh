@@ -20,6 +20,9 @@
 #   pin            the seat could not be put on the cheapest model
 #   reply          the agent's own answer never arrived, or was wrong
 #   webchat        (hermes, openclaw) a 5dive app chat message got no answer, or a wrong one
+#   readme         (claude on 24.04) a command the README shows failed on this box
+#                  (DIVE-7370, scripts/init-smoke-readme.py; it runs on a skipped
+#                  reply too, since most README commands need no model)
 #
 # The reply is graded on the agent's TEXT: it is asked a sum and must answer
 # it. The self-check and `agent list` both said ready on the dead Hermes seat.
@@ -246,6 +249,22 @@ webchat_arm() {
   echo "the web chat answered $want"
 }
 
+# DIVE-7370: every `5dive` command the README shows, run for real on this box.
+# One cell is enough (they share the CLI); Claude Code on 24.04 is the README's
+# own quickstart. The tree's README is staged at /opt/init-smoke-README.md.
+cell_has_readme() { [[ "$1" == claude && "$2" == ubuntu-24.04 ]]; }
+
+# readme_arm [--no-model]: --no-model when the seat cannot answer (no key, or
+# a key out of credit); the runner then skips the commands that need a reply.
+readme_arm() {
+  local rc=0
+  step readme
+  python3 /usr/local/sbin/init-smoke-readme run /opt/init-smoke-README.md /init-smoke-readme.json "$@" || rc=$?
+  (( rc == 0 )) && return 0
+  DETAIL="$(jq -r .line /init-smoke-readme.json 2>/dev/null || echo "the README runner exited $rc"): $(jq -r '[.commands[] | select(.status == "fail") | .readme] | join("; ")' /init-smoke-readme.json 2>/dev/null)"
+  return 1
+}
+
 run_arm() {
   CELL="$1" OS="$2"
   local type rc=0 a b want out
@@ -284,8 +303,9 @@ run_arm() {
 
   step reply
   if (( PLACEHOLDER )); then
-    DETAIL="no $(cell_key "$CELL") test key in the repo secrets: install, init and pin ran on a placeholder key; the reply was not asked"
     show_seat
+    if cell_has_readme "$CELL" "$OS"; then readme_arm --no-model || finish fail; fi
+    STEP=reply DETAIL="no $(cell_key "$CELL") test key in the repo secrets: install, init and pin ran on a placeholder key; the reply was not asked"
     finish skip
   fi
   # A sum, so the answer is in no text the CLI or the question printed: only
@@ -301,6 +321,7 @@ run_arm() {
       step webchat
       webchat_arm || { show_seat; finish fail; }
     fi
+    if cell_has_readme "$CELL" "$OS"; then readme_arm || finish fail; fi
     STEP="" DETAIL=""
     finish pass
   fi
@@ -309,6 +330,11 @@ run_arm() {
   if grep -qi 'credit balance is too low' <<<"$out"; then
     DETAIL="the $(cell_key "$CELL") test key is out of credit (the seat's AI account refused the turn): install, init and pin ran; the reply was not graded"
     show_seat
+    if cell_has_readme "$CELL" "$OS"; then
+      local credit="$DETAIL"
+      readme_arm --no-model || finish fail
+      STEP=reply DETAIL="$credit"
+    fi
     finish skip
   fi
   DETAIL="asked $a + $b, the reply did not say $want (ask exited $rc): $(printf '%s' "$out" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-300)"
