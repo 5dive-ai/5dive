@@ -120,7 +120,21 @@ pin_model() {
   [[ -n "$haiku" ]] || { DETAIL="could not read the haiku model id from the installed CLI"; return 1; }
   case "$type" in
     claude)
-      out=$(5dive agent config "$NAME" set model=haiku 2>&1) || rc=$? ;;
+      # `config set` restarts the seat a moment AFTER it returns. Wait for that
+      # restart, or the question goes to the old session and the restart kills
+      # it mid-reply (10-30: "tmux session not found", DIVE-7353).
+      local inv
+      inv=$(systemctl show -p InvocationID --value "5dive-agent@${NAME}.service" 2>/dev/null)
+      out=$(5dive agent config "$NAME" set model=haiku 2>&1) || rc=$?
+      if (( rc == 0 )); then
+        local _
+        for _ in $(seq 1 90); do
+          [[ "$(systemctl show -p InvocationID --value "5dive-agent@${NAME}.service" 2>/dev/null)" != "$inv" ]] && break
+          sleep 1
+        done
+        [[ "$(systemctl show -p InvocationID --value "5dive-agent@${NAME}.service" 2>/dev/null)" != "$inv" ]] \
+          || { out+=$'\n'"the seat was not restarted within 90s of the model pin"; rc=1; }
+      fi ;;
     codex)
       out=$(5dive agent config "$NAME" set "model=${INIT_SMOKE_CODEX_MODEL:-gpt-5-mini}" 2>&1) || rc=$? ;;
     openclaw)

@@ -761,8 +761,14 @@ _install_status() {
 # compiler (it builds node-pty) and can only apt-get one with a cached sudo.
 # `-g`: _load_module evals this module inside a function, where a plain
 # `declare` stays local.
+# DIVE-7353: the rest of what that installer asks to apt-get, because asking is
+# what stalls `5dive init`: with a terminal it stops at "Install ripgrep ... ffmpeg
+# ...? [Y/n]" (then "Install build tools?") and wants claude's sudo password,
+# which claude does not have. With everything present it asks nothing. ripgrep is
+# the agent's file search, ffmpeg its Telegram voice replies, python3-dev and
+# libffi-dev the build tools it checks for.
 declare -gA TYPE_SYSLIB=(
-  [hermes]="libatomic.so.1:libatomic1 build-essential:build-essential"
+  [hermes]="libatomic.so.1:libatomic1 build-essential:build-essential ripgrep:ripgrep ffmpeg:ffmpeg python3-dev:python3-dev libffi-dev:libffi-dev"
 )
 
 _syslib_present() {
@@ -775,26 +781,28 @@ _syslib_present() {
 }
 
 # _install_syslib <type> — no-op unless TYPE_SYSLIB names something missing.
+# Whatever is missing goes in ONE apt-get and one line on screen (DIVE-7353).
 _install_syslib() {
-  local spec
+  local spec lib
+  local -a missing=() pkgs=()
   for spec in ${TYPE_SYSLIB[$1]:-}; do
-    _install_syslib_one "$1" "$spec"
+    _syslib_present "${spec%%:*}" && continue
+    missing+=("$spec"); pkgs+=("${spec#*:}")
   done
-}
-
-_install_syslib_one() {
-  local spec="$2"
-  local lib="${spec%%:*}" pkg="${spec#*:}"
-  _syslib_present "$lib" && return 0
-  local hint="$1 needs $lib (Debian/Ubuntu package: $pkg), and it is not installed on this box. Install it (sudo apt-get install -y $pkg), then retry"
+  (( ${#missing[@]} )) || return 0
+  local hint="$1 needs these Debian/Ubuntu packages, and they are not installed on this box: ${pkgs[*]}. Install them (sudo apt-get install -y ${pkgs[*]}), then retry"
   command -v apt-get >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "$hint"
-  step "Installing $pkg ($1 needs $lib)"
+  step "Installing system packages $1 needs: ${pkgs[*]}"
   local -a apt=(env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120)
   # A fresh cloud image can ship with empty package lists: refresh once, retry.
-  "${apt[@]}" install -y --no-install-recommends "$pkg" >&2 \
-    || { "${apt[@]}" update >&2 && "${apt[@]}" install -y --no-install-recommends "$pkg" >&2; } \
+  "${apt[@]}" install -y --no-install-recommends "${pkgs[@]}" >&2 \
+    || { "${apt[@]}" update >&2 && "${apt[@]}" install -y --no-install-recommends "${pkgs[@]}" >&2; } \
     || true
-  _syslib_present "$lib" || fail "$E_NOT_INSTALLED" "$hint"
+  for spec in "${missing[@]}"; do
+    lib="${spec%%:*}"
+    _syslib_present "$lib" \
+      || fail "$E_NOT_INSTALLED" "$1 needs $lib (Debian/Ubuntu package: ${spec#*:}), and it is not installed on this box. Install it (sudo apt-get install -y ${spec#*:}), then retry"
+  done
 }
 
 cmd_install() {

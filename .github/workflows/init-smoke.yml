@@ -18,6 +18,12 @@ name: init-smoke
 #   INIT-SMOKE FAIL cell=<cell> os=<os> step=<step>: <what failed>
 #
 # KEYS: repo secrets INIT_SMOKE_ANTHROPIC_API_KEY and INIT_SMOKE_OPENAI_API_KEY.
+# The Claude cells take INIT_SMOKE_CLAUDE_CODE_OAUTH_TOKEN (a `claude
+# setup-token`) when it is set: the Anthropic test key works headless, which is
+# all OpenClaw and Hermes need, but interactive Claude Code refuses it ("Credit
+# balance is too low", DIVE-7353). init's "Anthropic API key" prompt takes
+# either: a token starting sk-ant-oat01- is stored as CLAUDE_CODE_OAUTH_TOKEN.
+# Unset, the Claude cells fall back to the API key and stay red, on purpose.
 # A cell whose secret is unset still runs install, init and the model pin on a
 # placeholder key, and reports SKIP at step=reply (neutral, not red). Pull
 # requests never get a key: they check the rig, and spend nothing.
@@ -165,9 +171,14 @@ jobs:
         env:
           # Pull requests never get a key (they run the rig on a placeholder).
           ANTHROPIC_KEY: ${{ github.event_name != 'pull_request' && secrets.INIT_SMOKE_ANTHROPIC_API_KEY || '' }}
+          CLAUDE_TOKEN: ${{ github.event_name != 'pull_request' && secrets.INIT_SMOKE_CLAUDE_CODE_OAUTH_TOKEN || '' }}
           OPENAI_KEY: ${{ github.event_name != 'pull_request' && secrets.INIT_SMOKE_OPENAI_API_KEY || '' }}
         run: |
-          case "$CELL" in codex) key="$OPENAI_KEY" ;; *) key="$ANTHROPIC_KEY" ;; esac
+          case "$CELL" in
+            codex) key="$OPENAI_KEY" ;;
+            claude) key="${CLAUDE_TOKEN:-$ANTHROPIC_KEY}" ;;
+            *) key="$ANTHROPIC_KEY" ;;
+          esac
           rc=0
           INIT_SMOKE_KEY="$key" docker exec -e INIT_SMOKE_KEY is /usr/local/sbin/init-smoke run "$CELL" "ubuntu-$OS" || rc=$?
           mkdir -p /tmp/result
