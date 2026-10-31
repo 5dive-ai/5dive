@@ -1241,6 +1241,14 @@ main() {
       # Never advertised.
       cmd_dashboard_relay "$@"
       exit $? ;;
+    _chat_e2e)
+      # DIVE-6878: hidden root half of encrypted 5dive.app chat on a self-hosted
+      # server. Reachable ONLY via the exact-path NOPASSWD line
+      # render_standard_sudoers writes; one JSON request on stdin (open, seal,
+      # seal-file), the seat never reads the box key (src/cmd_chat.sh). Not
+      # audited: it runs once per chat message. Never advertised.
+      cmd_chat_e2e_root "$@"
+      exit $? ;;
     _secret_link_notify)
       # DIVE-7128: hidden root half of a standard seat's secret gate alert. The
       # seat is derived from SUDO_UID and must have filed the open gate named on
@@ -1472,6 +1480,15 @@ main() {
       # DIVE-519: mint a human-origin proof token for an approval/secret gate (or
       # toggle enforcement). Root-only (reads the 0400 key); audits its own mint.
       cmd_gate_proof "$@" ;;
+    chat)
+      # DIVE-6878: encrypted 5dive.app chat (src/cmd_chat.sh). The pairing
+      # secret of `chat e2e enable` is NEVER audited; approve/revoke name a
+      # device code, which is public.
+      case "${1:-}" in
+        e2e) [[ "${2:-}" == enable ]] && { AUDIT_CMD="chat e2e enable"; AUDIT_ARGS=(); } ;;
+        devices|device) case "${2:-}" in approve|revoke|rm) AUDIT_CMD="chat devices ${2}"; AUDIT_ARGS=("${@:3}") ;; esac ;;
+      esac
+      cmd_chat "$@" ;;
     secret)
       # DIVE-930/932 secure credential drop: box-side secret-write primitive.
       # Root-only (writes root-owned /etc/5dive/connectors). The value arrives on

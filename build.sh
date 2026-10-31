@@ -193,6 +193,7 @@ LAZY_FILES=(
   src/cmd_pkg.sh
   src/cmd_agent_rights.sh
   src/cmd_dashboard_relay.sh
+  src/cmd_chat.sh
   src/cmd_selfupdate.sh
 )
 

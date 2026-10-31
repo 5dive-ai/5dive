@@ -79,7 +79,11 @@ _a2a_queue_dir() { printf '%s\n' "${TMPROOT}/agent-${1}/.5dive/a2a-queue"; }
 _hb_agent_idle() { return 0; }
 inject_and_submit() { printf '%s\t%s\n' "$1" "$2" >>"$DELIVERED"; return 0; }
 registry_read() { printf '{"agents":{"scout":{},"head":{}}}\n'; }
-_HB_A2A_DRAIN_BUDGET_SEC=0; _HB_A2A_DRAIN_POLL_SEC=0
+# DIVE-6878: a budget, not 0. The sweep's deadline is whole seconds (date +%s),
+# so with 0 a clock tick between computing it and the first check stopped the
+# sweep after one message: the merge queue went red twice at 14.79->15.03s and
+# 34.83->35.0s. 30s only bounds a broken drain; a working one never waits.
+_HB_A2A_DRAIN_BUDGET_SEC=30; _HB_A2A_DRAIN_POLL_SEC=0
 
 marker() { cat "${STATE_DIR}/a2a-spool/${1}" 2>/dev/null || printf 'absent'; }
 
