@@ -1036,7 +1036,7 @@ ls_out=$( (JSON_MODE=1; _secret_saved ls) 2>&1 )
 [[ "$(saved_val OLD_ITEM)" == plain-old-1 ]] && ! grep -qF plain-old-1 "$SAVED" && grep -q '^OLD_ITEM=v2:' "$SAVED" \
   && ok_t "L17h migration: a plain saved line is encrypted in place by the first saved verb, and nothing plain is left" \
   || bad_t "L17h migration" "$(cat "$SAVED")"
-want='{"names":["github","old-item"],"items":[{"name":"github","fields":["login","password","2fa"],"login":"owner@example.com","host":"github.com","lastUsedAt":null,"lastUsedBy":null},{"name":"old-item","fields":["value"],"login":null,"host":null,"lastUsedAt":null,"lastUsedBy":null}]}'
+want='{"names":["github","old-item"],"items":[{"name":"github","fields":["login","password","2fa"],"login":"owner@example.com","host":"github.com","lastUsedAt":null,"lastUsedBy":null,"last4":null},{"name":"old-item","fields":["value"],"login":null,"host":null,"lastUsedAt":null,"lastUsedBy":null,"last4":null}]}'
 [[ "$(jq -c '.data' <<<"$ls_out")" == "$want" ]] \
   && ok_t "L17i saved ls --json: names kept, items carry fields, the login, the site and last use (none yet)" \
   || bad_t "L17i ls shape" "$ls_out"
@@ -1140,6 +1140,81 @@ hits=$(grep -rnE '(\btar\b|\brsync\b|\bcp\b|\bscp\b)[^#]*(/etc/5dive([/" ]|$)|va
 [[ -z "$hits" ]] \
   && ok_t "L17r no tar, cp, rsync or scp in the CLI names /etc/5dive, vault.key or saved.env" \
   || bad_t "L17r a copy path names the Vault" "$hits"
+
+# --- L18: DIVE-7381 — a card as one item, with the caution on its page ---------
+# lodar 2026-10-31: "can I creat a new debit card for you and put it in the
+# vault?", "just put caution when user inputs the card to the vault". Every
+# "never" arm makes the number reachable first (it was just typed), then counts 0.
+CN='4242 4242 4242 4242'; CND=4242424242424242; CE='7/39'; CEN='07/39'; CC=814; CH='Sam Owner'
+CAUTION='<b>Use a separate virtual card with a low limit.</b> Any agent on this box can use it, so the limit is what protects you.'
+rm -f "$USAGE"
+printf 'old-visa' | ( _secret_write VISA --connector=saved ) >/dev/null 2>&1
+o=$(mint --save=visa --card); tc=$(tok_of "$o"); hc=$(hash_of "$tc")
+[[ "$(jq -r '.data.card' <<<"$o")" == true && "$(jq -r '.data.pair' <<<"$o")" == false ]] && grep -qx 'card=1' "$SECRET_DROP_DIR/$hc" \
+  && ! mint --card >/dev/null 2>&1 && ! mint --save=visa2 --card --pair >/dev/null 2>&1 \
+  && ok_t "L18a secret link --save=<name> --card mints a card link; --card without --save, or with --pair, is refused" \
+  || bad_t "L18a card link" "$o"
+PORT8=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')
+python3 "$TMP/server.py" 127.0.0.1 "$PORT8" "$WRAP" "$SECRET_DROP_DIR" 0 2> "$TMP/server8.log" & SRV_PID=$!
+for _ in $(seq 1 50); do curl -fsS "http://127.0.0.1:$PORT8/healthz" >/dev/null 2>&1 && break; sleep 0.1; done
+B8="http://127.0.0.1:$PORT8"
+code=$(curl -s -o "$TMP/c1.html" -w '%{http_code}' "$B8/$tc")
+pre=$(python3 -c 'import sys; t=open(sys.argv[1]).read(); c=t.find(sys.argv[2]); b=t.find("<textarea"); print("yes" if 0 <= c < b else "no")' "$TMP/c1.html" "$CAUTION")
+[[ "$code" == 200 && "$pre" == yes ]] && grep -q '>Card number</label>' "$TMP/c1.html" && grep -q '>Expiry (MM/YY)</label>' "$TMP/c1.html" \
+  && grep -q '>Security code</label>' "$TMP/c1.html" && grep -q '>Name on card (optional)</label>' "$TMP/c1.html" \
+  && grep -q '<textarea id=f-number inputmode=numeric name=number class=secret' "$TMP/c1.html" \
+  && grep -q '<textarea id=f-cvc inputmode=numeric name=cvc class=secret' "$TMP/c1.html" && ! grep -q 'type=password' "$TMP/c1.html" \
+  && ok_t "L18b the card page shows the caution ABOVE the first box, then number, expiry, code, name on card; number and code masked, never type=password" \
+  || bad_t "L18b card page" "code=$code pre=$pre $(sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$TMP/c1.html" | head -c 700)"
+cpost() { curl -s -o "$TMP/$1.html" -w '%{http_code}' --data-urlencode "number=$2" --data-urlencode "exp=$3" --data-urlencode "cvc=$4" --data-urlencode "holder=$5" "$B8/$tc"; }
+c1=$(cpost c2 '4242 4242 4242 4241' "$CE" "$CC" "$CH"); c2=$(cpost c3 "$CN" '01/20' "$CC" "$CH")
+c3=$(cpost c4 "$CN" "$CE" 12 "$CH"); c4=$(cpost c5 "$CN" "$CE" "" "$CH")
+[[ "$c1 $c2 $c3 $c4" == "400 400 400 400" && -f "$SECRET_DROP_DIR/$hc" ]] && grep -q 'Check the card number' "$TMP/c2.html" \
+  && grep -q 'security code are each needed' "$TMP/c5.html" \
+  && [[ "$(saved_val VISA)" == old-visa ]] && ! grep -q '^VISA__' "$SAVED" \
+  && ok_t "L18c a mistyped number (Luhn), a past expiry, a 2-digit code or an empty box: refused whole, with the rule, nothing written, link still live" \
+  || bad_t "L18c card refusal" "codes=$c1 $c2 $c3 $c4 env=$(grep '^VISA' "$SAVED")"
+code=$(cpost c6 "$CN" "$CE" "$CC" "$CH")
+[[ "$code" == 200 && ! -f "$SECRET_DROP_DIR/$hc" ]] && grep -q 'pay with it' "$TMP/c6.html" \
+  && [[ "$(saved_val VISA__NUMBER)" == "$CND" && "$(saved_val VISA__EXP)" == "$CEN" && "$(saved_val VISA__CVC)" == "$CC" && "$(saved_val VISA__HOLDER)" == "$CH" ]] \
+  && ! grep -q '^VISA=' "$SAVED" \
+  && ok_t "L18d a card POST writes number (digits only), expiry (MM/YY), code and name as one item, drops the old one-value line, burns the link" \
+  || bad_t "L18d card save" "code=$code env=$(grep '^VISA' "$SAVED")"
+bad=""
+for v in "$CND" "$CN" "$CEN" "$CH" 4242; do grep -qF -- "$v" "$SAVED" && bad+="[env:$v] "; done
+for v in "$CND" "$CN"; do grep -qF -- "$v" "$TMP/c6.html" "$TMP/server8.log" && bad+="[page:$v] "; done
+[[ -z "$bad" && "$(grep -c '^VISA__[A-Z]*=v2:' "$SAVED")" == 4 ]] \
+  && ok_t "L18e NEGATIVE CONTROL: no card part is in saved.env in the clear (4 v2: lines), and the page and log never echo the number" \
+  || bad_t "L18e card plaintext" "$bad"
+kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+ls_out=$( (JSON_MODE=1; _secret_saved ls) 2>&1 ); ls_h=$( (JSON_MODE=0; _secret_saved ls) 2>&1 )
+bad=""; for v in "$CND" "$CN" "$CEN" "$CC" "$CH" "${CND:0:12}"; do grep -qF -- "$v" <<<"$ls_out$ls_h" && bad+="[$v] "; done
+[[ -z "$bad" && "$(jq -c '.data.items[] | select(.name == "visa") | [.fields, .login, .last4]' <<<"$ls_out")" == '[["number","exp","cvc","holder"],null,"4242"]' ]] \
+  && grep -qx 'visa (card ending 4242), not used yet' <<<"$ls_h" \
+  && ok_t "L18f NEGATIVE CONTROL: saved ls lists the card by name and last 4 only ('visa (card ending 4242)'); no number, expiry, code or name, json or human" \
+  || bad_t "L18f card in ls" "bad=$bad json=$(jq -c '.data.items' <<<"$ls_out") human=$ls_h"
+r=$( (JSON_MODE=0; _secret_reveal --agent=kostya --host=checkout.test visa.number visa.exp visa.cvc visa.holder) 2>"$TMP/rv8.err" ); rc=$?
+( _secret_reveal --agent=kostya --host=x visa.pin ) >/dev/null 2>&1; rc2=$?
+[[ $rc -eq 0 && $rc2 -ne 0 && "$(jq -r '[."visa.number", ."visa.exp", ."visa.cvc", ."visa.holder"] | join("|")' <<<"$r")" == "$CND|$CEN|$CC|$CH" ]] \
+  && grep -qE '^visa checkout\.test kostya ' "$USAGE" \
+  && ok_t "L18g _reveal answers visa.number, .exp, .cvc, .holder with their values and logs the use; an unknown field (.pin) is refused" \
+  || bad_t "L18g card reveal" "rc=$rc rc2=$rc2 err=$(cat "$TMP/rv8.err")"
+printf '1/40' | ( _secret_write VISA__EXP --connector=saved ) >/dev/null 2>&1; rc=$?
+printf '12' | ( _secret_write VISA__CVC --connector=saved ) >/dev/null 2>&1; rc2=$?
+[[ $rc -eq 0 && $rc2 -ne 0 && "$(saved_val VISA__EXP)" == 01/40 && "$(saved_val VISA__CVC)" == "$CC" && "$(saved_val VISA__NUMBER)" == "$CND" ]] \
+  && ok_t "L18h secret write <KEY>__EXP normalises one card part and keeps the rest; a bad part is refused" \
+  || bad_t "L18h write a card part" "rc=$rc rc2=$rc2"
+this_m=$(date -u +%m/%y) last_y=$(date -u -d '-1 year' +%m/%y)
+[[ -n "$(_saved_card_number 4111-1111-1111-1111)" && -z "$(_saved_card_number 4111111111111112)" && -z "$(_saved_card_number 42424242)" \
+   && "$(_saved_card_exp "$this_m")" == "$this_m" && -z "$(_saved_card_exp "$last_y")" && -z "$(_saved_card_exp 13/40)" \
+   && "$(_saved_card_exp 0740)" == 07/40 && "$(_saved_card_exp '07 / 2040')" == 07/40 && -z "$(_saved_card_cvc 12345)" ]] \
+  && ok_t "L18i card checks: Luhn on 12-19 digits, expiry this month or later as MM/YY (MMYY, MM/YYYY), code 3-4 digits" \
+  || bad_t "L18i card checks" "n=$(_saved_card_number 4111-1111-1111-1111) e=$(_saved_card_exp "$this_m")"
+out=$( (JSON_MODE=1; _secret_saved rm visa) 2>&1 ); rc=$?
+[[ $rc -eq 0 ]] && ! grep -q '^VISA' "$SAVED" && ! grep -q '^visa ' "$USAGE" \
+  && ok_t "L18j saved rm <card> removes every part and its usage lines" \
+  || bad_t "L18j rm card" "rc=$rc env=$(grep '^VISA' "$SAVED")"
+
 
 echo
 echo "secret-drop-link unit: $PASS passed, $FAIL failed"

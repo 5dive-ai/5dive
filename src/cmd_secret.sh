@@ -70,21 +70,28 @@ _secret_usage() {
       value lands as KEY=value in /home/claude/projects/<app>/.env.local when
       that file exists, else .env, written as the project folder's owner.
 
-  5dive secret link --save=<name> [--pair] [--ttl=<minutes>]
+  5dive secret link --save=<name> [--pair | --card] [--ttl=<minutes>]
       A one-time link for a SAVED login with no task, kept on this box for
       agents to type into a site (DIVE-6844). The name is lowercase letters,
       digits and dashes (github). --pair asks for a login, a password and an
-      optional 2FA setup key in one page; without it, one value. A link for a
+      optional 2FA setup key in one page; --card for a card's number, expiry,
+      security code and name on card, with a caution to use a separate virtual
+      card with a low limit (any agent on the box can use it); without either,
+      one value. A link for a
       name already saved replaces it and never shows the old value. Saved values
       are encrypted with this box's key, /etc/5dive/vault.key, which no export
       or copy carries: on a new box, save them again.
-  5dive secret saved [ls] [--json]      each name, its login and its last use;
-                                        never a password or a value. Root-only.
+  5dive secret saved [ls] [--json]      each name, its login (a card: its last 4
+                                        digits) and its last use; never a
+                                        password, a card number or a value.
+                                        Root-only.
   5dive secret saved rm <name>          forget one. Root-only.
       An agent uses one in the browser by name, without seeing it:
       5dive browser act <url> --steps='[{"op":"fill","selector":"…","saved":"<name>.password"}]'
       (<name>.login, <name>.password, or <name>.2fa, which types the current
-      code; a bare <name> is a one-value item)
+      code; a card's <name>.number, <name>.exp (MM/YY), <name>.cvc and
+      <name>.holder; a bare <name> is a one-value item)
+
   5dive secret https [status | enable --via=ip|sslip|domain|auto [--host=<name>] | disable]
       A self-hosted box (no 5dive domain) has no https name for those links, so
       its FIRST `secret link` makes one by itself: a Let's Encrypt certificate for
@@ -194,7 +201,13 @@ cmd_secret() {
 # DIVE-6973, the item shapes (`__` cannot come from a name: names forbid `--`):
 #   one value   KEY=v2:<b64>                       (DIVE-6844's items, unchanged)
 #   a pair      KEY__LOGIN=v2:… KEY__PASSWORD=v2:… [KEY__2FA=v2:<base32 seed>]
-# Saving one shape under a name drops the other, so a name is one item.
+#   a card      KEY__NUMBER=v2:… KEY__EXP=v2:<MM/YY> KEY__CVC=v2:… [KEY__HOLDER=v2:…]
+# Saving one shape under a name drops the others, so a name is one item.
+# DIVE-7381, a card (lodar 10-31 "just put caution when user inputs the card"):
+# the page asks for a separate low-limit virtual card, because any agent on the
+# box can use it and the limit is the guard. Unlike a login, a card is NOT bound
+# to the site of its first use (5dive-browser): the point is paying at the next
+# sign-up too. The guards are that limit and the browser's pay approval.
 #
 # DIVE-6973, encrypted at rest (lodar 03:24Z "can vault be encoded?"). Every
 # value line is `v2:` + `openssl enc -aes-256-cbc -pbkdf2` under a per-box key,
@@ -228,6 +241,8 @@ SECRET_VAULT_KEY="/etc/5dive/vault.key"
 SAVED_ENC_TAG="v2:"
 SAVED_ENC_V1="v1:"
 SAVED_ENC_CHECK="5DV2:"
+# Every field an item can have, as the store spells it (KEY__<FIELD>).
+SAVED_FIELDS="LOGIN|PASSWORD|2FA|NUMBER|EXP|CVC|HOLDER"
 _saved_name_ok() { [[ "$1" =~ ^[a-z][a-z0-9-]{0,39}$ && "$1" != *- && "$1" != *--* ]]; }
 _saved_key() { local k="${1^^}"; printf '%s' "${k//-/_}"; }
 _saved_name_of() { local n="${1,,}"; printf '%s' "${n//_/-}"; }
@@ -377,6 +392,75 @@ _saved_2fa_seed() {
   if [[ "$s" =~ ^[A-Z2-7]{16,128}$ ]]; then printf '%s' "$s"; fi
 }
 
+# DIVE-7381: card parts as the owner types them, down to what is stored. Empty
+# output = refused. A number is 12-19 digits (spaces and dashes dropped) that
+# pass the Luhn check, so a typo is caught here and not at a checkout.
+_saved_card_number() {
+  local n="${1//[[:space:]-]/}" i d sum=0 alt=0
+  [[ "$n" =~ ^[0-9]{12,19}$ ]] || return 0
+  for (( i=${#n}-1; i>=0; i-- )); do
+    d=${n:i:1}
+    if (( alt )); then d=$(( d * 2 )); (( d > 9 )) && d=$(( d - 9 )); fi
+    sum=$(( sum + d )); alt=$(( !alt ))
+  done
+  (( sum % 10 == 0 )) && printf '%s' "$n"
+  return 0
+}
+# MM/YY, M/YY, MM/YYYY, MM-YY, MM YY or MMYY -> MM/YY; a month that has passed is refused.
+_saved_card_exp() {
+  local e="${1//[[:space:]]/}" m y
+  if [[ "$e" =~ ^([0-9]{1,2})[/-]([0-9]{2}|20[0-9]{2})$ ]]; then m="${BASH_REMATCH[1]}" y="${BASH_REMATCH[2]}"
+  elif [[ "$e" =~ ^([0-9]{2})([0-9]{2})$ ]]; then m="${BASH_REMATCH[1]}" y="${BASH_REMATCH[2]}"
+  else return 0; fi
+  m=$(( 10#$m )); y=$(( 10#${y: -2} ))
+  (( m >= 1 && m <= 12 )) || return 0
+  (( (2000 + y) * 12 + m >= 10#$(date -u +%Y) * 12 + 10#$(date -u +%m) )) || return 0
+  printf '%02d/%02d' "$m" "$y"
+}
+_saved_card_cvc() { [[ "$1" =~ ^[0-9]{3,4}$ ]] && printf '%s' "$1"; return 0; }
+# One field of a card -> its stored form (HOLDER: one line of text, up to 100).
+_saved_card_field() {  # <FIELD> <value>
+  case "$1" in
+    NUMBER) _saved_card_number "$2" ;;
+    EXP)    _saved_card_exp "$2" ;;
+    CVC)    _saved_card_cvc "$2" ;;
+    HOLDER) local h="${2//[[:cntrl:]]/}"; h="${h#"${h%%[![:space:]]*}"}"; h="${h%"${h##*[![:space:]]}"}"
+            (( ${#h} >= 1 && ${#h} <= 100 )) && printf '%s' "$h" ;;
+  esac
+  return 0
+}
+
+# DIVE-7381: a card item from the save page, on stdin: number, expiry, security
+# code and the name on the card (may be empty), one per line. All of it or
+# nothing, in one rename. rc 3 = refused.
+_saved_write_card() {
+  local key="$1" number="" exp="" cvc="" holder="" extra="" f spec
+  IFS= read -r number || true
+  IFS= read -r exp || true
+  IFS= read -r cvc || true
+  IFS= read -r holder || true
+  IFS= read -r extra || true
+  number="${number%$'\r'}"; exp="${exp%$'\r'}"; cvc="${cvc%$'\r'}"; holder="${holder%$'\r'}"
+  [[ -z "$extra" ]] || return 3
+  local specs=()
+  for spec in "NUMBER=$number" "EXP=$exp" "CVC=$cvc"; do
+    f=$(_saved_card_field "${spec%%=*}" "${spec#*=}")
+    [[ -n "$f" ]] || { number="" cvc=""; return 3; }
+    specs+=("${spec%%=*}=$f")
+  done
+  if [[ -n "$holder" ]]; then
+
+    f=$(_saved_card_field HOLDER "$holder"); [[ -n "$f" ]] || return 3
+    specs+=("HOLDER=$f")
+  fi
+  number="" cvc=""
+  _saved_lock; _saved_migrate
+  _saved_put "^${key}(__(${SAVED_FIELDS}))?=" "$key" "${specs[@]}" || { specs=(); _saved_unlock; return 1; }
+  specs=()
+  _saved_unbind "$key" || true
+  _saved_unlock
+}
+
 # DIVE-6973: a pair item from the save page, on stdin: login, password and the
 # 2FA setup key (may be empty), one per line. All of it or nothing; the host the
 # name was bound to is freed (a new login may be for a new site). rc 3 = refused.
@@ -394,27 +478,29 @@ _saved_write_pair() {
     specs+=("2FA=$seed")
   fi
   _saved_lock; _saved_migrate
-  _saved_put "^${key}(__(LOGIN|PASSWORD|2FA))?=" "$key" "${specs[@]}" || { _saved_unlock; return 1; }
+  _saved_put "^${key}(__(${SAVED_FIELDS}))?=" "$key" "${specs[@]}" || { _saved_unlock; return 1; }
   _saved_unbind "$key" || true
   _saved_unlock
 }
 
 # One record per item, sorted by name, fields joined by \x1f:
 #   name, fields (comma list), login (decrypted, control chars dropped),
-#   host, lastUsedAt, lastUsedBy.
-# Never a password, a 2FA key or a one-value item's value.
+#   host, lastUsedAt, lastUsedBy, last4 (a card's, else empty).
+# Never a password, a 2FA key, a one-value item's value, or a card's number
+# (only its last 4 digits), expiry or code.
 _saved_items() {
   local f; f=$(_saved_file)
   [[ -r "$f" ]] || return 0
-  local -A one=() lg=() pw=() tf=() host=() at=() by=()
+  local -A one=() lg=() pw=() tf=() cn=() ce=() cc=() ch=() host=() at=() by=()
   local line k base
   while IFS= read -r line; do
     [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]] || continue
     k="${BASH_REMATCH[1]}"
-    if [[ "$k" =~ ^(.+)__(LOGIN|PASSWORD|2FA)$ ]]; then
+    if [[ "$k" =~ ^(.+)__(${SAVED_FIELDS})$ ]]; then
       base="${BASH_REMATCH[1]}"
       case "${BASH_REMATCH[2]}" in
         LOGIN) lg[$base]="${line#*=}" ;; PASSWORD) pw[$base]=1 ;; 2FA) tf[$base]=1 ;;
+        NUMBER) cn[$base]="${line#*=}" ;; EXP) ce[$base]=1 ;; CVC) cc[$base]=1 ;; HOLDER) ch[$base]=1 ;;
       esac
     else
       one[$k]=1
@@ -433,19 +519,24 @@ _saved_items() {
       at[$un]="$ut"; by[$un]="$ua"
     done < "$uf"
   fi
-  local keys name fields login
-  keys=$(printf '%s\n' "${!one[@]}" "${!lg[@]}" "${!pw[@]}" "${!tf[@]}" | sed '/^$/d' | sort -u)
+  local keys name fields login last4
+  keys=$(printf '%s\n' "${!one[@]}" "${!lg[@]}" "${!pw[@]}" "${!tf[@]}" "${!cn[@]}" "${!ce[@]}" "${!cc[@]}" "${!ch[@]}" | sed '/^$/d' | sort -u)
   while IFS= read -r k; do
     [[ -n "$k" ]] || continue
-    name=$(_saved_name_of "$k"); login=""
-    if [[ -n "${lg[$k]+x}${pw[$k]+x}${tf[$k]+x}" ]]; then
+    name=$(_saved_name_of "$k"); login="" last4=""
+    if [[ -n "${cn[$k]+x}${ce[$k]+x}${cc[$k]+x}${ch[$k]+x}" ]]; then
+      fields="number,exp,cvc"; [[ -n "${ch[$k]+x}" ]] && fields+=",holder"
+      # The number is decrypted into this shell only, and only its last 4 leave.
+      [[ -n "${cn[$k]+x}" ]] && last4=$(_vault_dec "${cn[$k]}") || last4=""
+      [[ "$last4" =~ ^[0-9]{12,19}$ ]] && last4="${last4: -4}" || last4=""
+    elif [[ -n "${lg[$k]+x}${pw[$k]+x}${tf[$k]+x}" ]]; then
       fields="login,password"; [[ -n "${tf[$k]+x}" ]] && fields+=",2fa"
       [[ -n "${lg[$k]+x}" ]] && login=$(_vault_dec "${lg[$k]}") || login=""
       login="${login//[[:cntrl:]]/}"
     else
       fields="value"
     fi
-    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$name" "$fields" "$login" "${host[$k]:-}" "${at[$name]:-}" "${by[$name]:-}"
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' "$name" "$fields" "$login" "${host[$k]:-}" "${at[$name]:-}" "${by[$name]:-}" "$last4"
   done <<<"$keys" | sort -t$'\x1f' -k1,1
 }
 
@@ -478,13 +569,15 @@ _secret_saved() {
               login: (if .[2] == "" then null else .[2] end),
               host: (if .[3] == "" then null else .[3] end),
               lastUsedAt: (if .[4] == "" then null else .[4] end),
-              lastUsedBy: (if .[5] == "" then null else .[5] end)}]
+              lastUsedBy: (if .[5] == "" then null else .[5] end),
+              last4: (if (.[6] // "") == "" then null else .[6] end)}]
           | {ok: true, data: {names: map(.name), items: .}}'
       elif [[ -z "$recs" ]]; then
         echo "OK — (nothing saved)"
       else
-        local n fl lo ho wa wb
-        while IFS=$'\x1f' read -r n fl lo ho wa wb; do
+        local n fl lo ho wa wb l4
+        while IFS=$'\x1f' read -r n fl lo ho wa wb l4; do
+          [[ -n "$l4" ]] && lo="card ending $l4"
           printf '%s%s, %s\n' "$n" "${lo:+ ($lo)}" \
             "$([[ -n "$wa" ]] && printf 'used by %s %s' "${wb:-an agent}" "$(_saved_ago "$wa")" || printf 'not used yet')"
         done <<<"$recs"
@@ -496,10 +589,10 @@ _secret_saved() {
       require_root secret saved
       local f key tmp uf rc=0; f=$(_saved_file); key=$(_saved_key "$name"); uf=$(_saved_usage_file)
       _saved_lock; _saved_migrate
-      [[ -f "$f" ]] && grep -qE "^${key}(__(LOGIN|PASSWORD|2FA))?=" "$f" || fail "$E_NOT_FOUND" "nothing is saved as $name"
+      [[ -f "$f" ]] && grep -qE "^${key}(__(${SAVED_FIELDS}))?=" "$f" || fail "$E_NOT_FOUND" "nothing is saved as $name"
       tmp="$(mktemp "${f}.XXXXXX")" || fail "$E_GENERIC" "mktemp failed"
       chmod 600 "$tmp"
-      grep -vE "^${key}(__(LOGIN|PASSWORD|2FA))?=" "$f" > "$tmp" || rc=$?
+      grep -vE "^${key}(__(${SAVED_FIELDS}))?=" "$f" > "$tmp" || rc=$?
       (( rc <= 1 )) || { rm -f "$tmp"; fail "$E_GENERIC" "could not read $f; nothing was removed"; }
       chown root:claude "$tmp" 2>/dev/null || true
       chmod 600 "$tmp"
@@ -519,7 +612,8 @@ _secret_saved() {
 # DIVE-6973: `secret _reveal --agent=<seat> --host=<host> <ref>...` (root,
 # internal): the browser's root hop asks for what a fill types. ref = <name> (a
 # one-value item) | <name>.login | <name>.password | <name>.2fa (the base32
-# seed: the hop turns it into the current code, and only the code leaves root).
+# seed: the hop turns it into the current code, and only the code leaves root)
+# | a card's <name>.number | .exp (MM/YY) | .cvc | .holder (DIVE-7381).
 # stdout: ONE JSON object {"<ref>": "<plaintext>"}, built on a pipe (never a
 # --arg, which `ps` shows every seat). One usage line per distinct item name.
 # A missing or unreadable ref: an error naming it on stderr, NOTHING on stdout
@@ -537,13 +631,13 @@ _secret_reveal() {
     esac
   done
   require_root secret _reveal
-  (( ${#refs[@]} )) || fail "$E_USAGE" "usage: 5dive secret _reveal --agent=<seat> --host=<host> <name>[.login|.password|.2fa]..."
+  (( ${#refs[@]} )) || fail "$E_USAGE" "usage: 5dive secret _reveal --agent=<seat> --host=<host> <name>[.login|.password|.2fa|.number|.exp|.cvc|.holder]..."
   [[ "$agent" =~ ^[a-z0-9][a-z0-9_.-]{0,63}$ ]] || fail "$E_USAGE" "--agent=<seat> is required (the seat the value is typed for)"
   [[ -z "$host" || "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})(:[0-9]{1,5})?$ ]] || fail "$E_VALIDATION" "--host '$host' is not a host name"
   local r name
   for r in "${refs[@]}"; do
-    [[ "$r" =~ ^[a-z][a-z0-9-]{0,39}(\.(login|password|2fa))?$ ]] && _saved_name_ok "${r%%.*}" \
-      || fail "$E_VALIDATION" "'$r' is not a saved name (<name>, <name>.login, <name>.password or <name>.2fa)"
+    [[ "$r" =~ ^[a-z][a-z0-9-]{0,39}(\.(login|password|2fa|number|exp|cvc|holder))?$ ]] && _saved_name_ok "${r%%.*}" \
+      || fail "$E_VALIDATION" "'$r' is not a saved name (<name>, <name>.login, <name>.password, <name>.2fa, or a card's <name>.number, .exp, .cvc or .holder)"
   done
   _saved_lock; _saved_migrate
   local f; f=$(_saved_file)
@@ -678,20 +772,25 @@ _secret_write() {
     && fail "$E_VALIDATION" "a saved value is typed into one field, so it must be one line; nothing was saved"
 
   # DIVE-6973: the saved store is encrypted, one item per name (see above).
-  # KEY is a one-value item, KEY__LOGIN|PASSWORD|2FA one field of a pair; either
-  # shape replaces the other, and a rewrite frees the name's site.
+  # KEY is a one-value item, KEY__<FIELD> one field of a pair or a card; any
+  # shape replaces the others, and a rewrite frees the name's site.
   if [[ "$connector" == "$SECRET_SAVED_CONNECTOR" ]]; then
     local sbase="$key" sfld="" sdrop action="created"
-    if [[ "$key" =~ ^(.+)__(LOGIN|PASSWORD|2FA)$ ]]; then
+    if [[ "$key" =~ ^(.+)__(${SAVED_FIELDS})$ ]]; then
       sbase="${BASH_REMATCH[1]}"; sfld="${BASH_REMATCH[2]}"
       sdrop="^${sbase}(__${sfld})?="
     else
-      sdrop="^${key}(__(LOGIN|PASSWORD|2FA))?="
+      sdrop="^${key}(__(${SAVED_FIELDS}))?="
     fi
     if [[ "$sfld" == 2FA ]]; then
       local sseed; sseed=$(_saved_2fa_seed "$value")
       [[ -n "$sseed" ]] || fail "$E_VALIDATION" "that is not a 2FA setup key (letters A-Z and digits 2-7, as the site shows it); nothing was saved"
       value="$sseed"
+    fi
+    if [[ "$sfld" =~ ^(NUMBER|EXP|CVC|HOLDER)$ ]]; then
+      local scard; scard=$(_saved_card_field "$sfld" "$value")
+      [[ -n "$scard" ]] || fail "$E_VALIDATION" "that is not a usable card ${sfld,,} (a number passes the card check, an expiry is MM/YY and not past, a code is 3 or 4 digits); nothing was saved"
+      value="$scard"; scard=""
     fi
     local sf; sf=$(_saved_file)
     _saved_lock; _saved_migrate

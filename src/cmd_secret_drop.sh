@@ -159,12 +159,13 @@ _secret_drop_burn_task() {
 # ---- secret link -----------------------------------------------------------
 
 _secret_link() {
-  local ref="" ttl="$SECRET_DROP_TTL_MIN" start=1 again=0 save="" pair=0
+  local ref="" ttl="$SECRET_DROP_TTL_MIN" start=1 again=0 save="" pair=0 card=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ttl=*)     ttl="${1#*=}" ;;
       --save=*)    save="${1#*=}" ;;   # DIVE-6844: a saved value, no task
       --pair)      pair=1 ;;   # DIVE-6973: login + password (+ 2FA key) in one page
+      --card)      card=1 ;;   # DIVE-7381: number, expiry, code (+ name on card)
       --again)     again=1 ;;   # DIVE-6205: mint although a link for the gate is live
       --no-start)  start=0 ;;   # tests / a box whose page is supervised elsewhere
       --*)         fail "$E_USAGE" "unknown flag: $1" ;;
@@ -176,6 +177,8 @@ _secret_link() {
   [[ -n "$ref" || -n "$save" ]] || fail "$E_USAGE" "usage: 5dive secret link <DIVE-N> [--ttl=<minutes>] [--again] [--json] | --save=<name>"
   [[ -z "$ref" || -z "$save" ]] || fail "$E_USAGE" "a link is for a task's gate OR a saved value (--save), not both"
   (( ! pair )) || [[ -n "$save" ]] || fail "$E_USAGE" "--pair is for a saved login: secret link --save=<name> --pair"
+  (( ! card )) || [[ -n "$save" ]] || fail "$E_USAGE" "--card is for a saved card: secret link --save=<name> --card"
+  (( ! (pair && card) )) || fail "$E_USAGE" "a saved item is a login (--pair) or a card (--card), not both"
   [[ "$ttl" =~ ^[0-9]+$ ]] && (( ttl >= 1 && ttl <= 60 )) || fail "$E_VALIDATION" "--ttl must be 1-60 minutes"
   local ident="" key="" connector=""
   if [[ -n "$save" ]]; then
@@ -185,7 +188,7 @@ _secret_link() {
   else
     _secret_link_gate "$ref" "$again"
   fi
-  _secret_link_mint "$ttl" "$start" "$ident" "$key" "$connector" "$save" "$pair"
+  _secret_link_mint "$ttl" "$start" "$ident" "$key" "$connector" "$save" "$pair" "$card"
 }
 
 # The task's open secret gate, checked. Sets ident, key and connector in the
@@ -216,7 +219,7 @@ _secret_link_gate() {
 
 # Mint and serve one link: for a gate (ident set) or a saved name (save set).
 _secret_link_mint() {
-  local ttl="$1" start="$2" ident="$3" key="$4" connector="$5" save="${6:-}" pair="${7:-0}"
+  local ttl="$1" start="$2" ident="$3" key="$4" connector="$5" save="${6:-}" pair="${7:-0}" card="${8:-0}"
   local base terminal="sudo 5dive secret write ${key} --connector=${connector} --task=${ident}"
   [[ -n "$save" ]] && terminal="sudo 5dive secret write ${key} --connector=${connector}"
   # DIVE-7113: a self-hosted box with no https name makes one itself, the first
@@ -238,7 +241,8 @@ _secret_link_mint() {
   exp=$(( $(date +%s) + ttl * 60 ))
   ( umask 077; printf 'task=%s\nkey=%s\nconnector=%s\nexpires=%s\n' "$ident" "$key" "$connector" "$exp" > "$SECRET_DROP_DIR/$hash"
     [[ -z "$save" ]] || printf 'save=%s\n' "$save" >> "$SECRET_DROP_DIR/$hash"
-    (( ! pair )) || printf 'pair=1\n' >> "$SECRET_DROP_DIR/$hash" ) \
+    (( ! pair )) || printf 'pair=1\n' >> "$SECRET_DROP_DIR/$hash"
+    (( ! card )) || printf 'card=1\n' >> "$SECRET_DROP_DIR/$hash" ) \
     || fail "$E_GENERIC" "cannot store the link"
 
   # DIVE-5372: the first link on a box appends the secrets.<domain> route and
@@ -280,20 +284,23 @@ not ready yet: the secure page is still getting its certificate. If the link doe
   [[ "$key" == *,* ]] && lands="the page has one box for each of $(_secret_keys_words "$key"); they land in ${connector}.env and clear ${ident}"
   [[ -n "$save" ]] && lands="the value is saved as ${save}, for agents to type into a site"
   (( pair )) && lands="the login, password and optional 2FA key are saved as ${save}, for agents to sign in with"
+  (( card )) && lands="the card is saved as ${save}, for agents to pay with; the page asks for a separate virtual card with a low limit"
   # DIVE-7128: the url reaches jq through the environment, not argv, which any
   # seat can list while the root side mints a standard seat's link.
   FIVE_DROP_URL="$url" ok "$url
 single use, expires ${exp_iso} (${ttl} min); ${lands}${note}" \
      '{url: $ENV.FIVE_DROP_URL, expires_at: $e, ttl_minutes: ($t|tonumber), task: $i, key: $k, connector: $c, ready: ($r|fromjson)}
-      + (if $s == "" then {} else {save: $s, pair: ($p == "1")} end)' \
+      + (if $s == "" then {} else {save: $s, pair: ($p == "1"), card: ($cd == "1")} end)' \
      --arg e "$exp_iso" --arg t "$ttl" --arg i "$ident" --arg k "$key" --arg c "$connector" --arg r "$ready" \
-     --arg s "$save" --arg p "$pair"
+     --arg s "$save" --arg p "$pair" --arg cd "$card"
 }
 
 # DIVE-6844: the saved name a link writes, or empty for a gate's link.
 _secret_drop_save_of() { sed -n 's/^save=//p' "$1" | head -n 1; }
 # DIVE-6973: 1 when the link asks for a login pair, else 0.
 _secret_drop_pair_of() { [[ "$(sed -n 's/^pair=//p' "$1" | head -n 1)" == 1 ]] && printf 1 || printf 0; }
+# DIVE-7381: 1 when the link asks for a card, else 0.
+_secret_drop_card_of() { [[ "$(sed -n 's/^card=//p' "$1" | head -n 1)" == 1 ]] && printf 1 || printf 0; }
 
 # Burn every live link for one saved name: a value saved through one makes the
 # others stale, as a gate's links are.
@@ -334,9 +341,11 @@ _secret_drop_peek() {
   fi
   local save; save=$(_secret_drop_save_of "$f")
   if [[ -n "$save" ]]; then
-    local pair; pair=$(_secret_drop_pair_of "$f")
-    ok "save $save" '{task: "", save: $s, key: $k, connector: $c, ask: "", agent: "", expires: ($x|tonumber), rule: $r, pair: ($p == "1")}' \
-       --arg s "$save" --arg k "$key" --arg c "$connector" --arg x "$exp" --arg r "$(_secret_drop_rule "$connector" "$pair")" --arg p "$pair"
+    local pair card rule; pair=$(_secret_drop_pair_of "$f"); card=$(_secret_drop_card_of "$f")
+    rule=$(_secret_drop_rule "$connector" "$pair")
+    (( card )) && rule=$(_secret_drop_rule "$connector" card)
+    ok "save $save" '{task: "", save: $s, key: $k, connector: $c, ask: "", agent: "", expires: ($x|tonumber), rule: $r, pair: ($p == "1"), card: ($cd == "1")}' \
+       --arg s "$save" --arg k "$key" --arg c "$connector" --arg x "$exp" --arg r "$rule" --arg p "$pair" --arg cd "$card"
     return 0
   fi
   local id; id=$(_secret_drop_gate_open "$ident" "$key" "$connector")
@@ -360,7 +369,9 @@ _secret_drop_peek() {
 # DIVE-6727: the rule a refused paste broke, in the owner's words, by the gate's
 # connector class. Static text: it names the rule and never carries a byte of the
 # value. The page shows it on a refusal (from _peek), and the agent is told it.
-_secret_drop_rule() { # <connector> [<pair: 1>] [<several keys: 1>]
+_secret_drop_rule() { # <connector> [<pair: 1 | card>] [<several keys: 1>]
+  [[ "$1" == saved && "${2:-0}" == card ]] \
+    && { printf '%s' "Check the card number, and that the expiry is a month and year still to come (MM/YY) and the security code is the 3 or 4 digits on the card."; return; }
   [[ "$1" == saved && "${2:-0}" == 1 ]] \
     && { printf '%s' "The login and the password must each be one line. A 2FA setup key is the code of letters A-Z and digits 2-7 the site shows when you add an authenticator app."; return; }
   # DIVE-7184: one box per key, each one line; all are checked before any is saved.
@@ -473,8 +484,11 @@ _secret_drop_redeem() {
       || { rm -f "$f"; fail "$E_CONFLICT" "link is malformed"; }
     # DIVE-6973: a pair link writes the whole item (login, password, 2FA key)
     # in one rename, or nothing; the write frees the name's site itself.
-    local pair; pair=$(_secret_drop_pair_of "$f")
-    if (( pair )); then
+    local pair card; pair=$(_secret_drop_pair_of "$f"); card=$(_secret_drop_card_of "$f")
+    if (( card )); then
+      ( _saved_write_card "$key" ) >/dev/null 2>&1 \
+        || fail "$E_VALIDATION" "value refused: $(_secret_drop_rule "$connector" card)"
+    elif (( pair )); then
       ( _saved_write_pair "$key" ) >/dev/null 2>&1 \
         || fail "$E_VALIDATION" "value refused: $(_secret_drop_rule "$connector" 1)"
     else
@@ -1094,6 +1108,7 @@ CSS = ("body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;
        ".secret{-webkit-text-security:disc}"
        "label{display:block;font-weight:600;margin-top:.75rem}label+textarea{margin-top:.25rem}"
        ".pair textarea{min-height:0;resize:none}.tip{background:#fff6dc;border-radius:8px;padding:.6rem .75rem}"
+       ".warn{border-left:4px solid #c4302b}"
        "button{width:100%;font:inherit;font-weight:600;padding:.75rem;border:0;border-radius:8px;background:#1b1b1a;color:#fff}"
        "small{color:#666}code{font-size:.9em}"
        "@media (prefers-color-scheme:dark){body{background:#151514;color:#eee}.ask{background:#1f1f1e;border-color:#333}"
@@ -1138,6 +1153,8 @@ FIELD = ("<textarea name=%s class=%s rows=%d autocomplete=off autocapitalize=off
          "%s aria-label='%s'></textarea>")
 
 def save_form(d):
+    if d.get("card"):
+        return save_card_form(d)
     if d.get("pair"):
         return save_pair_form(d)
     return ("<h1>Save <b>%s</b></h1>" % html.escape(d["save"]) + SEPARATE +
@@ -1162,6 +1179,30 @@ def save_pair_form(d):
             FIELD.replace("<textarea ", "<textarea id=f-totp ", 1) % ("totp", "secret", 1, "", "2FA setup key") +
             "<p><small>With this, your agents can sign in without you. Use it on an account made for them.</small></p>"
             "<button type=submit>Save</button></form>"
+            "<p><small>This page is served by your own server. It all goes only there, and this "
+            "link then stops working. Expires at %s UTC.</small></p>"
+            % time.strftime("%H:%M", time.gmtime(int(d["expires"]))))
+
+# DIVE-7381 (lodar 10-31 "just put caution when user inputs the card"): one item
+# = number, expiry, security code and an optional name on card. The caution sits
+# above the first box, where it is read before anything is typed.
+CARD_CAUTION = ("<p class='tip warn'><b>Use a separate virtual card with a low limit.</b> "
+                "Any agent on this box can use it, so the limit is what protects you.</p>")
+
+def save_card_form(d):
+    def box(i, name, cls, extra, label, mode):
+        return ("<label for=f-%s>%s</label>" % (i, label) +
+                FIELD.replace("<textarea ", "<textarea id=f-%s inputmode=%s " % (i, mode), 1)
+                % (name, cls, 1, extra, label))
+    return ("<h1>Save <b>%s</b></h1>" % html.escape(d["save"]) + CARD_CAUTION +
+            "<p>Your agents can pay with it at a sign-up. They never see the number, and it is never shown again.</p>"
+            "<form method=post autocomplete=off class=pair>" +
+            box("number", "number", "secret", "required autofocus", "Card number", "numeric") +
+            box("exp", "exp", "plain", "required", "Expiry (MM/YY)", "numeric") +
+            box("cvc", "cvc", "secret", "required", "Security code", "numeric") +
+            box("holder", "holder", "plain", "", "Name on card (optional)", "text") +
+            "<p><small>Each payment still asks you first, unless you have turned that off.</small></p>"
+            "<button type=submit>Save card</button></form>"
             "<p><small>This page is served by your own server. It all goes only there, and this "
             "link then stops working. Expires at %s UTC.</small></p>"
             % time.strftime("%H:%M", time.gmtime(int(d["expires"]))))
@@ -1264,7 +1305,16 @@ class Handler(BaseHTTPRequestHandler):
             return form.get(k, [""])[0].replace("\r\n", "\n").replace("\r", "\n")
         pair = "password" in form
         multi = "k0" in form
-        if multi:
+        card = "number" in form
+        if card:
+            # DIVE-7381: four one-line fields, handed to the box as four lines;
+            # the box checks the number, expiry and code before it writes any.
+            parts = [field(k).strip() for k in ("number", "exp", "cvc", "holder")]
+            value = None
+            if all(parts[:3]) and not any("\n" in p for p in parts):
+                value = "".join(p + "\n" for p in parts)
+            parts = None
+        elif multi:
             # DIVE-7184: one line per box, in the page's order; the box checks
             # each against its rule before it writes any.
             vals = []
@@ -1288,14 +1338,16 @@ class Handler(BaseHTTPRequestHandler):
         form = None
         if not value:
             return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>%s The link still works.</p>"
-                % ("Every box is needed, one line each." if multi else
+                % ("The card number, expiry and security code are each needed." if card else
+                   "Every box is needed, one line each." if multi else
                    "Each of login and password is needed, one line each." if pair else "Nothing was pasted.")))
         rc, out = run(["_peek", "--hash=" + h])
         if rc != 0:
             value = None
             return self.gone(rc)
         what = json.loads(out).get("data", {})
-        if pair != bool(what.get("pair")) or (multi and value.count("\n") != len(what.get("keys") or [])) \
+        if pair != bool(what.get("pair")) or card != bool(what.get("card")) \
+                or (multi and value.count("\n") != len(what.get("keys") or [])) \
                 or (not multi and len(what.get("keys") or []) > 1):
             # A form from another page: never write half an item into this one.
             value = None
@@ -1323,7 +1375,12 @@ class Handler(BaseHTTPRequestHandler):
                 "working on it. It may have been saved. Ask your agent before trying again.</p>"))
         if rc != 0: return self.gone(rc)
         d = json.loads(out).get("data", {})
+        if d.get("save") and card:
+            return self.send_page(200, page("Saved", "<h1>Saved</h1><p>Card <b>%s</b> is on your server now. "
+                "Your agents can pay with it; nobody can see the number. You can close this tab.</p>"
+                % html.escape(d["save"])))
         if d.get("save") and pair:
+
             return self.send_page(200, page("Saved", "<h1>Saved</h1><p><b>%s</b> is on your server now. "
                 "Your agents can sign in with it; nobody can see the password. You can close this tab.</p>"
                 % html.escape(d["save"])))
