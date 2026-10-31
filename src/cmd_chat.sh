@@ -67,8 +67,9 @@ _chat_e2e_stage() {
     tmp=$(mktemp -p "$lib" ".stage.XXXXXX") || fail "$E_GENERIC" "chat-e2e: cannot write in $lib."
     if [[ "$f" == chat-e2e.ts ]]; then _chat_e2e_root_ts >"$tmp"; else _chat_e2e_envelope_ts >"$tmp"; fi
     if cmp -s -- "$tmp" "$lib/$f" && [[ -O "$lib/$f" && ! -L "$lib/$f" ]]; then rm -f -- "$tmp"
-    else chmod 0644 -- "$tmp" && mv -fT -- "$tmp" "$lib/$f"; fi
+    else { chmod 0644 -- "$tmp" && mv -fT -- "$tmp" "$lib/$f"; } || fail "$E_GENERIC" "chat-e2e: cannot install $lib/$f."; fi
   done
+  return 0
 }
 
 # _chat_e2e_run <call|admin> <dir> [side-file] — the request on stdin, the answer on stdout.
