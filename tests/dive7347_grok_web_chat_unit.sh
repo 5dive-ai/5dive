@@ -20,6 +20,15 @@
 #   B4  channels=dashboard alone: the dashboard table, no telegram table.
 #   K1  the cold-start kick fires for a web-chat-only seat, with no Telegram words.
 #
+# DIVE-7351 (same subject, same file): Antigravity takes the web chat too, and a
+# grok agent's model reaches the launch line.
+#   A1  antigravity has the web chat; the refusal names it.
+#   A2  channels=telegram,dashboard: mcp_config.json carries both servers, the
+#       dashboard one with --runtime=antigravity, other servers kept.
+#   A3  a second boot keeps one entry; dashboard leaving CHANNELS removes it.
+#   A4  the empty file agy ships becomes valid JSON with the dashboard entry.
+#   A5  the telegram heal is not fooled by the dashboard entry's server.ts.
+#   M1  [models] default becomes --model on the grok launch; none, none passed.
 # DIVE-7349 — Hermes and OpenClaw take it too (same subject, same harness):
 #   H1  a hermes seat gets the 5dive channel plugin linked from the dashboard
 #       checkout, enabled without a prompt, and its spool + sender in ~/.hermes/.env.
@@ -47,11 +56,11 @@ eq_t()  { [[ "$2" == "$3" ]] && ok_t "$1" || bad_t "$1" "expected [$2], got [$3]
 
 # --- who may take the web chat -------------------------------------------------
 got=""
-for t in claude codex grok hermes openclaw pi ""; do type_has_web_chat "$t" && got+="${t}:y " || got+="${t:-none}:n "; done
-eq_t "W1 type_has_web_chat" "claude:y codex:y grok:y hermes:y openclaw:y pi:n none:n " "$got"
+for t in claude codex grok antigravity hermes openclaw pi ""; do type_has_web_chat "$t" && got+="${t}:y " || got+="${t:-none}:n "; done
+eq_t "W1/A1 type_has_web_chat" "claude:y codex:y grok:y antigravity:y hermes:y openclaw:y pi:n none:n " "$got"
 out=$( ( install_channel_for_agent pi dashboard px "" ) 2>&1 ); rc=$?
-[[ $rc -ne 0 && "$out" == *"requires type=claude, codex, grok, hermes or openclaw"* ]] \
-  && ok_t "W2 pi refused, the message names the list" || bad_t "W2 pi refused, the message names the list" "rc=$rc out=$out"
+[[ $rc -ne 0 && "$out" == *"requires type=claude, codex, grok, antigravity, hermes or openclaw"* ]] \
+  && ok_t "W2/A1 pi refused, the message names the list" || bad_t "W2/A1 pi refused, the message names the list" "rc=$rc out=$out"
 
 # --- the boot script ------------------------------------------------------------
 WORK=$(mktemp -d)
@@ -102,6 +111,41 @@ out=$(kick telegram,dashboard)
 [[ "$out" == *"KICK:Start your Telegram listen loop"* ]] \
   && ok_t "K1 a Telegram seat keeps its listen-loop kick" || bad_t "K1 a Telegram seat keeps its listen-loop kick" "$out"
 
+# --- Antigravity (DIVE-7351) -------------------------------------------------------
+TGBLOCK=$(awk '/^if \[\[ "\$TYPE" == "antigravity" \]\] && \[\[ ",\$\{CHANNELS\}," == \*,telegram,\* \]\]; then/ {on=1} on {print} on && /^fi$/ {exit}' "$START")
+AGYBLOCK=$(awk '/^# DIVE-7351: the web chat for an antigravity agent/ {on=1} on {print} on && /^fi$/ {exit}' "$START")
+[[ -n "$TGBLOCK" && "$AGYBLOCK" == *'--runtime=antigravity'* ]] || bad_t "extract the antigravity blocks" "telegram=${#TGBLOCK} dashboard=${#AGYBLOCK}"
+TGPLUG="$WORK/plugins/telegram-agy"; mkdir -p "$TGPLUG/hooks"; : > "$TGPLUG/server.ts"
+export TELEGRAM_AGY_PLUGIN_DIR="$TGPLUG"
+AMCP="$HOME/.gemini/config/mcp_config.json"
+aboot() { ( TYPE=antigravity CHANNELS="$1" NAME=ag; eval "$TGBLOCK"; eval "$AGYBLOCK" ) 2>&1; }
+servers() { jq -r '.mcpServers | keys | join(" ")' "$AMCP" 2>&1; }
+
+mkdir -p "$HOME/.gemini/config"
+printf '%s\n' "{\"mcpServers\":{\"telegram\":{\"command\":\"bun\",\"args\":[\"$TGPLUG/server.ts\"]},\"mine\":{\"command\":\"x\"}}}" > "$AMCP"
+aboot telegram,dashboard >/dev/null
+eq_t "A2 both servers, a user server kept" "dashboard mine telegram" "$(servers)"
+eq_t "A2 dashboard runs the agy bridge" "$PLUG/server.ts --runtime=antigravity" "$(jq -r '.mcpServers.dashboard.args | join(" ")' "$AMCP")"
+aboot telegram,dashboard >/dev/null
+eq_t "A3 one entry after a second boot" "dashboard mine telegram" "$(servers)"
+aboot telegram >/dev/null
+eq_t "A3 chat off: dashboard entry gone" "mine telegram" "$(servers)"
+: > "$AMCP"
+aboot dashboard >/dev/null
+eq_t "A4 shipped empty file: web chat only" "dashboard" "$(servers)"
+aboot telegram,dashboard >/dev/null
+eq_t "A5 telegram wired beside an existing dashboard entry" "dashboard telegram" "$(servers)"
+
+# --- the grok model on the launch line (DIVE-7351) ------------------------------------
+MBLOCK=$(awk '/^# DIVE-7351: the model a grok agent was set to/ {on=1} on {print} on && /^fi$/ {exit}' "$START")
+[[ "$MBLOCK" == *'--model'* ]] || bad_t "M1 extract the model block" "not found"
+margs() { ( TYPE=grok; ARGS=(--always-approve); eval "$MBLOCK"; printf '%s ' "${ARGS[@]}" ) 2>&1; }
+printf '%s\n' '[mcp_servers.telegram]' 'command = "bun"' '' '[models]  # picked in the app' 'default = "grok-4.5"  # pinned' '' '[mcp_servers.dashboard]' 'default = "not-a-model"' > "$CFG"
+eq_t "M1 [models] default is passed as --model" "--always-approve --model grok-4.5 " "$(margs)"
+printf '%s\n' '[mcp_servers.telegram]' 'command = "bun"' > "$CFG"
+eq_t "M1 no model set, no flag" "--always-approve " "$(margs)"
+printf '%s\n' '[models]' 'default = "x; rm -rf /"' > "$CFG"
+eq_t "M1 a value that is not a model id is not passed" "--always-approve " "$(margs)"
 # --- DIVE-7349: hermes and openclaw ---------------------------------------------
 # The setup helpers run as the seat user through sudo; here they run as us, in a
 # fixture HOME, with the hermes/openclaw CLIs replaced by argv loggers.

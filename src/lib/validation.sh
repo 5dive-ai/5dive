@@ -237,16 +237,16 @@ valid_channel() {
 }
 
 # DIVE-7347: the runtimes the web chat (channels=dashboard) can reach — Claude
-# by native push, Codex through its dispatcher, Grok through the dashboard
-# server's pane bridge, Hermes and OpenClaw through its spool (DIVE-7349). The
-# one list every channels=dashboard check reads.
-WEB_CHAT_TYPES=(claude codex grok hermes openclaw)
+# by native push, Codex through its dispatcher, Grok and Antigravity (DIVE-7351)
+# through the dashboard server's pane bridge, Hermes and OpenClaw through its
+# spool (DIVE-7349). The one list every channels=dashboard check reads.
+WEB_CHAT_TYPES=(claude codex grok antigravity hermes openclaw)
 type_has_web_chat() {
   local t
   for t in "${WEB_CHAT_TYPES[@]}"; do [[ "${1:-}" == "$t" ]] && return 0; done
   return 1
 }
-# "claude, codex, grok, hermes or openclaw" — for the refusals that name the list.
+# "claude, codex, grok, antigravity, hermes or openclaw" — for the refusals that name the list.
 web_chat_types_text() {
   local n=${#WEB_CHAT_TYPES[@]}
   local IFS=,
