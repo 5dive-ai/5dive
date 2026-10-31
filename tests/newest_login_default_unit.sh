@@ -226,6 +226,63 @@ eq_t 'with no login added, the spec is unchanged' "$(jq -c . <<<"$SPEC")" "$(_co
 grep -q '_compose_apply_newest_login "\$spec"' src/cmd_compose.sh \
   && ok_t 'team import runs it' || bad_t 'team import does not run _compose_apply_newest_login' ''
 
+echo '== 6. DIVE-7415: the owner pins a default, and it beats newer logins =='
+PIN="$AUTH_PROFILES_DIR/.default"
+registry_read() { printf '%s\n' '{"agents":{}}'; }
+fresh_box; claude_login mp; pick >/dev/null; claude_login konst; age konst claude 100
+JSON_MODE=1
+_d=$( ( cmd_account_default mp ) 2>/dev/null)
+eq_t 'account default <account> pins its login and answers it, pinned' 'mp claude true' "$(jq -r '.data | "\(.account) \(.type) \(.pinned)"' <<<"$_d")"
+chatgpt_login gpt
+eq_t 'a login added after the pin does not take the default' mp:claude "$(pick)"
+eq_t '...it is still recorded as added (the newest-login rule is untouched)' added "$(line gpt codex | cut -d' ' -f2)"
+_l=$( ( cmd_account_list ) 2>/dev/null)
+eq_t 'account list --json marks the pinned row default AND pinned, only it' 'mp=claude:true' \
+  "$(jq -r '.data[] | select(.default) | "\(.name)=\(.default):\(.pinned)"' <<<"$_l")"
+eq_t 'a hire of the pinned harness gets the pin' mp:claude "$(pick claude)"
+eq_t 'a hire that names another harness gets that harness'"'"'s newest login' gpt:codex "$(pick codex)"
+eq_t 'team import follows the pin' '{"type":"claude","auth_profile":"mp"}' \
+  "$(_compose_apply_newest_login '{"agents":{"lead":{"type":"claude"}}}' | jq -c '.agents.lead')"
+eq_t 'a one-tap hire of a Claude+Codex pack stays on the pinned Claude login' \
+  '--type=claude --auth-profile=mp model=opus effort=high' "$(imported pinned --as=marcus)"
+_d=$( ( cmd_account_default gpt:codex ) 2>/dev/null)
+eq_t 'account default <account>:<type> pins that harness' 'gpt codex true' "$(jq -r '.data | "\(.account) \(.type) \(.pinned)"' <<<"$_d")"
+_d=$( ( cmd_account_default --clear ) 2>/dev/null)
+eq_t '--clear: back to the newest login (DIVE-7152 unchanged)' 'gpt codex false' "$(jq -r '.data | "\(.account) \(.type) \(.pinned)"' <<<"$_d")"
+[[ ! -e "$PIN" ]] && ok_t '--clear removes the pin file' || bad_t '--clear left the pin file' "$(cat "$PIN")"
+( cmd_account_default konst ) >/dev/null 2>&1
+mv "$AUTH_PROFILES_DIR/konst/combined.env" "$TMP/konst.env"
+eq_t 'a pinned login signed out right now is skipped (newest wins meanwhile)' gpt:codex "$(pick)"
+[[ -e "$PIN" ]] && ok_t '...and the pin is kept, so a refresh mid-write never loses it' || bad_t 'a signed-out pin was dropped' ''
+mv "$TMP/konst.env" "$AUTH_PROFILES_DIR/konst/combined.env"
+eq_t '...signed back in, the pin is the default again' konst:claude "$(pick)"
+( cmd_account_rename konst konst2 ) >/dev/null 2>&1
+eq_t 'account rename keeps the pin on the renamed account' konst2:claude "$(pick)"
+( cmd_account_remove konst2 ) >/dev/null 2>&1
+[[ ! -e "$PIN" ]] && ok_t 'account remove of the pinned account clears the pin' || bad_t 'remove left the pin' "$(cat "$PIN")"
+eq_t '...and new hires go back to the newest login' gpt:codex "$(pick)"
+age gpt codex 100; claude_login konst2
+pinned() { account_default_v >/dev/null; printf '%s:%s pinned=%s' "$ACCOUNT_DEFAULT_ACCOUNT" "$ACCOUNT_DEFAULT_TYPE" "$ACCOUNT_DEFAULT_PINNED"; }
+eq_t 'a new account of the same name does not inherit the old pin (it is just the newest login)' \
+  'konst2:claude pinned=0' "$(pinned)"
+printf '1\tghost\tclaude\n' > "$PIN"
+eq_t 'a pin naming an account that is gone is ignored' 'konst2:claude pinned=0' "$(pinned)"
+[[ ! -e "$PIN" ]] && ok_t '...and dropped' || bad_t 'a gone pin was kept' ''
+_d=$( ( cmd_account_default nobody ) 2>&1)
+grep -q "no account named 'nobody'" <<<"$_d" && ok_t 'pinning an account the box does not have is refused' || bad_t 'pin of a missing account' "$_d"
+mkdir -p "$AUTH_PROFILES_DIR/empty"; : > "$AUTH_PROFILES_DIR/empty/combined.env"
+_d=$( ( cmd_account_default empty ) 2>&1)
+grep -q 'holds no' <<<"$_d" && ok_t 'pinning an account with no login is refused (never an empty login)' || bad_t 'pin of an empty account' "$_d"
+_d=$( ( cmd_account_default mp:codex ) 2>&1)
+grep -q 'holds no codex login' <<<"$_d" && ok_t 'pinning a harness the account is not signed in for is refused' || bad_t 'pin of a wrong harness' "$_d"
+_d=$( ( cmd_account_default mp --clear ) 2>&1)
+grep -q 'usage: 5dive account default' <<<"$_d" && ok_t 'a pin and --clear together is a usage error' || bad_t 'pin+clear' "$_d"
+_d=$( ( cmd_account_default mp:bogus ) 2>&1)
+grep -q 'usage: 5dive account default <account>' <<<"$_d" && ok_t 'an unknown harness is refused with its usage' || bad_t 'unknown harness' "$_d"
+JSON_MODE=0
+_h=$( ( cmd_account_default mp ) 2>/dev/null)
+grep -q '^New agents use mp (claude), set as the default ' <<<"$_h" && ok_t 'the human line says it was set, not added' || bad_t 'human line' "$_h"
+
 echo
-printf 'DIVE-7152 new hires go to the login added last: %d passed, %d failed\n' "$PASS" "$FAIL"
+printf 'DIVE-7152 new hires go to the login added last (+ DIVE-7415 the pinned default): %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1

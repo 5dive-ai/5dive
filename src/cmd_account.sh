@@ -380,8 +380,15 @@ account_each() {
 # With no `added` login the hire paths keep their
 # own rules, unchanged. Only a writable ledger (root) is written; a read-only
 # caller sees the same answer, it just does not record it.
+#
+# DIVE-7415 (lodar 2026-10-31: "an option to set default account"): the owner
+# can pin one login, <AUTH_PROFILES_DIR>/.default (`<epoch> \t <account> \t
+# <type>`), and it beats every newer login. `account default <account>` pins,
+# `--clear` unpins. A pin whose account is gone is dropped, and back to the
+# newest login. A pinned login that is signed out right now is skipped, not
+# dropped: a file mid-refresh must not lose the owner's choice.
 ACCOUNT_DEFAULT_TYPES=(claude codex grok)
-ACCOUNT_DEFAULT_ACCOUNT="" ACCOUNT_DEFAULT_TYPE="" ACCOUNT_DEFAULT_SINCE=""
+ACCOUNT_DEFAULT_ACCOUNT="" ACCOUNT_DEFAULT_TYPE="" ACCOUNT_DEFAULT_SINCE="" ACCOUNT_DEFAULT_PINNED=0
 
 account_logins_ledger() { printf '%s/.logins' "${AUTH_PROFILES_DIR}"; }
 
@@ -468,9 +475,18 @@ _account_logins_write() {
 # keeps its own rule.
 account_default_v() {
   local want="${1:-}" key ts state best_ts=-1 best=""
-  ACCOUNT_DEFAULT_ACCOUNT="" ACCOUNT_DEFAULT_TYPE="" ACCOUNT_DEFAULT_SINCE=""
+  ACCOUNT_DEFAULT_ACCOUNT="" ACCOUNT_DEFAULT_TYPE="" ACCOUNT_DEFAULT_SINCE="" ACCOUNT_DEFAULT_PINNED=0
   [[ -n "${AUTH_PROFILES_DIR:-}" && -d "${AUTH_PROFILES_DIR}" ]] || return 1
   account_logins_sync
+  # DIVE-7415: the owner's pin first, while it is signed in for that harness.
+  if account_default_pin_v; then
+    key="$ACCOUNT_PIN_ACCOUNT"$'\t'"$ACCOUNT_PIN_TYPE"
+    if [[ -n "${ACCOUNT_LOGINS_LIVE[$key]:-}" ]] && [[ -z "$want" || "$ACCOUNT_PIN_TYPE" == "$want" ]]; then
+      ACCOUNT_DEFAULT_ACCOUNT="$ACCOUNT_PIN_ACCOUNT" ACCOUNT_DEFAULT_TYPE="$ACCOUNT_PIN_TYPE" ACCOUNT_DEFAULT_PINNED=1
+      TZ=UTC printf -v ACCOUNT_DEFAULT_SINCE '%(%Y-%m-%dT%H:%M:%SZ)T' "$ACCOUNT_PIN_SINCE"
+      return 0
+    fi
+  fi
   for key in "${!ACCOUNT_LOGINS[@]}"; do
     ts="${ACCOUNT_LOGINS[$key]%%$'\t'*}" state="${ACCOUNT_LOGINS[$key]#*$'\t'}"
     [[ "$state" == added && -n "${ACCOUNT_LOGINS_LIVE[$key]:-}" ]] || continue
@@ -487,10 +503,58 @@ account_default_v() {
   return 0
 }
 
+account_default_pin_file() { printf '%s/.default' "${AUTH_PROFILES_DIR}"; }
+
+# account_default_pin_v — the owner's pin, in ACCOUNT_PIN_{ACCOUNT,TYPE,SINCE};
+# rc 1 when there is none. A pin whose account directory is gone is removed
+# here (best effort, as the ledger), so a new account of the same name never
+# inherits it.
+ACCOUNT_PIN_ACCOUNT="" ACCOUNT_PIN_TYPE="" ACCOUNT_PIN_SINCE=""
+account_default_pin_v() {
+  _account_default_pin_read || return 1
+  if [[ ! -d "${AUTH_PROFILES_DIR}/${ACCOUNT_PIN_ACCOUNT}" ]]; then
+    ACCOUNT_PIN_ACCOUNT="" ACCOUNT_PIN_TYPE="" ACCOUNT_PIN_SINCE=""
+    account_default_pin_drop
+    return 1
+  fi
+  return 0
+}
+
+_account_default_pin_read() {
+  local f ts="" acct="" t=""
+  ACCOUNT_PIN_ACCOUNT="" ACCOUNT_PIN_TYPE="" ACCOUNT_PIN_SINCE=""
+  f=$(account_default_pin_file)
+  [[ -r "$f" ]] || return 1
+  IFS=$'\t' read -r ts acct t <"$f" || true
+  [[ "$ts" =~ ^[0-9]+$ ]] && valid_profile_name "$acct" && [[ " ${ACCOUNT_DEFAULT_TYPES[*]} " == *" $t "* ]] \
+    || return 1
+  ACCOUNT_PIN_ACCOUNT="$acct" ACCOUNT_PIN_TYPE="$t" ACCOUNT_PIN_SINCE="$ts"
+}
+
+account_default_pin_drop() {
+  [[ -w "${AUTH_PROFILES_DIR:-}" ]] && rm -f "$(account_default_pin_file)" 2>/dev/null
+  return 0
+}
+
+# account_default_pin_rename <old> <new> — `account rename` keeps the pin on the account.
+account_default_pin_rename() {
+  _account_default_pin_read || return 0
+  [[ "$ACCOUNT_PIN_ACCOUNT" == "$1" ]] || return 0
+  _account_default_pin_write "$2" "$ACCOUNT_PIN_TYPE" "$ACCOUNT_PIN_SINCE"
+}
+
+_account_default_pin_write() {
+  local f tmp
+  f=$(account_default_pin_file) tmp="$(account_default_pin_file).tmp.$$"
+  printf '%s\t%s\t%s\n' "$3" "$1" "$2" >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$f" \
+    || { rm -f "$tmp" 2>/dev/null; return 1; }
+}
+
 _account_default_json() {
   if account_default_v; then
     jq -cn --arg a "$ACCOUNT_DEFAULT_ACCOUNT" --arg t "$ACCOUNT_DEFAULT_TYPE" --arg s "$ACCOUNT_DEFAULT_SINCE" \
-      '{account:$a, type:$t, since:$s}'
+      --argjson p "$( (( ACCOUNT_DEFAULT_PINNED )) && echo true || echo false)" \
+      '{account:$a, type:$t, since:$s, pinned:$p}'
   else
     printf 'null\n'
   fi
@@ -502,14 +566,47 @@ _account_default_json() {
 # (it stays signed in, and agents on it stay on it), and the one before it is
 # the default again. Naming the login, not "the last one", makes a second tap on
 # Undo a no-op instead of undoing the login before it too.
+#
+# DIVE-7415: `5dive account default <account>[:<type>]` pins that login, and it
+# stays the default when a newer one is added; with no type, the account's own
+# login in claude, codex, grok order. `--clear` unpins (back to the newest login).
 cmd_account_default() {
-  local undo="" a
+  local undo="" pin="" clear=0 a
+  local usage="usage: 5dive account default [<account>[:<type>] | --clear | --undo=<account>:<type>]"
   for a in "$@"; do
     case "$a" in
       --undo=*) undo="${a#--undo=}" ;;
-      *) fail "$E_USAGE" "usage: 5dive account default [--undo=<account>:<type>]" ;;
+      --clear) clear=1 ;;
+      -*) fail "$E_USAGE" "$usage" ;;
+      *) [[ -z "$pin" ]] || fail "$E_USAGE" "$usage"; pin="$a" ;;
     esac
   done
+  if [[ -n "$undo" && ( -n "$pin" || $clear -eq 1 ) ]] || [[ -n "$pin" && $clear -eq 1 ]]; then
+    fail "$E_USAGE" "$usage"
+  fi
+  if [[ -n "$pin" ]]; then
+    local acct="${pin%%:*}" t="" key
+    [[ "$pin" == *:* ]] && t="${pin#*:}"
+    valid_profile_name "$acct" && [[ -z "$t" || " ${ACCOUNT_DEFAULT_TYPES[*]} " == *" $t "* ]] \
+      || fail "$E_VALIDATION" "usage: 5dive account default <account>[:<type>] (type: ${ACCOUNT_DEFAULT_TYPES[*]})"
+    require_root
+    [[ -d "${AUTH_PROFILES_DIR}/${acct}" ]] || fail "$E_NOT_FOUND" "no account named '$acct'"
+    account_logins_sync
+    if [[ -z "$t" ]]; then
+      for key in "${ACCOUNT_DEFAULT_TYPES[@]}"; do
+        [[ -n "${ACCOUNT_LOGINS_LIVE[$acct$'\t'$key]:-}" ]] && { t="$key"; break; }
+      done
+      [[ -n "$t" ]] || fail "$E_NOT_FOUND" "account '$acct' holds no ${ACCOUNT_DEFAULT_TYPES[*]} login on this box"
+    fi
+    [[ -n "${ACCOUNT_LOGINS_LIVE[$acct$'\t'$t]:-}" ]] \
+      || fail "$E_NOT_FOUND" "account '$acct' holds no $t login on this box"
+    local now; printf -v now '%(%s)T' -1
+    _account_default_pin_write "$acct" "$t" "$now" \
+      || fail "$E_GENERIC" "could not write $(account_default_pin_file)"
+  elif (( clear )); then
+    require_root
+    account_default_pin_drop
+  fi
   if [[ -n "$undo" ]]; then
     local acct="${undo%%:*}" t="${undo#*:}" key
     [[ "$undo" == *:* ]] && valid_profile_name "$acct" && [[ " ${ACCOUNT_DEFAULT_TYPES[*]} " == *" $t "* ]] \
@@ -530,7 +627,8 @@ cmd_account_default() {
   elif [[ "$cur" == null ]]; then
     echo "No login added since this box started counting: each hire path keeps its own rule."
   else
-    jq -r '"New agents use \(.account) (\(.type)), added \(.since)."' <<<"$cur"
+    jq -r 'if .pinned then "New agents use \(.account) (\(.type)), set as the default \(.since)."
+           else "New agents use \(.account) (\(.type)), added \(.since)." end' <<<"$cur"
   fi
 }
 
@@ -584,12 +682,13 @@ cmd_account_list() {
     printf -v rec '%s\t' "${fields[@]}"
     recs+=("${rec%$'\t'}")
   done < <(account_each)
-  # DIVE-7152: the row new hires go to carries `default: <type>`.
+  # DIVE-7152: the row new hires go to carries `default: <type>`; DIVE-7415:
+  # and `pinned: true` when the owner set it.
   ACCOUNT_LOGINS_PRESCANNED=1
   account_default_v || true
   ACCOUNT_LOGINS_PRESCANNED=0
   rows=$(printf '%s\n' ${recs[@]+"${recs[@]}"} | jq -Rsc --argjson reg "$(registry_read)" \
-    --arg da "$ACCOUNT_DEFAULT_ACCOUNT" --arg dt "$ACCOUNT_DEFAULT_TYPE" '
+    --arg da "$ACCOUNT_DEFAULT_ACCOUNT" --arg dt "$ACCOUNT_DEFAULT_TYPE" --arg dp "$ACCOUNT_DEFAULT_PINNED" '
     # bound-agent index: profile -> [agent], from ONE registry read. Mirrors
     # account_agents_bound s select(.value.authProfile == $p), per profile.
     ( ($reg.agents // {}) | to_entries
@@ -606,7 +705,8 @@ cmd_account_list() {
               agents: ($bound[$n] // []),
               signins: (reduce range(0; ($sig | length); 2) as $i
                           ({}; .[$sig[$i]] = ($sig[$i + 1] | fromjson))) }
-            + (if $da != "" and $n == $da then {default: $dt} else {} end))')
+            + (if $da != "" and $n == $da then {default: $dt} else {} end)
+            + (if $da != "" and $n == $da and $dp == "1" then {pinned: true} else {} end))')
   if (( JSON_MODE )); then
     echo "$rows" | jq -c '{ok:true, data: .}'
   else
@@ -1708,6 +1808,7 @@ cmd_account_rename() {
 
   step "Renaming account dir '$old' -> '$new'"
   mv "${AUTH_PROFILES_DIR}/${old}" "${AUTH_PROFILES_DIR}/${new}"
+  account_default_pin_rename "$old" "$new"
 
   # Update registry .authProfile fields and re-point each agent's symlink.
   if [[ "$(jq -r 'length' <<<"$affected")" -gt 0 ]]; then
@@ -1775,6 +1876,8 @@ cmd_account_remove() {
 
   step "Deleting account dir ${AUTH_PROFILES_DIR}/${name}"
   rm -rf "${AUTH_PROFILES_DIR:?}/${name}"
+  # DIVE-7415: a removed default is no default; the newest login is again.
+  account_default_pin_v || true
   ok "account '$name' removed" \
      '{name:$n, removed:true}' --arg n "$name"
 }

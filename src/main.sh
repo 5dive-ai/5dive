@@ -318,6 +318,7 @@ Accounts (a named auth profile — group sign-ins so multiple agents share one l
   5dive account list                                   # name, types signed in, # agents bound
   5dive account show <name>                            # detail incl. env keys present
   5dive account default [--undo=<acct>:<type>]         # the login new hires go to (the one added last); Undo
+  5dive account default <acct>[:<type>] | --clear      # pin the login new hires go to (beats newer ones); unpin
   5dive account usage                                  # per-account 5h/7d limit usage (dashboard dots + /usage)
   5dive account usage --history [--7d] [--account=<n>] # provider 5h/7d readings OVER TIME (appended samples, not the latest)
   5dive account poll                                   # read every Claude account's 5h/7d from the provider now (no seat
