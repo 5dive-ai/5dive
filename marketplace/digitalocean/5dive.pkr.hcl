@@ -22,9 +22,11 @@ variable "do_token" {
   sensitive = true
 }
 
+# nyc3 refused s-1vcpu-1gb for our team on 2026-10-31 ("Size is not available in
+# this region"); fra1 builds. The snapshot can be copied to any region later.
 variable "region" {
   type    = string
-  default = "nyc3"
+  default = "fra1"
 }
 
 # DigitalOcean's advice: build on the $6 size, so the 1-Click can be created on
@@ -77,8 +79,13 @@ build {
   }
 
   # Their clean-up empties /tmp, so both scripts wait in /root/do-tools.
+  # DigitalOcean's base image ships their droplet agent, and their own image
+  # check FAILs on its directory ("DigitalOcean directory detected"): purge it.
   provisioner "shell" {
+    environment_vars = ["DEBIAN_FRONTEND=noninteractive"]
     inline = [
+      "apt-get -qqy purge droplet-agent || true",
+      "rm -rf /opt/digitalocean",
       "mkdir -p /root/do-tools && cd /root/do-tools",
       "curl -fsSL -o 90-cleanup.sh https://raw.githubusercontent.com/digitalocean/marketplace-partners/${local.do_tools_ref}/scripts/90-cleanup.sh",
       "curl -fsSL -o 99-img-check.sh https://raw.githubusercontent.com/digitalocean/marketplace-partners/${local.do_tools_ref}/scripts/99-img-check.sh",
