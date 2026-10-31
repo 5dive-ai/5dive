@@ -34,7 +34,10 @@ sudo 5dive init
 
 You need a Linux server (Ubuntu 22.04 or newer) and your own AI subscription or API key, no 5dive account.
 
-**Prefer a package?** On Ubuntu or Debian, add our signed apt repo, then install:
+<details>
+<summary><b>Other ways to install:</b> apt package, Docker, Mac mini</summary>
+
+**apt** (Ubuntu or Debian), from our signed package repo:
 
 <!-- apt-lines:start -->
 ```sh
@@ -44,6 +47,17 @@ sudo apt update && sudo apt install 5dive && sudo 5dive-setup
 <!-- apt-lines:end -->
 
 Then `sudo 5dive init`. After `sudo apt upgrade`, run `sudo 5dive-setup` to apply the new version.
+
+**Docker** (a Mac mini, a home server, or just to try it): install Docker Desktop, then:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/5dive-ai/5dive/main/docker/compose.yaml && docker compose up -d
+docker exec -it 5dive 5dive init
+```
+
+More in [docker/README.md](docker/README.md).
+
+</details>
 
 One app for your whole team, no bot tokens: link your server free at [5dive.ai/self-host](https://5dive.ai/self-host).
 
