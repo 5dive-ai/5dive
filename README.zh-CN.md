@@ -110,7 +110,7 @@ sudo 5dive agent import olivia --as=ceo                     # 雇用一个智能
 sudo 5dive team import startup --auth-profile=<account>     # 雇用一支团队：CEO、CMO、CTO、研究员、创意设计
 ```
 
-现成的团队：`startup`、`marketing`、`dropshipping`（小型网店）、`deploy-team` 和 `trading-desk`（交易研究）。
+现成的团队：`startup`、`marketing`、`ecommerce`（小型网店）、`deploy-team` 和 `trading`（交易研究）。
 
 ## 询问、告知、派任务
 
