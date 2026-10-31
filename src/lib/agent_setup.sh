@@ -760,6 +760,23 @@ seed_codex_model() {
   chmod 700 "$dir"
 }
 
+# DIVE-7417: the third-party provider a new codex seat runs on, as a one-shot
+# seed beside the model seed: three lines, the provider id, its base_url and the
+# env var holding its key. 5dive-agent-start turns it into model_provider plus
+# a [model_providers.<id>] table on first start (apply_codex_provider_seed).
+# The key itself is never in it.
+seed_codex_provider() {
+  local name="$1" provider="$2"
+  local dir="${AGENT_HOME_ROOT:-/home}/agent-${name}/.codex"
+  local url="${CODEX_PROVIDER_BASEURL[$provider]:-}" var="${CODEX_PROVIDER_VAR[$provider]:-}"
+  [[ -n "$url" && -n "$var" ]] || return 1
+  mkdir -p "$dir" || return 1
+  printf '%s\n%s\n%s\n' "$provider" "$url" "$var" > "$dir/.5dive-provider-seed" || return 1
+  chmod 600 "$dir/.5dive-provider-seed"
+  chown "agent-${name}:agent-${name}" "$dir" "$dir/.5dive-provider-seed" 2>/dev/null || true
+  chmod 700 "$dir"
+}
+
 preseed_codex_return_channel() {
   local name="$1"
   local user="agent-${name}" root="${CODEX_AGENT_HOME_ROOT:-/home}"

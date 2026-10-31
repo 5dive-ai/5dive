@@ -876,6 +876,21 @@ declare -A OPENCODE_PROVIDER_VAR=(
   [openrouter]="OPENROUTER_API_KEY"
 )
 
+# DIVE-7417: Codex on a provider other than OpenAI. Codex reads a third-party
+# endpoint from a [model_providers.<id>] table in config.toml whose env_key
+# names the variable holding the key, so the key rides the environment (the
+# codex connector or the seat's auth profile), never argv or the config file.
+# 5dive-agent-start writes the table on first start from the seed `agent
+# create` leaves (seed_codex_provider). Codex 0.166 refuses wire_api="chat";
+# OpenRouter serves the Responses API at <base_url>/responses (measured
+# 2026-10-31: openai/gpt-6-luna answered a sum through it).
+declare -A CODEX_PROVIDER_VAR=(
+  [openrouter]="OPENROUTER_API_KEY"
+)
+declare -A CODEX_PROVIDER_BASEURL=(
+  [openrouter]="https://openrouter.ai/api/v1"
+)
+
 # pi provider -> native env var. pi is API-key multi-provider (NO OAuth): it
 # reads the standard per-provider *_API_KEY var straight from the environment
 # (verified against @earendil-works/pi-coding-agent 0.80.6 dist — it recognizes
