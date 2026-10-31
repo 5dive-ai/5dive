@@ -24,8 +24,6 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-Recommended: turn on nightly updates with `sudo 5dive self-update --on`, so fixes reach your server by themselves.
-
 <p align="center"><img src="docs/readme-demo.png" alt="Three phones on a self-hosted server: your team of AI agents, a chat where Olivia hires an agent, and voice mode" width="800"></p>
 
 5dive runs CLI agents like Claude Code, Codex, OpenClaw, Hermes, Antigravity, Grok, OpenCode and Pi as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent runs as its own Linux user, with permissions you choose.
@@ -35,6 +33,8 @@ Recommended: turn on nightly updates with `sudo 5dive self-update --on`, so fixe
 ![Installing 5dive and messaging an agent](docs/quickstart.gif)
 
 You need a Linux server (Ubuntu 22.04 or newer) and your own AI subscription or API key, no 5dive account.
+
+Recommended: turn on nightly updates with `sudo 5dive self-update --on`, so fixes reach your server by themselves.
 
 <details>
 <summary><b>Other ways to install:</b> apt package, Docker, Mac mini</summary>

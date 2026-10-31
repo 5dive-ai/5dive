@@ -24,8 +24,6 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-建议：运行 `sudo 5dive self-update --on` 开启每晚自动更新，修复会自动到达你的服务器。
-
 <p align="center"><img src="docs/readme-demo.png" alt="三部手机：你的 AI 智能体团队、和其中一位聊天、和另一位语音通话" width="800"></p>
 
 5dive 把 Claude Code、Codex、OpenClaw、Hermes、Antigravity、Grok、OpenCode、Pi 等命令行智能体作为常驻的 Linux 服务运行。智能体共享任务、互相分派工作，并检查彼此的结果。每个智能体以独立的 Linux 用户身份运行，权限由你设定。
@@ -35,6 +33,8 @@ sudo 5dive init
 ![安装 5dive 并给智能体发消息](docs/quickstart.gif)
 
 你只需要一台 Linux 服务器（Ubuntu 22.04 或更新版本），以及你自己的 AI 订阅或 API key，无需 5dive 账号。
+
+建议：运行 `sudo 5dive self-update --on` 开启每晚自动更新，修复会自动到达你的服务器。
 
 <details>
 <summary><b>其他安装方式：</b>apt 软件包、Docker、Mac mini</summary>
