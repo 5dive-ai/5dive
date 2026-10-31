@@ -1559,6 +1559,18 @@ install_channel_for_openclaw_agent() {
   local plugin="$1" name="$2" token="$3" home_channel="${4:-}" allowed_users="${5:-}"
   local user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
+  if [[ "$plugin" == "dashboard" ]]; then
+    # DIVE-7349: the web chat. A seat with any channel runs `openclaw gateway
+    # run` in its pane; 5dive-agent-start runs the dashboard server beside it
+    # (--runtime=openclaw), which answers each message with one `openclaw
+    # agent` turn through that gateway.
+    prepare_dashboard_bridge "$user"
+    step "Setting openclaw gateway.mode for $user"
+    # The gateway refuses to start with gateway.mode unset (see below).
+    sudo -u "$user" -H bash -c 'export NVM_DIR=/home/claude/.nvm; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; export PATH="/home/claude/.local/bin:$PATH"; /home/claude/.local/bin/openclaw config set gateway.mode local 2>&1 | tail -3' >&2 \
+      || warn "openclaw config set gateway.mode failed for agent '$name' (rerun: sudo -u $user -H openclaw config set gateway.mode local)"
+    return 0
+  fi
   [[ -n "$token" ]] || fail "$E_VALIDATION" "openclaw $plugin channel requires a bot token"
 
   # Pre-seed the allowlist + command-owner list from the dashboard wizard's
@@ -1658,6 +1670,10 @@ install_channel_for_hermes_agent() {
   local plugin="$1" name="$2" token="$3" home_channel="${4:-}" allowed_users="${5:-}"
   local user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
+  if [[ "$plugin" == "dashboard" ]]; then
+    install_dashboard_for_hermes_agent "$name"
+    return 0
+  fi
   [[ -n "$token" ]] || fail "$E_VALIDATION" "hermes $plugin channel requires a bot token"
 
   local var
@@ -1705,6 +1721,37 @@ HERMES_ENV
     fail "$E_GENERIC" \
       "hermes $plugin env write failed for agent '$name'."
   fi
+}
+
+# DIVE-7349: the web chat for a hermes agent. Two halves: the dashboard server,
+# which 5dive-agent-start runs beside the seat (--runtime=hermes) and which
+# drops each web-chat message in a spool, and the 5dive channel plugin inside
+# the hermes gateway (plugins/dashboard/hermes in the dashboard checkout),
+# which reads that spool and writes the answers back. The plugin is linked,
+# not copied, so a self-update of the dashboard checkout updates it too; the
+# gateway re-reads it on its boot restart. Only the bridge's sender may talk.
+HERMES_5DIVE_SPOOL_REL=".hermes/channels/5dive"
+install_dashboard_for_hermes_agent() {
+  local name="$1" user="agent-$1" dash
+  prepare_dashboard_bridge "$user"
+  dash=$(dashboard_plugin_dir)
+  [[ -f "$dash/hermes/plugin.yaml" ]] \
+    || fail "$E_NOT_INSTALLED" "the dashboard checkout at $dash has no hermes plugin (needs dashboard 0.5.15+). Run '5dive self-update'."
+  step "Linking the 5dive channel plugin into hermes for $user"
+  if ! sudo -u "$user" -H env DASH_HERMES="$dash/hermes" SPOOL_REL="$HERMES_5DIVE_SPOOL_REL" bash -c '
+      set -e
+      install -d -m 700 "$HOME/.hermes" "$HOME/.hermes/plugins" "$HOME/$SPOOL_REL"
+      ln -sfn "$DASH_HERMES" "$HOME/.hermes/plugins/fivedive"' >&2; then
+    fail "$E_GENERIC" "hermes 5dive plugin link failed for agent '$name'"
+  fi
+  # --no-allow-tool-override answers enable'"'"'s one question (the plugin adds no tools).
+  sudo -u "$user" -H "${TYPE_BIN[hermes]}" plugins enable fivedive --no-allow-tool-override </dev/null >&2 \
+    || sudo -u "$user" -H "${TYPE_BIN[hermes]}" plugins enable fivedive </dev/null >&2 \
+    || fail "$E_GENERIC" "hermes plugins enable fivedive failed for agent '$name' (rerun: sudo -u $user -H hermes plugins enable fivedive)"
+  local home
+  home=$(getent passwd "$user" | cut -d: -f6)
+  seed_hermes_byo_env "$name" FIVEDIVE_SPOOL_DIR "$home/$HERMES_5DIVE_SPOOL_REL"
+  seed_hermes_byo_env "$name" FIVEDIVE_ALLOWED_USERS "5dive-app"
 }
 
 # Idempotently install + start the hermes messaging gateway for agent-<name>.
@@ -1943,6 +1990,25 @@ dashboard_plugin_dir() {
   return 1
 }
 
+# What every seat whose web chat runs through the dashboard server needs
+# (Grok, DIVE-7347; Hermes and OpenClaw, DIVE-7349): the server's checkout,
+# bun to run it, and the inbox the control plane and shelld drop messages in.
+# That inbox is the runtime-neutral path, as for Codex. No token: the server
+# reads the box connectord bearer.
+prepare_dashboard_bridge() {
+  local user="$1"
+  dashboard_plugin_dir >/dev/null \
+    || fail "$E_NOT_INSTALLED" \
+       "dashboard plugin not found (looked in /usr/local/lib/5dive/dashboard and the 5dive-plugins checkout). Set DASHBOARD_PLUGIN_DIR or run '5dive self-update'."
+  if ! ensure_bun_for_agent "$user"; then
+    fail "$E_NOT_INSTALLED" \
+      "bun unavailable for $user (required by the dashboard chat) and automatic install failed. Check network access to bun.sh, or install bun to /usr/local/bin manually, then retry."
+  fi
+  step "Preparing dashboard inbox for $user"
+  sudo -u "$user" -H bash -c \
+    'mkdir -p "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now"; chmod 700 "$HOME/.claude" "$HOME/.claude/channels" "$HOME/.claude/channels/dashboard" "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now" 2>/dev/null || true'
+}
+
 # Configure the telegram channel for a grok agent. Structurally identical to
 # install_channel_for_codex_agent — grok has no plugin marketplace, so a single
 # shared plugin checkout serves every grok agent (server.ts resolves its state
@@ -1963,17 +2029,7 @@ install_channel_for_grok_agent() {
     # ~/.grok/config.toml (written at boot by 5dive-agent-start), and that
     # server types each message into Grok's pane and reads the answer back
     # from Grok's session file. No token: it reads the box connectord bearer.
-    dashboard_plugin_dir >/dev/null \
-      || fail "$E_NOT_INSTALLED" \
-         "dashboard plugin not found (looked in /usr/local/lib/5dive/dashboard and the 5dive-plugins checkout). Set DASHBOARD_PLUGIN_DIR or run '5dive self-update'."
-    if ! ensure_bun_for_agent "$user"; then
-      fail "$E_NOT_INSTALLED" \
-        "bun unavailable for $user (required by the dashboard chat) and automatic install failed. Check network access to bun.sh, or install bun to /usr/local/bin manually, then retry."
-    fi
-    # shelld/control-plane delivery uses the runtime-neutral path, as for Codex.
-    step "Preparing dashboard inbox for $user"
-    sudo -u "$user" -H bash -c \
-      'mkdir -p "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now"; chmod 700 "$HOME/.claude" "$HOME/.claude/channels" "$HOME/.claude/channels/dashboard" "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now" 2>/dev/null || true'
+    prepare_dashboard_bridge "$user"
     return 0
   fi
   [[ -n "$token" ]] || fail "$E_VALIDATION" "grok telegram channel requires a bot token"
@@ -2659,11 +2715,11 @@ PI_EXT
 # routes) — kept as positional so the call site stays uniform.
 install_channel_for_agent() {
   local type="$1" plugin="$2" name="$3" token="$4" home_channel="${5:-}" allowed_users="${6:-}"
-  # Dashboard has native-push support in Claude, a dispatcher adapter in Codex
-  # and a pane bridge in Grok (DIVE-7347) and Antigravity (DIVE-7351). Other
-  # runtimes still have no dashboard transport.
+  # Dashboard has native-push support in Claude, a dispatcher adapter in Codex,
+  # a pane bridge in Grok (DIVE-7347) and Antigravity (DIVE-7351), and a spool
+  # bridge in Hermes and OpenClaw (DIVE-7349). Other runtimes still have no dashboard transport.
   if [[ "$plugin" == "dashboard" ]] && ! type_has_web_chat "$type"; then
-    fail "$E_VALIDATION" "channels=dashboard requires type=claude, codex, grok or antigravity (agent '$name' is type $type)"
+    fail "$E_VALIDATION" "channels=dashboard requires type=$(web_chat_types_text) (agent '$name' is type $type)"
   fi
   # DIVE-2895: same for buzz — it is a claude channel plugin (MCP notification
   # inbound), and the poll-fork runtimes have no Buzz variant. Refuse here so

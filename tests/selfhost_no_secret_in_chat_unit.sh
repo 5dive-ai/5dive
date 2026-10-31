@@ -211,8 +211,8 @@ box "$ORTEST"; : > "$FIVEDIVE_CHAT_ONLY_MARK"
 eq_t "a claude hire with Telegram and no token: made on the app chat, not refused" \
   'profile=or-test defer=0 channels=dashboard byo=' "$(made marcus --type=claude --auth-profile=or-test --channels=telegram)"
 box "$ORTEST"; : > "$FIVEDIVE_CHAT_ONLY_MARK"   # fresh: the arm above wrote nothing, but stay independent
-eq_t "an openclaw hire with Telegram and no token: made, its key reused" \
-  'profile=theo defer=0 channels=none byo=openrouter' "$(made theo --type=openclaw --channels=telegram)"
+eq_t "an openclaw hire with Telegram and no token: made on the app chat too (DIVE-7349), its key reused" \
+  'profile=theo defer=0 channels=dashboard byo=openrouter' "$(made theo --type=openclaw --channels=telegram)"
 eq_t "telegram,dashboard keeps the chat once" \
   'profile=or-test defer=0 channels=dashboard byo=' "$(made marcus --type=claude --auth-profile=or-test --channels=telegram,dashboard)"
 eq_t "a token that IS given is used (no tap needed)" \

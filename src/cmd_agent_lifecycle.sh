@@ -70,8 +70,9 @@ cmd_restart() {
     # needs a raw `sudo systemd-run` grant (which is arbitrary root). The ~1s
     # transient unit survives the caller's own session teardown, so an agent
     # restarting itself (e.g. after editing model/effort) doesn't SIGTERM the
-    # restart mid-flight.
-    systemd-run --on-active=1 --collect \
+    # restart mid-flight. AccuracySec keeps "~1s" from being up to a minute
+    # (systemd's default timer slack, DIVE-7353).
+    systemd-run --on-active=1 --timer-property=AccuracySec=100ms --collect \
       /bin/systemctl restart "5dive-agent@${name}.service" >&2
     ok "agent '$name' restart scheduled (deferred ~1s)." \
        '{name:$n, action:"restart", deferred:true}' --arg n "$name"
@@ -116,7 +117,7 @@ cmd_self_restart() {
   require_agent "$name"
   # Fixed, name-only command (no caller injection); the ~1s transient unit
   # survives this caller's teardown so its own SIGTERM can't abort the restart.
-  systemd-run --on-active=1 --collect \
+  systemd-run --on-active=1 --timer-property=AccuracySec=100ms --collect \
     /bin/systemctl restart "5dive-agent@${name}.service" >&2
   ok "agent '$name' self-restart scheduled (deferred ~1s)." \
      '{name:$n, action:"restart", self:true, deferred:true}' --arg n "$name"

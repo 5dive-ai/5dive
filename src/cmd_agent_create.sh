@@ -3742,10 +3742,11 @@ cmd_create() {
     fail "$E_VALIDATION" "type '$type' supports --channels=telegram only (no discord build)"
   fi
   # Dashboard has native-push support in Claude, an app-server dispatcher
-  # adapter in Codex, and a pane bridge in Grok (DIVE-7347) and Antigravity
-  # (DIVE-7351). Other runtimes still have no dashboard transport.
+  # adapter in Codex, a pane bridge in Grok (DIVE-7347) and Antigravity
+  # (DIVE-7351), and a spool bridge in Hermes and OpenClaw (DIVE-7349). Other runtimes still have no dashboard
+  # transport.
   if ! type_has_web_chat "$type" && channel_in_list dashboard "$channels"; then
-    fail "$E_VALIDATION" "channels=dashboard requires type=claude, codex, grok or antigravity (got type=$type)"
+    fail "$E_VALIDATION" "channels=dashboard requires type=$(web_chat_types_text) (got type=$type)"
   fi
 
   # DIVE-906: secrets via stdin, never argv. The "-" sentinel on --api-key,
@@ -4500,7 +4501,8 @@ cmd_create() {
   # the gateway can't talk to the model. See ensure_hermes_gateway for
   # the underlying systemd-user plumbing.
   if [[ "$type" == "hermes" ]] \
-      && { channel_in_list telegram "$channels" || channel_in_list discord "$channels"; } \
+      && { channel_in_list telegram "$channels" || channel_in_list discord "$channels" \
+           || channel_in_list dashboard "$channels"; } \
       && (( ! defer_auth )); then
     ensure_hermes_gateway "$name"
   fi

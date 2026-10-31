@@ -19,6 +19,7 @@
 #   init           `5dive init` stopped, asked something unexpected, or failed
 #   pin            the seat could not be put on the cheapest model
 #   reply          the agent's own answer never arrived, or was wrong
+#   webchat        (hermes, openclaw) a 5dive app chat message got no answer, or a wrong one
 #
 # The reply is graded on the agent's TEXT: it is asked a sum and must answer
 # it. The self-check and `agent list` both said ready on the dead Hermes seat.
@@ -120,7 +121,21 @@ pin_model() {
   [[ -n "$haiku" ]] || { DETAIL="could not read the haiku model id from the installed CLI"; return 1; }
   case "$type" in
     claude)
-      out=$(5dive agent config "$NAME" set model=haiku 2>&1) || rc=$? ;;
+      # `config set` restarts the seat a moment AFTER it returns. Wait for that
+      # restart, or the question goes to the old session and the restart kills
+      # it mid-reply (10-30: "tmux session not found", DIVE-7353).
+      local inv
+      inv=$(systemctl show -p InvocationID --value "5dive-agent@${NAME}.service" 2>/dev/null)
+      out=$(5dive agent config "$NAME" set model=haiku 2>&1) || rc=$?
+      if (( rc == 0 )); then
+        local _
+        for _ in $(seq 1 90); do
+          [[ "$(systemctl show -p InvocationID --value "5dive-agent@${NAME}.service" 2>/dev/null)" != "$inv" ]] && break
+          sleep 1
+        done
+        [[ "$(systemctl show -p InvocationID --value "5dive-agent@${NAME}.service" 2>/dev/null)" != "$inv" ]] \
+          || { out+=$'\n'"the seat was not restarted within 90s of the model pin"; rc=1; }
+      fi ;;
     codex)
       out=$(5dive agent config "$NAME" set "model=${INIT_SMOKE_CODEX_MODEL:-gpt-5-mini}" 2>&1) || rc=$? ;;
     openclaw)
@@ -157,6 +172,78 @@ PY
   printf '%s\n' "$out" | tail -5
   (( rc == 0 )) || { DETAIL="$type model pin exited $rc: $(printf '%s' "$out" | tail -1)"; return 1; }
   echo "pinned $type to the cheapest model ($haiku for Anthropic)"
+}
+
+# DIVE-7349: the 5dive app chat on hermes and openclaw seats. A message is left
+# where the control plane leaves one (the seat's dashboard inbox) and graded on
+# what the seat's dashboard bridge posts back. The control plane itself is not
+# in the container, so a stand-in on loopback answers the bridge's calls and
+# records the reply: everything from the inbox to the outbound POST is real,
+# the seat's gateway and model included.
+cell_has_webchat() { case "$(cell_type "$1")" in hermes|openclaw) return 0 ;; *) return 1 ;; esac; }
+
+FAKE_API_PORT=18999
+start_fake_api() {
+  python3 - "$FAKE_API_PORT" /tmp/webchat-replies.jsonl >/tmp/fake-api.log 2>&1 <<'PY' &
+import http.server, json, sys, time, urllib.parse
+port, log = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def _ok(self, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(200); self.send_header('content-type', 'application/json')
+        self.send_header('content-length', str(len(b))); self.end_headers(); self.wfile.write(b)
+    def _route(self):
+        u = urllib.parse.urlparse(self.path)
+        n = int(self.headers.get('content-length') or 0)
+        body = self.rfile.read(n) if n else b''
+        if u.path == '/server/messages/pending':
+            # A long poll waits like the real one, so the bridge does not spin.
+            wait = int(urllib.parse.parse_qs(u.query).get('wait', ['0'])[0] or 0)
+            time.sleep(min(wait, 20)); return self._ok({'pending': []})
+        if u.path == '/server/messages/pending/ack': return self._ok({'ok': True, 'acked': 0})
+        if u.path == '/server/messages/event':
+            with open(log, 'a') as f: f.write(body.decode() + '\n')
+            return self._ok({'id': 1})
+        return self._ok({})
+    do_GET = do_POST = _route
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
+PY
+}
+
+webchat_arm() {
+  local home inbox a b want out _
+  home=$(getent passwd "agent-${NAME}" | cut -d: -f6)
+  start_fake_api
+  : > /tmp/webchat-replies.jsonl
+  # The bridge's own override file (plugins/dashboard/server.ts reads it at boot).
+  install -d -o "agent-${NAME}" -m 700 "$home/.claude" "$home/.claude/channels" "$home/.claude/channels/dashboard"
+  printf 'DASHBOARD_API_BASE=http://127.0.0.1:%s\nCONNECTORD_TOKEN=init-smoke-not-a-token\n' "$FAKE_API_PORT" \
+    > "$home/.claude/channels/dashboard/.env"
+  chown "agent-${NAME}" "$home/.claude/channels/dashboard/.env"
+  out=$(5dive agent config "$NAME" set channels=dashboard 2>&1) || {
+    DETAIL="agent config set channels=dashboard failed: $(printf '%s' "$out" | tail -1)"; return 1; }
+  printf '%s\n' "$out" | tail -5
+  seat_up || { DETAIL="the seat did not come back up with the web chat on"; return 1; }
+  sleep 20
+  a=$((RANDOM % 400 + 100)) b=$((RANDOM % 400 + 500)) want=$((a + b))
+  inbox="$home/.claude/channels/dashboard/agent-inbox"
+  # The shelld drop contract: a temp name, then a rename to *.json.
+  jq -cn --arg t "What is $a + $b? Reply with only the number." '{text: $t, chat_id: "dashboard"}' \
+    | sudo -u "agent-${NAME}" bash -c 'mkdir -p "$1" && cat > "$1/.m.tmp" && mv "$1/.m.tmp" "$1/m.json"' _ "$inbox"
+  for _ in $(seq 1 100); do
+    grep -q . /tmp/webchat-replies.jsonl 2>/dev/null && break
+    sleep 3
+  done
+  echo "--- web chat replies ---"; cat /tmp/webchat-replies.jsonl
+  if ! grep -q . /tmp/webchat-replies.jsonl; then
+    DETAIL="a web chat message got no reply in 300s"; return 1
+  fi
+  if ! jq -r '.body // empty' /tmp/webchat-replies.jsonl | grep -qw -- "$want"; then
+    DETAIL="web chat: asked $a + $b, the reply did not say $want: $(jq -r '.body // empty' /tmp/webchat-replies.jsonl | tail -1 | cut -c1-300)"
+    return 1
+  fi
+  echo "the web chat answered $want"
 }
 
 run_arm() {
@@ -210,6 +297,10 @@ run_arm() {
   printf '%s\n' "$out" | tail -15
   if grep -qw -- "$want" <<<"$out"; then
     echo "the agent answered $want"
+    if cell_has_webchat "$CELL"; then
+      step webchat
+      webchat_arm || { show_seat; finish fail; }
+    fi
     STEP="" DETAIL=""
     finish pass
   fi
