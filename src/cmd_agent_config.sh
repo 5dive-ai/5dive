@@ -117,7 +117,7 @@ cmd_config() {
           fail "$E_VALIDATION" "type '$type' does not support channels"
         fi
         if ! type_has_web_chat "$type" && channel_in_list dashboard "$v"; then
-          fail "$E_VALIDATION" "channels=dashboard requires type=claude, codex or grok (agent '$name' is type $type)"
+          fail "$E_VALIDATION" "channels=dashboard requires type=$(web_chat_types_text) (agent '$name' is type $type)"
         fi
         # DIVE-3333: same claude-only rule for buzz (agent_setup.sh refuses it
         # in install_channel_for_agent, and 5dive-agent-start refuses it again).
@@ -602,6 +602,9 @@ cmd_config() {
   if [[ -n "$channels_changed_to" ]] && channel_in_list dashboard "$channels_changed_to"; then
     step "Installing dashboard channel for agent '$name' (type=$type)"
     _config_install_channel "$prev_channels" "$type" dashboard "$name" ""
+    # DIVE-7349: on hermes the web chat is answered inside the messaging
+    # gateway (its 5dive channel plugin), so a web-chat-only seat needs it too.
+    [[ "$type" == "hermes" ]] && ensure_hermes_gateway "$name"
   fi
   # DIVE-3333 buzz attach. Same token-free shape as dashboard above: the buzz
   # plugin carries no per-agent secret, so the dispatch is gated purely on
