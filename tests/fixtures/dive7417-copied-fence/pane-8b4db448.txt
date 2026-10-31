@@ -1,0 +1,20 @@
+e pattern matching only
+────────────────────────────────────────
+● [5dive-msg from=ask id=8b4db448 tier=unknown:no-caller via=unknown:no-caller]
+What is 112 + 705? Reply with only the number. [reply-format] Put your answer
+between these two marker lines: <5dive-r:8b4db448></5dive-r:8b4db448> — the
+opening marker alone on one line, your answer next, the closing marker alone on
+the last line.
+Initializing agent...
+────────────────────────────────────────
+  ┊ 🐍 preparing execute_code…
+  ┊ 🐍 exec      print(112 + 705)  0.1s
+╭─ ☤ Hermes ───────────────────────────────────────────────────────────────────╮
+<5dive-r:8b4db448></5dive-r:8b4db448>
+817
+<5dive-r:8b4db448></5dive-r:8b4db448>
+╰──────────────────────────────────────────────────────────────────────────────╯
+ ☤ gpt-6-luna │ ~11.9K/1.1M │ [░░░░░░░░░░] ~1% │ ◎...  ─ Calculate 112 plus 705
+────────────────────────────────────────────────────────────────────────────────
+❯ Draft a reply to the last email in my inbox
+────────────────────────────────────────────────────────────────────────────────
