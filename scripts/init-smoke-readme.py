@@ -43,6 +43,21 @@ SKIP = {
 }
 MODEL = {'agent ask': 'no test key: the agent cannot answer'}
 
+# A README command that fails today for a reason a row owns. It still runs,
+# every night: a failure is reported as KNOWN with the row, not as red, and a
+# pass is reported as a pass (then delete the entry). Never a skip by another
+# name: each entry names an open row whose DONE WHEN removes it.
+KNOWN = {
+    'goal add': 'DIVE-7380',
+    'agent export': 'DIVE-7380',
+}
+
+# Flags the README leaves to a person at a terminal (a confirmation prompt).
+ADD = {'plugin add': ['--yes']}
+
+# Bytes a command reads on stdin (a secret the README pipes in by hand).
+STDIN = {'trigger add': b'readme-smoke-secret\n'}
+
 # A table item that names a command but not the arguments it needs.
 FILL = {
     'agent logs': ['agent', 'logs', AGENT, '--lines=20'],
@@ -51,16 +66,22 @@ FILL = {
     'company': ['company', '--yes', '--name=Init Smoke', '--objective=Ship the launch',
                 '--metric-cmd=echo 1', '--target=2'],
     'objective add': ['objective', 'add', 'Readme smoke', '--metric-cmd=echo 1', '--target=2'],
-    'trigger add': ['trigger', 'add', 'webhook', '--name=readme-smoke'],
+    'trigger add': ['trigger', 'add', 'webhook', '--name=readme-smoke', '--event=deploy.done',
+                    f'--assignee={AGENT}', '--secret-from-stdin'],
     'export': ['export', '-o', '5dive.yaml'],  # `up` reads ./5dive.yaml next
 }
 
 # The README's example teammates: this box has one agent.
 TEAM = {'cmo', 'creative', 'devops', 'researcher'}
+# A reviewer must not be the assignee: `--review=` gets the agent `agent import
+# olivia --as=ceo` hired (README line order: import runs first, `agent rm` later).
+REVIEWER = 'ceo'
 PLACEHOLDER = {'<name>': AGENT, '<agent>': AGENT, '<query>': 'release checklist',
                '<outcome>': 'Write the launch post'}
 
-BAD_OUTPUT = re.compile(r'unknown (command|subcommand|verb|flag|option)|^\s*(error:\s*)?usage:|command not found',
+# "command not found" counts only when it is 5dive's own: `doctor` reports a
+# missing `gh` that way, and that is a finding, not a broken README command.
+BAD_OUTPUT = re.compile(r'unknown (command|subcommand|verb|flag|option)|^\s*(error:\s*)?usage:|\b5dive\b[^\n]*command not found',
                         re.I | re.M)
 CMD_LINE = re.compile(r'(^|[\s;&|])(sudo\s+)?5dive\s')
 
@@ -162,9 +183,12 @@ def plan(readme, no_model):
         run = FILL.get(joined) if src == 'table' and joined in FILL and argv == p else None
         if run is None:
             run = [AGENT if a in TEAM else a for a in argv]
-            run = [re.sub(r'^(--[a-z-]+=)(\w+)$', lambda m: m.group(1) + (AGENT if m.group(2) in TEAM else m.group(2)), a)
+            run = [re.sub(r'^(--[a-z-]+=)(\w+)$', lambda m: m.group(1) + (
+                       (REVIEWER if m.group(1) == '--review=' else AGENT) if m.group(2) in TEAM else m.group(2)), a)
                    for a in run]
-        out.append((n, text, 'run', list(run)))
+        add = next((v for k, v in ADD.items() if joined == k or joined.startswith(k + ' ')), [])
+        run = list(run) + [a for a in add if a not in run]
+        out.append((n, text, 'run', run))
     return out
 
 
@@ -200,9 +224,11 @@ def run(readme, result_path, no_model):
             results.append(r)
             print('    FAIL: ' + r['why'], flush=True)
             continue
+        path = ' '.join(path_of(argv))
+        feed = next((v for k, v in STDIN.items() if path == k or path.startswith(k + ' ')), None)
         t0 = time.time()
         try:
-            p = subprocess.run(['5dive'] + argv, cwd=work, stdin=subprocess.DEVNULL,
+            p = subprocess.run(['5dive'] + argv, cwd=work, input=feed if feed is not None else b'',
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=900)
             rc, out = p.returncode, p.stdout.decode(errors='replace')
         except subprocess.TimeoutExpired as e:
@@ -217,18 +243,25 @@ def run(readme, result_path, no_model):
             r.update(status='fail', why='exited 0 but printed: ' + bad.group(0).strip()[:200])
         else:
             r['status'] = 'pass'
+        known = next((v for k, v in KNOWN.items() if path == k or path.startswith(k + ' ')), None)
+        if known and r['status'] == 'fail':
+            r.update(status='known', why=f'known-broken, {known}: ' + r['why'])
         if argv[:2] == ['task', 'add'] and r['status'] == 'pass':
             m = re.search(r'\b[A-Z][A-Z0-9]*-\d+\b', out)
             if m:
                 state['task'] = m.group(0)
-        print(f'    {r["status"].upper()} ({r["secs"]}s)' + (': ' + r['why'] if r['status'] == 'fail' else ''), flush=True)
+        print(f'    {r["status"].upper()} ({r["secs"]}s)' + (': ' + r['why'] if r['status'] in ('fail', 'known') else ''), flush=True)
         results.append(r)
     ran = sum(1 for r in results if r['status'] == 'pass')
     failed = [r for r in results if r['status'] == 'fail']
     skipped = [r for r in results if r['status'] == 'skip']
+    known = [r for r in results if r['status'] == 'known']
     line = f'README: {ran} of {len(results)} commands ran'
     if failed:
         line += f', {len(failed)} failed'
+    if known:
+        line += f', {len(known)} known-broken (' + '; '.join(
+            ' '.join(path_of(shlex.split(r['readme'])[1:])[:2]) + ' ' + r['why'].split(':')[0].split(', ')[1] for r in known) + ')'
     line += f', {len(skipped)} skipped'
     if skipped:
         names = {}
@@ -237,10 +270,10 @@ def run(readme, result_path, no_model):
             names[k] = names.get(k, 0) + 1
         line += ' (' + '; '.join(k + (f' x{n}' if n > 1 else '') for k, n in names.items()) + ')'
     json.dump({'line': line, 'total': len(results), 'ran': ran, 'failed': len(failed),
-               'skipped': len(skipped), 'commands': results}, open(result_path, 'w'), indent=1)
+               'skipped': len(skipped), 'known': len(known), 'commands': results}, open(result_path, 'w'), indent=1)
     print('\n' + line, flush=True)
-    for r in failed:
-        print(f'README FAIL line {r["line"]}: {r["readme"]}: {r["why"]}', flush=True)
+    for r in failed + known:
+        print(f'README {"FAIL" if r in failed else "KNOWN"} line {r["line"]}: {r["readme"]}: {r["why"]}', flush=True)
     return 1 if failed else 0
 
 

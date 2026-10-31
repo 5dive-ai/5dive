@@ -291,7 +291,7 @@ jobs:
               echo "| README line | command | result | why |"
               echo "|---|---|---|---|"
               jq -r '.commands[] | select(.status != "pass")
-                | "| \(.line) | `\(.readme)` | \(if .status == "fail" then "❌ failed" else "⏭ skipped" end) | \(.why) |"' "$readme"
+                | "| \(.line) | `\(.readme)` | \(if .status == "fail" then "❌ failed" elif .status == "known" then "⚠️ known-broken" else "⏭ skipped" end) | \(.why) |"' "$readme"
             fi; } | tee -a "$GITHUB_STEP_SUMMARY" > /tmp/summary.md
           echo "$head"
           [ -n "$readme" ] && jq -r .line "$readme"

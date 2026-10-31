@@ -22,8 +22,12 @@ mkdir -p "$TMP/bin"
 cat >"$TMP/bin/5dive" <<'STUB'
 #!/bin/bash
 printf '%s\n' "$*" >>"$STUB_LOG"
+[[ " $* " == *" --secret-from-stdin "* ]] && { read -r sec; printf 'stdin: %s\n' "$sec" >>"$STUB_LOG"; }
 case "$1 $2" in
   "task add")  echo "added DIVE-41" ;;
+  "goal add")  [[ -n "${GOAL_FAIL:-}" ]] && { echo "error: no planner" >&2; exit 3; }; echo "ok" ;;
+  "agent nf")  echo "5dive: agent nf: command not found" ;;
+  "doctor ")   echo "github:read NO sudo: gh: command not found" ;;
   "agent lst") echo "error: unknown command 'lst'" >&2; exit 2 ;;
   "agent bad") echo "usage: 5dive agent bad <name>" ;;
   *) echo "ok" ;;
@@ -49,6 +53,14 @@ line=$(jq -r .line "$TMP/good.json")
   && ok_t "summary line: $line" || bad_t "summary line shape" "$line"
 jq -e '[.commands[] | select(.status == "skip")] | length > 0 and all(.why | length > 0)' "$TMP/good.json" >/dev/null \
   && ok_t "every skip carries a reason" || bad_t "a skip without a reason"
+grep -qx 'plugin add 5dive-ai/5dive-browser --yes' "$TMP/good.log" \
+  && ok_t "plugin add confirms with --yes (no terminal to answer)" || bad_t "plugin add without --yes"
+grep -qx "task add Design the ad --assignee=my-agent --review=ceo" "$TMP/good.log" \
+  && ok_t "--review gets a second agent, never the assignee" || bad_t "review == assignee"
+grep -qx 'stdin: readme-smoke-secret' "$TMP/good.log" \
+  && ok_t "trigger add reads its secret on stdin" || bad_t "trigger add got no stdin secret"
+jq -e '[.commands[] | select(.readme == "5dive doctor")][0].status == "pass"' "$TMP/good.json" >/dev/null \
+  && ok_t "doctor reporting a missing gh is not a broken command" || bad_t "doctor's gh finding went red"
 grep -qx 'agent ask my-agent Which post goes out today?' "$TMP/good.log" \
   && bad_t "--no-model still asked the agent" || ok_t "--no-model skips agent ask"
 run model README.md
@@ -68,6 +80,18 @@ grep -qx 'agent list' "$TMP/usage.log" && ok_t "a bare table verb continues its 
 printf '```\n5dive goal add "<nothing-maps-this>"\n```\n' >"$TMP/ph.md"
 run ph "$TMP/ph.md"; rc=$?
 (( rc == 1 )) && [[ ! -s "$TMP/ph.log" ]] && ok_t "an unmapped placeholder is red, not run" || bad_t "placeholder rc=$rc"
+
+printf '```\n5dive agent nf\n```\n' >"$TMP/nf.md"
+run nf "$TMP/nf.md"; rc=$?
+(( rc == 1 )) && ok_t "5dive's own 'command not found' on exit 0 is red" || bad_t "nf rc=$rc"
+
+# --- 3. KNOWN: a failure a row owns is reported with the row, still run nightly ---
+GOAL_FAIL=1 run known README.md --no-model; rc=$?
+line=$(jq -r .line "$TMP/known.json")
+(( rc == 0 )) && [[ "$line" == *"1 known-broken (goal add DIVE-7380)"* ]] && grep -q '^goal add ' "$TMP/known.log" \
+  && ok_t "a KNOWN failure runs, names its row, holds nothing: $line" || bad_t "known rc=$rc" "$line"
+jq -e '[.commands[] | select(.readme | startswith("5dive goal add"))][0].status == "pass"' "$TMP/good.json" >/dev/null \
+  && ok_t "a KNOWN command that passes is a pass" || bad_t "a passing KNOWN command not counted as a pass"
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))
