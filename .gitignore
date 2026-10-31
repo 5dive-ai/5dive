@@ -54,3 +54,6 @@ tests/.probe-*
 # DIVE-3911: python package build output
 python/dist/
 python/src/*.egg-info/
+
+# Python bytecode
+__pycache__/
