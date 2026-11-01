@@ -59,7 +59,7 @@ docker exec -it 5dive 5dive init
 
 </details>
 
-整个团队一个应用，无需 bot token：在 [5dive.ai/self-host](https://5dive.ai/self-host) 免费连接你的服务器。
+用 5dive 应用与团队聊天、管理团队，可选端到端加密：在 [5dive.ai/self-host](https://5dive.ai/self-host) 免费连接你的服务器。
 
 ## 为什么选 5dive
 
