@@ -2750,7 +2750,8 @@ _va_installing() {
   [[ -n "${FIVEDIVE_VOICE_AUTO_INSTALLING:-}" ]] && { [[ "$FIVEDIVE_VOICE_AUTO_INSTALLING" == 1 ]]; return; }
   systemctl is-active --quiet "$VA_SETUP_UNIT" 2>/dev/null && return 0
   local p; p="$(cat "$(_va_state_file).pid" 2>/dev/null)"
-  [[ "$p" =~ ^[0-9]+$ ]] && kill -0 "$p" 2>/dev/null
+  if [[ "$p" =~ ^[0-9]+$ ]]; then kill -0 "$p" 2>/dev/null; return; fi
+  return 1
 }
 _va_record() {  # _va_record on|off owner
   local f tmp; f="$(_va_state_file)"
