@@ -2821,23 +2821,23 @@ cmd_plugin_auto_voice() {
   local mode="auto"
   case "${1:-}" in
     "") ;;
-    --on) mode=on ;; --off) mode=off ;; --status) mode=status ;;
+    --on|--off|--status) mode="$1" ;;
     *) fail "$E_USAGE" "usage: 5dive plugin auto-voice [--on|--off|--status]" ;;
   esac
   local v; v="$(_va_verdict)"
   local choice source; choice="$(_va_kv choice)"; source="$(_va_kv source)"
   case "$mode" in
-    status)
+    --status)
       ok "voice: $v${choice:+ (choice=$choice by $source)}; memory $(_va_mem_mb) MB, free disk $(_va_disk_mb) MB" \
          '{verdict:$v, choice:(if $c == "" then null else $c end), source:(if $s == "" then null else $s end)}' \
          --arg v "$v" --arg c "$choice" --arg s "$source"
       return 0 ;;
-    off)
+    --off)
       _va_record off owner || fail "$E_GENERIC" "could not write $(_va_state_file)"
       local more=""; [[ "$v" == present ]] && more=" Voice is still installed; remove it with: sudo 5dive plugin remove voice"
       ok "Voice stays off on this server; 5dive will not turn it on by itself.$more" '{choice:"off", source:"owner"}'
       return 0 ;;
-    on)
+    --on)
       if [[ "$v" == present ]]; then
         _va_record on owner || true
         ok "Voice is already on this server." '{verdict:"present"}'; return 0
