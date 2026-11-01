@@ -6,6 +6,7 @@ working 5dive server in one click (DIVE-6801).
 | Where | What we submit | Folder |
 |---|---|---|
 | DigitalOcean Marketplace (1-Click) | a snapshot built with Packer, sent from the Vendor Portal | `digitalocean/` + `image/` |
+| Vultr Marketplace | a snapshot built with Packer, turned into an app image in the vendor portal | `vultr/` + `image/` |
 | Linode (Akamai) Marketplace | an Ansible app, sent as a pull request to `akamai-compute-marketplace/marketplace-apps` | `linode/` |
 
 Nothing here is listed or published until the listing copy in `LISTING.md` has
@@ -48,6 +49,35 @@ updates; no password and no SSH keys on root or any user account (uid >= 1000);
 bash history and logs cleared; no DigitalOcean agent directory. Build on the $6
 size so every size can use the image.
 
+## Vultr
+
+```sh
+export VULTR_API_KEY=<the vendor account's API key>
+packer init marketplace/vultr
+packer build marketplace/vultr
+```
+
+Same `image/` steps as DigitalOcean, then Vultr's own `clean_system` from their
+helper script (pinned by commit and sha256), which also adds the `vultr` kernel
+option they require. The build server is deleted by Packer; the snapshot stays.
+
+Then, in the vendor portal (Marketplace, on the hello@5dive.ai account): create
+the app with `LISTING.md`'s Vultr section, no app variables, "Build App Image"
+from the snapshot, "Deploy Image" to test it, mark the build Live, slug
+`5dive`, Make Public. Vultr reviews and emails when it is approved. Vultr takes
+no revenue share from publishers.
+
+The boot test on the test server: `cloud-init status` is done,
+`/var/log/5dive-firstboot.log` ends in "first boot done", `5dive doctor` is
+healthy, the login line shows, `ufw status` is SSH/80/443, and all of it again
+after a reboot. Delete the test server after.
+
+Rules checked 2026-11-01 against https://docs.vultr.com/vultr-marketplace and
+`vultr/vultr-marketplace@95768fc`: an OS with cloud-init; the `vultr` kernel
+option; updates, temp files, SSH keys, logs, history, machine id cleared, free
+space zeroed and trimmed; the smallest disk possible (`marketplace-2c-2gb`);
+gallery images 8:5, 800x500.
+
 ## Linode
 
 `linode/` mirrors their repository: copy `linode/apps/linode-marketplace-5dive/`
@@ -66,9 +96,10 @@ full colour.
 
 ## Next, by effort
 
-- **Vultr Marketplace**: a vendor account, then a snapshot from the same `image/`
-  scripts (cloud-init based, like DigitalOcean).
 - **Hetzner Cloud apps**: closed to new apps today ("we cannot accept ...
   suggestions for new apps as of now", `hetznercloud/apps` README, 2026-10-30).
   The same `image/` scripts build a snapshot a Hetzner user can keep as their
   own template meanwhile.
+- **Hostinger**: its open listing path (the "Deploy on Hostinger" button) only
+  takes a Docker Compose file, and 5dive is Linux users plus systemd on the
+  server, not a container. Not built (DIVE-7479 has the reasoning).
