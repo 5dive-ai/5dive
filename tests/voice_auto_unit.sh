@@ -186,6 +186,11 @@ printf '# host\nkeep me\n' > "$WORK/live.md"
 sync_managed_block "$WORK/live.md" "$P" 5dive:voice-offer && sync_managed_block "$WORK/live.md" "$P" 5dive:voice-offer
 n=$(grep -c '5dive:voice-offer:begin' "$WORK/live.md"); grep -q 'keep me' "$WORK/live.md" && (( n == 1 )) \
   && ok_t "AGENT: syncing twice leaves one block and the host's own lines" || bad_t "AGENT sync twice" "$(cat "$WORK/live.md")"
+# The way a box installed from a local tree names it (init-smoke: file:///opt/5dive-bundle).
+printf '# host\n' > "$WORK/live2.md"
+sync_managed_block "$WORK/live2.md" "file://$ROOT/$P" 5dive:voice-offer \
+  && grep -q '5dive:voice-offer:begin' "$WORK/live2.md" \
+  && ok_t "AGENT: a file:// source syncs too (an install from a local tree)" || bad_t "AGENT file://" "$(cat "$WORK/live2.md")"
 
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

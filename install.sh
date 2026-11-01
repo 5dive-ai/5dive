@@ -1608,7 +1608,9 @@ MANAGED
 sync_managed_block() {
   local live="$1" src="$2" id="$3" tmp block
   tmp="$(mktemp)" || return 1
-  if [[ "$src" == http*://* ]]; then curl -fsSL "$src" -o "$tmp" || { rm -f "$tmp"; return 1; }
+  # file:// too (DIVE-7451): an install from a local tree (init-smoke's bundle)
+  # names its sources that way, and cp cannot read a URL, so no block synced there.
+  if [[ "$src" == http*://* || "$src" == file://* ]]; then curl -fsSL "$src" -o "$tmp" || { rm -f "$tmp"; return 1; }
   else cp "$src" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }; fi
   block="$(awk -v id="$id" '
     index($0, "<!-- " id ":begin") { inb = 1 }
