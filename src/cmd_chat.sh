@@ -37,6 +37,28 @@ _chat_e2e_live()    { local d="${FIVEDIVE_CHAT_E2E_DIR:-/etc/5dive/chat-e2e}"; p
 _chat_e2e_pairing() { printf '%s.pairing' "$(_chat_e2e_live)"; }
 _chat_e2e_lib()     { local d="${FIVEDIVE_CHAT_E2E_LIB:-/usr/local/lib/5dive/chat-e2e}"; printf '%s' "${d%/}"; }
 
+# DIVE-7440: the key dirs are 0700, their PARENT (/etc/5dive) is not. Every seat
+# stats <live> to know whether to seal (the dashboard plugin's isE2E) and reads
+# /etc/5dive/chat-only, so a parent at 0700 makes encryption invisible to the
+# agent: it delivers envelopes raw and its plaintext replies bounce with 409.
+# 0.111.0's enable did exactly that (`install -d -m 0700 parent dir` sets BOTH).
+_chat_e2e_mkparent() {
+  local parent; parent=$(dirname -- "$(_chat_e2e_live)")
+  [[ -d "$parent" ]] || install -d -m 0755 -- "$parent"
+}
+# Undo that on a box it hit: only the exact signature (parent 0700 AND a key dir
+# under it), so a parent someone locked down on purpose is left alone. Prints
+# one line when it changed something; never fails the caller.
+_chat_e2e_heal_parent() {
+  local live parent mode
+  live=$(_chat_e2e_live); parent=$(dirname -- "$live")
+  [[ -d "$live" || -d "$live.pairing" ]] || return 0
+  mode=$(stat -c '%a' -- "$parent" 2>/dev/null) || return 0
+  [[ "$mode" == 700 ]] || return 0
+  chmod 0755 -- "$parent" 2>/dev/null || return 0
+  echo "Repaired $parent (was 0700, now 0755): agents can see that chat is encrypted again."
+}
+
 # The dir that holds the keys: the live one, else the one waiting for its first
 # device, else nothing.
 _chat_e2e_keydir() {
@@ -201,7 +223,9 @@ USAGE
 _chat_cmd_e2e() {
   local sub="${1:-status}"; shift || true
   _gate_is_root || fail "$E_PERMISSION" "chat e2e needs root: sudo 5dive chat e2e $sub"
+  _chat_e2e_heal_parent >&2
   case "$sub" in
+    heal) return 0 ;;   # self-update's call: the repair above, nothing else
     enable)
       (( $# == 1 )) || fail "$E_USAGE" "usage: sudo 5dive chat e2e enable <secret>   (copy the line from 5dive.app)"
       local secret="$1" dir live key
@@ -214,7 +238,8 @@ _chat_cmd_e2e() {
       dir=$(_chat_e2e_keydir)
       if [[ -z "$dir" ]]; then
         dir="$live.pairing"
-        install -d -m 0700 -- "$(dirname -- "$live")" "$dir" || fail "$E_GENERIC" "cannot create $dir."
+        # The parent keeps its own mode (DIVE-7440); only the key dir is 0700.
+        { _chat_e2e_mkparent && install -d -m 0700 -- "$dir"; } || fail "$E_GENERIC" "cannot create $dir."
       fi
       # printf is a builtin: the secret goes into the file without being any
       # process's argument.
@@ -249,6 +274,7 @@ _chat_cmd_e2e() {
 _chat_cmd_devices() {
   local sub="${1:-ls}"; shift || true
   _gate_is_root || fail "$E_PERMISSION" "chat devices needs root: sudo 5dive chat devices $sub"
+  _chat_e2e_heal_parent >&2   # `sync` runs every minute: a hit box heals within one
   local dir; dir=$(_chat_e2e_keydir)
   [[ -n "$dir" ]] || fail "$E_NOT_FOUND" "encrypted chat is off on this server. Turn it on from 5dive.app."
   case "$sub" in
@@ -327,6 +353,9 @@ cmd_chat_e2e_root() {
     [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 && "$(_gate_uid_to_agent "$ruid")" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
       || fail "$E_AUTH_REQUIRED" "_chat_e2e caller uid ${ruid} is not an agent seat."
   fi
+  # DIVE-7440: a seat calls this when it cannot see the key dir; put the parent
+  # back on the way, so the next look needs no call.
+  _chat_e2e_heal_parent >/dev/null 2>&1 || true
   local live; live=$(_chat_e2e_live)
   [[ -d "$live" && ! -L "$live" && -f "$live/box.jwk" ]] \
     || fail "$E_NOT_FOUND" "encrypted chat is not on on this server."
@@ -444,6 +473,8 @@ export function makeBox(dir: string) {
 
   // --- the seat's verb: open, seal, seal-file ------------------------------
   async function call(req: any, side: string): Promise<Record<string, unknown>> {
+    // DIVE-7440: a seat that cannot see the key dir asks root whether it is on.
+    if (req?.op === 'state') return { on: true }
     const conv = String(req?.conv ?? '')
     if (!CONV_RE.test(conv)) refuse('bad conversation id')
     if (req.op === 'open') {
