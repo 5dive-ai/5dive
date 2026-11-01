@@ -4592,6 +4592,11 @@ cmd_create() {
     fi
   fi
 
+  # DIVE-7478: the owner is greeted now, and sees "typing" until the session
+  # below has booted and polls, instead of ~40 s of silence.
+  if channel_in_list telegram "$channels" && [[ -n "$telegram_token" && -n "$telegram_allowed_users" ]]; then
+    _tg_connect_greet_launch "$name" "$type"
+  fi
   step "Enabling 5dive-agent@${name}.service"
   systemctl daemon-reload
   systemctl enable --now "5dive-agent@${name}.service" >&2

@@ -516,6 +516,12 @@ cmd_config() {
       "$token_for_install" "$new_home_channel" "$allowed_for_install"
     # DIVE-6701: a bot attached after the hire answers to the card name too.
     _tg_call_names_seed "$name" "$type" >/dev/null 2>&1 || true
+    # DIVE-7478: a bot attached now greets its owner at once and shows "typing"
+    # until the restarted session polls. First attach only: a token rotation on a
+    # seat in use must not say hello again.
+    if [[ -n "$new_telegram_token" ]] && ! channel_in_list telegram "$prev_channels"; then
+      _tg_connect_greet_launch "$name" "$type"
+    fi
     # DIVE-4413: install_channel_for_agent hands home_channel to the hermes and
     # openclaw installers ONLY (agent_setup.sh) — every other type took the value
     # and discarded it. The access.json types have a real lever for the same
