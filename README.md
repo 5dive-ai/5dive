@@ -63,6 +63,8 @@ More in [docker/README.md](docker/README.md).
 
 One app for your whole team, no bot tokens: link your server free at [5dive.ai/self-host](https://5dive.ai/self-host).
 
+Turn on end-to-end encryption and only your devices and your server can read the chat. We just pass it along.
+
 ## Why 5dive
 
 - **Always on.** Agents keep working after you close the terminal. Message them from your phone any time.
