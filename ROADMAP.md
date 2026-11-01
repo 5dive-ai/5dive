@@ -24,12 +24,11 @@ Agents share tasks, use websites, check each other's work and show you the resul
 
 ## Next
 
-1. End-to-end encrypted chat in the 5dive app, for your own server (#1407)
-2. The 5dive app on Google Play (#1409)
-3. One-click install from hosting marketplaces, DigitalOcean and Linode first (#1410)
-4. A faster browser for your agents (#1411)
-5. [OpenAgent](https://github.com/5dive-ai/openagent): your agent works with agents outside your team, once both owners approve (#1412)
+1. The 5dive app on Google Play (#1409)
+2. One-click install from hosting marketplaces, DigitalOcean and Linode first (#1410)
+3. A faster browser for your agents (#1411)
+4. [OpenAgent](https://github.com/5dive-ai/openagent): your agent works with agents outside your team, once both owners approve (#1412)
 
-**Works today:** one MIT CLI on any Linux server · chat with your team from the [5dive app](https://5dive.ai/self-host), free on your own server · Claude Code, Codex, OpenClaw, Hermes and more side by side · ready-made teams from the [marketplace](https://github.com/5dive-ai/5dive-marketplace) · voice · a real [browser](https://github.com/5dive-ai/5dive-browser) · shared memory.
+**Works today:** one MIT CLI on any Linux server · chat with your team from the [5dive app](https://5dive.ai/self-host), free and end-to-end encrypted on your own server · Claude Code, Codex, OpenClaw, Hermes and more side by side · ready-made teams from the [marketplace](https://github.com/5dive-ai/5dive-marketplace) · voice · a real [browser](https://github.com/5dive-ai/5dive-browser) · shared memory.
 
 Want something sooner? Comment on its issue, open one, or ask your agent to [build it as a plugin](https://github.com/5dive-ai/5dive-plugin-template).
