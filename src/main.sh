@@ -704,6 +704,10 @@ _agent_verb_dispatch() {
         _first_job_run)
           AUDIT_CMD="agent _first_job_run"; AUDIT_ARGS=("${1:-}")
           cmd_agent_first_job_run "$@" ;;
+        # DIVE-7478: hidden root primitive — the connect greeting unit's body.
+        _tg_connect_greet)
+          AUDIT_CMD="agent _tg_connect_greet"; AUDIT_ARGS=("${1:-}")
+          cmd_agent_tg_connect_greet "$@" ;;
         # DIVE-1065: hidden privileged delivery primitive. Only reachable via the
         # scoped-sudoers grant a standard agent gets (write_standard_sudoers);
         # `cmd_send` re-execs into it for non-root agent callers. Not advertised.
