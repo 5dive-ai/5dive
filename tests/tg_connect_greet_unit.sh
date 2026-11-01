@@ -28,6 +28,10 @@
 # Run: bash tests/tg_connect_greet_unit.sh   (no root, no network)
 set -uo pipefail
 
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.." || exit 2
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/tg-connect-greet.XXXXXX")"
