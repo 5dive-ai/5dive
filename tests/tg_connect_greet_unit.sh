@@ -136,7 +136,7 @@ check "G1 the greeting is the run's first send (before any typing)" \
   '[[ "$(grep -m1 -E "^(sendMessage|sendChatAction) " "$TMP/calls.log" | cut -d" " -f1)" == sendMessage ]]'
 check "G2 the token never reaches curl argv" '! grep -qF "secret-part" "$TMP/curl.argv"'
 check "G3 typing goes to the greeted owner while the bridge is down" \
-  '(( $(calls sendChatAction) >= 2 )) && grep "^sendChatAction " "$TMP/calls.log" | grep -q "\"chat_id\":$OWNER" && grep -q "\"action\":\"typing\"" "$TMP/calls.log"'
+  '(( $(calls sendChatAction) >= 2 )) && grep -q "^sendChatAction .*\"chat_id\":$OWNER" "$TMP/calls.log" && grep -q "\"action\":\"typing\"" "$TMP/calls.log"'
 mk="$SEAT_DIR/connect-greeted.json"
 check "G4 connect-greeted.json names the bot and the chat" \
   '[[ "$(jq -c "{botId, chats}" "$mk")" == "{\"botId\":\"7000000001\",\"chats\":[\"$OWNER\"]}" ]] && jq -e ".at > 1700000000000" "$mk" >/dev/null' "$(cat "$mk" 2>&1)"
@@ -173,11 +173,11 @@ ru=$(jq -s -r --arg o "$OWNER" '[.[] | select((.chat_id|tostring) == $o)] | last
 check "G6 the 403 owner is greeted after their first message: tried once, then once more" '[[ "$owner_sends" == 2 ]]' "$sends"
 check "G6 in their language" '[[ "$ru" == "Здравствуйте, я Ada."* && "$ru" == *"Я запускаюсь"* ]]' "$ru"
 check "G6 the peek never confirms an update (no offset in any getUpdates)" \
-  '(( $(calls getUpdates) >= 1 )) && ! grep "^getUpdates " "$TMP/calls.log" | grep -q offset' "$(grep '^getUpdates ' "$TMP/calls.log")"
+  '(( $(calls getUpdates) >= 1 )) && ! grep -q "^getUpdates .*offset" "$TMP/calls.log"' "$(grep '^getUpdates ' "$TMP/calls.log")"
 check "G6 the marker gains the chat greeted late" '[[ "$(jq -c .chats "$SEAT_DIR/connect-greeted.json")" == "[\"$OWNER\"]" ]]'
 check "G8 a stranger (999) and the group are never greeted" \
   '! jq -s -e "map(.chat_id) | any(. == 999 or . == -100777)" <<<"$sends" >/dev/null'
-check "G6 the owner still not seen (555) is never typed at" '! grep "^sendChatAction " "$TMP/calls.log" | grep -q "\"chat_id\":555"'
+check "G6 the owner still not seen (555) is never typed at" '! grep -q "^sendChatAction .*\"chat_id\":555" "$TMP/calls.log"'
 
 seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
 STUB_403="$OWNER" STUB_PEEK_409=1 run ada
@@ -238,7 +238,7 @@ _tgcg_is_root() { return 0; }
 rm -f "$TMP/sdrun.argv"
 _tg_connect_greet_launch ada claude >/dev/null 2>&1
 check "L1 systemd-run starts unit 5dive-tg-greet-ada running 'agent _tg_connect_greet ada'" \
-  'grep -qx -- "--unit=5dive-tg-greet-ada" "$TMP/sdrun.argv" && tr "\n" " " <"$TMP/sdrun.argv" | grep -q -- "-- /usr/local/bin/5dive agent _tg_connect_greet ada "' "$(cat "$TMP/sdrun.argv" 2>&1)"
+  'grep -qx -- "--unit=5dive-tg-greet-ada" "$TMP/sdrun.argv" && grep -qF -- "-- /usr/local/bin/5dive agent _tg_connect_greet ada " <<<"$(tr "\n" " " <"$TMP/sdrun.argv")"' "$(cat "$TMP/sdrun.argv" 2>&1)"
 rm -f "$TMP/sdrun.argv"
 for t in openclaw hermes; do _tg_connect_greet_launch ada "$t" >/dev/null 2>&1; done
 check "L2 openclaw and hermes are not launched (their gateway answers at once)" '[[ ! -e "$TMP/sdrun.argv" ]]'
@@ -249,7 +249,7 @@ check "L3 positive control: the same codex launch with the switch on does start 
 
 # ── W1-W4: wiring ────────────────────────────────────────────────────────────
 check "W1 main.sh dispatches _tg_connect_greet" \
-  'grep -A2 "^ *_tg_connect_greet)" src/main.sh | grep -q "cmd_agent_tg_connect_greet"'
+  'grep -q "cmd_agent_tg_connect_greet" <<<"$(grep -A2 "^ *_tg_connect_greet)" src/main.sh)"'
 check "W2 build.sh loads the module" 'grep -qx "  src/cmd_tg_connect_greet.sh" build.sh'
 cfg=$(grep -B3 -A1 '_tg_connect_greet_launch' src/cmd_agent_config.sh)
 check "W3 config set launches on a first attach with a new token only" \
@@ -278,7 +278,7 @@ nc6() {
 }
 nc "NC2 a copy whose peek confirms updates is CAUGHT by G6" \
   's/{"timeout":0,"limit":100}/{"timeout":0,"limit":100,"offset":-1}/' nc6 \
-  '! grep "^getUpdates " "$TMP/calls.log" | grep -q offset'
+  '! grep -q "^getUpdates .*offset" "$TMP/calls.log"'
 
 e1() {
   seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
