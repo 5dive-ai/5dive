@@ -19,12 +19,17 @@
 #   G9   owners: `owners` wins over allowFrom but only allowlisted, positive ids.
 #   G10  no owner id: nothing is sent.
 #   G11  the persona's name and welcome replace the bot's (bun only; skipped without).
+#   E1-E2 under the binary's set -e, a dead network (every call, or only the peek)
+#        costs the sends, never the run: it still ends with its JSON line, rc 0.
+#   P1-P2 the markers are written as the seat (runuser -u agent-<name> when root),
+#        and a symlink planted at boot-greeted is replaced, its target untouched.
 #   L1-L3 the launch: the systemd-run argv (unit, verb, name); skipped for
 #        openclaw/hermes; FIVE_TG_CONNECT_GREET=0 turns it off.
 #   W1-W4 wiring: the dispatch arm, build.sh loads the module, config set launches
 #        on a first attach with a new token only, create launches before the seat starts.
 #   NC1  NEGATIVE CONTROL: a copy with the bridge-up stop removed must be CAUGHT by G5.
 #   NC2  NEGATIVE CONTROL: a copy whose peek passes an offset must be CAUGHT by G6.
+#   NC3  NEGATIVE CONTROL: a copy without the getMe `|| …` guard must be CAUGHT by E1.
 # Run: bash tests/tg_connect_greet_unit.sh   (no root, no network)
 set -uo pipefail
 
@@ -73,6 +78,7 @@ printf '%s\n' "$@" >>"$STUB_DIR/curl.argv"
 url=$(sed -n 's/^url = "\(.*\)"$/\1/p'); method="${url##*/}"
 body=""; prev=""; for a in "$@"; do [[ "$prev" == "--data-binary" ]] && body="$a"; prev="$a"; done
 printf '%s %s\n' "$method" "$body" >>"$STUB_DIR/calls.log"
+[[ "${STUB_CURL_FAIL:-}" == all || "${STUB_CURL_FAIL:-}" == "$method" ]] && exit 7
 case "$method" in
   getMe) printf '{"ok":true,"result":{"id":7000000001,"first_name":"Ada","username":"ada_bot"}}' ;;
   getMyShortDescription) printf '{"ok":true,"result":{"short_description":"keeps the books"}}' ;;
@@ -203,6 +209,29 @@ else
   printf 'skip - G11 (no bun on PATH)\n'
 fi
 
+# ── E1-E2: set -e and a dead network ─────────────────────────────────────────
+seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+OUT=$( set -e; STUB_CURL_FAIL=all cmd_agent_tg_connect_greet ada 2>/dev/null ); rc=$?
+check "E1 every call failing: the run still ends (rc 0, its JSON line, nobody greeted)" \
+  '[[ $rc == 0 && "$(jq -c .greeted <<<"$OUT")" == "[]" ]]' "rc=$rc out=$OUT"
+seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+OUT=$( set -e; STUB_403="$OWNER" STUB_CURL_FAIL=getUpdates cmd_agent_tg_connect_greet ada 2>/dev/null ); rc=$?
+check "E2 the peek failing: the run still ends (rc 0, its JSON line)" \
+  '[[ $rc == 0 && "$(jq -r .bridgeUp <<<"$OUT")" == false ]]' "rc=$rc out=$OUT"
+
+# ── P1-P2: the markers are the seat's own writes ─────────────────────────────
+seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+printf 'precious\n' >"$TMP/victim"; ln -s "$TMP/victim" "$SEAT_DIR/boot-greeted"
+run ada
+check "P2 a symlink planted at boot-greeted is replaced, its target untouched" \
+  '[[ "$(cat "$TMP/victim")" == precious && ! -L "$SEAT_DIR/boot-greeted" && "$(cat "$SEAT_DIR/boot-greeted")" == 7000000001 ]]'
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"$STUB_DIR/runuser.argv"\n[[ "$1" == -u && "$3" == -- ]] && shift 3\nexec "$@"\n' >"$TMP/bin/runuser"
+chmod +x "$TMP/bin/runuser"
+seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+( _tgcg_is_root() { return 0; }; run ada )
+check "P1 as root, both marker writes go through runuser -u agent-ada" \
+  '[[ "$(grep -c "^-u agent-ada -- sh -c" "$TMP/runuser.argv" 2>/dev/null)" == 2 ]]' "$(cat "$TMP/runuser.argv" 2>&1)"
+
 # ── L1-L3: the launch ────────────────────────────────────────────────────────
 # The harness is not root and must not become it: the seam says root.
 _tgcg_is_root() { return 0; }
@@ -234,7 +263,11 @@ nc() { # <label> <sed-expr> <arm-fn> <predicate>
   local copy="$TMP/nc.sh"
   sed "$2" "$MOD" >"$copy"
   if cmp -s "$copy" "$MOD"; then bad_t "$1" "the mutation did not apply"; return; fi
-  ( load "$copy"; export PATH; $3; eval "$4" ) && bad_t "$1" "the mutated copy PASSED the arm" || ok_t "$1"
+  # Not on the left of && / ||: that context switches set -e off for everything
+  # inside it, nested `set -e` included, and E1's mutant would pass vacuously.
+  local r
+  ( load "$copy"; export PATH; $3; eval "$4" ); r=$?
+  if (( r == 0 )); then bad_t "$1" "the mutated copy PASSED the arm"; else ok_t "$1"; fi
 }
 nc "NC1 a copy without the bridge-up stop is CAUGHT by G5" \
   '/_tgcg_bridge_up "\$dir" "\$started_s" && break$/d' g5 \
@@ -246,6 +279,14 @@ nc6() {
 nc "NC2 a copy whose peek confirms updates is CAUGHT by G6" \
   's/{"timeout":0,"limit":100}/{"timeout":0,"limit":100,"offset":-1}/' nc6 \
   '! grep "^getUpdates " "$TMP/calls.log" | grep -q offset'
+
+e1() {
+  seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+  OUT=$( set -e; STUB_CURL_FAIL=all cmd_agent_tg_connect_greet ada 2>/dev/null ); rc=$?
+}
+nc "NC3 a copy without the getMe guard is CAUGHT by E1 (set -e kills the run)" \
+  's/  me=$(_tgcg_call "$token" getMe) || me=""/  me=$(_tgcg_call "$token" getMe)/' e1 \
+  '[[ $rc == 0 && "$(jq -c .greeted <<<"$OUT")" == "[]" ]]'
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

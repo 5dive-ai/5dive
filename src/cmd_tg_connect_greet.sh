@@ -91,19 +91,28 @@ _tgcg_text() {
 # _tgcg_lang <language_code> — the two languages the plugin speaks.
 _tgcg_lang() { [[ "${1:-}" == ru* ]] && printf 'ru' || printf 'en'; }
 
-# _tgcg_mark <state_dir> <bot_id> <started_ms> <chat...> — record who was greeted,
-# owned by the seat (the bridge reads it as that user).
+# _tgcg_as_user <user> <cmd...> — run as the seat. The state dir is the agent's
+# own, so root never writes there: a symlink planted in it cannot point a root
+# write anywhere else.
+_tgcg_as_user() {
+  local u="$1"; shift
+  if _tgcg_is_root; then runuser -u "$u" -- "$@"; else "$@"; fi
+}
+
+# _tgcg_put <user> <dir> <file> — stdin to <dir>/<file>, 0600, atomically, as <user>.
+_tgcg_put() {
+  # shellcheck disable=SC2016 # $1/$2 belong to the inner sh
+  _tgcg_as_user "$1" sh -c 'umask 077; t=$(mktemp "$1/.$2.XXXXXX") && cat >"$t" && mv -f "$t" "$1/$2"' _ "$2" "$3"
+}
+
+# _tgcg_mark <user> <state_dir> <bot_id> <started_ms> <chat...> — record who was greeted.
 _tgcg_mark() {
-  local dir="$1" bot="$2" at="$3"; shift 3
-  local own tmp
-  own=$(stat -c '%U:%G' "$dir" 2>/dev/null) || return 0
-  tmp=$(mktemp "$dir/.${TG_CONNECT_GREETED_FILE}.XXXXXX") || return 0
-  jq -cn --arg b "$bot" --argjson at "$at" '{botId: $b, at: $at, chats: $ARGS.positional}' --args "$@" >"$tmp" \
-    && chown "$own" "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$dir/$TG_CONNECT_GREETED_FILE" \
-    || rm -f "$tmp"
+  local user="$1" dir="$2" bot="$3" at="$4"; shift 4
+  jq -cn --arg b "$bot" --argjson at "$at" '{botId: $b, at: $at, chats: $ARGS.positional}' --args "$@" \
+    | _tgcg_put "$user" "$dir" "$TG_CONNECT_GREETED_FILE" 2>/dev/null || true
   # The claude plugin's boot greeting (DIVE-5411) records the bot it greeted for
   # here; a plugin that predates connect-greeted.json then skips its boot arm.
-  printf '%s\n' "$bot" >"$dir/boot-greeted" 2>/dev/null && chown "$own" "$dir/boot-greeted" && chmod 600 "$dir/boot-greeted" || true
+  printf '%s\n' "$bot" | _tgcg_put "$user" "$dir" boot-greeted 2>/dev/null || true
 }
 
 # _tgcg_bridge_up <state_dir> <started_s> — the session's bridge holds the poll
@@ -140,7 +149,9 @@ cmd_agent_tg_connect_greet() {
   local started_s started_ms
   started_s=$(date +%s); started_ms=$(_tgcg_now_ms)
   local me bot_name about persona p_name p_welcome_en p_welcome_ru
-  me=$(_tgcg_call "$token" getMe)
+  # Every call is `|| …`: the binary runs under set -e, and a network blip must
+  # cost one send, never the run.
+  me=$(_tgcg_call "$token" getMe) || me=""
   bot_name=$(jq -r '.result.first_name // empty' <<<"$me" 2>/dev/null) || bot_name=""
   about=$(jq -r '.result.short_description // empty' <<<"$(_tgcg_call "$token" getMyShortDescription)" 2>/dev/null) || about=""
   persona=$(_tgcg_persona "$home" "$type" en); p_name="${persona%%$'\t'*}"; p_welcome_en="${persona#*$'\t'}"
@@ -154,7 +165,7 @@ cmd_agent_tg_connect_greet() {
   _tgcg_greet() { # <chat> <lang> — 0 sent, 1 not
     local w="$p_welcome_en"; [[ "$2" == ru ]] && w="$p_welcome_ru"
     text=$(_tgcg_text "$2" "$bot_name" "$about" "$w") || return 1
-    resp=$(_tgcg_call "$token" sendMessage "$(jq -cn --arg c "$1" --arg t "$text" '{chat_id: ($c|tonumber), text: $t}')")
+    resp=$(_tgcg_call "$token" sendMessage "$(jq -cn --arg c "$1" --arg t "$text" '{chat_id: ($c|tonumber), text: $t}')") || return 1
     [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == true ]]
   }
   for o in "${owners[@]}"; do
@@ -162,7 +173,7 @@ cmd_agent_tg_connect_greet() {
     else pending[$o]=1   # 403 until they press Start: greet on their first message
     fi
   done
-  (( ${#greeted[@]} )) && _tgcg_mark "$dir" "$bot_id" "$started_ms" "${!greeted[@]}"
+  (( ${#greeted[@]} )) && _tgcg_mark "$user" "$dir" "$bot_id" "$started_ms" "${!greeted[@]}"
 
   local tick=0 peek_ok=1 ups uid from lc
   local -A seen=()
@@ -175,7 +186,7 @@ cmd_agent_tg_connect_greet() {
     fi
     if (( peek_ok && ${#pending[@]} && tick % TG_CONNECT_PEEK_EVERY == 0 )); then
       # No offset: nothing is confirmed, the bridge still gets every update.
-      ups=$(_tgcg_call "$token" getUpdates '{"timeout":0,"limit":100}')
+      ups=$(_tgcg_call "$token" getUpdates '{"timeout":0,"limit":100}') || ups=""
       if [[ "$(jq -r '.ok // false' <<<"$ups" 2>/dev/null)" != true ]]; then
         peek_ok=0   # a webhook or another poller holds the bot: leave it alone
       else
@@ -187,7 +198,7 @@ cmd_agent_tg_connect_greet() {
           lang=$(_tgcg_lang "$lc")
           if _tgcg_greet "$from" "$lang"; then
             unset "pending[$from]"; greeted[$from]=1
-            _tgcg_mark "$dir" "$bot_id" "$started_ms" "${!greeted[@]}"
+            _tgcg_mark "$user" "$dir" "$bot_id" "$started_ms" "${!greeted[@]}"
             _tgcg_call "$token" sendChatAction "{\"chat_id\":$from,\"action\":\"typing\"}" >/dev/null || true
           fi
         done < <(jq -r '.result[] | select(.message.chat.type == "private")
