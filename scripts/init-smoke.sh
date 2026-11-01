@@ -283,6 +283,55 @@ webchat_arm() {
 # DIVE-7370: every `5dive` command the README shows, run for real on this box.
 # One cell is enough (they share the CLI); Claude Code on 24.04 is the README's
 # own quickstart. The tree's README is staged at /opt/init-smoke-README.md.
+# DIVE-7451: speech-to-text is offered on first use, never installed unasked.
+# After init: nothing is installed, the agent's box-wide instructions carry the
+# offer, and `--status` says to ask. Then the owner's yes, as the agent runs it
+# (`--on`, `--wait`), and a spoken clip is heard on THIS box (local backend
+# forced, and no OpenRouter key here, so nothing else could hear it). Prints the
+# measured cost: install time from the yes, disk, and whisper's peak memory.
+voice_arm() {
+  local t0 t1 st heard vlog=/var/lib/5dive/voice-auto.log
+  if [[ -x /usr/local/bin/5dive-transcribe ]] || jq -e 'any(.[]?; .plugin == "voice")' /var/lib/5dive/plugins/installed.json >/dev/null 2>&1 \
+     || systemctl is-active --quiet 5dive-voice-auto-setup 2>/dev/null; then
+    DETAIL="init installed voice although nobody asked for it"; return 1
+  fi
+  grep -qF '<!-- 5dive:voice-offer:begin' /home/claude/projects/CLAUDE.md \
+    || { DETAIL="projects/CLAUDE.md has no voice-offer block, so the agent would never ask"; return 1; }
+  st=$(5dive plugin auto-voice --status 2>&1 | tail -1)
+  echo "voice: before the yes: $st"
+  grep -q 'voice: ask' <<<"$st" && grep -qF 'Install speech-to-text on your server?' <<<"$st" \
+    || { DETAIL="a fresh box's status does not say to ask: $st"; return 1; }
+  t0=$(date +%s)
+  local out
+  out=$(5dive plugin auto-voice --on 2>&1) || { DETAIL="auto-voice --on failed: $out"; tail -30 "$vlog" 2>/dev/null; return 1; }
+  echo "voice: yes: $(tail -1 <<<"$out")"
+  out=$(5dive plugin auto-voice --wait --timeout=1200 2>&1) \
+    || { DETAIL="voice setup did not finish in 20 minutes: $out"; tail -30 "$vlog" 2>/dev/null; return 1; }
+  t1=$(date +%s)
+  [[ -x /usr/local/bin/5dive-transcribe ]] || { DETAIL="--wait said ready but there is no 5dive-transcribe"; return 1; }
+  # Wait for the warm model to answer, then hear a clip spoken by edge-tts.
+  for i in $(seq 1 60); do curl -fs -o /dev/null http://127.0.0.1:8765/health 2>/dev/null && break; sleep 2; done
+  local clip=/tmp/voice-arm.mp3
+  /home/claude/.venv/bin/edge-tts --text "Please water the green plants on Friday morning." --write-media "$clip" >/dev/null 2>&1 \
+    || { DETAIL="edge-tts could not make the test clip"; return 1; }
+  heard=$(timeout 180 5dive-transcribe --backend=local --lang=en "$clip" 2>&1) || true
+  echo "voice: heard on this box: $heard"
+  grep -qi 'plants' <<<"$heard" && grep -qi 'friday' <<<"$heard" \
+    || { DETAIL="the box's own whisper did not hear the clip: $heard"; return 1; }
+  grep -qx 'choice=on' /var/lib/5dive/voice-auto && grep -qx 'source=owner' /var/lib/5dive/voice-auto \
+    || { DETAIL="the yes was not recorded as the owner's: $(tr '\n' ' ' < /var/lib/5dive/voice-auto 2>/dev/null)"; return 1; }
+  local venv hf apt_kb pkgs pid hwm
+  venv=$(du -sm /home/claude/.venv 2>/dev/null | cut -f1)
+  hf=$(du -sm /home/claude/.cache/huggingface /root/.cache/huggingface 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  pkgs=$(awk '/^Commandline:.*install.*ffmpeg/{f=1; next} f && /^Install:/{print; exit}' /var/log/apt/history.log 2>/dev/null \
+    | sed 's/^Install: //; s/([^)]*)//g; s/,/ /g')
+  apt_kb=0
+  [[ -n "$pkgs" ]] && apt_kb=$(dpkg-query -W -f '${Installed-Size}\n' $pkgs 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  pid=$(systemctl show -p MainPID --value whisper-service 2>/dev/null)
+  hwm=$(awk '/^VmHWM:/{print int($2/1024)}' "/proc/$pid/status" 2>/dev/null)
+  echo "VOICE-COST install=$(( t1 - t0 ))s disk: venv=${venv}MB model=${hf}MB apt=$(( apt_kb / 1024 ))MB total=$(( venv + hf + apt_kb / 1024 ))MB whisper_peak_rss=${hwm:-?}MB"
+}
+
 cell_has_readme() { [[ "$1" == claude && "$2" == ubuntu-24.04 ]]; }
 
 # readme_arm [--no-model]: --no-model when the seat cannot answer (no key, or
@@ -330,6 +379,9 @@ run_arm() {
     || { DETAIL="init was told Yes to nightly updates, but 5dive-self-update.timer is not enabled"; finish fail; }
   DETAIL=""
   seat_up || { DETAIL="init said ready, but the seat's unit or tmux session is not up"; show_seat; finish fail; }
+
+  # DIVE-7451: speech-to-text on first use, before any key is needed.
+  [[ "$CELL" == claude ]] && { step voice; voice_arm || finish fail; }
 
   step pin
   pin_model "$type" || { show_seat; finish fail; }

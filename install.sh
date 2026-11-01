@@ -1608,7 +1608,9 @@ MANAGED
 sync_managed_block() {
   local live="$1" src="$2" id="$3" tmp block
   tmp="$(mktemp)" || return 1
-  if [[ "$src" == http*://* ]]; then curl -fsSL "$src" -o "$tmp" || { rm -f "$tmp"; return 1; }
+  # file:// too (DIVE-7451): an install from a local tree (init-smoke's bundle)
+  # names its sources that way, and cp cannot read a URL, so no block synced there.
+  if [[ "$src" == http*://* || "$src" == file://* ]]; then curl -fsSL "$src" -o "$tmp" || { rm -f "$tmp"; return 1; }
   else cp "$src" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }; fi
   block="$(awk -v id="$id" '
     index($0, "<!-- " id ":begin") { inb = 1 }
@@ -1742,6 +1744,16 @@ projects_claudemd_is_stock() { # <file>
     sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/${PIN_PROMPTS}projects-CLAUDE.md" 5dive:hired-agents \
       && ok "projects/CLAUDE.md (hired-agents block synced)" \
       || echo "warn: could not sync the hired-agents block into projects/CLAUDE.md" >&2
+  fi
+  # DIVE-7451: speech-to-text on a self-hosted box is offered on FIRST USE (a
+  # voice note, a voice-mode tap, the owner asking), never installed unasked —
+  # not here, not by a nightly. This block is how the agent knows to ask, once
+  # (the auto-voice verb holds the answer). Synced on every run, so a box set up
+  # before it learns it on its next update. A box 5dive built has voice already.
+  if [[ ! -f /etc/5dive/provisioning.env ]]; then
+    sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/${PIN_PROMPTS}voice-offer-CLAUDE.md" 5dive:voice-offer \
+      && ok "projects/CLAUDE.md (voice-offer block synced)" \
+      || echo "warn: could not sync the voice-offer block into projects/CLAUDE.md" >&2
   fi
   # DIVE-6635: every registered claude seat gets the current team block.
   if [[ -s "$LIB_DIR/team-CLAUDE.md" && -f "$STATE_DIR/agents.json" ]]; then
