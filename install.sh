@@ -1743,6 +1743,16 @@ projects_claudemd_is_stock() { # <file>
       && ok "projects/CLAUDE.md (hired-agents block synced)" \
       || echo "warn: could not sync the hired-agents block into projects/CLAUDE.md" >&2
   fi
+  # DIVE-7451: speech-to-text on a self-hosted box is offered on FIRST USE (a
+  # voice note, a voice-mode tap, the owner asking), never installed unasked —
+  # not here, not by a nightly. This block is how the agent knows to ask, once
+  # (the auto-voice verb holds the answer). Synced on every run, so a box set up
+  # before it learns it on its next update. A box 5dive built has voice already.
+  if [[ ! -f /etc/5dive/provisioning.env ]]; then
+    sync_managed_block /home/claude/projects/CLAUDE.md "$REPO/${PIN_PROMPTS}voice-offer-CLAUDE.md" 5dive:voice-offer \
+      && ok "projects/CLAUDE.md (voice-offer block synced)" \
+      || echo "warn: could not sync the voice-offer block into projects/CLAUDE.md" >&2
+  fi
   # DIVE-6635: every registered claude seat gets the current team block.
   if [[ -s "$LIB_DIR/team-CLAUDE.md" && -f "$STATE_DIR/agents.json" ]]; then
     _team_n=0
@@ -1973,17 +1983,6 @@ if [[ "${1:-}" == "--upgrade" ]]; then
       || echo "warn: box plugins: some did not upgrade (the reason is on the lines above); the CLI upgrade went ahead" >&2
   fi
   # <<< DIVE-6618 host plugins
-
-  # DIVE-7451: a self-hosted box set up before voice came by itself gets it on
-  # this run, once, when it has the memory and disk for it (~2 GB / ~3 GB free).
-  # The verb decides and records who chose it: a box 5dive runs, a box that has
-  # voice, a box whose owner removed it or said no, and a smaller box are left
-  # alone. The slow half installs in the background; it never fails the upgrade.
-  if [[ "$_hp_help" == *"plugin auto-voice"* ]]; then
-    say "Voice on this server"
-    "$BIN_DIR/5dive" plugin auto-voice 2>&1 | sed 's/^/  /' \
-      || echo "warn: voice was not turned on this time (the reason is above); the CLI upgrade went ahead" >&2
-  fi
 
   # Plugins are SHA-pinned per-user in installed_plugins.json, so CLI
   # upgrade alone doesn't refresh them. Run the helper best-effort: if
