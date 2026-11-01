@@ -1478,6 +1478,11 @@ cmd_self_update() {
     # per name (its own marker), so a name the owner removed stays removed.
     timeout 60 "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" agent telegram-access seed-names >/dev/null 2>&1 \
       || warn "card-name seeding did not finish (re-run: sudo 5dive agent telegram-access seed-names)"
+    # DIVE-7440: 0.111.0's `chat e2e enable` left /etc/5dive at 0700, which hides
+    # encrypted chat from every agent. The fresh binary puts it back (a no-op on
+    # any box that does not have exactly that shape).
+    timeout 30 "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" chat e2e heal >/dev/null 2>&1 \
+      || warn "encrypted-chat folder repair did not finish (re-run: sudo 5dive chat e2e heal)"
   fi
 
   local r f s d pk prose

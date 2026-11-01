@@ -135,7 +135,12 @@ run _chat_cmd_e2e enable "$SECRET"; rc=$?
 check 'enable before the link is refused, with no network call' '[[ $rc == "$E_AUTH_REQUIRED" && ! -s "$LOGS/calls" && ! -e "$PAIR" ]]'
 printf 'CONNECTORD_TOKEN=tok-one\n' >"$FIVEDIVE_CONNECTORD_ENV"
 run _chat_cmd_e2e enable not-a-secret; check 'a malformed secret is refused' '[[ $? == "$E_VALIDATION" && ! -e "$PAIR" ]]'
-printf '%s\n' "$SECRET" | run _chat_cmd_e2e enable -; rc=$?
+chmod 0755 "$TMP/etc"   # the parent as the installer leaves /etc/5dive
+# The heal is stubbed for this one call (it runs inside enable's sync and would
+# hide a regression in enable itself); its own arms are below.
+enable_noheal(){ _chat_e2e_heal_parent(){ :; }; _chat_cmd_e2e enable -; }
+printf '%s\n' "$SECRET" | run enable_noheal; rc=$?
+check 'DIVE-7440: enable leaves the PARENT at 0755 (seats must still see the key dir)' '[[ "$(stat -c %a "$TMP/etc")" == 755 ]]'
 check 'enable - (secret on stdin) makes the pairing dir' '[[ $rc == 0 && -d "$PAIR" && "$(stat -c %a "$PAIR")" == 700 ]]'
 check 'box key, proof and secret are 0600 files' \
   '[[ "$(stat -c %a "$PAIR/box.jwk") $(stat -c %a "$PAIR/box.proof") $(stat -c %a "$PAIR/pair.secret")" == "600 600 600" ]]'
@@ -179,6 +184,13 @@ rail '{"op":"seal-file","conv":"dashboard","m":"r-1","data":"aGk"}'; check 'seal
 rail '{"op":"seal-file","conv":"dashboard","m":"r-1#f0","data":"aGk"}'; check 'seal-file: #f0 seals' '[[ $? == 0 ]] && jq -e .env "$TMP/out" >/dev/null'
 UID_=1077 rail '{"op":"seal","conv":"dashboard","m":"r-2","msg":{"text":"x"}}'; check 'a uid that is not a seat is refused' '[[ $? == "$E_AUTH_REQUIRED" ]]'
 ( printf '{}' | cmd_chat_e2e_root extra ) >/dev/null 2>&1; check 'an argument is refused' '[[ $? == "$E_USAGE" ]]'
+# DIVE-7440: the plugin asks this when it cannot see the key dir. Its contract:
+# answer {on:true} when on, exit E_NOT_FOUND (4) when off, and heal the parent.
+rail '{"op":"state"}'; check 'state: on answers {"on":true}' '[[ $? == 0 && "$(jq -c . "$TMP/out")" == "{\"on\":true}" ]]'
+chmod 0700 "$TMP/etc"; rail '{"op":"state"}'
+check 'state: the rail puts a 0700 parent back to 0755' '[[ $? == 0 && "$(stat -c %a "$TMP/etc")" == 755 ]]'
+FIVEDIVE_CHAT_E2E_DIR="$TMP/nope/chat-e2e" rail '{"op":"state"}'
+check 'state: off exits 4 (E_NOT_FOUND), the code the plugin reads as off' '[[ $? == 4 && $E_NOT_FOUND == 4 ]]'
 dev new dev-phone001 >/dev/null; PHONEPUB=$(dev pub dev-phone001)
 APPROVE=$(jq -nc --arg p "$PHONEPUB" '{t:"approve", device:"dev-phone001", pub:$p}' | dev seal dev-laptop1 dashboard c-2 "$BOXPUB")
 : >"$LOGS/calls"
@@ -205,6 +217,28 @@ jq -s '.' "$TMP/laptop.json" >"$DEVICES"
 run _chat_cmd_devices sync
 check 'sync drops a device the API no longer lists (revoked in the app)' \
   '! _chat_e2e_admin "$LIVE" "{\"op\":\"roster\"}" | jq -e "any(.devices[]; .id == \"dev-phone001\")" >/dev/null'
+
+# ── DIVE-7440: heal a parent 0.111.0's enable locked to 0700 ─────────────────
+chmod 0700 "$TMP/etc"
+run _chat_cmd_e2e heal; rc=$?
+check 'heal: parent at 0700 with chat-e2e under it goes back to 0755, and says so' \
+  '[[ $rc == 0 && "$(stat -c %a "$TMP/etc")" == 755 ]] && grep -q "Repaired $TMP/etc" "$TMP/err"'
+chmod 0700 "$TMP/etc"
+run _chat_cmd_e2e status
+check 'heal: status repairs it too' '[[ "$(stat -c %a "$TMP/etc")" == 755 ]]'
+chmod 0700 "$TMP/etc"
+run _chat_cmd_devices ls
+check 'heal: the per-minute devices path repairs it too' '[[ "$(stat -c %a "$TMP/etc")" == 755 ]]'
+chmod 0750 "$TMP/etc"
+run _chat_cmd_e2e heal
+check 'heal: a parent locked another way (0750) is left alone' '[[ "$(stat -c %a "$TMP/etc")" == 750 ]]'
+chmod 0755 "$TMP/etc"
+mkdir -p "$TMP/other"; chmod 0700 "$TMP/other"
+FIVEDIVE_CHAT_E2E_DIR="$TMP/other/chat-e2e" run _chat_cmd_e2e heal
+check 'heal: a 0700 parent with no key dir under it is left alone' '[[ "$(stat -c %a "$TMP/other")" == 700 ]]'
+NOT_ROOT=1 run _chat_cmd_e2e heal; check 'heal as non-root is refused' '[[ $? == "$E_PERMISSION" ]]'
+check 'self-update calls the fresh binary to heal' \
+  'grep -q "5dive\" chat e2e heal" "$SRC/cmd_selfupdate.sh"'
 
 # ── the secret ───────────────────────────────────────────────────────────────
 leaks(){ # <secret> -> 0 when it shows up anywhere this harness can see
