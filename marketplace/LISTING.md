@@ -9,8 +9,8 @@ from your phone", and the repo description is quoted as approved.
 - **Version:** the newest 5dive CLI release at build time (the server updates
   itself to the newest one on first boot)
 - **Operating system:** Ubuntu 24.04 LTS
-- **Suggested plan:** 2 vCPU, 4 GB RAM (DigitalOcean `s-2vcpu-4gb`, Linode
-  Shared 4 GB). One small agent runs on 1 GB.
+- **Suggested plan:** 2 vCPU, 4 GB RAM (DigitalOcean `s-2vcpu-4gb`, Vultr
+  `vc2-2c-4gb`, Linode Shared 4 GB). One small agent runs on 1 GB.
 - **Support:** https://github.com/5dive-ai/5dive/issues
 - **Website:** https://5dive.ai
 - **Source:** https://github.com/5dive-ai/5dive (MIT)
@@ -41,6 +41,25 @@ Own it. Run it from your phone.
 2. The login screen shows one line: open https://5dive.ai/self-host to link
    this server to your 5dive account and hire your team from your phone.
 3. Prefer the command line? Run `sudo 5dive init` to set up your first agent.
+
+## Vultr fields
+
+- **One-line description:** the short line above.
+- **Readme:** the description above.
+- **Categories:** Developer Tools, AI.
+- **App variables:** none.
+- **App instructions:**
+
+  > Log in to your server: `ssh root@{{ip}}` (password `{{root_password}}`).
+  >
+  > The login screen shows one line: open https://5dive.ai/self-host to link
+  > this server to your 5dive account and hire your team from your phone.
+  >
+  > Prefer the command line? Run `sudo 5dive init` to set up your first agent.
+
+- **Icon:** the 5dive logo, square PNG.
+- **Gallery (8:5, 800x500 PNG):** the phone app with a hired team, and the
+  self-host page. Made when the listing is submitted.
 
 ## Linode assets still owed
 

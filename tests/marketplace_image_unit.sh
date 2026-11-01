@@ -2,7 +2,7 @@
 # DIVE-6801: the 5dive marketplace image (marketplace/). What can be graded off a
 # real cloud: the clean-up strips every per-server key and fails the build on one
 # it missed, the login line says how to link and goes silent once linked, the
-# first boot never stops on a failed step, and the DigitalOcean and Linode
+# first boot never stops on a failed step, and the DigitalOcean, Vultr and Linode
 # wrappers point at the files that exist.
 set -euo pipefail
 
@@ -121,6 +121,21 @@ done
 [[ -n "$(grep -n 'purge droplet-agent' $pkr | head -1)" ]] \
   && [[ "$(grep -n 'purge droplet-agent' $pkr | head -1 | cut -d: -f1)" -lt "$(grep -n 'bash 99-img-check.sh' $pkr | cut -d: -f1)" ]] \
   && ok "packer: droplet-agent is purged before the image check" || bad "packer: droplet-agent is not purged before the image check"
+
+# 6b. The Vultr template (DIVE-7479): Ubuntu 24.04, our two steps, then Vultr's
+#     pinned helper's clean_system last, and the key never written into the file.
+vpk=marketplace/vultr/5dive.pkr.hcl
+for needle in 'os_id         = "2284"' 'bash /tmp/5dive-image/build.sh' 'bash /tmp/5dive-image/cleanup.sh' \
+              'install_cloud_init latest' '"clean_system",' 'sha256sum -c -' 'sensitive = true' \
+              'default   = env("VULTR_API_KEY")' 'inline_shebang   = "/bin/bash -e"'; do
+  grep -qF "$needle" $vpk && ok "vultr packer: $needle" || bad "vultr packer is missing: $needle"
+done
+grep -q 'vultr-marketplace/${local.vultr_tools_ref}/helper-scripts/vultr-helper.sh' $vpk \
+  && grep -qE 'vultr_tools_ref +=  ?"[0-9a-f]{40}"' $vpk && grep -qE 'vultr_helper_sha += "[0-9a-f]{64}"' $vpk \
+  && ok "vultr packer: helper pinned by commit and sha256" || bad "vultr packer: helper is not pinned"
+[[ "$(grep -n 'bash /tmp/5dive-image/cleanup.sh' $vpk | cut -d: -f1)" -lt "$(grep -n '"clean_system",' $vpk | cut -d: -f1)" ]] \
+  && ok "vultr packer: Vultr's clean-up runs after ours" || bad "vultr packer: clean_system is not last"
+if grep -qiE 'api_key += "[^$]' $vpk; then bad "vultr packer: a literal API key"; else ok "vultr packer: no literal API key"; fi
 
 # 7. The Linode app is whole: the deploy script names this app, every role exists.
 grep -q '^export MARKETPLACE_APP="apps/linode-marketplace-5dive"$' $lin/deployment_scripts/linode-marketplace-5dive/5dive-deploy.sh \
