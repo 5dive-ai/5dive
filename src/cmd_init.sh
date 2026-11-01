@@ -292,6 +292,48 @@ _init_nightly_ask() {
   echo >&2
 }
 
+# DIVE-7451: voice on a self-hosted box, so its voice notes are heard here and
+# never on 5dive's server. Enough memory: on by itself, said in one line. Less
+# than ~2 GB: asked once (the speech model would compete with the agents for
+# memory), and the answer is recorded as the owner's. Nothing is asked with no
+# terminal to answer on; the plugin's own `auto-voice` verb owns the decision.
+_init_voice_step() {
+  [[ "${FIVEDIVE_VOICE_AUTO:-1}" == "0" ]] && return 0
+  # In THIS shell first: on the lazy bundle the plugin module (and the VA_*
+  # values used below) loads on its first call, and a $( ) load is lost.
+  _va_managed >/dev/null 2>&1 || true
+  local v; v="$(_va_verdict 2>/dev/null)" || return 0
+  case "$v" in
+    install)
+      if _va_install auto; then
+        _init_ok "$VA_ON_LINE"
+        _init_note "Turn it off any time: sudo 5dive plugin remove voice"
+      else
+        _init_warn "Voice could not be added this time. Try: $VA_ON_CMD"
+      fi
+      echo >&2 ;;
+    low-disk)
+      _init_warn "Voice is off: it needs about $(( VA_MIN_DISK_MB / 1024 )) GB of free disk. Free some space, then: $VA_ON_CMD"
+      echo >&2 ;;
+    ask)
+      _init_stdin_tty || return 0
+      local voice
+      _init_note "Voice lets you talk to your agent. This server has under 2 GB of memory."
+      _init_pick voice "Turn on voice? (puts a speech model on this server)" 2 \
+        "on|Turn on|Voice notes are heard on this server, never on ours" \
+        "off|Not now|Keeps the memory for your agents"
+      if [[ "$voice" == "on" ]]; then
+        if _va_install owner; then _init_ok "$VA_ON_LINE"
+        else _init_warn "Voice could not be added this time. Try: $VA_ON_CMD"; fi
+      else
+        _va_record off owner || true
+        _init_note "Voice stays off. Turn it on any time: $VA_ON_CMD"
+      fi
+      echo >&2 ;;
+  esac
+  return 0
+}
+
 cmd_init() {
   # --- Flags: --quiet/--demo suppress sub-process noise (see _init_run) ---
   local _arg
@@ -848,6 +890,8 @@ MANAGE
 
   cmd_app_hint >&2
 
+  # DIVE-7451: voice, before the last question.
+  _init_voice_step
   # DIVE-7369: last, so the answer is the last thing on screen.
   _init_nightly_ask
 }

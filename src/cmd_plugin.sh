@@ -202,6 +202,8 @@ _plugin_usage() {
   5dive plugin setup <plugin>[@<marketplace>] [--yes]     # run the publisher's one-time host setup
   5dive plugin auto-upgrade                       # what self-update runs: official plugins to the newest
                                                   # version, community ones reported, never moved
+  5dive plugin auto-voice [--on|--off|--status]   # voice on a self-hosted box: on by itself with 2 GB+
+                                                  # of memory, asked below that; --off keeps it off
 
   5dive plugin marketplace add <source> [--as=<name>]
   5dive plugin marketplace list [--json]
@@ -1612,6 +1614,9 @@ cmd_plugin_remove() {
     plugin_seat_apply "$plugin" "$mkt" "$_rm_caps" unregister || true
   fi
 
+  # DIVE-7451: an owner who removed voice stays removed — the automatic pass
+  # reads this and never puts it back.
+  [[ "$plugin" == voice ]] && { _va_record off owner || true; }
   ok "$key removed — every version, its pointer and its grants are gone" '{plugin:$k}' --arg k "$key"
 }
 
@@ -2705,6 +2710,157 @@ cmd_plugin_auto_upgrade() {
      --argjson u "$up" --argjson b "$behind" --argjson sr "$sran" --argjson so "$sowed"
 }
 
+# >>> DIVE-7451 voice default (extracted verbatim by tests/voice_auto_unit.sh)
+# A self-hosted box hears voice notes on its own whisper, the way every 5dive
+# Cloud and partner box already does (DIVE-5539), so a note never leaves the
+# box and an encrypted chat can have voice mode (DIVE-7443). Voice used to come
+# only with `plugin add voice` + `voice setup`, which no self-hoster ran, so
+# their notes were heard on 5dive's server (lodar 11-01: "I thought stt made on
+# users server"). Now:
+#   - a box with ~2 GB of memory or more, and the disk for it, gets voice on its
+#     own: once at `5dive init`, and once on its next self-update for a box set
+#     up before this (install.sh --upgrade runs `plugin auto-voice`);
+#   - a smaller box is ASKED once, at the end of init;
+#   - a box 5dive runs is never touched here: its build already set voice up,
+#     and an owner who removed it there must stay removed.
+# WHO CHOSE IT is recorded (community/wiki/a-default-a-later-run-re-applies-must-
+# record-who-chose-it.md): $STATE_DIR/voice-auto holds choice=on|off and
+# source=auto|owner. Any recorded choice is final for the automatic pass, so a
+# box that got voice once and lost it is never re-installed behind the owner,
+# and `plugin remove voice` writes choice=off source=owner.
+VA_MIN_MEM_MB="${FIVEDIVE_VOICE_AUTO_MIN_MEM_MB:-1800}"   # a "2 GB" plan reports ~1.9 GiB
+VA_MIN_DISK_MB="${FIVEDIVE_VOICE_AUTO_MIN_DISK_MB:-3072}"  # ~1 GB for voice, the rest headroom
+VA_SETUP_UNIT="5dive-voice-auto-setup"
+_va_state_file() { printf '%s\n' "${VOICE_AUTO_STATE:-${STATE_DIR:-/var/lib/5dive}/voice-auto}"; }
+_va_managed()    { [[ -f "${SELF_UPDATE_PROVISIONING:-/etc/5dive/provisioning.env}" ]]; }
+_va_kv()         { local f; f="$(_va_state_file)"; [[ -r "$f" ]] && sed -n "s/^${1}=//p" "$f" 2>/dev/null | head -n1; return 0; }
+
+# _va_mem_mb — the memory this box can give voice, in MiB: MemTotal, or the
+# cgroup limit when one is lower (a container's /proc/meminfo shows the host's).
+_va_mem_mb() {
+  [[ -n "${FIVEDIVE_VOICE_AUTO_MEM_MB:-}" ]] && { printf '%s\n' "$FIVEDIVE_VOICE_AUTO_MEM_MB"; return 0; }
+  local kb lim
+  kb=$(awk '/^MemTotal:/{print $2; exit}' "${VA_MEMINFO:-/proc/meminfo}" 2>/dev/null) || kb=""
+  [[ "$kb" =~ ^[0-9]+$ ]] || { printf '0\n'; return 0; }
+  local mb=$(( kb / 1024 ))
+  for lim in ${VA_CGROUP_FILES:-/sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes}; do
+    [[ -r "$lim" ]] || continue
+    lim=$(cat "$lim" 2>/dev/null) || lim=""
+    if [[ "$lim" =~ ^[0-9]+$ ]] && (( lim / 1048576 < mb )); then mb=$(( lim / 1048576 )); fi
+    break
+  done
+  printf '%s\n' "$mb"
+}
+_va_disk_mb() {
+  [[ -n "${FIVEDIVE_VOICE_AUTO_DISK_MB:-}" ]] && { printf '%s\n' "$FIVEDIVE_VOICE_AUTO_DISK_MB"; return 0; }
+  local d; d=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}') || d=""
+  [[ "$d" =~ ^[0-9]+$ ]] && printf '%s\n' "$d" || printf '0\n'
+}
+# Voice is on this box already: the plugin is registered (enabled or not), or
+# its hearing wrapper is (a box set up by hand or by 5dive's own installer).
+_va_present() {
+  [[ -x "${FIVEDIVE_TRANSCRIBE_BIN:-/usr/local/bin/5dive-transcribe}" ]] && return 0
+  jq -e 'any(.[]?; .plugin == "voice")' "$(_plugin_installed_json)" >/dev/null 2>&1
+}
+_va_record() {  # _va_record on|off auto|owner
+  local f tmp; f="$(_va_state_file)"
+  mkdir -p "$(dirname "$f")" 2>/dev/null || return 1
+  tmp="${f}.tmp.$$"
+  printf 'choice=%s\nsource=%s\nat=%s\n' "$1" "$2" "${VOICE_AUTO_NOW:-$(date +%s)}" > "$tmp" 2>/dev/null \
+    && mv -f "$tmp" "$f" 2>/dev/null && return 0
+  rm -f "$tmp" 2>/dev/null; return 1
+}
+
+# _va_decide <managed:0|1> <present:0|1> <choice> <mem-mb> <disk-mb> — pure.
+# Prints one verdict: managed | present | chosen | ask | low-disk | install.
+_va_decide() {
+  local managed="$1" present="$2" choice="$3" mem="$4" disk="$5"
+  (( managed )) && { printf 'managed\n'; return 0; }
+  (( present )) && { printf 'present\n'; return 0; }
+  [[ -n "$choice" ]] && { printf 'chosen\n'; return 0; }
+  [[ "$mem" =~ ^[0-9]+$ ]] && (( mem >= VA_MIN_MEM_MB )) || { printf 'ask\n'; return 0; }
+  [[ "$disk" =~ ^[0-9]+$ ]] && (( disk >= VA_MIN_DISK_MB )) || { printf 'low-disk\n'; return 0; }
+  printf 'install\n'
+}
+_va_verdict() {
+  local m=0 p=0
+  _va_managed && m=1
+  _va_present && p=1
+  _va_decide "$m" "$p" "$(_va_kv choice)" "$(_va_mem_mb)" "$(_va_disk_mb)"
+}
+
+# _va_install auto|owner — add the plugin now (seconds), hand the slow half
+# (ffmpeg, the python engine, the whisper `base` model) to a background unit, and
+# record who chose it. The same two steps a Cloud build's setup unit runs
+# (`plugin setup voice --yes`), so the engine and its whisper default are the
+# plugin's own. Returns 1 when the plugin could not be added; nothing is
+# recorded then, so the next run tries again.
+_va_install() {
+  local who="$1" bin="${FIVEDIVE_VOICE_AUTO_CLI:-/usr/local/bin/5dive}" log
+  log="${STATE_DIR:-/var/lib/5dive}/voice-auto.log"
+  "$bin" plugin add voice --yes >>"$log" 2>&1 || return 1
+  if command -v systemd-run >/dev/null 2>&1 && [[ -d "${VA_SYSTEMD_DIR:-/run/systemd/system}" ]]; then
+    systemctl reset-failed "$VA_SETUP_UNIT" >/dev/null 2>&1 || true
+    systemd-run --unit="$VA_SETUP_UNIT" --no-block --collect \
+      --property=TimeoutStartSec=3600 --setenv=HOME=/root \
+      "$bin" plugin setup voice --yes >>"$log" 2>&1 \
+      || { nohup setsid "$bin" plugin setup voice --yes >>"$log" 2>&1 < /dev/null & }
+  else
+    nohup setsid "$bin" plugin setup voice --yes >>"$log" 2>&1 < /dev/null &
+  fi
+  _va_record on "$who" || true
+  return 0
+}
+
+VA_ON_LINE="Voice is on: your voice notes are heard on this server, never on ours. The speech model is installing in the background (a few minutes)."
+VA_ON_CMD="sudo 5dive plugin auto-voice --on"
+
+# `5dive plugin auto-voice [--on|--off|--status]` — what self-update runs (no
+# flag: the automatic pass), and the owner's own switch (--on / --off).
+cmd_plugin_auto_voice() {
+  local mode="auto"
+  case "${1:-}" in
+    "") ;;
+    --on) mode=on ;; --off) mode=off ;; --status) mode=status ;;
+    *) fail "$E_USAGE" "usage: 5dive plugin auto-voice [--on|--off|--status]" ;;
+  esac
+  local v; v="$(_va_verdict)"
+  local choice source; choice="$(_va_kv choice)"; source="$(_va_kv source)"
+  case "$mode" in
+    status)
+      ok "voice: $v${choice:+ (choice=$choice by $source)}; memory $(_va_mem_mb) MB, free disk $(_va_disk_mb) MB" \
+         '{verdict:$v, choice:(if $c == "" then null else $c end), source:(if $s == "" then null else $s end)}' \
+         --arg v "$v" --arg c "$choice" --arg s "$source"
+      return 0 ;;
+    off)
+      _va_record off owner || fail "$E_GENERIC" "could not write $(_va_state_file)"
+      local more=""; [[ "$v" == present ]] && more=" Voice is still installed; remove it with: sudo 5dive plugin remove voice"
+      ok "Voice stays off on this server; 5dive will not turn it on by itself.$more" '{choice:"off", source:"owner"}'
+      return 0 ;;
+    on)
+      if [[ "$v" == present ]]; then
+        _va_record on owner || true
+        ok "Voice is already on this server." '{verdict:"present"}'; return 0
+      fi
+      _va_install owner || fail "$E_GENERIC" "voice could not be added (see ${STATE_DIR:-/var/lib/5dive}/voice-auto.log)"
+      ok "$VA_ON_LINE" '{verdict:"install", source:"owner"}'
+      return 0 ;;
+  esac
+  local prose
+  case "$v" in
+    managed)  prose="this box is run by 5dive; its voice is set up from 5dive's side" ;;
+    present)  prose="voice is already on this server" ;;
+    chosen)   prose="voice was ${choice:-chosen} by ${source:-someone} before; left as it is" ;;
+    ask)      prose="this server has under 2 GB of memory, so voice was not turned on by itself. Turn it on: $VA_ON_CMD" ;;
+    low-disk) prose="voice needs about $(( VA_MIN_DISK_MB / 1024 )) GB of free disk and this server has $(_va_disk_mb) MB; not turned on. Free some space, then: $VA_ON_CMD" ;;
+    install)
+      _va_install auto || fail "$E_GENERIC" "voice could not be added this time (see ${STATE_DIR:-/var/lib/5dive}/voice-auto.log); the next update tries again"
+      prose="$VA_ON_LINE Turn it off: sudo 5dive plugin remove voice" ;;
+  esac
+  ok "$prose" '{verdict:$v}' --arg v "$v"
+}
+# <<< DIVE-7451 voice default
+
 cmd_plugin() {
   local sub="${1:-list}"; [[ $# -gt 0 ]] && shift
   case "$sub" in
@@ -2719,6 +2875,7 @@ cmd_plugin() {
     rollback)        cmd_plugin_rollback "$@" ;;
     setup)           cmd_plugin_setup "$@" ;;
     auto-upgrade)    cmd_plugin_auto_upgrade "$@" ;;
+    auto-voice)      cmd_plugin_auto_voice "$@" ;;
     *) fail "$E_USAGE" "unknown: 5dive plugin $sub (see: 5dive plugin --help)" ;;
   esac
 }

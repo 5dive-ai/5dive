@@ -1974,6 +1974,17 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   fi
   # <<< DIVE-6618 host plugins
 
+  # DIVE-7451: a self-hosted box set up before voice came by itself gets it on
+  # this run, once, when it has the memory and disk for it (~2 GB / ~3 GB free).
+  # The verb decides and records who chose it: a box 5dive runs, a box that has
+  # voice, a box whose owner removed it or said no, and a smaller box are left
+  # alone. The slow half installs in the background; it never fails the upgrade.
+  if [[ "$_hp_help" == *"plugin auto-voice"* ]]; then
+    say "Voice on this server"
+    "$BIN_DIR/5dive" plugin auto-voice 2>&1 | sed 's/^/  /' \
+      || echo "warn: voice was not turned on this time (the reason is above); the CLI upgrade went ahead" >&2
+  fi
+
   # Plugins are SHA-pinned per-user in installed_plugins.json, so CLI
   # upgrade alone doesn't refresh them. Run the helper best-effort: if
   # no agents are registered yet (fresh box) it's a no-op; if claude

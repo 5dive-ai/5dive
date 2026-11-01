@@ -36,7 +36,10 @@ PLACEHOLDER=0
 
 # cell -> type, provider key, init answers. Sign-in-only paths (ChatGPT, Grok)
 # stay manual: they need a person at a browser.
-CELLS=(claude openclaw hermes-sandboxed hermes-standard codex)
+# DIVE-7451: claude-1gb is the claude cell on a box held to 1 GB of memory (the
+# workflow boots it with --memory=1g): init must ASK about voice there, not
+# install it. Every other cell has the runner's memory, so voice turns on.
+CELLS=(claude openclaw hermes-sandboxed hermes-standard codex claude-1gb)
 
 list_cells() { printf '%s\n' "${CELLS[@]}"; }
 
@@ -76,9 +79,10 @@ steps_json() {
     hermes-sandboxed) iso="Sandboxed" ;;
     hermes-standard)  iso="Standard" ;;
   esac
-  python3 - "$label" "$auth" "$provider" "$key" "$model" "$channel" "$iso" <<'PY'
+  local small=0; [[ "$cell" == *-1gb ]] && small=1
+  python3 - "$label" "$auth" "$provider" "$key" "$model" "$channel" "$iso" "$small" <<'PY'
 import json, re, sys
-label, auth, provider, key, model, channel, iso = sys.argv[1:8]
+label, auth, provider, key, model, channel, iso, small = sys.argv[1:9]
 menu = r'[\s\S]*?Choose \[\d+\]: '
 s = [{'wait': 'Pick an agent type:' + menu, 'pick': label}]
 # The agent tool installs between the type pick and the next prompt.
@@ -97,6 +101,9 @@ if iso:
 else:
     s.append({'wait': 'Pick isolation:' + menu, 'send': '\n'})
 s.append({'wait': r'Ready to create [a-z0-9-]+\?' + menu, 'pick': 'Create agent'})
+# DIVE-7451: under 2 GB of memory init asks about voice, before the last question.
+if small == '1':
+    s.append({'wait': r'Turn on voice\? \(puts a speech model on this server\)' + menu, 'pick': 'Not now', 'secs': 1200})
 # DIVE-7369: the last question, after the agent is made (so behind the create).
 s.append({'wait': r'Turn on nightly updates\?' + menu, 'pick': 'Turn on', 'secs': 1200})
 print(json.dumps(s, indent=1))
@@ -283,6 +290,55 @@ webchat_arm() {
 # DIVE-7370: every `5dive` command the README shows, run for real on this box.
 # One cell is enough (they share the CLI); Claude Code on 24.04 is the README's
 # own quickstart. The tree's README is staged at /opt/init-smoke-README.md.
+# DIVE-7451, the big-box arm: init turned voice on by itself. Wait for the
+# background setup, then hear a spoken clip on THIS box (local backend forced,
+# and no OpenRouter key here, so nothing else could hear it). Prints the
+# measured cost: install time from init's queue, disk, and whisper's peak memory.
+voice_arm() {
+  local st=/var/lib/5dive/voice-auto t0 t1 i done=0 vlog=/var/lib/5dive/voice-auto.log
+  grep -qx 'choice=on' "$st" 2>/dev/null && grep -qx 'source=auto' "$st" \
+    || { DETAIL="init did not turn voice on by itself on a $(( $(awk '/^MemTotal:/{print $2}' /proc/meminfo) / 1024 )) MB box: $(tr '\n' ' ' < "$st" 2>/dev/null)"; return 1; }
+  t0=$(sed -n 's/^at=//p' "$st")
+  for i in $(seq 1 240); do
+    if [[ -x /usr/local/bin/5dive-transcribe ]] && systemctl is-active --quiet whisper-service \
+       && ! systemctl is-active --quiet 5dive-voice-auto-setup 2>/dev/null; then done=1; break; fi
+    sleep 5
+  done
+  t1=$(date +%s)
+  (( done )) || { DETAIL="voice setup did not finish in 20 minutes"; tail -30 "$vlog" 2>/dev/null; return 1; }
+  # Wait for the warm model to answer, then hear a clip spoken by edge-tts.
+  for i in $(seq 1 60); do curl -fs -o /dev/null http://127.0.0.1:8765/health 2>/dev/null && break; sleep 2; done
+  local clip=/tmp/voice-arm.mp3 heard
+  /home/claude/.venv/bin/edge-tts --text "Please water the green plants on Friday morning." --write-media "$clip" >/dev/null 2>&1 \
+    || { DETAIL="edge-tts could not make the test clip"; return 1; }
+  heard=$(timeout 180 5dive-transcribe --backend=local --lang=en "$clip" 2>&1) || true
+  echo "voice: heard on this box: $heard"
+  grep -qi 'plants' <<<"$heard" && grep -qi 'friday' <<<"$heard" \
+    || { DETAIL="the box's own whisper did not hear the clip: $heard"; return 1; }
+  local venv hf apt_kb pkgs pid hwm
+  venv=$(du -sm /home/claude/.venv 2>/dev/null | cut -f1)
+  hf=$(du -sm /home/claude/.cache/huggingface /root/.cache/huggingface 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  pkgs=$(awk '/^Commandline:.*install.*ffmpeg/{f=1; next} f && /^Install:/{print; exit}' /var/log/apt/history.log 2>/dev/null \
+    | sed 's/^Install: //; s/([^)]*)//g; s/,/ /g')
+  apt_kb=0
+  [[ -n "$pkgs" ]] && apt_kb=$(dpkg-query -W -f '${Installed-Size}\n' $pkgs 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  pid=$(systemctl show -p MainPID --value whisper-service 2>/dev/null)
+  hwm=$(awk '/^VmHWM:/{print int($2/1024)}' "/proc/$pid/status" 2>/dev/null)
+  echo "VOICE-COST install=$(( t1 - t0 ))s disk: venv=${venv}MB model=${hf}MB apt=$(( apt_kb / 1024 ))MB total=$(( venv + hf + apt_kb / 1024 ))MB whisper_peak_rss=${hwm:-?}MB"
+}
+
+# DIVE-7451, the small-box arm: init asked (the driver answered Not now), so
+# nothing was installed and the answer is recorded as the owner's.
+voice_small_arm() {
+  local st=/var/lib/5dive/voice-auto
+  grep -qx 'choice=off' "$st" 2>/dev/null && grep -qx 'source=owner' "$st" \
+    || { DETAIL="init on the 1 GB box did not record the owner's No: $(tr '\n' ' ' < "$st" 2>/dev/null)"; return 1; }
+  if [[ -x /usr/local/bin/5dive-transcribe ]] || jq -e 'any(.[]?; .plugin == "voice")' /var/lib/5dive/plugins/installed.json >/dev/null 2>&1; then
+    DETAIL="voice was installed on the 1 GB box although the owner said Not now"; return 1
+  fi
+  echo "voice: 1 GB box ($(5dive plugin auto-voice --status 2>&1 | tail -1)) — asked, nothing installed"
+}
+
 cell_has_readme() { [[ "$1" == claude && "$2" == ubuntu-24.04 ]]; }
 
 # readme_arm [--no-model]: --no-model when the seat cannot answer (no key, or
@@ -330,6 +386,12 @@ run_arm() {
     || { DETAIL="init was told Yes to nightly updates, but 5dive-self-update.timer is not enabled"; finish fail; }
   DETAIL=""
   seat_up || { DETAIL="init said ready, but the seat's unit or tmux session is not up"; show_seat; finish fail; }
+
+  # DIVE-7451: voice on a self-hosted box, before any key is needed.
+  case "$CELL" in
+    claude)     step voice; voice_arm || finish fail ;;
+    claude-1gb) step voice; voice_small_arm || finish fail ;;
+  esac
 
   step pin
   pin_model "$type" || { show_seat; finish fail; }

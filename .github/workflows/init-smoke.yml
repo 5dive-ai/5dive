@@ -57,7 +57,7 @@ on:
   workflow_dispatch:
     inputs:
       cells:
-        description: 'Comma-separated cells (claude, openclaw, hermes-sandboxed, hermes-standard, codex). Blank = all.'
+        description: 'Comma-separated cells (claude, openclaw, hermes-sandboxed, hermes-standard, codex, claude-1gb). Blank = all.'
         required: false
         default: ''
       os:
@@ -171,7 +171,10 @@ jobs:
       - name: Boot the fresh box
         run: |
           gunzip -c "/tmp/img/is-$OS.tar.gz" | docker load
-          docker run -d --privileged --name is "is:$OS"
+          # DIVE-7451: the -1gb cell is a box held to 1 GB of memory (swap
+          # allowed, as a small VPS has), so init must ask about voice there.
+          mem=""; case "$CELL" in *-1gb) mem="--memory=1g --memory-swap=4g" ;; esac
+          docker run -d --privileged $mem --name is "is:$OS"
           timeout 120 docker exec is systemctl is-system-running --wait || true
           docker exec is systemctl is-system-running || true
       - name: Stage the tree under test as the install source
