@@ -1192,8 +1192,17 @@ five_api_base() {
 # exception is a loopback host — a local inference server (vLLM, llama.cpp,
 # Ollama's anthropic shim) is reached over http://127.0.0.1 and never leaves the
 # box, so requiring TLS there would refuse the most common self-hosted shape for
-# no gain. A private-LAN address is NOT exempt: it is off-box, it is a real
-# network, and "the LAN is trusted" is exactly the assumption that is wrong.
+# no gain. A private-LAN IPv4 address is exempt too since DIVE-7568 (see below):
+# the office GPU box serves plain http, and refusing it refused the product.
+valid_base_url_private_ipv4() {
+  [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  local a=$((10#${BASH_REMATCH[1]})) b=$((10#${BASH_REMATCH[2]})) c=$((10#${BASH_REMATCH[3]})) d=$((10#${BASH_REMATCH[4]}))
+  (( a <= 255 && b <= 255 && c <= 255 && d <= 255 )) || return 1
+  (( a == 10 || a == 127 )) && return 0
+  (( a == 172 && b >= 16 && b <= 31 )) && return 0
+  (( a == 192 && b == 168 )) && return 0
+  return 1
+}
 valid_base_url() {
   local url="$1" host=""
   [[ -n "$url" ]] || return 1
@@ -1212,6 +1221,12 @@ valid_base_url() {
       # respect the brackets or `[::1]:8080` truncates to `[:`.
       if [[ "$host" == \[*\]* ]]; then host="${host%%\]*}]"; else host="${host%:*}"; fi
       [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "[::1]" ]] && return 0
+      # DIVE-7568: «Your own AI» is a GPU box in the office far more often than
+      # a server on this one, and its address is a private one with no TLS
+      # (Ollama, vLLM, LM Studio all serve plain http). So http:// to a PRIVATE
+      # IPv4 address is accepted always: 10/8, 172.16/12, 192.168/16, 127/8.
+      # Names (gpu.local) and public addresses still need https:// or local-only.
+      valid_base_url_private_ipv4 "$host" && return 0
       # DIVE-7557: in local-only mode the model server is SUPPOSED to be a GPU
       # box on the office network, and the key it gets is a local one. There
       # the LAN is the whole trust boundary the owner chose, so http:// to a

@@ -113,6 +113,7 @@ CORE_FILES=(
 LAZY_FILES=(
   src/cmd_auth.sh
   src/cmd_account.sh
+  src/cmd_account_custom.sh
   src/cmd_agent.sh
   src/cmd_agent_create.sh
   src/cmd_agent_lifecycle.sh

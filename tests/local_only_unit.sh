@@ -9,8 +9,9 @@
 #   ALLOW.    flag file → office-network model servers (RFC1918, .lan, loopback),
 #             local reads, a bug PREVIEW and self-update --status still run.
 #   URL.      the office-network classifier, both directions.
-#   BASEURL.  valid_base_url: http:// to 192.168.x is refused with the switch off
-#             and accepted with it on; a public http:// host is refused either way.
+#   BASEURL.  valid_base_url: http:// to 192.168.x is accepted either way
+#             (DIVE-7568); http://gpu.lan only with the switch on; a public
+#             http:// host is refused either way.
 #   ONOFF.    `on` against a mocked root turns off only ENABLED units, writes the
 #             agent drop-in + codex managed config, sets motd-news off, holds snap;
 #             a unit the owner had off is NOT recorded, and `off` leaves it off
@@ -50,7 +51,7 @@ mkdir -p "$TMPD/root/etc/5dive" "$TMPD/bin" "$TMPD/units" "$TMPD/mkt"
 
 # shellcheck disable=SC1090
 for f in lib/error_codes.sh lib/output.sh lib/local_only.sh cmd_local_only.sh; do source "src/$f"; done
-eval "$(sed -n '/^valid_base_url()/,/^}/p' src/header.sh)"
+eval "$(sed -n '/^valid_base_url_private_ipv4()/,/^}/p;/^valid_base_url()/,/^}/p' src/header.sh)"
 require_root() { return 0; }
 JSON_MODE=0
 
@@ -196,10 +197,14 @@ done
 
 # ── BASEURL ──────────────────────────────────────────────────────────────────
 flag_off
-if ! valid_base_url http://192.168.1.5:8000 && valid_base_url http://127.0.0.1:8000; then ok_ "BASEURL: switch off → http://192.168.x refused (unchanged), loopback ok"
-else bad_ "BASEURL off" "LAN http accepted with the switch off"; fi
+# DIVE-7568: a private IPv4 address is accepted over http with the switch off
+# too; a NAME on the office network (gpu.lan) still needs the switch.
+if valid_base_url http://192.168.1.5:8000 && valid_base_url http://127.0.0.1:8000 \
+   && ! valid_base_url http://gpu.lan:8000 && ! valid_base_url http://192.0.2.10:8000; then
+  ok_ "BASEURL: switch off → http://192.168.x and loopback ok, http://gpu.lan and public http:// refused"
+else bad_ "BASEURL off" "private IPv4 refused, or a name/public host accepted, with the switch off"; fi
 flag_on
-if valid_base_url http://192.168.1.5:8000 && ! valid_base_url http://192.0.2.10:8000; then ok_ "BASEURL: switch on → http://192.168.x accepted, public http:// still refused"
+if valid_base_url http://192.168.1.5:8000 && valid_base_url http://gpu.lan:8000 && ! valid_base_url http://192.0.2.10:8000; then ok_ "BASEURL: switch on → http://192.168.x and http://gpu.lan accepted, public http:// still refused"
 else bad_ "BASEURL on" "LAN refused or public accepted"; fi
 
 # ── ONOFF ────────────────────────────────────────────────────────────────────
