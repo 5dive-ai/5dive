@@ -5,6 +5,8 @@
 #   A. bash: the api-base file the root rail reads, the local-only refusal of
 #      `chat e2e enable`, the gate-notice route (office chat, never Telegram),
 #      the unit text, the build list.
+#   C. DIVE-7566: `local serve` first run on a never-linked box (minted token),
+#      the rail's token choice by destination.
 #   B. live: the REAL server on bun, two loopback listeners on random ports (the
 #      office listener on 127.0.0.1 with a throwaway self-signed cert), driven
 #      with curl exactly as the root rail and a browser would.
@@ -25,7 +27,8 @@ trap 'rc=$?; [[ -n "$SRV_PID" ]] && kill "$SRV_PID" 2>/dev/null; rm -rf "$TMPD";
 
 export FIVE_LOCAL_ONLY_FILE="$TMPD/local-only"
 export FIVE_API_BASE_FILE="$TMPD/api-base"
-for f in header.sh lib/error_codes.sh lib/output.sh lib/local_only.sh cmd_local_chat.sh cmd_local_chat_server.sh; do source "src/$f"; done
+export FIVEDIVE_CONNECTORD_ENV="$TMPD/no-connectord.env"
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/local_only.sh cmd_local_chat.sh cmd_local_chat_server.sh cmd_dashboard_relay.sh; do source "src/$f"; done
 set +e   # header.sh turns errexit on; this harness reads every rc itself
 JSON_MODE=0
 
@@ -72,13 +75,48 @@ rm -f "$FIVE_LOCAL_ONLY_FILE"
 unset -f curl
 source src/cmd_local_chat.sh   # the real local_chat_notice back
 
-unit=$(_lc_unit_text /usr/local/bin/bun 192.0.2.10 8443 8480)
+unit=$(FIVEDIVE_CONNECTORD_ENV=/etc/5dive/connectord.env _lc_unit_text /usr/local/bin/bun 192.0.2.10 8443 8480)
 check 'A14 unit runs as the dedicated user, never root' 'grep -qx "User=5dive-chat" <<<"$unit"'
 check 'A15 unit hands the token in as a credential' 'grep -qx "LoadCredential=token:/etc/5dive/connectord.env" <<<"$unit"'
 check 'A16 unit is sandboxed (NoNewPrivileges, ProtectSystem=strict)' 'grep -qx "NoNewPrivileges=yes" <<<"$unit" && grep -qx "ProtectSystem=strict" <<<"$unit"'
 check 'A17 build.sh bundles both modules' 'grep -qx "  src/cmd_local_chat.sh" build.sh && grep -qx "  src/cmd_local_chat_server.sh" build.sh'
 check 'A18 main dispatches `local`' 'grep -q "cmd_local \"\$@\"" src/main.sh'
 check 'A19 local-only on starts it and off stops it (undo record)' 'grep -q "_lo_record \"local-chat\"" src/cmd_local_only.sh && grep -q "local-chat) ( _lc_serve_stop )" src/cmd_local_only.sh'
+
+# ── C. DIVE-7566: `local serve` as the CLI runs it (set -euo pipefail) ────────
+# The DIVE-7560 proof: a never-linked box could not start the chat (no
+# connectord.env), and the first `local serve` died with rc 2 (a sed on the
+# config file that is not there yet, under pipefail). Root, systemd and the
+# server user are stubs; the files land under FIVE_LOCAL_CHAT_ROOT.
+export FIVE_LOCAL_CHAT_ROOT="$TMPD/root"
+mkdir -p "$TMPD/root/etc/systemd/system"
+serve_() {   # a fresh `local serve`, errexit and pipefail on, as bin/5dive runs
+  ( set -euo pipefail
+    require_root() { :; }; getent() { return 0; }; systemctl() { return 0; }
+    _lc_bun() { printf /usr/local/bin/bun; }; _lc_agents_write() { :; }
+    _lc_serve "$@" )
+}
+out=$( (set -euo pipefail; _lc_conf_get LAN_ADDR; echo "rc=$?") 2>&1 )
+check 'C1 reading the config before it exists is empty, not an exit' '[[ "$out" == "rc=0" ]]'
+out=$(serve_ --addr=192.0.2.10 2>&1); r=$?
+TOKF="$TMPD/root/etc/5dive/local-chat/token.env"
+if (( r == 0 )) && grep -q "Office chat is ON: https://192.0.2.10:8443" <<<"$out"; then ok_ 'C2 first `local serve` on a never-linked box starts (no connectord.env, no config yet)'
+else bad_ 'C2 first serve' "rc=$r $out"; fi
+check 'C3 a token is minted for the office chat, root-only, 64 hex' '[[ "$(stat -c %a "$TOKF")" == 600 ]] && grep -qE "^CONNECTORD_TOKEN=[0-9a-f]{64}$" "$TOKF"'
+check 'C4 the unit loads the minted token, and connectord.env is NOT written' 'grep -qx "LoadCredential=token:$TOKF" "$TMPD/root/etc/systemd/system/5dive-local-chat.service" && [[ ! -e "$FIVEDIVE_CONNECTORD_ENV" ]]'
+check 'C5 the config names the token file and the agents rail points at the office chat' 'grep -qx "TOKEN_FILE=$TOKF" "$(_lc_conf)" && [[ "$(five_api_base)" == http://127.0.0.1:8480 ]]'
+T1=$(cat "$TOKF"); serve_ >/dev/null 2>&1; r=$?
+check 'C6 a second serve (no flags: address from the config) keeps the same token' '(( r == 0 )) && [[ "$(cat "$TOKF")" == "$T1" ]]'
+# The root rail picks the token by where it is sending.
+check 'C7 rail → office chat (loopback base) uses the minted token' '[[ "$(_dash_relay_token)" == "${T1#CONNECTORD_TOKEN=}" ]]'
+printf 'https://api.5dive.com\n' >"$FIVE_API_BASE_FILE"
+check 'C8 rail → api.5dive.com never gets the minted token' '[[ -z "$(_dash_relay_token)" ]]'
+printf 'CONNECTORD_TOKEN=linked-tok\n' >"$TMPD/connectord.env"
+check 'C9 a linked box: api.5dive.com gets the box token' '[[ "$(FIVEDIVE_CONNECTORD_ENV=$TMPD/connectord.env _dash_relay_token)" == linked-tok ]]'
+out=$(FIVEDIVE_CONNECTORD_ENV="$TMPD/connectord.env" serve_ 2>&1); r=$?
+check 'C10 a linked box: serve uses the box token, the office chat and the rail agree' '(( r == 0 )) && grep -qx "LoadCredential=token:$TMPD/connectord.env" "$TMPD/root/etc/systemd/system/5dive-local-chat.service" && [[ "$(FIVEDIVE_CONNECTORD_ENV=$TMPD/connectord.env _dash_relay_token)" == linked-tok ]]'
+serve_ >/dev/null 2>&1   # back to the never-linked shape for B
+rm -f "$FIVE_API_BASE_FILE"
 
 # ── B. live server ───────────────────────────────────────────────────────────
 BUN=$(command -v bun || echo /usr/local/bin/bun)
@@ -89,7 +127,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
 printf 'CONNECTORD_TOKEN="boxtok-123"\n' >"$TMPD/connectord.env"
 printf '["alice","bob"]\n' >"$TMPD/agents.json"
 LAN=$((20000 + RANDOM % 20000)); LOOP=$((LAN + 1))
-export LC_STATE="$TMPD/state" LC_LAN_ADDR=127.0.0.1 LC_LAN_PORT=$LAN LC_LOOP_PORT=$LOOP \
+export LC_STATE="$TMPD/root/var/lib/5dive-local-chat" LC_LAN_ADDR=127.0.0.1 LC_LAN_PORT=$LAN LC_LOOP_PORT=$LOOP \
   LC_CERT="$TMPD/cert.pem" LC_KEY="$TMPD/key.pem" LC_TOKEN_FILE="$TMPD/connectord.env" \
   LC_AGENTS_FILE="$TMPD/agents.json" LC_UPLOADS="/home/claude/chat-uploads"
 "$BUN" "$TMPD/server.ts" serve >"$TMPD/server.log" 2>&1 & SRV_PID=$!
@@ -116,6 +154,23 @@ r=$(web -H 'content-type: application/json' -d '{"code":"abcd-2345","name":"phon
 check 'B9 the right code (any case, with dash) pairs and sets an HttpOnly cookie' '[[ "$(jq -r .ok <<<"$r")" == true ]] && grep -q "#HttpOnly_127.0.0.1" "$JAR"'
 check 'B10 the code works once' '[[ "$(code -H "x-local-chat: 1" -H "content-type: application/json" -d "{\"code\":\"ABCD2345\"}" "$W/api/pair")" == 403 ]]'
 check 'B11 the paired device lists the agents' '[[ "$(web "$W/api/agents" | jq -c "[.agents[].name]")" == "[\"alice\",\"bob\"]" ]]'
+
+# DIVE-7566: the `local pair` VERB itself (it took SIGPIPE, rc 141, on every
+# run; the arms above call the server's admin op directly and never ran it).
+# Under errexit + pipefail as bin/5dive runs it, against this live server.
+mkdir -p "$(_lc_lib)"; cp "$TMPD/server.ts" "$(_lc_lib)/server.ts"
+printf 'LAN_ADDR=127.0.0.1\nLAN_PORT=%s\nLOOP_PORT=%s\n' "$LAN" "$LOOP" >"$(_lc_conf)"
+cp "$TMPD/cert.pem" "$(_lc_etc)/cert.pem"
+pair_() { ( set -euo pipefail; require_root() { :; }; runuser() { shift 3; "$@"; }; _lc_bun() { printf '%s' "$BUN"; }; cmd_local pair ) ; }
+out=$(pair_ 2>&1); r=$?
+PCODE=$(grep -oE 'Type this code:  [A-Z0-9]{4}-[A-Z0-9]{4}' <<<"$out" | awk '{print $NF}')
+if (( r == 0 )) && [[ "$PCODE" =~ ^[ABCDEFGHJKMNPQRSTUVWXYZ2-9]{4}-[ABCDEFGHJKMNPQRSTUVWXYZ2-9]{4}$ ]] && grep -q "$(_lc_fingerprint)" <<<"$out"; then
+  ok_ "B11a \`local pair\` runs (rc 0) and prints a code and the cert fingerprint"
+else bad_ 'B11a local pair verb' "rc=$r $out"; fi
+r=$(curl -sSk -c "$TMPD/jar2" -H 'x-local-chat: 1' -H 'content-type: application/json' -d "{\"code\":\"$PCODE\",\"name\":\"laptop\"}" "$W/api/pair")
+check 'B11b the printed code pairs a device with the office chat' '[[ "$(jq -r .ok <<<"$r")" == true ]]'
+out=$(JSON_MODE=1 pair_ 2>&1); r=$?
+check 'B11c `local pair --json` runs too' '(( r == 0 )) && [[ "$(jq -r ".data.code | test(\"^[A-Z0-9]{4}-[A-Z0-9]{4}$\")" <<<"$out")" == true ]]'
 
 # inbound: browser → box pending (the same shape the API returns).
 web -H 'content-type: application/json' -d '{"agent":"alice","text":"hello alice"}' "$W/api/messages" >/dev/null

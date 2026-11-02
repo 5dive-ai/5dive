@@ -16,6 +16,8 @@
 #             a unit the owner had off is NOT recorded, and `off` leaves it off
 #             while restoring everything `on` changed. An owner's own codex managed
 #             config is never overwritten or removed.
+#   CHAT.     DIVE-7566: the office chat failing → never "ON", never rc 0; the
+#             switch stays in force. Started → ON, recorded for off.
 #   NTP.      --ntp=<lan host> points time sync at it (timesyncd stays on);
 #             a public --ntp is refused.
 #   CHECK.    a public connection in the ss watch → LEAK + exit 1; only
@@ -229,6 +231,26 @@ mkdir -p "$TMPD/root/etc/codex"; printf 'model = "mine"\n' > "$(_lo_codex)"
 ( _lo_on && _lo_off ) >/dev/null 2>&1
 [[ $(cat "$(_lo_codex)") == 'model = "mine"' ]] && ok_ "ONOFF: an owner's codex managed config is never overwritten or removed" || bad_ "ONOFF codex owner" "changed"
 rm -f "$(_lo_codex)"
+
+# ── CHAT (DIVE-7566) ─────────────────────────────────────────────────────────
+# The office chat step, run under the mocked root (FIVE_LOCAL_ONLY_CHAT=1) with
+# `local serve` stubbed. A chat that did not start must never read as ON / rc 0
+# (the DIVE-7560 proof: "error: ... no connectord token", then "ON", rc 0).
+flag_off
+_lc_serve_stop() { return 0; }
+_lc_serve() { echo "error: local chat: the server did not start" >&2; return 1; }
+( FIVE_LOCAL_ONLY_CHAT=1 _lo_on ) >"$TMPD/chat.out" 2>&1; rc=$?
+if (( rc != 0 )) && ! grep -q 'Local-only mode is ON' "$TMPD/chat.out" && grep -q 'office chat did NOT start' "$TMPD/chat.out" \
+   && [[ -e "$FIVE_LOCAL_ONLY_FILE" ]] && ! grep -qx 'local-chat' "$(_lo_undo)"; then
+  ok_ "CHAT: the office chat failed → no plain ON, rc $rc, the switch stays in force"
+else bad_ "CHAT failed" "rc=$rc $(cat "$TMPD/chat.out")"; fi
+( _lo_off ) >/dev/null 2>&1
+_lc_serve() { return 0; }
+( FIVE_LOCAL_ONLY_CHAT=1 _lo_on ) >"$TMPD/chat.out" 2>&1; rc=$?
+[[ $rc == 0 ]] && grep -q 'Local-only mode is ON' "$TMPD/chat.out" && grep -qx 'local-chat' "$(_lo_undo)" \
+  && ok_ "CHAT: the office chat started → ON, rc 0, recorded for off" || bad_ "CHAT started" "rc=$rc $(cat "$TMPD/chat.out")"
+( _lo_off ) >/dev/null 2>&1
+unset -f _lc_serve _lc_serve_stop
 
 # ── NTP ──────────────────────────────────────────────────────────────────────
 echo enabled > "$TMPD/units/systemd-timesyncd.service"
