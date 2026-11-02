@@ -399,6 +399,12 @@ check 'hosted: a box with no token is refused with no network call, and no key d
   '[[ $rc == "$E_AUTH_REQUIRED" && ! -e "$H/etc/chat-e2e.pairing" && ! -s "$LOGS/calls" ]] && grep -q "Turn encrypted chat on from 5dive.app" "$TMP/err"'
 
 # ── DIVE-7520: disable at the server leaves the off mark seats trust ────────
+rail '{"op":"seal","conv":"dashboard","m":"off-3","msg":{"text":"x"}}'; check 'seal: an off- id is refused (only root says off)' '[[ $? != 0 ]]'
+cp -a "$LIVE" "$TMP/live-copy"; : >"$LOGS/bodies"
+run _chat_cmd_e2e disable; rc=$?
+check 'disable on a live box: every device is told off, sealed under the box key' \
+  '[[ $rc == 0 && -f "$LIVE.off" ]] && [[ "$(grep "\"agent\":\"tap\"" "$LOGS/bodies" | tail -1 | jq -r .body | dev open dev-laptop1 dashboard "$BOXPUB" | jq -r .t)" == off ]]'
+rm -rf "$LIVE.off" "$LIVE".disabled-*; mv "$TMP/live-copy" "$LIVE"
 D="$TMP/dis"; mkdir -p "$D/etc/chat-e2e"; echo '{}' >"$D/etc/chat-e2e/roster.json"
 FIVEDIVE_CHAT_E2E_DIR="$D/etc/chat-e2e" run _chat_cmd_e2e disable; rc=$?
 check 'disable: the off mark is written and the keys are moved aside, not deleted' \

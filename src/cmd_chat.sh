@@ -151,9 +151,9 @@ _chat_e2e_api_devices() {
 # chat took; `devices sync` (every minute) and every seat call post again while
 # the list is newer than that, so a lost revoke is retried until it lands.
 _chat_e2e_announce() {
-  local dir="$1" agents ans env a n=0 want=0 rev
+  local dir="$1" off="${2:-}" agents ans env a n=0 want=0 rev
   agents=$(registry_read | jq -r '.agents // {} | to_entries[] | select((.value.channels // "") | split(",") | index("dashboard")) | .key' 2>/dev/null | head -n 50) || agents=""
-  ans=$(_chat_e2e_admin "$dir" '{"op":"announce","convs":["dashboard"]}') || return 0
+  ans=$(_chat_e2e_admin "$dir" "{\"op\":\"announce\",\"convs\":[\"dashboard\"]${off:+,\"off\":true}}") || return 0
   rev=$(jq -r '.n // empty' <<<"$ans")
   env=$(jq -c '.posts[0].env // empty' <<<"$ans") || return 0
   [[ -n "$env" && "$rev" =~ ^[0-9]+$ ]] || return 0
@@ -164,7 +164,7 @@ _chat_e2e_announce() {
     res=$(_dash_relay_call POST "$(_dash_relay_api_base)/server/messages/event" "$body" "$(_dash_relay_token)" 2>/dev/null) || continue
     [[ "${res%%$'\n'*}" =~ ^2[0-9][0-9]$ ]] && n=$((n + 1))
   done <<<"$agents"
-  if (( n == want )); then _chat_e2e_admin "$dir" "{\"op\":\"announced\",\"n\":$rev}" >/dev/null 2>&1 || true; fi
+  if [[ -z "$off" ]] && (( n == want )); then _chat_e2e_admin "$dir" "{\"op\":\"announced\",\"n\":$rev}" >/dev/null 2>&1 || true; fi
   return 0
 }
 
@@ -322,6 +322,8 @@ _chat_cmd_e2e() {
       # (never a seat, never the API) can say "off". The keys are kept aside.
       local live; live=$(_chat_e2e_live)
       [[ -d "$live" || -d "$live.pairing" ]] || { echo "Encrypted chat is already off."; return 0; }
+      # Every device hears it from the box key first: an app believes no other "off".
+      [[ -f "$live/box.jwk" ]] && { _chat_e2e_announce "$live" off >/dev/null 2>&1 || true; }
       ( umask 022; printf 'turned off at %s by sudo 5dive chat e2e disable\n' "$(date -u +%FT%TZ)" >"$live.off" ) \
         || fail "$E_GENERIC" "cannot write $live.off."
       local d
@@ -624,7 +626,7 @@ export function makeBox(dir: string) {
     }
     if (req.op === 'seal') {
       const m = String(req.m ?? '')
-      if (!/^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,127}$/.test(m) || m.startsWith('roster-')) refuse('a seat may not use that message id')
+      if (!/^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,127}$/.test(m) || m.startsWith('roster-') || m.startsWith('off-')) refuse('a seat may not use that message id')
       // Root writes the type: a seat can never make a body read as a device list.
       let inner: Record<string, unknown>
       if (req.status) inner = { t: 'status', label: String(req.status.label ?? '').slice(0, 200) }
@@ -717,11 +719,15 @@ export function makeBox(dir: string) {
       }
       case 'announce': {
         // The device list, sealed to every device on it, for each conversation.
+        // DIVE-7520: `off` instead tells every device, under the box key, that
+        // the owner turned encryption off here (the one "off" an app believes).
         const r = roster()
         const posts: { conv: string; m: string; env: E.Envelope }[] = []
+        const id = req.off ? `off-${r.n}` : `roster-${r.n}`
+        const body = req.off ? JSON.stringify({ t: 'off', n: r.n }) : rosterBody(r)
         for (const conv of Array.isArray(req.convs) ? req.convs : []) {
           if (typeof conv !== 'string' || !CONV_RE.test(conv)) continue
-          posts.push({ conv, m: `roster-${r.n}`, env: await sealOut(conv, `roster-${r.n}`, rosterBody(r)) })
+          posts.push({ conv, m: id, env: await sealOut(conv, id, body) })
         }
         return { n: r.n, posts }
       }
