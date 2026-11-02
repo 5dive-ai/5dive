@@ -17,7 +17,7 @@
 #   * The seat is derived from SUDO_UID, never from the caller, and it is the
 #     `agent` of every call. So a seat reads, acks and replies as ITSELF only:
 #     narrower than the token, which speaks for every agent on the box.
-#   * Six operations, each a fixed URL: ping (no network, says the rail and the
+#   * Fixed operations, each a fixed URL: ping (no network, says the rail and the
 #     token are there), pending, ack <id>..., event <chat_id> <text> [file]...,
 #     status <chat_id> <0|1> [label] (the live step the chat shows, DIVE-6715)
 #     and ask <chat_id> <text> <question_id> (<label> <description>){2,10} (a
@@ -25,7 +25,10 @@
 #     The root side builds every body with jq. sudo resets the environment, so
 #     the caller cannot redirect the API base. DIVE-6816 adds `pending [wait]`
 #     (a long poll, wait clamped to 25 s) and, for a chat-only box, `fetch
-#     <path>` and `put <path>` (see the block above the root half).
+#     <path>` and `put <path>` (see the block above the root half). DIVE-7502
+#     adds the two sealed ops of an encrypted chat (see the block above the
+#     root half): `event-e2e <chat_id> <envelope> [file.e2e]...` and
+#     `status-e2e <chat_id> <0|1> [envelope]`.
 #   * An ack names only ids this seat's own pending poll returned. The control
 #     plane scopes a DM ack by owner, not by agent, so without this one seat
 #     could mark another agent's messages collected and hold them back.
@@ -257,6 +260,48 @@ with open(dest, "wb") as out:
   rm -f "$out"
 }
 
+# --- DIVE-7502: an encrypted chat (dashboard plugin docs/chat-e2e.md) --------
+# A standard seat on a 5dive server replies through this rail, so a sealed
+# reply needs its own ops; without them the plugin's reply fails closed. The
+# seat seals through `_chat_e2e` (the box key stays root's) and hands this rail
+# only ciphertext:
+#   event-e2e  <chat_id> <envelope> [file]...  the body is ONE envelope (64 KiB,
+#              the API's cap), each file a sealed blob `<seat>-*.e2e` in the
+#              outbox whose bytes are an envelope too (the chat's 20 MB cap). A
+#              plain file never rides an encrypted reply: the owner would get
+#              it from shelld in the clear. The metadata says e2e {v:1}.
+#   status-e2e <chat_id> <0|1> [envelope]      the "working: ..." step, sealed
+#              (8 KiB, the API's cap); no envelope = plain "working".
+# The shape is the API's own check (box -> device: h.v 1, h.d "out"): the API
+# re-checks, but a non-envelope must never leave this rail marked sealed.
+_dash_relay_e2e_body_max()   { printf '%s' 65536; }
+_dash_relay_e2e_status_max() { printf '%s' 8192; }
+_DASH_RELAY_ENVELOPE_JQ='type == "object" and (.h | type) == "object" and .h.v == 1 and .h.d == "out"
+  and (.h.t | type) == "number"
+  and ([.h.s, .h.c, .h.m, .h.salt] | all(type == "string" and length > 0))
+  and (.iv | type) == "string" and (.ct | type) == "string"
+  and (.k | type) == "object" and (.k | length) > 0'
+
+# _dash_relay_envelope_ok <text> <max-bytes> — one envelope, at most max bytes.
+_dash_relay_envelope_ok() {
+  local e="$1" max="$2"
+  (( $(printf '%s' "$e" | wc -c) <= max )) || return 1
+  jq -se "length == 1 and (.[0] | $_DASH_RELAY_ENVELOPE_JQ)" >/dev/null 2>&1 <<<"$e"
+}
+
+# _dash_relay_e2e_file_ok <seat> <path> — a sealed blob of this seat directly
+# in the outbox (`<seat>-*.e2e`), its bytes one envelope within the file cap.
+# Prints the resolved path, or nothing.
+_dash_relay_e2e_file_ok() {
+  local seat="$1" f="$2" real size
+  real=$(_dash_relay_file_ok "$f") || return 1
+  [[ "${real##*/}" == "${seat}-"?*.e2e ]] || return 1
+  size=$(stat -c %s -- "$real" 2>/dev/null) || return 1
+  (( size <= $(_dash_relay_file_max) )) || return 1
+  jq -se "length == 1 and (.[0] | $_DASH_RELAY_ENVELOPE_JQ)" >/dev/null 2>&1 <"$real" || return 1
+  printf '%s' "$real"
+}
+
 # Root half. Reached ONLY through the exact-path NOPASSWD grant (or by root).
 cmd_dashboard_relay() {
   _gate_is_root || fail "$E_PERMISSION" "_dashboard_relay is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
@@ -359,6 +404,38 @@ cmd_dashboard_relay() {
           --args "${wire[@]:4}") \
         || fail "$E_GENERIC" "_dashboard_relay: could not build the question."
       _dash_relay_call POST "${base}/server/messages/event" "$body" "$tok" ;;
+    event-e2e)
+      (( ${#wire[@]} >= 3 && ${#wire[@]} <= 13 )) \
+        || fail "$E_VALIDATION" "_dashboard_relay event-e2e takes a chat id, the envelope and at most 10 sealed files."
+      local chat="${wire[1]}" env="${wire[2]}" f real body
+      [[ "$chat" =~ ^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,127}$ ]] \
+        || fail "$E_VALIDATION" "_dashboard_relay event-e2e: invalid chat id."
+      _dash_relay_envelope_ok "$env" "$(_dash_relay_e2e_body_max)" \
+        || fail "$E_VALIDATION" "_dashboard_relay event-e2e: the body is not one encrypted envelope (at most $(_dash_relay_e2e_body_max) bytes); nothing was sent."
+      local -a files=()
+      for f in "${wire[@]:3}"; do
+        real=$(_dash_relay_e2e_file_ok "$seat" "$f") \
+          || fail "$E_VALIDATION" "_dashboard_relay event-e2e: a file must be this seat's sealed blob in $(_dash_relay_outbox) (${seat}-....e2e, an envelope); nothing was sent ($f)."
+        files+=("$real")
+      done
+      body=$(jq -nc --arg a "$seat" --arg b "$env" --arg c "$chat" '$ARGS.positional as $f
+          | {agent:$a, body:$b, metadata:({chat_id:$c} + (if ($f|length) > 0 then {files:$f} else {} end) + {e2e:{v:1}})}' \
+          --args "${files[@]}") \
+        || fail "$E_GENERIC" "_dashboard_relay: could not build the reply."
+      _dash_relay_call POST "${base}/server/messages/event" "$body" "$tok" ;;
+    status-e2e)
+      (( ${#wire[@]} >= 3 && ${#wire[@]} <= 4 )) \
+        || fail "$E_VALIDATION" "_dashboard_relay status-e2e takes a chat id, 0 or 1, and at most one envelope."
+      local chat="${wire[1]}" flag="${wire[2]}" env="${wire[3]:-}" body
+      [[ "$chat" =~ ^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,127}$ ]] \
+        || fail "$E_VALIDATION" "_dashboard_relay status-e2e: invalid chat id."
+      [[ "$flag" == 0 || "$flag" == 1 ]] || fail "$E_VALIDATION" "_dashboard_relay status-e2e: the flag is 0 or 1."
+      [[ -z "$env" ]] || _dash_relay_envelope_ok "$env" "$(_dash_relay_e2e_status_max)" \
+        || fail "$E_VALIDATION" "_dashboard_relay status-e2e: the label is not one encrypted envelope (at most $(_dash_relay_e2e_status_max) bytes)."
+      body=$(jq -nc --arg a "$seat" --arg c "$chat" --arg f "$flag" --arg l "$env" \
+          '{agent:$a, chat_id:$c, active:($f == "1"), label:(if $l == "" then null else $l end), e2e:{v:1}}') \
+        || fail "$E_GENERIC" "_dashboard_relay: could not build the status."
+      _dash_relay_call POST "${base}/server/messages/status" "$body" "$tok" ;;
     fetch)
       (( ${#wire[@]} == 2 )) || fail "$E_VALIDATION" "_dashboard_relay fetch takes one path."
       local p="${wire[1]}" dir
@@ -374,6 +451,6 @@ cmd_dashboard_relay() {
         || fail "$E_VALIDATION" "_dashboard_relay put: the path must be this seat's file in $(_dash_relay_outbox) (${seat}-...): $p"
       _dash_relay_put "${base}/server/selfhost/files?path=$(_dash_relay_uri "$real")" "$tok" "$real" "$ruid" ;;
     *)
-      fail "$E_VALIDATION" "_dashboard_relay allows only ping, pending, ack, event, status, ask, fetch or put." ;;
+      fail "$E_VALIDATION" "_dashboard_relay allows only ping, pending, ack, event, event-e2e, status, status-e2e, ask, fetch or put." ;;
   esac
 }
