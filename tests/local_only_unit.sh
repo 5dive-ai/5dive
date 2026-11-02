@@ -44,7 +44,7 @@ export FIVE_LOCAL_ONLY_FILE="$TMPD/root/etc/5dive/local-only"
 export FIVE_LOCAL_ONLY_ROOT="$TMPD/root"
 export FIVE_LOCAL_ONLY_TICK=0
 export FIVE_REPORTED_FLAG="$TMPD/reported"
-mkdir -p "$TMPD/root/etc/5dive" "$TMPD/bin" "$TMPD/units"
+mkdir -p "$TMPD/root/etc/5dive" "$TMPD/bin" "$TMPD/units" "$TMPD/mkt"
 
 # shellcheck disable=SC1090
 for f in lib/error_codes.sh lib/output.sh lib/local_only.sh cmd_local_only.sh; do source "src/$f"; done
@@ -121,6 +121,17 @@ REFUSED=(
   "hire lawyer"
   "hire lawyer --from-market --base-url=http://10.0.0.5:8000"
   "market"
+  "plugin marketplace add 5dive-ai/5dive-plugins"
+  "plugin marketplace add https://github.com/acme/plugins.git"
+  "plugin marketplace update"
+  "plugin marketplace upgrade 5dive-plugins"
+  "tool google start"
+  "tool google submit sess1"
+  "tools google start"
+  "hire-link lawyer"
+  "hire-link --create --name=Ada --description=contracts"
+  "hire-link custom-abcdef123456 --hire"
+  "pkg install ripgrep"
 )
 ALLOWED_ON=(
   "agent create bob --type=claude --base-url=http://192.168.1.50:8000/v1 --api-key=-"
@@ -140,6 +151,12 @@ ALLOWED_ON=(
   "task ls"
   "config local-only check"
   "agent list"
+  "plugin marketplace add $TMPD/mkt"
+  "plugin marketplace list"
+  "tool google poll sess1"
+  "tool google cancel sess1"
+  "tool set github"
+  "pkg"
 )
 
 # ── OFF ──────────────────────────────────────────────────────────────────────

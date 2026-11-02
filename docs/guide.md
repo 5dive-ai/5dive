@@ -604,6 +604,8 @@ sudo 5dive config local-only check                   # ok/LEAK per item, then a 
 ```
 
 While it is on, agents must use a model server on your network
-(`--base-url=http://<lan-ip>:<port>`); Telegram, a2a, cloud AI accounts, updates and installs
-from the internet are refused with a one-line reason. `sudo 5dive config local-only off`
+(`--base-url=http://<lan-ip>:<port>`); Telegram, a2a, cloud AI accounts, Google sign-in, hire
+links, updates and installs from the internet (plugins, marketplaces, skills, packs, `pkg
+install`) are refused with a one-line reason. A plugin marketplace from a folder on the box still
+works; an office apt mirror is used with plain `apt` as root. `sudo 5dive config local-only off`
 puts back exactly what it changed.

@@ -150,7 +150,29 @@ local_only_gate() {
       case "$sub" in
         add|install|upgrade|update)
           _lo_source_is_local "${2:-}" || local_only_refuse "Installing plugins from the internet" ;;
+        marketplace)
+          # marketplace add <owner/repo|git-url> git-clones from GitHub; a
+          # folder on this box is copied. upgrade/update re-fetches every git
+          # source (a local one is re-added: remove, then add the folder).
+          case "${2:-}" in
+            add) _lo_source_is_local "${3:-}" || local_only_refuse "Adding a plugin marketplace from the internet" ;;
+            upgrade|update) local_only_refuse "Refreshing plugin marketplaces from the internet" ;;
+          esac ;;
       esac ;;
+    tool|tools)
+      # tool google start|submit run Google's sign-in (accounts.google.com).
+      # poll/cancel only read or stop a local session; set/rm store a key.
+      [[ "$sub" == google ]] && case "${2:-}" in
+        start|submit) local_only_refuse "Signing in to Google" ;;
+      esac ;;
+    hire-link)
+      # Every path calls 5dive's servers: a slug reads the online catalogue and
+      # asks for a link, --create drafts on 5dive, --hire hires through it.
+      local_only_refuse "Hire links (they are made on 5dive's servers)" ;;
+    pkg)
+      # apt fetches from the internet mirrors in the box's sources list. An
+      # office with its own mirror installs as root with apt directly.
+      [[ "$sub" == install ]] && local_only_refuse "Installing system packages from the internet" ;;
     buzz)           [[ "$sub" == enable ]] && local_only_refuse "Buzz" ;;
     account)
       case "$sub" in
