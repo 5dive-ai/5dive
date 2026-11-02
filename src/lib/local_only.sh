@@ -127,7 +127,7 @@ local_only_gate() {
   for a in "$@"; do case "$a" in -h|--help) return 0 ;; esac; done   # asking is never refused
   local top="${1:-}"; shift || true
   local sub="${1:-}"
-  case "$top" in
+  case "${top}" in  # not "$top": install-contract T4 takes the 2nd such line in the bundle as the verb table
     a2a)            local_only_refuse "a2a (messages to agents on other servers)" ;;
     market)         local_only_refuse "The agent market" ;;
     telegram-app)   local_only_refuse "The Telegram app" ;;
