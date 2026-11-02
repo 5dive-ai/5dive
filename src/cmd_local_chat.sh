@@ -114,7 +114,9 @@ _lc_agents_write() {
   local out="$(_lc_etc)/agents.json" names
   names=$("$0" --json agent list 2>/dev/null | jq -c '[.data[]?.name | select(type == "string")]' 2>/dev/null) || names=""
   [[ "$names" == \[* ]] || names='[]'
-  printf '%s\n' "$names" >"$out.tmp" && chmod 0644 "$out.tmp" && mv -f "$out.tmp" "$out"
+  printf '%s\n' "$names" >"$out.tmp" && chmod 0644 "$out.tmp" && mv -f "$out.tmp" "$out" \
+    || warn "local chat: could not write $out (the page's agent list stays as it was)"
+  return 0
 }
 
 _lc_unit_text() {
@@ -191,7 +193,7 @@ _lc_serve() {
     || fail "$E_GENERIC" "local chat: cannot write $(five_api_base_file)."
   printf '%s\n' "Office chat is ON: https://${addr}:${port}" \
     "Connect a phone or laptop: sudo 5dive local pair" \
-    "Restart your agents once so their chat moves here: sudo systemctl restart '5dive-agent@*'"
+    "Restart each agent once so its chat moves here: sudo 5dive agent restart <name>"
 }
 
 _lc_serve_stop() {
