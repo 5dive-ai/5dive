@@ -18,6 +18,82 @@
 local_only_file() { printf '%s' "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}"; }
 local_only_on()   { [[ -e "$(local_only_file)" ]]; }
 
+# DIVE-7573 (D2): the env that keeps Claude Code from dialing out on its own
+# (telemetry, error reports, feature flags, auto-update). The local-only drop-in
+# gives it to every seat's systemd unit; every OTHER Claude Code run 5dive makes
+# (the plugin install at `agent create`, plugin registration, the mod probe)
+# goes through sudo and never sees the unit's env, so it takes these by hand.
+# The third one: at each start Claude Code tries to install its official plugin
+# marketplace (Google storage, then a git clone of GitHub) until that succeeds —
+# offline it never does, so every start dialed out (named in Claude Code
+# 2.1.316's own strings: "Attempting to auto-install official marketplace").
+LOCAL_ONLY_CLAUDE_ENV=(CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1
+  CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1)
+# DIVE-7573 (D4): a seat on a local/custom model. Claude Code defers the chat's
+# reply tool behind tool search, and a small model never calls the search: 0 of
+# 4 replies from qwen3:8b in the DIVE-7560 run, every one with this set.
+LOCAL_MODEL_SEAT_ENV=(ENABLE_TOOL_SEARCH=false)
+
+# `local_only_claude_env` — one `VAR=VALUE` per line when local-only is on,
+# nothing when off. Callers: mapfile -t qe < <(local_only_claude_env); env "${qe[@]}" …
+local_only_claude_env() {
+  local_only_on || return 0
+  printf '%s\n' "${LOCAL_ONLY_CLAUDE_ENV[@]}"
+}
+
+# DIVE-7573 (D3): every Claude Code session start refreshes the GitHub-sourced
+# plugin marketplaces a seat knows (100-180 outside DNS packets per start in the
+# DIVE-7560 run; it alone turned `check` red). On a local-only box a seat's
+# marketplaces are its own checkouts, read in place: `directory` sources, which
+# Claude Code never fetches. A remote one with no checkout on the box is dropped.
+#
+# `seat_marketplaces_local <home> on|off` rewrites one seat's settings.json
+# extraKnownMarketplaces and plugins/known_marketplaces.json, keeping each file's
+# owner and mode. `off` puts our two marketplaces back on GitHub, as a seat
+# created online has them. Idempotent both ways; never fails the caller.
+seat_marketplaces_local() { # <home> on|off
+  local home="$1" mode="$2" s k mk have='[]' n org tmp
+  s="$home/.claude/settings.json"; k="$home/.claude/plugins/known_marketplaces.json"
+  mk="$home/.claude/plugins/marketplaces"
+  for n in "$mk"/*/; do
+    [[ -d "$n" ]] && have=$(jq -c --arg n "$(basename "$n")" '. + [$n]' <<<"$have")
+  done
+  org=$(gh_org 2>/dev/null || printf '5dive-ai')
+  local f filter
+  for f in "$s" "$k"; do
+    [[ -f "$f" ]] || continue
+    if [[ "$f" == "$s" ]]; then
+      filter='if has("extraKnownMarketplaces") then .extraKnownMarketplaces |= (MAP) else . end'
+    else
+      filter='MAP'
+    fi
+    if [[ "$mode" == on ]]; then
+      # MAP: keep directory sources, point a remote one at its checkout, drop
+      # a remote one with none.
+      filter=${filter//MAP/'with_entries(.key as $k |
+        if (.value.source.source // "") == "directory" then .
+        elif ($have | index($k)) != null then
+          .value.source = {source: "directory", path: ($mk + "/" + $k)}
+          | if .value | has("installLocation") then .value.installLocation = ($mk + "/" + $k) else . end
+        else empty end)'}
+    else
+      filter=${filter//MAP/'with_entries(.key as $k |
+        if (.value.source.source // "") == "directory" and (.value.source.path == ($mk + "/" + $k)) then
+          if $k == "5dive-plugins" then .value.source = {source: "github", repo: ($org + "/5dive-plugins")}
+          elif $k == "claude-plugins-official" then .value.source = {source: "github", repo: "anthropics/claude-plugins-official"}
+          else . end
+        else . end)'}
+      [[ "$f" == "$s" ]] && filter="$filter"' | .extraKnownMarketplaces = ({
+          "claude-plugins-official": {source: {source: "github", repo: "anthropics/claude-plugins-official"}},
+          "5dive-plugins": {source: {source: "github", repo: ($org + "/5dive-plugins")}}} + (.extraKnownMarketplaces // {}))'
+    fi
+    tmp=$(jq --argjson have "$have" --arg mk "$mk" --arg org "$org" "$filter" "$f" 2>/dev/null) || continue
+    [[ -n "$tmp" ]] || continue
+    printf '%s\n' "$tmp" > "$f" 2>/dev/null || true   # in place: owner and mode kept
+  done
+  return 0
+}
+
 # DIVE-7558: five_api_base / five_api_base_file live in src/header.sh (the relay
 # and partner harnesses source header.sh, not this file).
 
