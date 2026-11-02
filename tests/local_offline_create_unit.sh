@@ -61,6 +61,8 @@ case "\$1 \$2" in
   "plugin marketplace") exit 1 ;;   # update/add dial GitHub: offline they fail
   "plugin install")
     mkt="\$HOME/.claude/plugins/marketplaces/5dive-plugins"
+    # DIVE-7574: what Claude Code sees when it runs bun install in the checkout.
+    echo "claude-install-env REG=\${NPM_CONFIG_REGISTRY:-} CHECKOUT_PKGS=\$([ -f "\$mkt/plugins/dashboard/node_modules/dep/package.json" ] && echo yes || echo no)" >>"$LOG"
     dest="\$HOME/.claude/plugins/cache/5dive-plugins/dashboard/1"
     mkdir -p "\$dest" && cp -a "\$mkt/plugins/dashboard/." "\$dest/" || exit 1
     printf '{"version":2,"plugins":{"dashboard@5dive-plugins":[{"installPath":"%s"}]}}' "\$dest" \
@@ -76,8 +78,9 @@ DASH="$T/staged-dashboard"
 mkdir -p "$DASH/.claude-plugin" "$DASH/node_modules/dep"
 printf 'console.log(1)\n' >"$DASH/server.ts"
 printf '{"name":"dashboard","version":"0.5.25"}\n' >"$DASH/.claude-plugin/plugin.json"
-printf '{"name":"d","scripts":{"start":"test -f /etc/5dive/local-only -a -d node_modules || bun install --no-summary; bun start.ts"}}\n' >"$DASH/package.json"
+printf '{"name":"d","scripts":{"start":"test -f /etc/5dive/local-only -a -d node_modules || bun install --no-summary; bun start.ts"},"dependencies":{"dep":"^1.0.0"}}\n' >"$DASH/package.json"
 printf 'x\n' >"$DASH/node_modules/dep/index.js"
+printf '{"name":"dep","version":"1.0.0"}\n' >"$DASH/node_modules/dep/package.json"
 export FIVEDIVE_OFFLINE_DASHBOARD_DIR="$DASH"
 
 id() { return 0; }
@@ -108,10 +111,51 @@ grep -q '^claude plugin install dashboard@5dive-plugins' "$LOG" && ok_ 'O4 the p
 PD="$T/home/a/.claude/plugins/cache/5dive-plugins/dashboard/1"
 [[ -f "$PD/node_modules/dep/index.js" ]] && ok_ 'O6 packages copied from the staged copy' || bad_ 'O6 node_modules' "$(ls -la "$PD" 2>&1)"
 [[ "$(git -C "$M" remote get-url origin 2>/dev/null)" == "https://github.com/$(gh_org)/5dive-plugins.git" \
-   && -f "$M/.claude-plugin/marketplace.json" && -f "$M/plugins/dashboard/server.ts" && ! -e "$M/plugins/dashboard/node_modules" ]] \
+   && -f "$M/.claude-plugin/marketplace.json" && -f "$M/plugins/dashboard/server.ts" ]] \
   && ok_ 'O7 the checkout is a marketplace whose origin names GitHub (a later online update works)' \
   || bad_ 'O7 checkout shape' "origin=$(git -C "$M" remote get-url origin 2>&1)"
 [[ -z "$(ls -A "$TMPDIR")" ]] && ok_ 'O8 the stage dir is removed' || bad_ 'O8 stage left' "$(ls -A "$TMPDIR")"
+# DIVE-7574 (N1): Claude Code runs a directory-source plugin IN PLACE, from the checkout.
+grep -q 'claude-install-env .*CHECKOUT_PKGS=yes' "$LOG" && [[ -f "$M/plugins/dashboard/node_modules/dep/package.json" ]] \
+  && ok_ 'N1a the checkout Claude Code runs the plugin from has its packages, BEFORE plugin install' \
+  || bad_ 'N1a checkout packages' "$(grep claude-install-env "$LOG") / $(ls -la "$M/plugins/dashboard" 2>&1)"
+# DIVE-7574 (N2): plugin install's own `bun install` looks up the npm registry unless pointed here.
+grep -q 'claude-install-env REG=http://127.0.0.1:9/ ' "$LOG" \
+  && ok_ 'N2a plugin install runs with the npm registry on this box (no registry lookup)' \
+  || bad_ 'N2a registry env' "$(grep claude-install-env "$LOG")"
+# The self-check reads what the owner will see: a chat that can start.
+FIVEDIVE_AGENT_HOME_ROOT="$T/selfcheck"; mkdir -p "$T/selfcheck"; ln -sfn "$T/home/a" "$T/selfcheck/agent-tap"
+printf '{"%s":{"source":{"source":"directory","path":"%s"}}}' 5dive-plugins "$M" >"$T/home/a/.claude/plugins/known_marketplaces.json"
+export FIVEDIVE_AGENT_HOME_ROOT
+eval "$(sed -n '/^selfcheck_chat_plugin_ready() {/,/^}/p' src/cmd_agent_create.sh)"
+[[ "$(selfcheck_chat_plugin_ready tap dashboard)" == ok:* ]] && ok_ 'SC1 self-check: chat plugin can start' \
+  || bad_ 'SC1 selfcheck ok' "$(selfcheck_chat_plugin_ready tap dashboard)"
+rm -rf "$M/plugins/dashboard/node_modules"; mkdir "$M/plugins/dashboard/node_modules"   # what a blocked first start leaves
+[[ "$(selfcheck_chat_plugin_ready tap dashboard)" == "issue:dashboard chat plugin CANNOT START"* ]] \
+  && ok_ 'SC2 self-check: an empty node_modules where Claude Code runs it is an issue, never PASS (run 3 printed PASS)' \
+  || bad_ 'SC2 selfcheck empty' "$(selfcheck_chat_plugin_ready tap dashboard)"
+# N1b: a second install (or an existing seat) with that empty folder gets it refilled.
+: >"$LOG"; run_install "$T/home/a"; rc=$?
+[[ $rc == 0 && -f "$M/plugins/dashboard/node_modules/dep/package.json" ]] && grep -q 'CHECKOUT_PKGS=yes' "$LOG" \
+  && ok_ 'N1b an EMPTY node_modules (a failed start) in the checkout is replaced, not taken as installed' \
+  || bad_ 'N1b refill' "rc=$rc $(grep claude-install-env "$LOG")"
+printf '{"plugin:dashboard:dashboard":{"timestamp":1}}' >"$T/home/a/.claude/mcp-needs-auth-cache.json"
+[[ "$(selfcheck_chat_plugin_ready tap dashboard)" == "issue:dashboard chat plugin FAILED to start"* ]] \
+  && ok_ "SC3 self-check: Claude Code's cached start failure is an issue" || bad_ 'SC3 selfcheck cache' "$(selfcheck_chat_plugin_ready tap dashboard)"
+rm -f "$T/home/a/.claude/mcp-needs-auth-cache.json"
+# N1c: an EXISTING seat switched by `local-only on` (seat_marketplaces_local) gets its checkout filled.
+H2="$T/home/b"; M2=$(MKT_OF "$H2"); C2="$H2/.claude/plugins/cache/5dive-plugins/dashboard/0.5.0"
+mkdir -p "$M2/.claude-plugin" "$M2/plugins/dashboard" "$C2/node_modules/dep"
+cp "$DASH/package.json" "$M2/plugins/dashboard/"; cp "$DASH/package.json" "$C2/"
+printf '{"name":"dep","from":"cache"}\n' >"$C2/node_modules/dep/package.json"
+printf '{"name":"5dive-plugins","plugins":[{"name":"dashboard","source":"./plugins/dashboard"}]}' >"$M2/.claude-plugin/marketplace.json"
+printf '{"version":2,"plugins":{"dashboard@5dive-plugins":[{"installPath":"%s"}]}}' "$C2" >"$H2/.claude/plugins/installed_plugins.json"
+printf '{"5dive-plugins":{"source":{"source":"github","repo":"5dive-ai/5dive-plugins"},"installLocation":"%s"}}' "$M2" >"$H2/.claude/plugins/known_marketplaces.json"
+printf '{"x":1}' >"$H2/.claude/mcp-needs-auth-cache.json"
+seat_marketplaces_local "$H2" on 2>"$T/sml.err"
+grep -q '"from":"cache"' "$M2/plugins/dashboard/node_modules/dep/package.json" 2>/dev/null && [[ ! -e "$H2/.claude/mcp-needs-auth-cache.json" ]] && [[ ! -s "$T/sml.err" ]] \
+  && ok_ "N1c local-only on: an existing seat's checkout gets its own cache copy's packages; failure cache dropped" \
+  || bad_ 'N1c existing seat' "$(cat "$T/sml.err") $(ls -la "$M2/plugins/dashboard" 2>&1)"
 
 # ── O9-O11: the claude user's own checkout is preferred ─────────────────────
 SRC="$T/claude-checkout"

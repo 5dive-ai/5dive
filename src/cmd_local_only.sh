@@ -14,7 +14,8 @@
 #      and feedback (codex has no env knob for these; the managed layer wins
 #      over each seat's own config.toml);
 #   3. 5dive's own nightly self-update timer, if the owner had turned it on;
-#   4. the OS: unattended-upgrades + apt timers, snap refresh (held), motd-news,
+#   4. the OS: unattended-upgrades + apt timers, snapd (masked when no snap is
+#      installed, else refresh held + store offline, DIVE-7574), motd-news,
 #      apport/whoopsie, ubuntu-advantage/landscape, fwupd refresh, and NTP —
 #      pointed at a LAN server with --ntp=<host>, else timesyncd off.
 #
@@ -42,6 +43,12 @@ LO_OS_UNITS=(
   ua-timer.timer ubuntu-advantage.service landscape-client.service
   fwupd-refresh.timer snapd.snap-repair.timer
 )
+
+# DIVE-7574: snapd's units, masked together on a box with no snap installed.
+LO_SNAPD_UNITS=(snapd.service snapd.socket snapd.seeded.service)
+# A snap is installed when snapd holds a .snap file for it (read from disk, so
+# asking never wakes snapd).
+_lo_snaps_installed() { compgen -G "$(_lo_root)/var/lib/snapd/snaps/*.snap" >/dev/null; }
 
 _lo_have() { command -v "$1" >/dev/null 2>&1; }
 _lo_unit_state() { _lo_have systemctl || { printf 'absent'; return 0; }
@@ -170,9 +177,27 @@ _lo_on() {
     if systemctl disable --now "$u" >/dev/null 2>&1; then _lo_record "unit $u"
     else warn "could not turn off $u"; warned=1; fi
   done
-  if _lo_have snap && ! grep -qxF "snap-hold" "$(_lo_undo)" 2>/dev/null; then
-    if snap refresh --hold >/dev/null 2>&1; then _lo_record "snap-hold"
-    else warn "could not hold snap refresh"; warned=1; fi
+  # DIVE-7574 (N3): holding refreshes was not enough. Any wake of snapd (a
+  # `snap` command, or snapd.seeded at every boot) made it ask the Snap Store
+  # for its catalog: 141-144 blocked lookups each time in the DIVE-7560 run 3.
+  # No snap installed: snapd has nothing to do, so it is masked (never started,
+  # not even at boot). Snaps installed: snapd's own offline mode, plus the hold.
+  if _lo_have snap || [[ -d "$(_lo_root)/var/lib/snapd" ]]; then
+    if ! _lo_snaps_installed; then
+      if ! grep -qxF "snapd-mask" "$(_lo_undo)" 2>/dev/null; then
+        if systemctl mask --now "${LO_SNAPD_UNITS[@]}" >/dev/null 2>&1; then _lo_record "snapd-mask"
+        else warn "could not turn off snapd"; warned=1; fi
+      fi
+    else
+      if ! grep -qxF "snap-hold" "$(_lo_undo)" 2>/dev/null; then
+        if snap refresh --hold >/dev/null 2>&1; then _lo_record "snap-hold"
+        else warn "could not hold snap refresh"; warned=1; fi
+      fi
+      if ! grep -qxF "snap-offline" "$(_lo_undo)" 2>/dev/null; then
+        if snap set system store.access=offline >/dev/null 2>&1; then _lo_record "snap-offline"
+        else warn "could not put snapd offline"; warned=1; fi
+      fi
+    fi
   fi
   local mf; mf=$(_lo_motd)
   if [[ -f "$mf" ]] && grep -q '^ENABLED=1' "$mf"; then
@@ -229,6 +254,9 @@ _lo_off() {
       case "$kind" in
         unit)      systemctl enable --now "$rest" >/dev/null 2>&1 || warn "could not turn $rest back on" ;;
         snap-hold) snap refresh --unhold >/dev/null 2>&1 || warn "could not release the snap hold" ;;
+        snap-offline) snap unset system store.access >/dev/null 2>&1 || warn "could not put snapd back online" ;;
+        snapd-mask) { systemctl unmask "${LO_SNAPD_UNITS[@]}" && systemctl start snapd.socket; } >/dev/null 2>&1 \
+                      || warn "could not turn snapd back on" ;;
         motd-news) [[ -f "$(_lo_motd)" ]] && sed -i 's/^ENABLED=0/ENABLED=1/' "$(_lo_motd)" ;;
         nightly)   declare -F _su_nightly_on >/dev/null && { _su_nightly_on >/dev/null 2>&1 || warn "could not turn nightly self-update back on"; } ;;
         file)      rm -f -- "$rest" ;;
@@ -289,9 +317,14 @@ _lo_check() {
       *) _lo_line ok "$u" off ;;
     esac
   done
-  if _lo_have snap; then
+  if grep -qxF snapd-mask "$(_lo_undo)" 2>/dev/null; then
+    _lo_line ok "snapd (no snaps installed)" off
+  elif _lo_have snap; then
     if grep -qxF snap-hold "$(_lo_undo)" 2>/dev/null; then _lo_line ok "snap auto-refresh" held
     else _lo_line LEAK "snap auto-refresh" on; bad=1; fi
+    # DIVE-7574: the catalog fetch at every snapd wake.
+    if grep -qxF snap-offline "$(_lo_undo)" 2>/dev/null; then _lo_line ok "snap store" offline
+    else _lo_line LEAK "snap store" online; bad=1; fi
   fi
   if [[ -f "$(_lo_motd)" ]] && grep -q '^ENABLED=1' "$(_lo_motd)"; then
     _lo_line LEAK "motd-news" on; bad=1

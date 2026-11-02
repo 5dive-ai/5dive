@@ -1328,7 +1328,7 @@ install_channel_plugin_for_agent() {
     MKT_FROM="$mkt_from" DASH_NM="${FIVEDIVE_OFFLINE_DASHBOARD_DIR:-/usr/local/lib/5dive/dashboard}/node_modules"
     CLAUDE_BIN="${FIVEDIVE_CLAUDE_BIN:-/home/claude/.local/bin/claude}" "${quiet_env[@]}" bash -s)
   local install_rc=0
-  if ! { declare -f marketplace_checkout_settled; cat <<'AGENT_PLUGIN_INSTALL'; } | "${seat_sh[@]}" >&2; then
+  if ! { declare -f marketplace_checkout_settled plugin_deps_complete; cat <<'AGENT_PLUGIN_INSTALL'; } | "${seat_sh[@]}" >&2; then
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
 export NVM_DIR="/home/claude/.nvm"
@@ -1395,6 +1395,25 @@ if [ -z "${MKT_FROM:-}" ]; then
     || "$CLAUDE" plugin marketplace add "$MKT_REPO"
 fi
 
+# DIVE-7574 (N1, N2): offline, Claude Code runs this plugin IN PLACE from the
+# checkout (a directory source), which a git clone leaves with no node_modules:
+# the first start ran `bun install` (blocked), Claude Code cached the failure,
+# and every later start crashed "Cannot find package". So the checkout gets the
+# box's own packages BEFORE the install, which also lets the install's own
+# `bun install --frozen-lockfile` finish with no change (the quiet env points its
+# registry at this box, so it looks nothing up).
+RUN_DIR=""
+if [ -n "${MKT_FROM:-}" ]; then
+  RUN_SRC=$(jq -r --arg p "$PLUGIN" '.plugins[]? | select(.name == $p) | .source | strings' \
+    "$MKT_DIR/.claude-plugin/marketplace.json" 2>/dev/null | head -1) || RUN_SRC=""
+  case "$RUN_SRC" in ""|/*|*..*) ;; *) RUN_DIR="$MKT_DIR/${RUN_SRC#./}" ;; esac
+  if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ] && ! plugin_deps_complete "$RUN_DIR" \
+     && [ "$PLUGIN" = dashboard ] && [ -d "$DASH_NM" ]; then
+    rm -rf "$RUN_DIR/node_modules" && cp -a "$DASH_NM" "$RUN_DIR/node_modules" \
+      && echo "    Packages: copied from $DASH_NM into the checkout (offline, Claude Code runs it from there)"
+  fi
+fi
+
 yes | "$CLAUDE" plugin install "${PLUGIN}@${MARKETPLACE}" >/dev/null || true
 # DIVE-4852: the install above STARTS the plugin's MCP server, before this agent's
 # channel secret exists on disk, and Claude Code caches that failure for 15 minutes
@@ -1429,9 +1448,13 @@ cd "$PLUGIN_DIR"
 # DIVE-7566: offline, the packages come from the root-staged dashboard copy
 # (install.sh ran its install online); npm would only fail.
 if [ -n "${MKT_FROM:-}" ]; then
-  if [ ! -d node_modules ] && [ "$PLUGIN" = dashboard ] && [ -d "$DASH_NM" ]; then
-    cp -a "$DASH_NM" ./node_modules && echo "    Packages: copied from $DASH_NM (offline)"
+  # DIVE-7574: "complete", not "exists" — a failed start leaves an empty folder.
+  if ! plugin_deps_complete . && [ "$PLUGIN" = dashboard ] && [ -d "$DASH_NM" ]; then
+    rm -rf ./node_modules && cp -a "$DASH_NM" ./node_modules && echo "    Packages: copied from $DASH_NM (offline)"
   fi
+  for d in "$PLUGIN_DIR" ${RUN_DIR:+"$RUN_DIR"}; do
+    plugin_deps_complete "$d" || echo "    WARNING: ${PLUGIN} has no packages in $d and this box holds none to give it: the chat will not start" >&2
+  done
 else
   timeout 60 npm install --omit=dev --ignore-scripts --no-audit --no-fund 2>&1 | tail -5
 fi
