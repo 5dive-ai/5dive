@@ -302,6 +302,14 @@ grep -qx -- '--max-filesize' "$CALLS" && grep -qx 20971520 "$CALLS" \
   && ok 'fetch caps the download at 20 MB' || bad "fetch cap ($(cat "$CALLS"))"
 token_safe tok-two && ok 'fetch: bearer on stdin, not argv' || bad 'fetch bearer placement'
 [[ -z "$(find "$UP/tap" -mindepth 1 ! -name 1760000000000-photo.png)" ]] && ok 'fetch leaves no temp file' || bad 'fetch leaves no temp file'
+# DIVE-7520: a seat with its own group gets its incoming files 0640 in a 0750
+# dir of that group: no other seat can read them.
+F7520="$UP/tap/1760000000009-secret.e2e"
+FIVEDIVE_CHAT_SEAT_GROUP="$(id -gn)" CURL_BODY='sealed bytes' run_root 1042 fetch "$F7520"; rc=$?
+[[ $rc == 0 && "$(stat -c %a "$F7520")" == 640 && "$(stat -c %a "$UP/tap")" == 750 \
+   && "$(stat -c %G "$F7520")" == "$(id -gn)" && "$(stat -c %G "$UP/tap")" == "$(id -gn)" ]] \
+  && ok "DIVE-7520 fetch: the seat's own group, 0640 file in a 0750 dir" || bad "DIVE-7520 fetch posture (rc=$rc, $(ls -la "$UP/tap"))"
+rm -f "$F7520"; chmod 0755 "$UP/tap"
 F2="$UP/tap/1760000000001-gone.webm"
 CURL_CODE=404 CURL_BODY='{"error":"not held"}' run_root 1042 fetch "$F2"; rc=$?
 [[ $rc == 0 && "$(head -1 "$TMP/out")" == 404 && ! -e "$F2" ]] && ok 'fetch passes a 404 through and writes nothing' || bad "fetch 404 (rc=$rc)"
