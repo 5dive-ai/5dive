@@ -222,28 +222,38 @@ for _ in $(seq 1 50); do [[ -s "$TMP/port" ]] && break; sleep 0.1; done
 P=$(cat "$TMP/port" 2>/dev/null)
 [[ -n "$P" ]] || { echo "FATAL - stub server did not start"; exit 1; }
 CUSTOM_AI_TEST_TIMEOUT=10
-at() {   # <base> <model> <harness> [key] → "ok|format|reason|rc"
+at() {   # <base> <model> <harness> [key] → "envelope.ok|data.ok|data.format|data.reason|rc"
+  # The app parses the envelope's data (DIVE-7569); a probe that ran is a result,
+  # so the envelope is ok:true and rc 0 even on a NOT OK verdict.
   local o rc
   o=$( (JSON_MODE=1; printf '%s' "${4:-}" | cmd_account_test --base-url="$1" --model="$2" --harness="$3" --api-key=-) 2>/dev/null); rc=$?
-  printf '%s|%s' "$(jq -r '[.ok, .format, .reason] | map(tostring) | join("|")' <<<"$o" 2>/dev/null)" "$rc"
+  printf '%s|%s' "$(jq -r '[.ok, .data.ok, .data.format, .data.reason] | map(tostring) | join("|")' <<<"$o" 2>/dev/null)" "$rc"
 }
 B="http://127.0.0.1:$P/both/v1"; C="http://127.0.0.1:$P/chatonly/v1"
-eq_t "TEST: claude on a server that speaks both → ok, anthropic" "true|anthropic|null|0" "$(at "$B" good claude)"
-eq_t "TEST: pi → ok, openai" "true|openai|null|0" "$(at "$B" good pi)"
-eq_t "TEST: codex → ok, openai (Responses API)" "true|openai|null|0" "$(at "$B" good codex)"
-eq_t "TEST: nothing listening → unreachable" "false|null|unreachable|1" "$(at "http://127.0.0.1:9/v1" good hermes)"
-eq_t "TEST: a refused key → bad_key" "false|null|bad_key|1" "$(at "$B" good opencode wrong-key)"
-eq_t "TEST: an unknown model → no_such_model" "false|null|no_such_model|1" "$(at "$B" missing openclaw)"
-eq_t "TEST: a tool call written as text (qwen3:4b, DIVE-7560) → no_tools" "false|openai|no_tools|1" "$(at "$B" texty pi)"
-eq_t "TEST: a model that refuses tools → no_tools" "false|openai|no_tools|1" "$(at "$B" notools hermes)"
-eq_t "TEST: claude on an OpenAI-only server → wrong_format, format openai" "false|openai|wrong_format|1" "$(at "$C" good claude)"
-eq_t "TEST: codex on a chat-only server → wrong_format, format openai" "false|openai|wrong_format|1" "$(at "$C" good codex)"
-eq_t "TEST: hermes on the same chat-only server → ok" "true|openai|null|0" "$(at "$C" good hermes)"
+eq_t "TEST: claude on a server that speaks both → ok, anthropic" "true|true|anthropic|null|0" "$(at "$B" good claude)"
+eq_t "TEST: pi → ok, openai" "true|true|openai|null|0" "$(at "$B" good pi)"
+eq_t "TEST: codex → ok, openai (Responses API)" "true|true|openai|null|0" "$(at "$B" good codex)"
+eq_t "TEST: nothing listening → unreachable" "true|false|null|unreachable|0" "$(at "http://127.0.0.1:9/v1" good hermes)"
+eq_t "TEST: a refused key → bad_key" "true|false|null|bad_key|0" "$(at "$B" good opencode wrong-key)"
+eq_t "TEST: an unknown model → no_such_model" "true|false|null|no_such_model|0" "$(at "$B" missing openclaw)"
+eq_t "TEST: a tool call written as text (qwen3:4b, DIVE-7560) → no_tools" "true|false|openai|no_tools|0" "$(at "$B" texty pi)"
+eq_t "TEST: a model that refuses tools → no_tools" "true|false|openai|no_tools|0" "$(at "$B" notools hermes)"
+eq_t "TEST: claude on an OpenAI-only server → wrong_format, format openai" "true|false|openai|wrong_format|0" "$(at "$C" good claude)"
+eq_t "TEST: codex on a chat-only server → wrong_format, format openai" "true|false|openai|wrong_format|0" "$(at "$C" good codex)"
+eq_t "TEST: hermes on the same chat-only server → ok" "true|true|openai|null|0" "$(at "$C" good hermes)"
 : > "$TMP/req.log"; at "$B" good claude sk-local-9 >/dev/null
 grep -q '^/both/v1/messages Bearer sk-local-9 sk-local-9$' "$TMP/req.log" \
   && ok_t "TEST: the key reaches the server as a header (anthropic: x-api-key + bearer)" || bad_t "TEST: key header: $(cat "$TMP/req.log")"
 out=$( (JSON_MODE=1; cmd_account_test --base-url=http://203.0.113.9/v1 --model=m --harness=pi </dev/null) 2>&1); rc=$?
 [[ $rc -eq $E_VALIDATION && "$out" == *"invalid --base-url"* ]] && ok_t "TEST: a public http:// address is refused before any request" || bad_t "TEST: public http rc=$rc $out"
+for u in "http://127.0.0.1:$P/both/v1?x=1" "http://127.0.0.1:$P/both/v1#f"; do
+  out=$( (JSON_MODE=1; cmd_account_test --base-url="$u" --model=good --harness=codex </dev/null) 2>&1); rc=$?
+  [[ $rc -eq $E_VALIDATION && "$out" == *"no ? or #"* ]] && ok_t "TEST: a ? or # in the address is refused (${u##*v1})" || bad_t "TEST: ?/# rc=$rc $out"
+done
+out=$( (JSON_MODE=1; cmd_account_add_custom o4 --provider=custom --base-url="http://127.0.0.1:1/v1?x=1" --model=m --harness=pi </dev/null) 2>&1); rc=$?
+[[ $rc -ne 0 && "$out" == *"no ? or #"* ]] && ok_t "SAVE: a ? in the address is refused" || bad_t "SAVE: ? rc=$rc $out"
+out=$( (JSON_MODE=0; printf '' | cmd_account_test --base-url=http://127.0.0.1:9/v1 --model=m --harness=pi --api-key=-) 2>/dev/null); rc=$?
+[[ $rc -eq 0 && "$out" == "NOT OK (unreachable) — "* ]] && ok_t "TEST: text mode prints NOT OK (reason) and exits 0 (a probe that ran is a result)" || bad_t "TEST: text rc=$rc $out"
 
 # ── LOCAL ───────────────────────────────────────────────────────────────────
 : > "$FIVE_LOCAL_ONLY_FILE"

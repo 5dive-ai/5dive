@@ -67,6 +67,10 @@ _custom_ai_read_key() {
 _custom_ai_check_url() {
   valid_base_url "$1" \
     || fail "$E_VALIDATION" "invalid --base-url '${1:0:120}' (https:// anywhere; http:// only to this box or an office address: 10.x, 172.16-31.x, 192.168.x, 127.x)"
+  # Every harness and the probe APPEND a path (/responses, /chat/completions,
+  # /v1/messages); after a '?' or '#' that path lands in the query or fragment.
+  [[ "$1" != *[?#]* ]] \
+    || fail "$E_VALIDATION" "invalid --base-url '${1:0:120}' (no ? or # in the address: the server path is added after it)"
 }
 
 _custom_ai_check_model() {
@@ -287,7 +291,7 @@ cmd_account_test() {
   _custom_ai_check_model "$model"
   key=$(_custom_ai_read_key "$key") || exit $?
 
-  local want wire v reason="" format="" r_want="" r_other=""
+  local want wire v reason="" format="" r_want=""
   want=$(custom_ai_harness_wire "$harness")
   # The harness's own format first: when it works, that is the whole answer.
   r_want=$(_custom_ai_probe "$want" "$url" "$model" "$key")
@@ -333,15 +337,22 @@ cmd_account_test() {
         say="the server answered, but not as an AI model server ${harness} can use"
       fi ;;
   esac
+  # A probe that ran is a RESULT, not a CLI error: the verdict rides the normal
+  # envelope ({ok:true, data:{ok, format, reason, ...}}) and the verb exits 0.
+  # fail() stays for usage and validation errors only. The app reads data.ok
+  # and data.reason (DIVE-7569).
+  local prose="$say"
+  [[ "$good" == true ]] || prose="NOT OK (${reason}) — $say"
   if (( JSON_MODE )); then
-    jq -cn --argjson ok "$good" --arg f "$fam" --arg r "$reason" --arg h "$harness" --arg m "$model" \
-           --arg u "$url" --arg w "$( [[ "$want" == anthropic ]] && echo anthropic || echo openai )" --arg s "$say" \
+    ok "$prose" \
       '{ok:$ok, format:(if $f=="" then null else $f end), reason:(if $r=="" then null else $r end),
-        harness:$h, model:$m, baseUrl:$u, needs:$w, message:$s}'
+        harness:$h, model:$m, baseUrl:$u, needs:$w, message:$s}' \
+      --argjson ok "$good" --arg f "$fam" --arg r "$reason" --arg h "$harness" --arg m "$model" \
+      --arg u "$url" --arg w "$( [[ "$want" == anthropic ]] && echo anthropic || echo openai )" --arg s "$say"
+  elif [[ "$good" == true ]]; then
+    echo "OK — $say"
   else
-    if [[ "$good" == true ]]; then echo "OK — $say"; else echo "NOT OK (${reason}) — $say"; fi
+    echo "$prose"
   fi
-  [[ "$good" == true ]] && return 0
-  mark_reported
-  exit 1
+  return 0
 }
