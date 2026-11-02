@@ -4375,6 +4375,15 @@ _gate_cgroup_human_capable() {
   # guard. Only logind (root) creates a scope DIRECTLY under user-<uid>.slice.
   [[ "$cg" =~ ^/user\.slice/user-[0-9]+\.slice/session-[^/]+\.scope$ ]] && return 0
 
+  # ACCEPT 3 — THE OFFICE CONTROL PANEL (DIVE-7576). A local-only box has no
+  # dashboard; the owner answers gates from the box's own /panel page, on a
+  # device paired with an owner code only root mints (`local pair --owner`).
+  # The answer reaches `task answer` through the panel's one root entry: a
+  # socket-activated instance of 5dive-local-panel@.service (Accept=yes, so
+  # systemd places it under the template's slice). Same residual as ACCEPT 1:
+  # a root-equivalent seat can start a unit under that name.
+  [[ "$cg" =~ ^/system\.slice/system-5dive\\x2dlocal\\x2dpanel\.slice/5dive-local-panel@[^/]+\.service$ ]] && return 0
+
   # Everything else refused: agent units, the primary claude runtime, an
   # unreadable cgroup, a non-systemd host. An unresolved principal is not a
   # verified one — the same rule the served/expected commit checks use.

@@ -21,7 +21,7 @@ _local_chat_server_ts() {
 // the LAN hop, so an e2e envelope posted here is refused, never stored.
 //
 //   bun local_chat_server.ts serve
-//   bun local_chat_server.ts admin pair-add <sha256-hex> <expires-epoch-s>
+//   bun local_chat_server.ts admin pair-add <sha256-hex> <expires-epoch-s> [chat|owner]
 //   bun local_chat_server.ts admin devices-ls
 //   bun local_chat_server.ts admin devices-revoke <id>
 import { Database } from "bun:sqlite";
@@ -44,6 +44,8 @@ const FILE_MAX = Number(env.LC_FILE_MAX || 20 * 1024 * 1024);
 const WAIT_MAX = 25;
 const AGENT_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const NOTICE_AGENT = "5dive";
+// DIVE-7576: the office control panel's one door to root (src/cmd_local_panel.sh).
+const PANEL_SOCK = env.LC_PANEL_SOCK || "/run/5dive-local-panel.sock";
 
 mkdirSync(join(STATE, "files"), { recursive: true, mode: 0o700 });
 const db = new Database(join(STATE, "chat.db"), { create: true });
@@ -69,6 +71,12 @@ CREATE TABLE IF NOT EXISTS files (
   path TEXT PRIMARY KEY, blob TEXT NOT NULL, name TEXT NOT NULL, size INTEGER NOT NULL, created INTEGER NOT NULL
 );
 `);
+// DIVE-7576: device roles. A device paired before roles existed is chat-only.
+// Added in place on a live db (CREATE TABLE IF NOT EXISTS never adds a column).
+for (const [t, col] of [["devices", "role"], ["pair_codes", "role"]]) {
+  const cols = db.query(`PRAGMA table_info(${t})`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE ${t} ADD COLUMN role TEXT NOT NULL DEFAULT 'chat'`);
+}
 
 const now = () => Math.floor(Date.now() / 1000);
 const sha256 = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
@@ -78,18 +86,19 @@ const json = (body: unknown, status = 200, headers: Record<string, string> = {})
 // ── admin (run as the server user by the CLI; never over the network) ────────
 if (process.argv[2] === "admin") {
   const [op, a, b] = process.argv.slice(3);
-  if (op === "pair-add" && /^[0-9a-f]{64}$/.test(a || "") && /^\d+$/.test(b || "")) {
+  const role = process.argv[6] ?? "chat";
+  if (op === "pair-add" && /^[0-9a-f]{64}$/.test(a || "") && /^\d+$/.test(b || "") && (role === "chat" || role === "owner")) {
     db.query("DELETE FROM pair_codes WHERE expires < ? OR used = 1").run(now());
-    db.query("INSERT OR REPLACE INTO pair_codes (hash, expires) VALUES (?, ?)").run(a, Number(b));
+    db.query("INSERT OR REPLACE INTO pair_codes (hash, expires, role) VALUES (?, ?, ?)").run(a, Number(b), role);
     console.log(JSON.stringify({ ok: true }));
   } else if (op === "devices-ls") {
-    console.log(JSON.stringify(db.query("SELECT id, name, created, last_seen, revoked FROM devices ORDER BY created").all()));
+    console.log(JSON.stringify(db.query("SELECT id, name, role, created, last_seen, revoked FROM devices ORDER BY created").all()));
   } else if (op === "devices-revoke" && /^[a-f0-9]{8,32}$/.test(a || "")) {
     const r = db.query("UPDATE devices SET revoked = 1 WHERE id = ? AND revoked = 0").run(a);
     console.log(JSON.stringify({ ok: r.changes > 0 }));
     process.exit(r.changes > 0 ? 0 : 3);
   } else {
-    console.error("usage: admin pair-add <sha256> <expires> | devices-ls | devices-revoke <id>");
+    console.error("usage: admin pair-add <sha256> <expires> [chat|owner] | devices-ls | devices-revoke <id>");
     process.exit(2);
   }
   process.exit(0);
@@ -310,11 +319,12 @@ async function boxSide(req: Request, url: URL): Promise<Response> {
 }
 
 // ── browser side ──────────────────────────────────────────────────────────────
-function deviceOf(req: Request): { id: string; name: string } | null {
+type Device = { id: string; name: string; role: string };
+function deviceOf(req: Request): Device | null {
   const m = (req.headers.get("cookie") ?? "").match(/(?:^|;\s*)lc_dev=([A-Za-z0-9_-]{20,100})/);
   if (!m) return null;
-  const d = db.query("SELECT id, name FROM devices WHERE cookie_hash = ? AND revoked = 0").get(sha256(m[1])) as
-    | { id: string; name: string } | null;
+  const d = db.query("SELECT id, name, role FROM devices WHERE cookie_hash = ? AND revoked = 0").get(sha256(m[1])) as
+    | Device | null;
   if (d) db.query("UPDATE devices SET last_seen = ? WHERE id = ?").run(now(), d.id);
   return d;
 }
@@ -322,8 +332,8 @@ function deviceOf(req: Request): { id: string; name: string } | null {
 const pairTries: number[] = [];
 async function browserSide(req: Request, url: URL): Promise<Response> {
   const p = url.pathname;
-  if (p === "/" && req.method === "GET")
-    return new Response(PAGE, {
+  if ((p === "/" || p === "/panel") && req.method === "GET")
+    return new Response(p === "/" ? PAGE : PANEL_PAGE, {
       headers: {
         "content-type": "text/html; charset=utf-8",
         "content-security-policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: blob:",
@@ -343,15 +353,17 @@ async function browserSide(req: Request, url: URL): Promise<Response> {
     let b: { code?: unknown; name?: unknown };
     try { b = await req.json(); } catch { return json({ error: "invalid body" }, 400); }
     const code = typeof b.code === "string" ? b.code.replace(/[\s-]/g, "").toUpperCase() : "";
-    const row = db.query("SELECT hash FROM pair_codes WHERE hash = ? AND used = 0 AND expires >= ?").get(sha256(code), now());
+    const row = db.query("SELECT hash, role FROM pair_codes WHERE hash = ? AND used = 0 AND expires >= ?").get(sha256(code), now()) as
+      | { hash: string; role: string } | null;
     if (!code || !row) return json({ error: "That code is wrong or expired." }, 403);
     db.query("UPDATE pair_codes SET used = 1 WHERE hash = ?").run(sha256(code));
     const cookie = randomBytes(32).toString("base64url");
     const id = randomBytes(6).toString("hex");
     const name = (typeof b.name === "string" ? b.name : "").replace(/[^\w .'-]/g, "").slice(0, 40) || "device";
-    db.query("INSERT INTO devices (id, name, cookie_hash, created, last_seen) VALUES (?, ?, ?, ?, ?)")
-      .run(id, name, sha256(cookie), now(), now());
-    return json({ ok: true, device: id }, 200, {
+    const role = row.role === "owner" ? "owner" : "chat";
+    db.query("INSERT INTO devices (id, name, cookie_hash, created, last_seen, role) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(id, name, sha256(cookie), now(), now(), role);
+    return json({ ok: true, device: id, role }, 200, {
       "set-cookie": `lc_dev=${cookie}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=31536000`,
     });
   }
@@ -363,6 +375,7 @@ async function browserSide(req: Request, url: URL): Promise<Response> {
     const last = db.query("SELECT * FROM messages WHERE agent = ? ORDER BY id DESC LIMIT 1");
     return json({
       device: dev.name,
+      role: dev.role,
       agents: agents().map((name) => {
         const l = last.get(name) as Row | null;
         return { name, status: status.get(name) ?? null, last: l ? serialize(l) : null };
@@ -416,6 +429,84 @@ async function browserSide(req: Request, url: URL): Promise<Response> {
     return json({ ok: true, path, name, size: bytes.length });
   }
   if (p === "/api/files" && req.method === "GET") return serveFile(url.searchParams.get("path") ?? "", true);
+  if (p.startsWith("/api/panel/")) return panelSide(req, p, dev);
+  return json({ error: "not found" }, 404);
+}
+
+// ── panel side (DIVE-7576): owner devices only ───────────────────────────────
+// Every action goes to root through the one socket (panelExec); this process
+// never acts as root and passes only the verb and fixed-position arguments.
+// The root side re-checks every argument (src/cmd_local_panel.sh).
+type PanelReply = { ok: boolean; data?: any; error?: string };
+function panelExec(argv: string[], device: string, input = "", timeoutMs = 900_000): Promise<PanelReply> {
+  // Bun.connect, not node:net: the request ends with a half-close (the root
+  // side reads the value to EOF), and Bun's node:net client drops the answer
+  // after end(). shutdown() sends FIN and keeps reading.
+  return new Promise((resolve) => {
+    const chunks: Uint8Array[] = [];
+    let done = false;
+    const finish = (r: PanelReply) => { if (!done) { done = true; clearTimeout(t); resolve(r); } };
+    const down = () => finish({ ok: false, error: "The panel helper is not running. On the server: sudo 5dive local serve" });
+    let sock: { end(): void } | null = null;
+    const t = setTimeout(() => { sock?.end(); finish({ ok: false, error: "that took too long" }); }, timeoutMs);
+    Bun.connect({
+      unix: PANEL_SOCK,
+      socket: {
+        open(s) { sock = s; s.write(JSON.stringify({ argv, device }) + "\n"); if (input) s.write(input); s.shutdown(); },
+        data(_s, d) { chunks.push(d); },
+        close() {
+          try { finish(JSON.parse(Buffer.concat(chunks).toString("utf8").trim() || "null") ?? { ok: false, error: "no answer" }); }
+          catch { finish({ ok: false, error: "the panel helper gave an answer this page cannot read" }); }
+        },
+        error() { down(); },
+        connectError() { down(); },
+      },
+    }).catch(down);
+  });
+}
+const reply = (r: PanelReply) => json(r, r.ok ? 200 : 422);
+const str = (v: unknown, max = 200) => (typeof v === "string" && v.length <= max ? v : "");
+
+async function panelSide(req: Request, p: string, dev: Device): Promise<Response> {
+  if (dev.role !== "owner")
+    return json({ error: "This device can chat but not manage the office server. Pair it as an owner: sudo 5dive local pair --owner", reason: "not_owner" }, 403);
+  const get = req.method === "GET", post = req.method === "POST";
+  let b: Record<string, unknown> = {};
+  if (post) { try { b = await req.json(); } catch { return json({ error: "invalid body" }, 400); } }
+  if (p === "/api/panel/team" && get) return reply(await panelExec(["team"], dev.id));
+  if (p === "/api/panel/team" && post) {
+    const verb = ({ add: "agent-add", restart: "agent-restart", remove: "agent-remove" } as Record<string, string>)[str(b.action)];
+    const name = str(b.name, 16);
+    if (!verb || !AGENT_RE.test(name)) return json({ error: "Names are lowercase letters, digits and dashes, up to 16." }, 400);
+    return reply(await panelExec([verb, name], dev.id));
+  }
+  if (p === "/api/panel/board" && get) return reply(await panelExec(["board"], dev.id));
+  if (p === "/api/panel/answer" && post) {
+    const ident = str(b.ident, 20), value = str(b.value);
+    if (!ident || !value) return json({ error: "invalid answer" }, 400);
+    return reply(await panelExec(["gate-answer", ident, value], dev.id));
+  }
+  if (p === "/api/panel/secrets" && get) return reply(await panelExec(["secrets"], dev.id));
+  if (p === "/api/panel/secrets" && post) {
+    const name = str(b.name, 64), value = typeof b.value === "string" ? b.value : "";
+    if (!name || !value || value.length > 8192) return json({ error: "A secret needs a name and a value (up to 8 KB)." }, 400);
+    return reply(await panelExec(["secret-set", name], dev.id, value));
+  }
+  if (p === "/api/panel/settings" && get) {
+    const r = await panelExec(["settings"], dev.id);
+    const devices = db.query("SELECT id, name, role, created, last_seen FROM devices WHERE revoked = 0 ORDER BY created").all();
+    return reply(r.ok ? { ok: true, data: { ...r.data, devices, me: dev.id } } : r);
+  }
+  if (p === "/api/panel/test" && post) {
+    const account = str(b.account, 32);
+    if (!account) return json({ error: "invalid account" }, 400);
+    return reply(await panelExec(["account-test", account], dev.id, "", 120_000));
+  }
+  if (p === "/api/panel/revoke" && post) {
+    const id = str(b.id, 32);
+    if (!/^[a-f0-9]{8,32}$/.test(id)) return json({ error: "invalid device" }, 400);
+    return reply(await panelExec(["device-revoke", id], dev.id));
+  }
   return json({ error: "not found" }, 404);
 }
 
@@ -472,7 +563,7 @@ form.send textarea{flex:1;resize:none;height:44px;max-height:140px;padding:11px 
 .pair .btn{width:100%;max-width:320px}.err{color:#dc2626;min-height:22px;margin-top:12px}
 .empty{padding:40px 24px;text-align:center;color:var(--mute)}
 </style></head><body>
-<header><button id="back" hidden>&larr; Back</button><h1 id="title">Office chat</h1></header>
+<header><button id="back" hidden>&larr; Back</button><h1 id="title">Office chat</h1><a id="manage" href="/panel" hidden style="color:var(--accent);text-decoration:none;font-size:15px">⚙️ Manage</a></header>
 <main id="app"></main>
 <script>
 const $ = (s) => document.querySelector(s);
@@ -513,6 +604,7 @@ async function showList() {
     if (view !== "list") return;
     try {
       const j = await api("/api/agents");
+      $("#manage").hidden = j.role !== "owner";
       if (!j.agents.length) { app.innerHTML = '<div class="empty">No agents yet. They show up here when they start.</div>'; }
       else app.innerHTML = '<nav class="list">' + j.agents.map((a) => {
         const st = a.status && a.status.active ? '<span class="live">' + esc(a.status.label ? "Working: " + a.status.label : "Working…") + "</span>"
@@ -579,6 +671,149 @@ async function showThread(agent) {
 back.onclick = () => { location.hash = ""; };
 const route = () => { const a = decodeURIComponent(location.hash.slice(1)); a ? showThread(a) : showList(); };
 window.onhashchange = route; route();
+</script></body></html>`;
+
+// ── the panel page (DIVE-7576): owner devices; same look as the chat ─────────
+const PANEL_PAGE = /*html*/ `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Office server</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#14171c;--mute:#667085;--line:#e4e7ec;--accent:#2563eb;--live:#16a34a;--warn:#b45309;--bad:#dc2626}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--ink:#eef0f3;--mute:#98a2b3;--line:#262b35;--accent:#60a5fa;--live:#22c55e;--warn:#f5b041;--bad:#f87171}}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+header{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:10px;padding:14px 16px;background:var(--card);border-bottom:1px solid var(--line)}
+header h1{margin:0;font-size:18px;flex:1}header a{color:var(--accent);text-decoration:none;font-size:15px}
+main{max-width:720px;margin:0 auto;padding:12px 16px 96px}
+nav.tabs{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
+nav.tabs button{flex:1;border:0;background:none;color:var(--mute);font-size:12px;padding:8px 0 10px;cursor:pointer}
+nav.tabs button b{display:block;font-size:22px;font-weight:400}nav.tabs button.on{color:var(--accent)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:0 0 12px}
+.card h3{margin:0 0 4px;font-size:16px}.mute{color:var(--mute);font-size:14px}
+.item{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line)}.item:first-of-type{border-top:0}
+.item .grow{flex:1;min-width:0}.item .grow b{display:block}.item .grow span{color:var(--mute);font-size:14px}
+.dot{flex:none;width:10px;height:10px;border-radius:50%;background:var(--mute)}.dot.on{background:var(--live)}.dot.bad{background:var(--bad)}
+.btn{border:0;border-radius:999px;background:var(--accent);color:#fff;font-size:15px;font-weight:600;padding:9px 16px;cursor:pointer}
+.btn.line{background:transparent;color:var(--accent);border:1px solid var(--accent)}.btn.red{background:transparent;color:var(--bad);border:1px solid var(--bad)}
+.btn:disabled{opacity:.5}.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.row .btn{text-transform:capitalize}
+input{width:100%;padding:12px;font:inherit;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);margin:6px 0}
+.ok{color:var(--live)}.leak{color:var(--bad);font-weight:600}.big{font-size:20px;font-weight:600;margin:4px 0}
+.toast{position:fixed;left:16px;right:16px;bottom:84px;margin:auto;max-width:520px;padding:12px 14px;border-radius:12px;background:var(--ink);color:var(--bg);display:none}
+.empty{padding:32px 8px;text-align:center;color:var(--mute)}
+</style></head><body>
+<header><h1 id="title">Office server</h1><a href="/">💬 Chat</a></header>
+<main id="app"><div class="empty">Loading…</div></main>
+<div class="toast" id="toast"></div>
+<nav class="tabs" id="tabs" hidden>
+<button data-t="team"><b>👥</b>Team</button><button data-t="board"><b>✅</b>Approvals</button>
+<button data-t="secrets"><b>🔑</b>Secrets</button><button data-t="settings"><b>⚙️</b>Settings</button></nav>
+<script>
+const $ = (s) => document.querySelector(s);
+const app = $("#app");
+const H = { "content-type": "application/json", "x-local-chat": "1" };
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+let tab = "team";
+function toast(t) { const e = $("#toast"); e.textContent = t; e.style.display = "block"; clearTimeout(e._t); e._t = setTimeout(() => { e.style.display = "none"; }, 4000); }
+async function api(path, body) {
+  const r = await fetch(path, body ? { method: "POST", headers: H, body: JSON.stringify(body) } : { credentials: "same-origin" });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401) { location.href = "/"; throw new Error("Pair this device first."); }
+  if (r.status === 403) { blocked(j.error); throw new Error(j.error); }
+  if (!r.ok || j.ok === false) throw new Error(j.error || "That did not work.");
+  return j.data;
+}
+function blocked(msg) {
+  $("#tabs").hidden = true;
+  app.innerHTML = '<div class="card"><h3>This device can chat, not manage</h3><p class="mute">' + esc(msg) + '</p><a class="btn" href="/" style="display:inline-block;text-decoration:none">Go to chat</a></div>';
+}
+async function act(btn, path, body, done) {
+  btn.disabled = true; const t = btn.textContent; btn.textContent = "Working…";
+  try { await api(path, body); toast(done); show(tab); } catch (e) { toast(e.message); btn.disabled = false; btn.textContent = t; }
+}
+const views = {
+  async team() {
+    const d = await api("/api/panel/team");
+    const list = Array.isArray(d) ? d : (d && d.agents) || [];
+    app.innerHTML = '<div class="card"><h3>Your agents</h3>' + (list.length ? list.map((a) => {
+      const up = String(a.active || a.state || "") === "active";
+      return '<div class="item"><span class="dot ' + (up ? "on" : "") + '"></span><div class="grow"><b>' + esc(a.name) + '</b><span>' + (up ? "Running" : "Stopped") + '</span></div>' +
+        '<button class="btn line" data-a="restart" data-n="' + esc(a.name) + '">Restart</button>' +
+        '<button class="btn red" data-a="remove" data-n="' + esc(a.name) + '">Remove</button></div>';
+    }).join("") : '<div class="empty">No agents yet.</div>') + '</div>' +
+      '<div class="card"><h3>Add an agent</h3><p class="mute">It runs on this server’s own AI.</p><input id="nn" placeholder="name, e.g. paralegal" maxlength="16" autocapitalize="off"><button class="btn" id="add">Add agent</button></div>';
+    app.onclick = (e) => {
+      const b = e.target.closest("button[data-a]"); if (!b) return;
+      const n = b.dataset.n, a = b.dataset.a;
+      if (a === "remove" && !confirm("Remove " + n + "? Its files are kept on the server.")) return;
+      act(b, "/api/panel/team", { action: a, name: n }, a === "remove" ? n + " removed" : n + " restarted");
+    };
+    $("#add").onclick = () => { const n = $("#nn").value.trim().toLowerCase(); if (n) act($("#add"), "/api/panel/team", { action: "add", name: n }, n + " added"); };
+  },
+  async board() {
+    const d = await api("/api/panel/board");
+    const gates = d.gates || [], open = (d.tasks || []).filter((t) => !/done|cancel/.test(t.status || ""));
+    app.innerHTML = '<div class="card"><h3>Waiting for you</h3>' + (gates.length ? gates.map((g) => {
+      let opts = String(g.need_options || "").split("|").map((o) => o.trim()).filter(Boolean);
+      if (!opts.length && g.need_type === "approval") opts = ["approve", "reject"];
+      if (!opts.length && g.need_type === "manual") opts = ["done"];
+      const btns = g.need_type === "secret" ? '<p class="mute">Needs a secret: add it under 🔑 Secrets.</p>' :
+        '<div class="row">' + opts.map((o) => '<button class="btn ' + (o === g.recommend ? "" : "line") + '" data-i="' + esc(g.ident) + '" data-v="' + esc(o) + '">' + esc(o) + '</button>').join("") + '</div>';
+      return '<div class="item" style="display:block"><b>' + esc(g.ask || g.title) + '</b><span class="mute">' + esc(g.ident) + (g.recommend ? " · suggested: " + esc(g.recommend) : "") + '</span>' + btns + '</div>';
+    }).join("") : '<div class="empty">Nothing waiting. 🎉</div>') + '</div>' +
+      '<div class="card"><h3>Open work</h3>' + (open.length ? open.slice(0, 50).map((t) =>
+        '<div class="item"><div class="grow"><b>' + esc(t.title) + '</b><span>' + esc(t.ident + " · " + (t.assignee || "unassigned") + " · " + String(t.status || "").replace(/_/g, " ")) + '</span></div></div>').join("") : '<div class="empty">No open work.</div>') + '</div>';
+    app.onclick = (e) => { const b = e.target.closest("button[data-i]"); if (b) act(b, "/api/panel/answer", { ident: b.dataset.i, value: b.dataset.v }, "Answered"); };
+  },
+  async secrets() {
+    const names = await api("/api/panel/secrets");
+    app.innerHTML = '<div class="card"><h3>Add or replace a secret</h3><p class="mute">Every agent can use it. You will not see the value again.</p>' +
+      '<input id="sn" placeholder="NAME_API_KEY" autocapitalize="characters" maxlength="64"><input id="sv" type="password" placeholder="value" autocomplete="off">' +
+      '<button class="btn" id="save">Save</button></div><div class="card"><h3>Saved</h3>' +
+      (names.length ? names.map((n) => '<div class="item"><span class="dot on"></span><div class="grow"><b>' + esc(n) + '</b><span>value hidden</span></div></div>').join("") : '<div class="empty">None yet.</div>') + '</div>';
+    app.onclick = null;
+    $("#save").onclick = () => {
+      const name = $("#sn").value.trim().toUpperCase(), value = $("#sv").value;
+      if (name && value) act($("#save"), "/api/panel/secrets", { name, value }, name + " saved");
+    };
+  },
+  async settings() {
+    const d = await api("/api/panel/settings");
+    const leaks = d.localOnly.filter((r) => !r.ok);
+    app.innerHTML = '<div class="card"><h3>Stays in the office?</h3>' +
+      (d.localOnly.length ? '<div class="big ' + (leaks.length ? "leak" : "ok") + '">' + (leaks.length ? "⚠️ " + leaks.length + " thing(s) still reach the internet" : "✅ Fully local") + '</div>' +
+        d.localOnly.map((r) => '<div class="item"><span class="dot ' + (r.ok ? "on" : "bad") + '"></span><div class="grow"><b>' + esc(r.item) + '</b><span>' + esc(r.state) + '</span></div></div>').join("")
+        : '<p class="mute">Local-only mode is not set up on this server.</p>') + '</div>' +
+      '<div class="card"><h3>Your AI</h3>' + (d.accounts.length ? d.accounts.map((a) =>
+        '<div class="item"><div class="grow"><b>' + esc(a.model || a.name) + '</b><span>' + esc(a.baseUrl) + '</span></div><button class="btn line" data-test="' + esc(a.name) + '">Test</button></div>').join("")
+        : '<p class="mute">No local AI added yet.</p>') + '</div>' +
+      '<div class="card"><h3>Connected devices</h3>' + d.devices.map((v) =>
+        '<div class="item"><div class="grow"><b>' + esc(v.name) + (v.id === d.me ? " (this one)" : "") + '</b><span>' + (v.role === "owner" ? "Can manage" : "Chat only") + '</span></div><button class="btn red" data-rv="' + esc(v.id) + '">Remove</button></div>').join("") + '</div>' +
+      (d.updateFromFile ? '<div class="card"><h3>Update</h3><p class="mute">Install an update file from your IT team.</p></div>' : "");
+    app.onclick = async (e) => {
+      const t = e.target.closest("button[data-test]"), r = e.target.closest("button[data-rv]");
+      if (t) {
+        t.disabled = true; t.textContent = "Testing…";
+        try { const x = await api("/api/panel/test", { account: t.dataset.test }); toast(x && x.ok ? "✅ Your AI answered" : "⚠️ " + ((x && x.reason) || "No answer")); }
+        catch (er) { toast(er.message); }
+        t.disabled = false; t.textContent = "Test";
+      }
+      if (r && confirm("Remove this device? It will need a new code to come back.")) act(r, "/api/panel/revoke", { id: r.dataset.rv }, "Device removed");
+    };
+  },
+};
+async function show(t) {
+  tab = t;
+  for (const b of document.querySelectorAll("nav.tabs button")) b.classList.toggle("on", b.dataset.t === t);
+  try { await views[t](); $("#tabs").hidden = false; }
+  catch (e) {
+    if (/can chat/.test(e.message)) return;
+    if ($("#tabs").hidden) { app.innerHTML = '<div class="empty">' + esc(e.message) + '</div>'; $("#tabs").hidden = false; }
+    else toast(e.message);
+  }
+}
+$("#tabs").onclick = (e) => { const b = e.target.closest("button[data-t]"); if (b) { location.hash = b.dataset.t; } };
+window.onhashchange = () => show(views[location.hash.slice(1)] ? location.hash.slice(1) : "team");
+window.onhashchange();
 </script></body></html>`;
 LOCAL_CHAT_TS
 }

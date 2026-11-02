@@ -5,7 +5,8 @@
 #
 #   sudo 5dive local serve [--addr=<office IP>] [--port=8443]   start it (local-only on runs this)
 #   sudo 5dive local serve --stop                               stop it, put the API base back
-#   sudo 5dive local pair                                       one-time code + cert fingerprint
+#   sudo 5dive local pair [--owner]                             one-time code + cert fingerprint
+#                                                               (--owner: the device may also open /panel, DIVE-7576)
 #   sudo 5dive local devices ls | revoke <id>                   who is let in
 #        5dive local status
 #
@@ -96,7 +97,8 @@ _lc_usage() {
   printf '%s\n' \
     "usage: sudo 5dive local serve [--addr=<office IP>] [--port=<port>]   # start the office chat" \
     "       sudo 5dive local serve --stop" \
-    "       sudo 5dive local pair                       # a one-time code to connect a phone or laptop" \
+    "       sudo 5dive local pair [--owner]             # a one-time code to connect a phone or laptop" \
+    "                                                   # --owner: it may also manage the server at /panel" \
     "       sudo 5dive local devices ls | revoke <id>" \
     "            5dive local status"
 }
@@ -109,6 +111,7 @@ cmd_local() {
     devices) _lc_devices "$@" ;;
     status)  _lc_status "$@" ;;
     _agents) _lc_agents_write ;;
+    panel-exec) _lp_exec "$@" ;;   # DIVE-7576: the panel's one root entry (src/cmd_local_panel.sh)
     ""|-h|--help|help) _lc_usage ;;
     *) fail "$E_USAGE" "local: unknown subcommand '$sub' (serve, pair, devices, status)." ;;
   esac
@@ -220,6 +223,7 @@ _lc_serve() {
   _lc_cert "$addr"
   _lc_agents_write
   _lc_unit_text "$bun" "$addr" "$port" "$loop" "$tokf" >"$(_lc_unit)" || fail "$E_GENERIC" "local chat: cannot write $(_lc_unit)."
+  _lp_install
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable "$(_lc_svc)" >/dev/null 2>&1 || warn "could not enable $(_lc_svc) at boot"
   systemctl restart "$(_lc_svc)" >/dev/null 2>&1 \
@@ -229,13 +233,14 @@ _lc_serve() {
     && chmod 0644 "$(five_api_base_file).tmp" && mv -f "$(five_api_base_file).tmp" "$(five_api_base_file)" \
     || fail "$E_GENERIC" "local chat: cannot write $(five_api_base_file)."
   printf '%s\n' "Office chat is ON: https://${addr}:${port}" \
-    "Connect a phone or laptop: sudo 5dive local pair" \
+    "Connect a phone or laptop: sudo 5dive local pair   (the owner's: --owner, to manage at /panel)" \
     "Restart each agent once so its chat moves here: sudo 5dive agent restart <name>"
 }
 
 _lc_serve_stop() {
   systemctl disable --now "$(_lc_svc)" >/dev/null 2>&1 || true
   rm -f -- "$(_lc_unit)"
+  _lp_remove
   systemctl daemon-reload >/dev/null 2>&1 || true
   # Put the API base back only if it is the one serve wrote.
   local f; f=$(five_api_base_file)
@@ -266,7 +271,13 @@ _lc_pair_code() {
 }
 
 _lc_pair() {
-  (( $# == 0 )) || fail "$E_USAGE" "local pair takes no flags."
+  local role=chat a
+  for a in "$@"; do
+    case "$a" in
+      --owner) role=owner ;;
+      *) fail "$E_USAGE" "local pair takes one flag, --owner (unknown: $a)." ;;
+    esac
+  done
   require_root
   local addr port code hash exp
   addr=$(_lc_conf_get LAN_ADDR); port=$(_lc_conf_get LAN_PORT)
@@ -278,10 +289,10 @@ _lc_pair() {
   [[ ${#code} == 8 ]] || fail "$E_GENERIC" "local chat: could not make a code."
   hash=$(printf '%s' "$code" | sha256sum | cut -d' ' -f1)
   exp=$(( $(date +%s) + 900 ))
-  _lc_admin pair-add "$hash" "$exp" >/dev/null || fail "$E_GENERIC" "local chat: could not save the code."
+  _lc_admin pair-add "$hash" "$exp" "$role" >/dev/null || fail "$E_GENERIC" "local chat: could not save the code."
   if (( JSON_MODE )); then
-    jq -cn --arg u "https://${addr}:${port}" --arg c "${code:0:4}-${code:4}" --arg f "$(_lc_fingerprint)" --argjson e "$exp" \
-      '{ok:true, data:{url:$u, code:$c, fingerprint:$f, expires:$e}}'
+    jq -cn --arg u "https://${addr}:${port}" --arg c "${code:0:4}-${code:4}" --arg f "$(_lc_fingerprint)" --argjson e "$exp" --arg r "$role" \
+      '{ok:true, data:{url:$u, code:$c, fingerprint:$f, expires:$e, role:$r}}'
     return 0
   fi
   printf '%s\n' \
@@ -289,7 +300,8 @@ _lc_pair() {
     "2. Your browser warns the certificate is self-signed. Check it ends with:" \
     "     $(_lc_fingerprint | tail -c 24)" \
     "   (full SHA-256: $(_lc_fingerprint)) — then continue." \
-    "3. Type this code:  ${code:0:4}-${code:4}   (works once, for 15 minutes)"
+    "3. Type this code:  ${code:0:4}-${code:4}   (works once, for 15 minutes)" \
+    "$([[ $role == owner ]] && printf '%s' "This device may also manage the server: https://${addr}:${port}/panel" || printf '%s' "This device can chat. To manage the server too: sudo 5dive local pair --owner")"
 }
 
 _lc_devices() {
@@ -300,8 +312,8 @@ _lc_devices() {
       local out; out=$(_lc_admin devices-ls) || fail "$E_GENERIC" "local chat: could not read the device list."
       if (( JSON_MODE )); then jq -c '{ok:true, data:.}' <<<"$out"; return 0; fi
       jq -r 'if length == 0 then "No devices yet. Connect one: sudo 5dive local pair" else
-        (["ID","NAME","ADDED","LAST SEEN","STATE"] | @tsv),
-        (.[] | [.id, .name, (.created | strftime("%Y-%m-%d")), (.last_seen | strftime("%Y-%m-%d %H:%M")),
+        (["ID","NAME","ROLE","ADDED","LAST SEEN","STATE"] | @tsv),
+        (.[] | [.id, .name, (.role // "chat"), (.created | strftime("%Y-%m-%d")), (.last_seen | strftime("%Y-%m-%d %H:%M")),
                 (if .revoked == 1 then "revoked" else "active" end)] | @tsv) end' <<<"$out" | column -t -s $'\t' ;;
     revoke)
       (( $# == 1 )) || fail "$E_USAGE" "usage: sudo 5dive local devices revoke <id>"
