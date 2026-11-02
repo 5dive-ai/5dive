@@ -1270,18 +1270,19 @@ cmd_self_update() {
 
   step "Upgrading 5dive CLI + plugins"
   # Send installer chatter to stderr so JSON stdout stays parseable.
+  if [[ -n "$stage" ]]; then
+    # DIVE-7577: a verified offline file — the staged installer, no route to resolve.
+    _ou_install_bun "$stage"
+    env "${inst_env[@]}" bash "$installer" --upgrade >&2 || { rm -rf "$stage"; fail "$E_GENERIC" "upgrade failed"; }
+  else
   # >>> DIVE-4140 stable installer handoff
   # The installer owns target resolution (override/canary/stable/last-known/floor).
   # Keep the caller explicit about the shared route instead of growing a second,
   # drifting resolver inside self-update.
-  if [[ -n "$stage" ]]; then
-    _ou_install_bun "$stage"
-    env "${inst_env[@]}" bash "$installer" --upgrade >&2 || { rm -rf "$stage"; fail "$E_GENERIC" "upgrade failed"; }
-  else
     CLI_VERSION_URL="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}" \
       bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
-  fi
   # <<< DIVE-4140 stable installer handoff
+  fi
 
   # DIVE-7577: install.sh refreshes the root-staged plugins; the 5dive-plugins
   # checkouts the seats run in place (and the claude user's, which new agents

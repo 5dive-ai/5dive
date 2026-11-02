@@ -143,7 +143,7 @@ if verify "$GOOD" 1.0.0; then
   git -C "$co" init -q && git -C "$co" add -A && git -C "$co" -c user.name=t -c user.email=t@t commit -qm init
   if _ou_refresh_checkout "$st/plugins" "$co" && grep -q v2 "$co/plugins/dashboard/server.ts" \
      && [[ ! -e "$co/plugins/dashboard/stale.ts" && -f "$co/plugins/dashboard/node_modules/left-pad/package.json" ]] \
-     && git -C "$co" log -1 --format=%s | grep -q '2.0.0' && git -C "$co" show HEAD:plugins/dashboard/server.ts | grep -q v2; then
+     && grep -q '2.0.0' <<<"$(git -C "$co" log -1 --format=%s)" && grep -q v2 <<<"$(git -C "$co" show HEAD:plugins/dashboard/server.ts)"; then
     ok_t "GOOD: a seat's plugin checkout is replaced whole and committed (a clone of it gets the new code)"
   else
     bad_t "GOOD: seat checkout not refreshed" "$(ls -la "$co/plugins/dashboard"; git -C "$co" log --oneline | head -3)"
@@ -273,7 +273,7 @@ n_gated="$(grep -B1 'bun install --production' "$I" | grep -c 'offline_update ||
 (( n_bun > 0 && n_bun == n_gated )) && ok_t "install.sh: all $n_bun bun installs are skipped under an update from a file" \
   || bad_t "install.sh: a bun install would dial npm offline" "$n_gated of $n_bun gated"
 for fn in build_relation legacy_release_build_sha; do
-  sed -n "/^$fn() {/,/^}/p" "$I" | grep -q 'offline_update && return 1' && ok_t "install.sh: $fn makes no GitHub call offline" \
+  grep -q 'offline_update && return 1' <<<"$(sed -n "/^$fn() {/,/^}/p" "$I")" && ok_t "install.sh: $fn makes no GitHub call offline" \
     || bad_t "install.sh: $fn dials GitHub during an update from a file"
 done
 for s in bin/5dive-refresh-plugins.sh bin/5dive-refresh-skills.sh; do
