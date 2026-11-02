@@ -66,12 +66,13 @@ account_types_authed_arr() {
   if [[ -s "$env_file" ]]; then
     # " KEY " sets, matching the greps they replace: `^KEY=` for env_keys,
     # `^KEY=.+` (a value) for env_vals.
-    local env_keys=" " env_vals=" " line
+    local env_keys=" " env_vals=" " line custom_h=""
     if [[ -r "$env_file" ]]; then
       while IFS= read -r line || [[ -n "$line" ]]; do
         [[ "${line%%=*}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ && "$line" == *=* ]] || continue
         env_keys+="${line%%=*} "
         if [[ -n "${line#*=}" ]]; then env_vals+="${line%%=*} "; fi
+        [[ "${line%%=*}" == FIVEDIVE_CUSTOM_HARNESS ]] && custom_h="${line#*=}"
       done <"$env_file"
     fi
     for type in "${!TYPE_API_VAR[@]}"; do
@@ -93,6 +94,11 @@ account_types_authed_arr() {
     # with a value. Without this, cmd_account_list never emits a pi signins
     # entry, so account_signin_detail's pi provider (the dashboard corner badge)
     # can never light up. DIVE-1821.
+    # DIVE-7568: an account on your own AI server is signed in for the one
+    # harness it was saved for.
+    if [[ "$env_vals" == *" FIVEDIVE_CUSTOM_BASE_URL "* && -n "$custom_h" && "$seen" != *" $custom_h "* ]]; then
+      out+=("$custom_h"); seen+="$custom_h "
+    fi
     local pv
     for pv in "${PI_PROVIDER_VAR[@]}"; do
       if [[ "$env_vals" == *" ${pv} "* ]]; then
@@ -1766,6 +1772,11 @@ cmd_account_show() {
 }
 
 cmd_account_add() {
+  # DIVE-7568: `--provider=custom` saves your own AI server on the account.
+  local _a
+  for _a in "$@"; do
+    [[ "$_a" == --provider=custom ]] && { cmd_account_add_custom "$@"; return; }
+  done
   local name="${1:-}"
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive account add <name>"
   valid_profile_name "$name" \
@@ -1964,6 +1975,16 @@ cmd_account_set() {
     esac
     shift
   done
+  # DIVE-7568: a custom server is the same record `account add --provider=custom`
+  # writes (key optional, any harness); `set` is its replace.
+  if [[ "$provider" == custom ]]; then
+    local -a _c=("$name" --provider=custom --harness="$type" --replace)
+    [[ -z "$base_url" ]] || _c+=("--base-url=$base_url")
+    [[ -z "$model" ]]    || _c+=("--model=$model")
+    [[ -z "$api_key" ]]  || _c+=("--api-key=$api_key")
+    cmd_account_add_custom "${_c[@]}"
+    return
+  fi
   [[ -n "$name" && -n "$type" && -n "$api_key" ]] || fail "$E_USAGE" "$(_account_set_usage)"
   valid_profile_name "$name" \
     || fail "$E_VALIDATION" "invalid account name (lowercase letters/digits/_-, start letter, <=32 chars)"

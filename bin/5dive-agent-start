@@ -926,6 +926,137 @@ hermes_gateway_unit_installed() {
   return 1
 }
 
+# >>> custom-ai renderers (DIVE-7568) >>>
+# «Your own AI»: an account saved with `account add --provider=custom` carries
+# FIVEDIVE_CUSTOM_{HARNESS,BASE_URL,MODEL,API_KEY} in its combined.env, which
+# systemd loaded into this process. Here each harness gets that server written
+# into its OWN config, at every start, so the account stays the one source:
+# move the account and every seat on it moves on its next restart. Claude needs
+# nothing here (its ANTHROPIC_* variables were written into the same file).
+# Only a seat of the harness the account was saved for is touched.
+# tests/dive7568_custom_ai_unit.sh extracts this block between its markers.
+custom_ai_openai_url() {
+  local u="${1%/}" rest
+  [[ "$u" == */v1 ]] && { printf '%s' "$u"; return; }
+  rest="${u#*://}"
+  if [[ "$rest" != */* ]]; then printf '%s/v1' "$u"; else printf '%s' "$u"; fi
+}
+custom_ai_values_ok() {   # the values reach TOML/JSON/YAML: no quote, no space
+  [[ "${FIVEDIVE_CUSTOM_BASE_URL:-}" =~ ^https?://[]A-Za-z0-9._~:/?#@!\$\&*+,\;=%[-]+$ ]] \
+    && [[ "${FIVEDIVE_CUSTOM_MODEL:-}" =~ ^[A-Za-z0-9._:/@+-]{1,200}$ ]]
+}
+CUSTOM_AI_ID="fivedive-custom"
+# codex: model_provider + model at the top, one [model_providers.<id>] table.
+# wire_api is "responses": codex 0.153+ refuses "chat". The key stays in the
+# environment (env_key names the variable); a keyless server gets no env_key,
+# because codex refuses to start when the variable it names is empty.
+custom_ai_render_codex() {   # <codex-home>
+  local cfg="$1/config.toml" tmp url
+  url="$(custom_ai_openai_url "$FIVEDIVE_CUSTOM_BASE_URL")"
+  [[ -f "$cfg" ]] || : > "$cfg"
+  tmp="$cfg.custom.$$"
+  awk -v id="$CUSTOM_AI_ID" '
+    BEGIN { pre = 1; skip = 0 }
+    /^[ \t]*\[/ { pre = 0; skip = ($0 ~ "^[ \t]*\\[model_providers\\." id "\\][ \t]*$") }
+    skip { next }
+    pre && /^[ \t]*(model|model_provider)[ \t]*=/ { next }
+    { print }' "$cfg" > "$tmp.body" || { rm -f "$tmp.body"; return 1; }
+  {
+    printf 'model_provider = "%s"\nmodel = "%s"\n' "$CUSTOM_AI_ID" "$FIVEDIVE_CUSTOM_MODEL"
+    cat "$tmp.body"
+    printf '\n[model_providers.%s]\nname = "Your own AI"\nbase_url = "%s"\nwire_api = "responses"\n' "$CUSTOM_AI_ID" "$url"
+    if [[ -n "${FIVEDIVE_CUSTOM_API_KEY:-}" ]]; then printf 'env_key = "FIVEDIVE_CUSTOM_API_KEY"\n'; fi
+  } > "$tmp" && rm -f "$tmp.body" && chmod 600 "$tmp" && mv -f "$tmp" "$cfg"
+}
+# hermes: its "custom" provider (an OpenAI-compatible base_url). The key goes
+# into the seat's ~/.hermes/.env (a file, not argv); config.yaml names it as
+# ${FIVEDIVE_CUSTOM_API_KEY}, which hermes expands from that .env. No key:
+# hermes sends its own "no-key-required".
+custom_ai_render_hermes() {   # <hermes-bin> <hermes-home>
+  local bin="$1" home="$2" envf="$2/.env" tmp
+  [[ -x "$bin" ]] || return 1
+  install -d -m 700 "$home"
+  touch "$envf"; chmod 600 "$envf"
+  tmp="$(mktemp -p "$home" .env.XXXXXX)"
+  grep -v '^FIVEDIVE_CUSTOM_API_KEY=' "$envf" > "$tmp" || true
+  [[ -n "${FIVEDIVE_CUSTOM_API_KEY:-}" ]] && printf 'FIVEDIVE_CUSTOM_API_KEY=%s\n' "$FIVEDIVE_CUSTOM_API_KEY" >> "$tmp"
+  chmod 600 "$tmp"; mv -f "$tmp" "$envf"
+  "$bin" config set model.provider custom >/dev/null 2>&1 || return 1
+  "$bin" config set model.base_url "$(custom_ai_openai_url "$FIVEDIVE_CUSTOM_BASE_URL")" >/dev/null 2>&1 || return 1
+  "$bin" config set model.default "$FIVEDIVE_CUSTOM_MODEL" >/dev/null 2>&1 || return 1
+  if [[ -n "${FIVEDIVE_CUSTOM_API_KEY:-}" ]]; then
+    "$bin" config set model.api_key '${FIVEDIVE_CUSTOM_API_KEY}' >/dev/null 2>&1 || return 1
+  else
+    "$bin" config set model.api_key "" >/dev/null 2>&1 || true
+  fi
+}
+# openclaw: a models.providers entry in its openai-completions API, and the
+# agent default pointed at it. Patched through openclaw's own CLI on stdin (the
+# key never on argv), merged, so the rest of openclaw.json is kept.
+custom_ai_render_openclaw() {   # <openclaw-bin>
+  local bin="$1"
+  [[ -x "$bin" ]] || return 1
+  jq -cn --arg id "$CUSTOM_AI_ID" --arg u "$(custom_ai_openai_url "$FIVEDIVE_CUSTOM_BASE_URL")" \
+         --arg m "$FIVEDIVE_CUSTOM_MODEL" --arg k "${FIVEDIVE_CUSTOM_API_KEY:-no-key-required}" \
+    '{models: {mode: "merge", providers: {($id): {baseUrl: $u, apiKey: $k, api: "openai-completions",
+        models: [{id: $m, name: $m, reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 8192}]}}},
+      agents: {defaults: {model: {primary: ($id + "/" + $m)}}}}' \
+    | "$bin" config patch --stdin >/dev/null 2>&1
+}
+# pi: a provider in ~/.pi/agent/models.json (pi's custom-provider file) and the
+# default in settings.json. apiKey is the NAME of the variable (pi resolves it
+# from the environment); a keyless server gets a placeholder pi sends unused.
+custom_ai_render_pi() {   # <pi-agent-dir>
+  local dir="$1" mf="$1/models.json" sf="$1/settings.json" cur tmp
+  install -d -m 700 "$dir"
+  cur='{}'; [[ -s "$mf" ]] && jq -e 'type=="object"' "$mf" >/dev/null 2>&1 && cur="$(cat "$mf")"
+  tmp="$(mktemp -p "$dir" .models.XXXXXX)"
+  jq --arg id "$CUSTOM_AI_ID" --arg u "$(custom_ai_openai_url "$FIVEDIVE_CUSTOM_BASE_URL")" \
+     --arg m "$FIVEDIVE_CUSTOM_MODEL" --arg k "$([[ -n "${FIVEDIVE_CUSTOM_API_KEY:-}" ]] && echo FIVEDIVE_CUSTOM_API_KEY || echo no-key-required)" \
+     '.providers = ((.providers // {}) + {($id): {baseUrl: $u, api: "openai-completions", apiKey: $k, models: [{id: $m}]}})' \
+     <<<"$cur" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp"; mv -f "$tmp" "$mf"
+  cur='{}'; [[ -s "$sf" ]] && jq -e 'type=="object"' "$sf" >/dev/null 2>&1 && cur="$(cat "$sf")"
+  tmp="$(mktemp -p "$dir" .settings.XXXXXX)"
+  jq --arg id "$CUSTOM_AI_ID" --arg m "$FIVEDIVE_CUSTOM_MODEL" '.defaultProvider = $id | .defaultModel = $m' \
+     <<<"$cur" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp"; mv -f "$tmp" "$sf"
+}
+# opencode: a provider on @ai-sdk/openai-compatible in the seat's own
+# ~/.config/opencode/opencode.json, and "model" pointed at it. The key is an
+# {env:...} reference, resolved by opencode from the environment.
+custom_ai_render_opencode() {   # <opencode-config-dir>
+  local dir="$1" f="$1/opencode.json" cur tmp
+  install -d -m 700 "$dir"
+  cur='{}'; [[ -s "$f" ]] && jq -e 'type=="object"' "$f" >/dev/null 2>&1 && cur="$(cat "$f")"
+  tmp="$(mktemp -p "$dir" .opencode.XXXXXX)"
+  jq --arg id "$CUSTOM_AI_ID" --arg u "$(custom_ai_openai_url "$FIVEDIVE_CUSTOM_BASE_URL")" \
+     --arg m "$FIVEDIVE_CUSTOM_MODEL" --argjson hk "$([[ -n "${FIVEDIVE_CUSTOM_API_KEY:-}" ]] && echo true || echo false)" \
+     '.["$schema"] = (.["$schema"] // "https://opencode.ai/config.json")
+      | .provider = ((.provider // {}) + {($id): {npm: "@ai-sdk/openai-compatible", name: "Your own AI",
+          options: ({baseURL: $u} + (if $hk then {apiKey: "{env:FIVEDIVE_CUSTOM_API_KEY}"} else {} end)),
+          models: {($m): {name: $m}}}})
+      | .model = ($id + "/" + $m)' <<<"$cur" > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp"; mv -f "$tmp" "$f"
+}
+custom_ai_apply() {   # <type> — dispatch for THIS seat; never fatal
+  local type="$1"
+  [[ -n "${FIVEDIVE_CUSTOM_BASE_URL:-}" && "${FIVEDIVE_CUSTOM_HARNESS:-}" == "$type" ]] || return 0
+  custom_ai_values_ok || { echo "warn: your own AI on this account has an address or model this start cannot write — skipped" >&2; return 0; }
+  local rc=0
+  case "$type" in
+    codex)    install -d -m 700 "$HOME/.codex"; custom_ai_render_codex "$HOME/.codex" || rc=$? ;;
+    hermes)   custom_ai_render_hermes "$BIN" "$HOME/.hermes" || rc=$? ;;
+    openclaw) custom_ai_render_openclaw "${CUSTOM_AI_OPENCLAW_BIN:-/home/claude/.local/bin/openclaw}" || rc=$? ;;
+    pi)       custom_ai_render_pi "$HOME/.pi/agent" || rc=$? ;;
+    opencode) custom_ai_render_opencode "$HOME/.config/opencode" || rc=$? ;;
+    *)        return 0 ;;
+  esac
+  (( rc == 0 )) || echo "warn: could not point $type at your own AI (${FIVEDIVE_CUSTOM_BASE_URL}) — the seat runs its previous model" >&2
+  return 0
+}
+# <<< custom-ai renderers (DIVE-7568) <<<
+
 if [[ "$TYPE" == "hermes" ]]; then
   AGENT_HERMES_HOME="$HOME/.hermes"
   install -d -m 700 "$AGENT_HERMES_HOME"
@@ -983,6 +1114,9 @@ if [[ "$TYPE" == "hermes" ]]; then
     "$BIN" config set model.default "$AGENT_MODEL" >/dev/null 2>&1 \
       || echo "warn: hermes model pin ($AGENT_MODEL) failed — the seat runs its account's model" >&2
   fi
+  # DIVE-7568: your own AI wins over the seeded config, before the gateway
+  # restart below reads it.
+  custom_ai_apply hermes
   # hermes' messaging gateway is a long-lived user daemon that survives
   # `systemctl restart 5dive-agent@<name>` (cmd_restart bounces the tmux
   # unit; the gateway is a separate `loginctl enable-linger`'d process that
@@ -1488,6 +1622,10 @@ if [[ "$TYPE" == "antigravity" ]]; then
     fi
   fi
 fi
+
+# DIVE-7568: your own AI, written into this harness's config (hermes did it
+# above, before its gateway restart).
+[[ "$TYPE" == hermes ]] || custom_ai_apply "$TYPE"
 
 SESSION="agent-${NAME}"
 

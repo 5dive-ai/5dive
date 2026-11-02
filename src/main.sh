@@ -324,6 +324,11 @@ Accounts (a named auth profile — group sign-ins so multiple agents share one l
   5dive account poll                                   # read every Claude account's 5h/7d from the provider now (no seat
                                                        # turn); the heartbeat does it every 10 min when account-poll=on
   5dive account add <name>                             # create empty account; sign in next
+  5dive account add <name> --provider=custom --base-url=<url> --model=<m> --harness=<h> [--api-key=-]
+                                                       # your own AI server (Ollama, vLLM, office GPU box) on
+                                                       # claude|codex|hermes|openclaw|pi|opencode; key optional
+  5dive account test --base-url=<url> --model=<m> --harness=<h> [--api-key=-] [--json]
+                                                       # one tool-call request: {ok, format, reason}; saves nothing
   5dive account login <name> --type=<type>             # interactive TTY login into an account
   5dive account set <name> --type=<type> --provider=<id> --api-key=-
                                                        # BYO provider key on an account, no agent needed;
@@ -1027,7 +1032,7 @@ _agent_verb_dispatch() {
 }
 
 _account_verb_dispatch() {
-      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|default|usage|poll|add|rename|remove|login|set|set-model|set-active-provider"
+      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|default|usage|poll|add|rename|remove|login|set|set-model|set-active-provider|test"
       local acctcmd="$1"; shift
       # `--help` after a subverb is a question about THAT verb, not an unknown
       # flag. Answered before the dispatch, through the same helper `task`
@@ -1063,6 +1068,8 @@ _account_verb_dispatch() {
           # `--api-key=` before anything reaches the log (src/lib/audit.sh).
           AUDIT_CMD="account set"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_account_set "$@" ;;
+        # DIVE-7568: does this AI server work for an agent? Read-only, no lock.
+        test)   cmd_account_test "$@" ;;
         set-model)
           # DIVE-5259: an account's model without its key (the included-model
           # switch). Audited, and under the lock `set-account` takes.

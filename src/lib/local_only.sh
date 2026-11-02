@@ -186,6 +186,9 @@ local_only_gate() {
       case "$sub" in
         login) local_only_refuse "Signing in to a cloud AI account" ;;
         set)   _lo_model_target_ok "${@:2}" ;;
+        # DIVE-7568: your own AI server — only one on the office network.
+        test)  _lo_model_target_ok "${@:2}" ;;
+        add)   [[ " ${*:2} " == *" --provider=custom "* ]] && _lo_model_target_ok "${@:2}" ;;
       esac ;;
     agent)
       shift || true
