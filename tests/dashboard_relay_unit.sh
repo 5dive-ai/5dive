@@ -302,13 +302,26 @@ grep -qx -- '--max-filesize' "$CALLS" && grep -qx 20971520 "$CALLS" \
   && ok 'fetch caps the download at 20 MB' || bad "fetch cap ($(cat "$CALLS"))"
 token_safe tok-two && ok 'fetch: bearer on stdin, not argv' || bad 'fetch bearer placement'
 [[ -z "$(find "$UP/tap" -mindepth 1 ! -name 1760000000000-photo.png)" ]] && ok 'fetch leaves no temp file' || bad 'fetch leaves no temp file'
-# DIVE-7520: a seat with its own group gets its incoming files 0640 in a 0750
-# dir of that group: no other seat can read them.
+# DIVE-7520: a seat with its own group gets its incoming files 0640: no other
+# seat can read them. DIVE-7566: the agent runs as agent-<seat> with
+# Group=claude (systemd/5dive-agent@.service), NOT in its own group, so the
+# 0750 group-only dir and file were EACCES to the very agent they were for
+# (DIVE-7560 proof). The seat now OWNS the file and traverses the dir as
+# "other" (0751: no listing). chown is wrapped to record the owner it is given
+# (this harness is not root: it cannot hand a file to another user).
 F7520="$UP/tap/1760000000009-secret.e2e"
-FIVEDIVE_CHAT_SEAT_GROUP="$(id -gn)" CURL_BODY='sealed bytes' run_root 1042 fetch "$F7520"; rc=$?
-[[ $rc == 0 && "$(stat -c %a "$F7520")" == 640 && "$(stat -c %a "$UP/tap")" == 750 \
-   && "$(stat -c %G "$F7520")" == "$(id -gn)" && "$(stat -c %G "$UP/tap")" == "$(id -gn)" ]] \
-  && ok "DIVE-7520 fetch: the seat's own group, 0640 file in a 0750 dir" || bad "DIVE-7520 fetch posture (rc=$rc, $(ls -la "$UP/tap"))"
+CHOWNS="$TMP/chowns"; : >"$CHOWNS"
+chown() { [[ "${1:-}" == -- ]] && printf '%s\n' "$2" >>"$CHOWNS"; command chown "$@" 2>/dev/null || command chown -- "$(id -un):${2#*:}" "${@:3}"; }
+FIVEDIVE_CHAT_SEAT_GROUP="$(id -gn)" FIVEDIVE_CHAT_SEAT_USER=agent-tap CURL_BODY='sealed bytes' run_root 1042 fetch "$F7520"; rc=$?
+unset -f chown
+[[ $rc == 0 && "$(stat -c %a "$F7520")" == 640 && "$(stat -c %G "$F7520")" == "$(id -gn)" && "$(stat -c %G "$UP/tap")" == "$(id -gn)" ]] \
+  && ok "DIVE-7520 fetch: the seat's own group, a 0640 file" || bad "DIVE-7520 fetch posture (rc=$rc, $(ls -la "$UP/tap"))"
+[[ "$(tail -1 "$CHOWNS")" == "agent-tap:$(id -gn)" ]] \
+  && ok "DIVE-7566 fetch: the file is handed to the seat's own USER (its process is not in its group)" \
+  || bad "DIVE-7566 fetch owner (chown got: $(cat "$CHOWNS"))"
+[[ "$(stat -c %a "$UP/tap")" == 751 ]] \
+  && ok "DIVE-7566 fetch: the seat dir is 0751 (the seat traverses as other; nobody else lists it)" \
+  || bad "DIVE-7566 dir mode ($(stat -c %a "$UP/tap"))"
 rm -f "$F7520"; chmod 0755 "$UP/tap"
 F2="$UP/tap/1760000000001-gone.webm"
 CURL_CODE=404 CURL_BODY='{"error":"not held"}' run_root 1042 fetch "$F2"; rc=$?

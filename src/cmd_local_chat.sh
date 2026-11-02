@@ -42,8 +42,45 @@ _lc_bun() {
   fail "$E_NOT_INSTALLED" "the office chat runs on bun, and this server has none (the 5dive install puts it at /usr/local/bin/bun)."
 }
 
-# _lc_conf_get <KEY> — one value from the config file (KEY=value lines).
-_lc_conf_get() { sed -n "s/^$1=//p" "$(_lc_conf)" 2>/dev/null | head -n 1; }
+# _lc_conf_get <KEY> — one value from the config file (KEY=value lines); empty
+# and 0 when there is no file yet. DIVE-7566: no pipe, so a missing file is not
+# a pipefail exit (that killed the first `local serve` on every box with rc 2).
+_lc_conf_get() {
+  local f v; f=$(_lc_conf)
+  [[ -r "$f" ]] || return 0
+  v=$(sed -n "s/^$1=//p" "$f" 2>/dev/null) || v=""
+  printf '%s' "${v%%$'\n'*}"
+}
+
+# DIVE-7566: the token the agents' chat rail and the office chat share. A box
+# linked to 5dive.app has one (connectord.env); a box never linked, which is
+# exactly the offline office, gets one minted here, root-only, kept across
+# restarts. It is never written to connectord.env: other parts of 5dive read
+# that file's presence as "linked to the app".
+_lc_minted_token() { printf '%s/token.env' "$(_lc_etc)"; }
+_lc_token_file() {
+  local f; f=$(_sp_connectord_env)
+  if [[ -r "$f" ]] && grep -q '^CONNECTORD_TOKEN=..*' "$f" 2>/dev/null; then printf '%s' "$f"; return 0; fi
+  f=$(_lc_minted_token)
+  if ! grep -q '^CONNECTORD_TOKEN=..*' "$f" 2>/dev/null; then
+    local t; t=$(openssl rand -hex 32 2>/dev/null) || t=""
+    [[ "$t" =~ ^[0-9a-f]{64}$ ]] || return 1
+    ( umask 077; printf 'CONNECTORD_TOKEN=%s\n' "$t" >"$f.tmp" && mv -f "$f.tmp" "$f" ) || return 1
+  fi
+  chmod 0600 "$f" 2>/dev/null || true
+  printf '%s' "$f"
+}
+
+# _lc_token_for_base <api base> <default file> — the token file the root rail
+# uses for <api base>: the office chat's own when the base is the loopback
+# listener `serve` wrote, else <default>. So a minted token goes ONLY to this
+# box's own office chat, never to api.5dive.com.
+_lc_token_for_base() {
+  local base="${1%/}" def="$2" loop tf
+  loop=$(_lc_conf_get LOOP_PORT); tf=$(_lc_conf_get TOKEN_FILE)
+  if [[ -n "$loop" && -n "$tf" && "$base" == "http://127.0.0.1:${loop}" && -r "$tf" ]]; then printf '%s' "$tf"
+  else printf '%s' "$def"; fi
+}
 
 # The office address: the first private IPv4 on this box. A public address is
 # never chosen by itself, so the page is not put on the internet by accident.
@@ -120,7 +157,7 @@ _lc_agents_write() {
 }
 
 _lc_unit_text() {
-  local bun="$1" addr="$2" port="$3" loop="$4"
+  local bun="$1" addr="$2" port="$3" loop="$4" tokf="${5:-$(_sp_connectord_env)}"
   printf '%s\n' \
     "# DIVE-7558: written by \`sudo 5dive local serve\`. Do not edit; re-run it." \
     "[Unit]" \
@@ -135,7 +172,7 @@ _lc_unit_text() {
     "ExecStart=${bun} $(_lc_lib)/server.ts serve" \
     "Environment=LC_STATE=$(_lc_state) LC_LAN_ADDR=${addr} LC_LAN_PORT=${port} LC_LOOP_PORT=${loop}" \
     "Environment=LC_AGENTS_FILE=$(_lc_etc)/agents.json" \
-    "LoadCredential=token:/etc/5dive/connectord.env" \
+    "LoadCredential=token:${tokf}" \
     "LoadCredential=cert:$(_lc_etc)/cert.pem" \
     "LoadCredential=key:$(_lc_etc)/key.pem" \
     "StateDirectory=5dive-local-chat" \
@@ -171,18 +208,18 @@ _lc_serve() {
   [[ "$port" =~ ^[0-9]{2,5}$ ]] && (( port >= 1024 && port <= 65535 )) \
     || fail "$E_VALIDATION" "local chat: --port must be 1024-65535 ($port)."
   local loop; loop=$(_lc_conf_get LOOP_PORT); loop="${loop:-8480}"
-  [[ -r "$(_sp_connectord_env)" ]] || fail "$E_NOT_FOUND" "local chat: this box has no connectord token ($(_sp_connectord_env)); the agents' chat adapter authenticates with it."
   local bun; bun=$(_lc_bun)
 
   install -d -m 0755 -- "$(_lc_etc)" || fail "$E_GENERIC" "local chat: cannot create $(_lc_etc)."
-  printf 'LAN_ADDR=%s\nLAN_PORT=%s\nLOOP_PORT=%s\n' "$addr" "$port" "$loop" >"$(_lc_conf)"
+  local tokf; tokf=$(_lc_token_file) || fail "$E_GENERIC" "local chat: could not make the chat's access key (openssl)."
+  printf 'LAN_ADDR=%s\nLAN_PORT=%s\nLOOP_PORT=%s\nTOKEN_FILE=%s\n' "$addr" "$port" "$loop" "$tokf" >"$(_lc_conf)"
   getent passwd "$(_lc_user)" >/dev/null 2>&1 \
     || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$(_lc_user)" \
     || fail "$E_GENERIC" "local chat: could not create the $(_lc_user) system user."
   _lc_stage
   _lc_cert "$addr"
   _lc_agents_write
-  _lc_unit_text "$bun" "$addr" "$port" "$loop" >"$(_lc_unit)" || fail "$E_GENERIC" "local chat: cannot write $(_lc_unit)."
+  _lc_unit_text "$bun" "$addr" "$port" "$loop" "$tokf" >"$(_lc_unit)" || fail "$E_GENERIC" "local chat: cannot write $(_lc_unit)."
   systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl enable "$(_lc_svc)" >/dev/null 2>&1 || warn "could not enable $(_lc_svc) at boot"
   systemctl restart "$(_lc_svc)" >/dev/null 2>&1 \
@@ -213,6 +250,21 @@ _lc_admin() {
   runuser -u "$(_lc_user)" -- env LC_STATE="$(_lc_state)" "$bun" "$(_lc_lib)/server.ts" admin "$@"
 }
 
+# 8 characters from the 31-letter alphabet, unbiased: a byte is kept only
+# below 248 (8 x 31) and maps to b % 31. Reads bounded chunks, no pipe.
+_lc_pair_code() {
+  local a='ABCDEFGHJKMNPQRSTUVWXYZ23456789' b out="" n=0
+  while (( ${#out} < 8 && n < 8 )); do
+    n=$((n + 1))
+    for b in $(od -An -tu1 -N32 /dev/urandom); do
+      (( b < 248 )) || continue
+      out+="${a:$(( b % 31 )):1}"
+      (( ${#out} == 8 )) && break
+    done
+  done
+  printf '%s' "$out"
+}
+
 _lc_pair() {
   (( $# == 0 )) || fail "$E_USAGE" "local pair takes no flags."
   require_root
@@ -220,7 +272,9 @@ _lc_pair() {
   addr=$(_lc_conf_get LAN_ADDR); port=$(_lc_conf_get LAN_PORT)
   [[ -n "$addr" ]] || fail "$E_NOT_FOUND" "local chat is not set up: sudo 5dive local serve"
   # 8 characters from an alphabet with no look-alikes (no 0/O, 1/I/L).
-  code=$(LC_ALL=C tr -dc 'ABCDEFGHJKMNPQRSTUVWXYZ23456789' </dev/urandom | head -c 8)
+  # DIVE-7566: bounded input, so tr ends on EOF and never takes the SIGPIPE
+  # `tr </dev/urandom | head` did under pipefail (rc 141 on every run).
+  code=$(_lc_pair_code)
   [[ ${#code} == 8 ]] || fail "$E_GENERIC" "local chat: could not make a code."
   hash=$(printf '%s' "$code" | sha256sum | cut -d' ' -f1)
   exp=$(( $(date +%s) + 900 ))

@@ -144,15 +144,18 @@ endpoint — a model you host yourself, or a vendor host we don't ship a row for
 # Open weights on a server you own. --model is required here: there is no catalog
 # entry to inherit per-tier model ids from, and an unpinned background tier would
 # 404 on the agent's own housekeeping turns.
-sudo 5dive agent create mistral-box --type=claude \
+sudo 5dive agent create mistral-box --type=claude --provider=custom \
   --base-url=https://llm.internal.example.com/anthropic \
   --api-key=<key> --auth-profile=mistral-box --model=mistral-large-3
 
 # A local inference server (vLLM, llama.cpp, an Ollama Anthropic shim):
-sudo 5dive agent create local-box --type=claude \
+sudo 5dive agent create local-box --type=claude --provider=custom \
   --base-url=http://127.0.0.1:8000 \
   --api-key=<key> --auth-profile=local-box --model=<slug>
 ```
+
+The key must be at least 10 characters; a server that takes any key (Ollama) still
+needs one that long, for example `ollama-local`.
 
 `https://` is required — the API key rides that URL on every request. `http://` is
 accepted only for `localhost` / `127.0.0.1` / `[::1]`, where the traffic never leaves

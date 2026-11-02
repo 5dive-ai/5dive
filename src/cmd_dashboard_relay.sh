@@ -55,10 +55,13 @@ _dash_relay_api_base() { five_api_base; }   # DIVE-7558: /etc/5dive/api-base win
 _dash_relay_outbox()   { local d="${DASHBOARD_OUTBOX:-/home/claude/chat-downloads}"; printf '%s' "${d%/}"; }
 _dash_relay_seen_dir() { printf '%s' "${FIVEDIVE_DASHBOARD_RELAY_DIR:-/var/lib/5dive/dashboard-relay}"; }
 
-# The box token, read as root. Empty when there is none.
+# The box token, read as root. Empty when there is none. DIVE-7566: when the
+# API base is this box's own office chat, the token is the one `local serve`
+# gave it (minted on a box never linked to 5dive.app; src/cmd_local_chat.sh).
 _dash_relay_token() {
   local f t=""
   f=$(_sp_connectord_env)
+  declare -F _lc_token_for_base >/dev/null && f=$(_lc_token_for_base "$(_dash_relay_api_base)" "$f")
   [[ -r "$f" ]] || return 0
   t=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$f" 2>/dev/null | head -n 1) || t=""
   t="${t%$'\r'}"; t="${t#\"}"; t="${t%\"}"; t="${t#\'}"; t="${t%\'}"
@@ -158,6 +161,18 @@ _dash_relay_seat_group() {
   getent group "agent-$1" >/dev/null 2>&1 && printf 'agent-%s' "$1"
   return 0
 }
+# DIVE-7566: the seat's own USER. The agent runs as agent-<seat> with
+# Group=claude (systemd/5dive-agent@.service), so its process is NOT in its own
+# group: the 0640 group-only file and the 0750 dir of DIVE-7520 were unreadable
+# to the very agent they were for (EACCES on Read; `sudo -u agent-<seat>` hid it,
+# that one does get the group). The seat now OWNS each incoming file and the dir
+# keeps traverse for others (0751, no listing), so the agent reads through the
+# owner bit and another seat still reads nothing. Empty = no user of its own.
+_dash_relay_seat_user() {
+  if [[ -n "${FIVEDIVE_CHAT_SEAT_USER+x}" ]]; then printf '%s' "$FIVEDIVE_CHAT_SEAT_USER"; return 0; fi
+  getent passwd "agent-$1" >/dev/null 2>&1 && printf 'agent-%s' "$1"
+  return 0
+}
 _dash_relay_uri()        { jq -rn --arg p "$1" '$p|@uri'; }
 
 # _dash_relay_upload_ok <seat> <path> — a file name directly in this seat's own
@@ -180,7 +195,9 @@ _dash_relay_seat_dir() {
   [[ -d "$dir" && ! -L "$dir" ]] || return 1
   [[ "$(realpath -e -- "$dir" 2>/dev/null)" == "$(realpath -e -- "$root" 2>/dev/null)/$seat" ]] || return 1
   local grp; grp=$(_dash_relay_seat_group "$seat")
-  if [[ -n "$grp" ]]; then { chgrp -- "$grp" "$dir" && chmod 0750 -- "$dir"; } 2>/dev/null || return 1; fi
+  # 0751 (DIVE-7566): the seat's process is not in its group, so it traverses
+  # as "other"; nobody but the owner and that group can list it.
+  if [[ -n "$grp" ]]; then { chgrp -- "$grp" "$dir" && chmod 0751 -- "$dir"; } 2>/dev/null || return 1; fi
   printf '%s' "$dir"
 }
 
@@ -206,9 +223,10 @@ _dash_relay_fetch() {
   if (( size < 0 || size > max )); then
     rm -f "$tmp"; printf '413\n{"error":"the file is over %s bytes"}' "$max"; return 0
   fi
-  # DIVE-7520: readable by the files owner and the seat it is for, nobody else.
-  local grp mode=0644; grp=$(_dash_relay_seat_group "${5:-}")
-  [[ -n "$grp" && -n "${5:-}" ]] && { own="${own%%:*}:$grp"; mode=0640; }
+  # DIVE-7520: readable by the seat it is for, nobody else. DIVE-7566: the seat
+  # reads it as its OWNER (its process lacks its own group, see above).
+  local grp usr mode=0644; grp=$(_dash_relay_seat_group "${5:-}"); usr=$(_dash_relay_seat_user "${5:-}")
+  [[ -n "$grp" && -n "${5:-}" ]] && { own="${usr:-${own%%:*}}:$grp"; mode=0640; }
   if ! { chown -- "$own" "$tmp" && chmod "$mode" -- "$tmp" && mv -fT -- "$tmp" "$dest"; } 2>/dev/null; then
     rm -f "$tmp"
     fail "$E_GENERIC" "_dashboard_relay fetch: could not write ${dest}."

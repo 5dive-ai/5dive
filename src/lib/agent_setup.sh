@@ -1217,6 +1217,44 @@ marketplace_checkout_settled() { # <repo-url> <dir> [tries]
   done
 }
 
+# DIVE-7566: a local-only box never reaches GitHub, so `agent create
+# --channels=dashboard` failed there (the marketplace clone, four tries). The
+# marketplace is seeded from a copy the box already holds instead, from a source
+# only the owner controls: the claude user's own 5dive-plugins checkout, else a
+# one-plugin marketplace built from the root-staged dashboard plugin
+# (install.sh stages /usr/local/lib/5dive/dashboard). Never another seat's
+# checkout: a seat writes its own, so copying it would let one seat pick the
+# code another runs. Prints a 0711 stage dir holding `5dive-plugins`, owned by
+# <user>, for the seat to clone from; the caller removes it.
+offline_marketplace_stage() { # <plugin> <user>
+  local plugin="$1" user="$2" stage src dash repo
+  src="${FIVEDIVE_OFFLINE_MKT_SRC:-/home/claude/.claude/plugins/marketplaces/5dive-plugins}"
+  dash="${FIVEDIVE_OFFLINE_DASHBOARD_DIR:-/usr/local/lib/5dive/dashboard}"
+  stage=$(mktemp -d "${TMPDIR:-/tmp}/5dive-mkt.XXXXXX") || return 1
+  chmod 0711 "$stage" || { rm -rf "$stage"; return 1; }
+  repo="$stage/5dive-plugins"
+  if [[ -f "$src/.claude-plugin/marketplace.json" ]] \
+     && git -c safe.directory='*' -C "$src" rev-parse -q --verify HEAD >/dev/null 2>&1 \
+     && git -c safe.directory='*' clone -q --no-hardlinks "$src" "$repo" >/dev/null 2>&1; then
+    :
+  elif rm -rf "$repo"; [[ "$plugin" == dashboard && -f "$dash/server.ts" && -f "$dash/.claude-plugin/plugin.json" ]]; then
+    mkdir -p "$repo/plugins/dashboard" "$repo/.claude-plugin" \
+      && tar -C "$dash" --exclude=./node_modules -cf - . | tar -C "$repo/plugins/dashboard" -xf - \
+      && jq -n '{name:"5dive-plugins", owner:{name:"5dive"},
+                 plugins:[{name:"dashboard", source:"./plugins/dashboard",
+                           description:"5dive dashboard chat channel (a local copy, made offline)"}]}' \
+           >"$repo/.claude-plugin/marketplace.json" \
+      && git -C "$repo" init -q \
+      && git -C "$repo" add -A \
+      && git -C "$repo" -c user.name=5dive -c user.email=support@5dive.com commit -qm "local copy of the dashboard plugin (offline box)" \
+      || { rm -rf "$stage"; return 1; }
+  else
+    rm -rf "$stage"; return 1
+  fi
+  chown -R "$user:" "$repo" || { rm -rf "$stage"; return 1; }
+  printf '%s' "$stage"
+}
+
 install_channel_plugin_for_agent() {
   local plugin="$1" name="$2" allowed_users="${3:-}" token="${4:-}"
   local user="agent-${name}"
@@ -1249,7 +1287,16 @@ install_channel_plugin_for_agent() {
     mkt_repo="https://github.com/$(gh_org)/5dive-plugins.git"
   fi
 
-  step "Installing $plugin plugin for $user (from $marketplace)"
+  # DIVE-7566: local-only — the box's own copy, never the network.
+  local mkt_from="" mkt_stage=""
+  if [[ "$marketplace" == 5dive-plugins ]] && declare -F local_only_on >/dev/null && local_only_on; then
+    mkt_stage=$(offline_marketplace_stage "$plugin" "$user") \
+      || fail "$E_NOT_INSTALLED" \
+         "this box is local-only and holds no copy of the $plugin chat to add (looked in /home/claude/.claude/plugins/marketplaces/5dive-plugins and /usr/local/lib/5dive/dashboard). Run '5dive self-update' once while the box is online."
+    mkt_from="$mkt_stage/5dive-plugins"
+  fi
+
+  step "Installing $plugin plugin for $user (from $marketplace${mkt_from:+, the copy on this box})"
   # Deliberately NOT a login shell: /etc/profile.d/5dive-shared-configs.sh
   # exports CLAUDE_CONFIG_DIR=/home/claude/.claude, which would cause
   # `claude plugin install` to land the plugin in the wrong home. Mirror
@@ -1259,15 +1306,18 @@ install_channel_plugin_for_agent() {
   # npm's exit code with tail's zero-exit and the agent would ship with
   # half-installed deps; surface the failure so the frontend can show it.
   # `declare -f` ships marketplace_checkout_settled (above) ahead of the script.
-  if ! { declare -f marketplace_checkout_settled; cat <<'AGENT_PLUGIN_INSTALL'; } \
-      | sudo -u "$user" -H env PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo" bash -s >&2
+  local install_rc=0
+  { declare -f marketplace_checkout_settled; cat <<'AGENT_PLUGIN_INSTALL'; } \
+      | sudo -u "$user" -H env PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo" \
+          MKT_FROM="$mkt_from" DASH_NM="${FIVEDIVE_OFFLINE_DASHBOARD_DIR:-/usr/local/lib/5dive/dashboard}/node_modules" \
+          CLAUDE_BIN="${FIVEDIVE_CLAUDE_BIN:-/home/claude/.local/bin/claude}" bash -s >&2 || install_rc=$?
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
 export NVM_DIR="/home/claude/.nvm"
 # shellcheck disable=SC1091
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
 export PATH="/home/claude/.local/bin:$PATH"
-CLAUDE=/home/claude/.local/bin/claude
+CLAUDE="${CLAUDE_BIN:-/home/claude/.local/bin/claude}"
 
 # `claude plugin marketplace add` crashes headless for a user that has never
 # run a claude session (ERR_STREAM_PREMATURE_CLOSE before git even spawns —
@@ -1278,7 +1328,10 @@ CLAUDE=/home/claude/.local/bin/claude
 MKT_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE"
 # DIVE-6005: never `rm -rf; git clone` into this path — the seat's own Claude Code
 # may be cloning into it right now (see marketplace_checkout_settled).
-marketplace_checkout_settled "$MKT_REPO" "$MKT_DIR"
+# DIVE-7566: on a local-only box MKT_FROM is the box's own copy; the checkout
+# then names GitHub as its origin, so a later online update works as usual.
+marketplace_checkout_settled "${MKT_FROM:-$MKT_REPO}" "$MKT_DIR"
+[ -n "${MKT_FROM:-}" ] && git -C "$MKT_DIR" remote set-url origin "$MKT_REPO" 2>/dev/null || true
 MKT_SLUG=$(printf '%s' "$MKT_REPO" | sed -e 's#^https://github.com/##' -e 's#\.git$##')
 KM_FILE="$HOME/.claude/plugins/known_marketplaces.json" \
   MKT_NAME="$MARKETPLACE" MKT_SLUG="$MKT_SLUG" MKT_DIR="$MKT_DIR" python3 <<'PREREG'
@@ -1300,9 +1353,13 @@ PREREG
 
 # DIVE-6005: one retry, because the seat's own first-boot fetch can hold the
 # checkout's git lock for the moment our `update` runs.
-"$CLAUDE" plugin marketplace update "$MARKETPLACE" 2>/dev/null \
-  || { sleep 3; "$CLAUDE" plugin marketplace update "$MARKETPLACE" 2>/dev/null; } \
-  || "$CLAUDE" plugin marketplace add "$MKT_REPO"
+# DIVE-7566: offline, both would dial GitHub; the registration above is enough
+# for `plugin install` (it installs from the local catalog).
+if [ -z "${MKT_FROM:-}" ]; then
+  "$CLAUDE" plugin marketplace update "$MARKETPLACE" 2>/dev/null \
+    || { sleep 3; "$CLAUDE" plugin marketplace update "$MARKETPLACE" 2>/dev/null; } \
+    || "$CLAUDE" plugin marketplace add "$MKT_REPO"
+fi
 
 yes | "$CLAUDE" plugin install "${PLUGIN}@${MARKETPLACE}" >/dev/null || true
 # DIVE-4852: the install above STARTS the plugin's MCP server, before this agent's
@@ -1335,7 +1392,15 @@ fi
 echo "    Plugin dir: $PLUGIN_DIR"
 cd "$PLUGIN_DIR"
 # tail keeps output bounded; pipefail above carries npm's real exit code.
-timeout 60 npm install --omit=dev --ignore-scripts --no-audit --no-fund 2>&1 | tail -5
+# DIVE-7566: offline, the packages come from the root-staged dashboard copy
+# (install.sh ran its install online); npm would only fail.
+if [ -n "${MKT_FROM:-}" ]; then
+  if [ ! -d node_modules ] && [ "$PLUGIN" = dashboard ] && [ -d "$DASH_NM" ]; then
+    cp -a "$DASH_NM" ./node_modules && echo "    Packages: copied from $DASH_NM (offline)"
+  fi
+else
+  timeout 60 npm install --omit=dev --ignore-scripts --no-audit --no-fund 2>&1 | tail -5
+fi
 
 # DIVE-3754: TAKE THE INSTALL OFF THE START PATH — DO NOT DECIDE WHAT LAUNCHES.
 # `npm install --omit=dev` ran two lines up, so at channel-start time a second
@@ -1380,7 +1445,8 @@ else:
     print("    Patched start script: removed bun install -> " + d["scripts"]["start"])
 PATCHPY
 AGENT_PLUGIN_INSTALL
-  then
+  [[ -n "$mkt_stage" ]] && rm -rf -- "$mkt_stage"
+  if (( install_rc != 0 )); then
     fail "$E_GENERIC" \
       "$plugin plugin install failed for agent '$name' (see journalctl / stderr above). Run: sudo 5dive doctor"
   fi

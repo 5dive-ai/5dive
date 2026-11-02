@@ -155,19 +155,31 @@ _lo_on() {
   fi
   _lo_have systemctl && systemctl daemon-reload >/dev/null 2>&1 || true
   # 5. DIVE-7558: the office chat, so the owner still has a chat page with the
-  # hosted app out of reach. Its own failure (no office address, no bun) is a
-  # warning: the switch is already in force, and `local serve` can be re-run.
-  if (( chat )) && [[ -z "$(_lo_root)" ]]; then
+  # hosted app out of reach. The switch is already in force when it fails (no
+  # office address, no bun), and `local serve` can be re-run. DIVE-7566: but
+  # then this never says plain ON and never exits 0: the owner would be left
+  # with no chat and a green result (the DIVE-7560 proof run).
+  local chat_failed=0
+  if (( chat )) && _lo_chat_enabled; then
     if ( _lc_serve ); then _lo_record "local-chat"
-    else warn "the office chat did not start (sudo 5dive local serve --addr=<office IP>)"; warned=1; fi
+    else chat_failed=1; fi
   fi
 
+  if (( chat_failed )); then
+    printf '%s\n' "Local-only mode is on, but the office chat did NOT start (the error is above), so there is no chat page yet." \
+      "Fix it, then start the chat: sudo 5dive local serve --addr=<office IP>" >&2
+    return "$E_GENERIC"
+  fi
   printf '%s\n' "Local-only mode is ON. Nothing on this box will connect outside your network." \
     "Restart your agents once so they pick it up: sudo systemctl restart '5dive-agent@*'" \
     "Prove it any time: sudo 5dive config local-only check"
   (( warned )) && printf '%s\n' "Some system items could not be turned off (see the warnings above); check lists them."
   return 0
 }
+
+# The office chat step runs on a real box only; FIVE_LOCAL_ONLY_CHAT=1 lets the
+# harness run it under FIVE_LOCAL_ONLY_ROOT with _lc_serve stubbed.
+_lo_chat_enabled() { [[ -z "$(_lo_root)" || "${FIVE_LOCAL_ONLY_CHAT:-}" == 1 ]]; }
 
 _lo_off() {
   (( $# == 0 )) || fail "$E_USAGE" "local-only off takes no flags"
