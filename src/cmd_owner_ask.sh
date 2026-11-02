@@ -262,6 +262,18 @@ _owner_ask_browser() {
     fail "$E_PERMISSION" "$SUDO_USER cannot send ${OA_SEAT}'s ask"
   fi
   local name="${OA_SEAT#agent-}"
+  # DIVE-7558: on a local-only box the ask is shown in that agent's office-chat
+  # thread, never sent to Telegram. The Approve tap is a Telegram button bound to
+  # a root nonce, which the office chat does not carry yet, so the approval
+  # itself stays on the server and the ask reports not-sent.
+  if local_only_on; then
+    local lo_body lo_text
+    lo_body=$(_owner_ask_cat_as "$OA_SEAT" "$OA_DIR/$OA_ID.json" 2>/dev/null)
+    lo_text=$(_owner_ask_text "$lo_body" "$name")
+    local_chat_notice "$name" "${lo_text:-${name} asks for your approval} (approve on the server: sudo 5dive browser approve ${OA_ID})" \
+      && { _owner_ask_not_sent "local-only: shown in the office chat; approve with sudo 5dive browser approve ${OA_ID}"; return 0; }
+    _owner_ask_not_sent "local-only: the office chat did not take the ask (sudo 5dive local status)"; return 0
+  fi
   _owner_ask_route "$name" || { _owner_ask_not_sent "$OA_ROUTE_WHY"; return 0; }
 
   local nonce hash body text markup

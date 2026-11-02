@@ -53,7 +53,7 @@ _lo_record() {   # <line> — append once
 
 _lo_usage() {
   printf '%s\n' \
-    "usage: sudo 5dive config local-only on [--ntp=<office time server>]" \
+    "usage: sudo 5dive config local-only on [--ntp=<office time server>] [--no-chat]" \
     "       sudo 5dive config local-only off" \
     "            5dive config local-only status" \
     "            5dive config local-only check [--watch=<seconds>]   # default 60; 0 = no watch" \
@@ -77,10 +77,11 @@ cmd_local_only() {
 }
 
 _lo_on() {
-  local ntp="" a
+  local ntp="" chat=1 a
   for a in "$@"; do
     case "$a" in
       --ntp=*) ntp="${a#--ntp=}" ;;
+      --no-chat) chat=0 ;;   # DIVE-7558: leave the office chat off
       *) fail "$E_USAGE" "unknown flag: $a (see: 5dive config local-only --help)" ;;
     esac
   done
@@ -153,6 +154,13 @@ _lo_on() {
     fi
   fi
   _lo_have systemctl && systemctl daemon-reload >/dev/null 2>&1 || true
+  # 5. DIVE-7558: the office chat, so the owner still has a chat page with the
+  # hosted app out of reach. Its own failure (no office address, no bun) is a
+  # warning: the switch is already in force, and `local serve` can be re-run.
+  if (( chat )) && [[ -z "$(_lo_root)" ]]; then
+    if ( _lc_serve ); then _lo_record "local-chat"
+    else warn "the office chat did not start (sudo 5dive local serve --addr=<office IP>)"; warned=1; fi
+  fi
 
   printf '%s\n' "Local-only mode is ON. Nothing on this box will connect outside your network." \
     "Restart your agents once so they pick it up: sudo systemctl restart '5dive-agent@*'" \
@@ -176,6 +184,7 @@ _lo_off() {
         motd-news) [[ -f "$(_lo_motd)" ]] && sed -i 's/^ENABLED=0/ENABLED=1/' "$(_lo_motd)" ;;
         nightly)   declare -F _su_nightly_on >/dev/null && { _su_nightly_on >/dev/null 2>&1 || warn "could not turn nightly self-update back on"; } ;;
         file)      rm -f -- "$rest" ;;
+        local-chat) ( _lc_serve_stop ) >/dev/null 2>&1 || warn "could not stop the office chat" ;;
       esac
     done < <(tac "$f")
     rm -f -- "$f"

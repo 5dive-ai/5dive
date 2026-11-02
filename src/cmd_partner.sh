@@ -33,7 +33,7 @@ _partner_connectord_env() { printf '%s' "${FIVE_CONNECTORD_ENV:-/etc/5dive/conne
 # this CLI uses (task/notify.sh, hooks/push-notify.sh, cmd_pack.sh's
 # _oa_api_base): FIVE_API_BASE, else production. provisioning.env carries no API
 # base, so there is nothing more authoritative on the box to read.
-_partner_api_base() { local b="${FIVE_API_BASE:-https://api.5dive.com}"; printf '%s' "${b%/}"; }
+_partner_api_base() { five_api_base; }   # DIVE-7558: /etc/5dive/api-base wins (src/lib/local_only.sh)
 
 _partner_usage() {
   cat <<'EOF'

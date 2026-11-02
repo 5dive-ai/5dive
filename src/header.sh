@@ -1167,6 +1167,19 @@ CLAUDE_CUSTOM_PROVIDER_ID="custom"
 # and the function is still loaded lazily, on the one call that needs it.
 _ESC_AUTO_NOTE=""
 
+# DIVE-7558: /etc/5dive/api-base (root 0644, one URL) is the control-plane base
+# the root rail (_dashboard_relay, chat, partner) uses when present; the office
+# chat server writes its loopback URL there. sudo resets FIVE_API_BASE, so the
+# root-owned file is the only redirect a standard seat cannot forge. The file
+# wins over the env; a line that is not one http(s) URL is ignored.
+five_api_base_file() { printf '%s' "${FIVE_API_BASE_FILE:-/etc/5dive/api-base}"; }
+five_api_base() {
+  local b="" f; f=$(five_api_base_file)
+  [[ -r "$f" ]] && IFS= read -r b <"$f" 2>/dev/null
+  [[ "$b" =~ ^https?://[^[:space:]/]+(/[^[:space:]]*)?$ ]] || b="${FIVE_API_BASE:-https://api.5dive.com}"
+  printf '%s' "${b%/}"
+}
+
 # Validate an operator-supplied Anthropic-compatible endpoint for claude BYO.
 #
 # This value is written into an auth profile's combined.env and loaded by
