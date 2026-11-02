@@ -81,25 +81,25 @@ okv 'A2 board: open rows and waiting gates' '(.data.tasks[0].ident == "DIVE-1") 
 okv 'A3 secrets: names only, never values' '.data == ["GITHUB_TOKEN","OPENAI_API_KEY"]' secrets
 okv 'A4 settings: local-only rows, the local AI, update hidden' '(.data.localOnly | length == 2) and (.data.localOnly[1] == {ok:false,item:"snap store",state:"online"}) and (.data.accounts == [{name:"office-ai",harness:"claude",baseUrl:"http://gpu.office:11434",model:"qwen3"}]) and (.data.updateFromFile == false)' settings
 okv 'A5 agent-restart' '.data.done' agent-restart alice
-check 'A5a … ran `agent restart alice`' 'tail -1 "$LOG" | grep -qx -- "--json agent restart alice "'
+check 'A5a … ran `agent restart alice`' 'grep -qx -- "--json agent restart alice " <<<"$(tail -1 "$LOG")"'
 okv 'A6 agent-remove' '.data.done' agent-remove bob
-check 'A6a … ran `agent rm bob`' 'tail -1 "$LOG" | grep -qx -- "--json agent rm bob "'
+check 'A6a … ran `agent rm bob`' 'grep -qx -- "--json agent rm bob " <<<"$(tail -1 "$LOG")"'
 out=$(pe agent-add paralegal)
-check 'A7 agent-add runs create on the local AI account (harness + account from the profile)' 'tail -1 "$LOG" | grep -qx -- "--json agent create paralegal --type=claude --auth-profile=office-ai "'
+check 'A7 agent-add runs create on the local AI account (harness + account from the profile)' 'grep -qx -- "--json agent create paralegal --type=claude --auth-profile=office-ai " <<<"$(tail -1 "$LOG")"'
 check 'A7a … and a CLI failure comes back as the error, not ok' '[[ "$(jq -r .ok <<<"$out")" == false ]] && [[ "$(jq -r .error <<<"$out")" == "agent create stub refused" ]]'
 okv 'A8 gate-answer with a listed option' '.data.done' gate-answer DIVE-2 'Send it today'
-check 'A8a … runs task answer as a human from the panel, the value as ONE argument' 'tail -1 "$LOG" | grep -qxF -- "--json task answer DIVE-2 --value=Send\\ it\\ today --human --from=office-panel "'
+check 'A8a … runs task answer as a human from the panel, the value as ONE argument' 'grep -qxF -- "--json task answer DIVE-2 --value=Send\\ it\\ today --human --from=office-panel " <<<"$(tail -1 "$LOG")"'
 okv 'A9 gate-answer approve on an approval gate' '.data.done' gate-answer DIVE-3 approve
 out=$(printf 's3cr3t-value' | ( _lp_exec secret-set ACME_API_KEY ))
-check 'A10 secret-set: the value on stdin into the tools store' '[[ "$(jq -r .data.saved <<<"$out")" == true ]] && [[ "$(cat "$TMPD/secret.stdin")" == s3cr3t-value ]] && tail -1 "$LOG" | grep -qx -- "--json secret write ACME_API_KEY --connector=tools "'
+check 'A10 secret-set: the value on stdin into the tools store' '[[ "$(jq -r .data.saved <<<"$out")" == true ]] && [[ "$(cat "$TMPD/secret.stdin")" == s3cr3t-value ]] && grep -qx -- "--json secret write ACME_API_KEY --connector=tools " <<<"$(tail -1 "$LOG")"'
 check 'A10a the secret value is on no argv and in no audit line' '! grep -q s3cr3t "$LOG" && ! grep -q s3cr3t "$AUD"'
 okv 'A11 account-test reads the account' '.data.ok == true' account-test office-ai
-check 'A11a … ran account test with the saved address, no key flag' 'tail -1 "$LOG" | grep -qx -- "--json account test --base-url=http://gpu.office:11434 --model=qwen3 --harness=claude "'
+check 'A11a … ran account test with the saved address, no key flag' 'grep -qx -- "--json account test --base-url=http://gpu.office:11434 --model=qwen3 --harness=claude " <<<"$(tail -1 "$LOG")"'
 printf 'FIVEDIVE_CUSTOM_API_KEY=k-123\n' >>"$TMPD/profiles/office-ai/combined.env"
 pe account-test office-ai >/dev/null
 check 'A11b … a saved key goes on stdin, never argv' '[[ "$(cat "$TMPD/test.stdin")" == k-123 ]] && ! grep -q k-123 "$LOG"'
 okv 'A12 device-revoke' '.data.done' device-revoke abcdef12
-check 'A12a … ran local devices revoke' 'tail -1 "$LOG" | grep -qx -- "--json local devices revoke abcdef12 "'
+check 'A12a … ran local devices revoke' 'grep -qx -- "--json local devices revoke abcdef12 " <<<"$(tail -1 "$LOG")"'
 out=$(pe account-test claude-main)
 check 'A13 account-test refuses an account that is not a local AI' '[[ "$(jq -r .ok <<<"$out")" == false ]]'
 
@@ -132,11 +132,11 @@ for shape in 'abc;id' '$(id)aaaaaa' '-abcdef12' $'abcdef12\n' 'ABCDEF12'; do
 done
 refused 'R10 account name with a slash' account-test '../x'
 before=$(calls); out=$(pe gate-answer DIVE-2 'Delete everything')
-check 'R11 a gate answer the gate does not offer is refused (only the read ran)' '[[ "$(jq -r .ok <<<"$out")" == false ]] && (( $(calls) == before + 1 )) && ! tail -1 "$LOG" | grep -q "task answer"'
+check 'R11 a gate answer the gate does not offer is refused (only the read ran)' '[[ "$(jq -r .ok <<<"$out")" == false ]] && (( $(calls) == before + 1 )) && ! grep -q "task answer" <<<"$(tail -1 "$LOG")"'
 out=$(pe gate-answer DIVE-9 approve)
-check 'R12 a row with no open gate is refused' '[[ "$(jq -r .error <<<"$out")" == *"not waiting"* ]] && ! tail -1 "$LOG" | grep -q "task answer"'
+check 'R12 a row with no open gate is refused' '[[ "$(jq -r .error <<<"$out")" == *"not waiting"* ]] && ! grep -q "task answer" <<<"$(tail -1 "$LOG")"'
 out=$(head -c 9000 /dev/zero | tr '\0' a | ( _lp_exec secret-set BIG_API_KEY ))
-check 'R13 a secret value over 8 KB is refused' '[[ "$(jq -r .ok <<<"$out")" == false ]] && ! tail -1 "$LOG" | grep -q BIG_API_KEY'
+check 'R13 a secret value over 8 KB is refused' '[[ "$(jq -r .ok <<<"$out")" == false ]] && ! grep -q BIG_API_KEY <<<"$(tail -1 "$LOG")"'
 
 # ── A. audit ─────────────────────────────────────────────────────────────────
 check 'A20 the audit log exists, 0600' '[[ -f "$AUD" && "$(stat -c %a "$AUD")" == 600 ]]'
@@ -147,7 +147,7 @@ check 'A23 a newline in an argument cannot forge a second audit line' '! grep -q
 # ── S. socket form ───────────────────────────────────────────────────────────
 sock() { ( _lp_exec --socket ); }
 out=$(printf '{"argv":["agent-restart","alice"],"device":"0011aabb"}\n' | sock)
-check 'S1 a JSON request runs, the device is audited' '[[ "$(jq -r .ok <<<"$out")" == true ]] && tail -1 "$AUD" | grep -qP "^\S+\t0011aabb\tagent-restart\talice\tok$"'
+check 'S1 a JSON request runs, the device is audited' '[[ "$(jq -r .ok <<<"$out")" == true ]] && grep -qP "^\S+\t0011aabb\tagent-restart\talice\tok$" <<<"$(tail -1 "$AUD")"'
 out=$(printf '{"argv":["agent-restart","alice\\nbob"]}\n' | sock)
 check 'S2 a newline inside an argument is refused' '[[ "$(jq -r .ok <<<"$out")" == false ]]'
 out=$(printf 'agent-restart alice\n' | sock)
@@ -155,7 +155,7 @@ check 'S3 a request that is not JSON is refused' '[[ "$(jq -r .error <<<"$out")"
 out=$(printf '{"argv":["secret-set","SOCK_API_KEY"],"device":"0011aabb"}\nfrom-the-socket' | sock)
 check 'S4 the value after the line reaches secret write on stdin' '[[ "$(jq -r .ok <<<"$out")" == true && "$(cat "$TMPD/secret.stdin")" == from-the-socket ]]'
 out=$(printf '{"argv":["agent-restart","-x"],"device":"$(id)"}\n' | sock)
-check 'S5 a forged device id is audited as invalid, the flag refused' '[[ "$(jq -r .ok <<<"$out")" == false ]] && tail -1 "$AUD" | grep -qP "\tinvalid\t"'
+check 'S5 a forged device id is audited as invalid, the flag refused' '[[ "$(jq -r .ok <<<"$out")" == false ]] && grep -qP "\tinvalid\t" <<<"$(tail -1 "$AUD")"'
 out=$(printf '{"argv":["team",1]}\n' | sock)
 check 'S6 a non-string argument is refused' '[[ "$(jq -r .error <<<"$out")" == "bad request" ]]'
 
@@ -250,7 +250,7 @@ check 'B8 the chat device still chats' '[[ "$(cw "$W/api/agents" | jq -r .role)"
 check 'B9 the owner device sees its role (the chat page shows Manage)' '[[ "$(ow "$W/api/agents" | jq -r .role)" == owner ]]'
 OWNER_ID=$(LC_STATE="$STATE" "$BUN" "$TMPD/server.ts" admin devices-ls | jq -r '.[] | select(.role == "owner") | .id')
 check 'B10 owner: team' '[[ "$(ow "$W/api/panel/team" | jq -c "[.data[].name]")" == "[\"alice\",\"bob\"]" ]]'
-check 'B11 owner: the action is audited with the owner device id' 'tail -1 "$AUD" | grep -qP "\t${OWNER_ID}\tteam\t\tok$"'
+check 'B11 owner: the action is audited with the owner device id' 'grep -qP "\t${OWNER_ID}\tteam\t\tok$" <<<"$(tail -1 "$AUD")"'
 check 'B12 owner: restart' '[[ "$(ow -H "content-type: application/json" -d "{\"action\":\"restart\",\"name\":\"alice\"}" "$W/api/panel/team" | jq -r .ok)" == true ]]'
 check 'B13 owner: board' '[[ "$(ow "$W/api/panel/board" | jq ".data.gates | length")" == 2 ]]'
 check 'B14 owner: answer a gate' '[[ "$(ow -H "content-type: application/json" -d "{\"ident\":\"DIVE-2\",\"value\":\"Wait for the client\"}" "$W/api/panel/answer" | jq -r .ok)" == true ]]'

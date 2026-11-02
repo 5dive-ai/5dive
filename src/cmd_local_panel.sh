@@ -213,7 +213,7 @@ _lp_run() {
 
 # "Install update from file" rides the offline update verb from the sibling row;
 # until a CLI carries it the panel hides the button.
-_lp_update_ready() { "$(_lp_cli)" self-update --help 2>&1 | grep -q -- '--from-file'; }
+_lp_update_ready() { local h; h=$("$(_lp_cli)" self-update --help 2>&1); grep -q -- '--from-file' <<<"$h"; }
 
 _lp_exec() {
   require_root
