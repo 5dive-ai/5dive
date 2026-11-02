@@ -1306,11 +1306,17 @@ install_channel_plugin_for_agent() {
   # npm's exit code with tail's zero-exit and the agent would ship with
   # half-installed deps; surface the failure so the frontend can show it.
   # `declare -f` ships marketplace_checkout_settled (above) ahead of the script.
+  # The whole pipeline sits on the heredoc's own line, on purpose (DIVE-7566):
+  # Ubuntu 22.04's bash 5.1 starts the heredoc body right after the FIRST
+  # physical line, so a `\`-continued `| sudo … bash -s` below it became script
+  # text — cat printed it and nothing ran (install "succeeded" doing nothing), and
+  # a command after the terminator other than `then` was a syntax error that broke
+  # every verb of the bundle. 5.2 reads the joined line. Keep it one line.
+  local -a seat_sh=(sudo -u "$user" -H env PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo"
+    MKT_FROM="$mkt_from" DASH_NM="${FIVEDIVE_OFFLINE_DASHBOARD_DIR:-/usr/local/lib/5dive/dashboard}/node_modules"
+    CLAUDE_BIN="${FIVEDIVE_CLAUDE_BIN:-/home/claude/.local/bin/claude}" bash -s)
   local install_rc=0
-  { declare -f marketplace_checkout_settled; cat <<'AGENT_PLUGIN_INSTALL'; } \
-      | sudo -u "$user" -H env PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo" \
-          MKT_FROM="$mkt_from" DASH_NM="${FIVEDIVE_OFFLINE_DASHBOARD_DIR:-/usr/local/lib/5dive/dashboard}/node_modules" \
-          CLAUDE_BIN="${FIVEDIVE_CLAUDE_BIN:-/home/claude/.local/bin/claude}" bash -s >&2 || install_rc=$?
+  if ! { declare -f marketplace_checkout_settled; cat <<'AGENT_PLUGIN_INSTALL'; } | "${seat_sh[@]}" >&2; then
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
 export NVM_DIR="/home/claude/.nvm"
@@ -1330,7 +1336,10 @@ MKT_DIR="$HOME/.claude/plugins/marketplaces/$MARKETPLACE"
 # may be cloning into it right now (see marketplace_checkout_settled).
 # DIVE-7566: on a local-only box MKT_FROM is the box's own copy; the checkout
 # then names GitHub as its origin, so a later online update works as usual.
-marketplace_checkout_settled "${MKT_FROM:-$MKT_REPO}" "$MKT_DIR"
+MKT_ORIGIN="$MKT_REPO"
+[ -n "${MKT_FROM:-}" ] && MKT_REPO="$MKT_FROM"
+marketplace_checkout_settled "$MKT_REPO" "$MKT_DIR"
+MKT_REPO="$MKT_ORIGIN"
 [ -n "${MKT_FROM:-}" ] && git -C "$MKT_DIR" remote set-url origin "$MKT_REPO" 2>/dev/null || true
 MKT_SLUG=$(printf '%s' "$MKT_REPO" | sed -e 's#^https://github.com/##' -e 's#\.git$##')
 KM_FILE="$HOME/.claude/plugins/known_marketplaces.json" \
@@ -1445,7 +1454,9 @@ else:
     print("    Patched start script: removed bun install -> " + d["scripts"]["start"])
 PATCHPY
 AGENT_PLUGIN_INSTALL
-  [[ -n "$mkt_stage" ]] && rm -rf -- "$mkt_stage"
+    install_rc=1
+  fi
+  if [[ -n "$mkt_stage" ]]; then rm -rf -- "$mkt_stage"; fi
   if (( install_rc != 0 )); then
     fail "$E_GENERIC" \
       "$plugin plugin install failed for agent '$name' (see journalctl / stderr above). Run: sudo 5dive doctor"

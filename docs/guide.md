@@ -154,7 +154,7 @@ sudo 5dive agent create local-box --type=claude --provider=custom \
   --api-key=<key> --auth-profile=local-box --model=<slug>
 ```
 
-The key must be at least 10 characters; a server that takes any key (Ollama) still
+The key must be at least ten characters long; a server that takes any key (Ollama) still
 needs one that long, for example `ollama-local`.
 
 `https://` is required — the API key rides that URL on every request. `http://` is

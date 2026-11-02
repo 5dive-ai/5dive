@@ -135,5 +135,14 @@ marketplace_checkout_settled() { git clone -q --depth 1 "$1" "$2"; }   # one try
 if (( rc != 0 )) && grep -q '^git-url' "$LOG"; then ok_ 'C1 control: without local-only the install dials GitHub and fails offline (the old behaviour, on every box)'
 else bad_ 'C1 control' "rc=$rc $(cat "$LOG")"; fi
 
+# ── P1: bash 5.1 (Ubuntu 22.04) reads a heredoc body from the line right after
+# the `<<` line, so a `\`-continued pipe below it is swallowed as script text and
+# the install runs nothing (and a non-`then` command after the terminator breaks
+# the whole bundle's parse). The seat pipeline must sit on the heredoc's line.
+hd=$(grep -n "cat <<'AGENT_PLUGIN_INSTALL'" src/lib/agent_setup.sh)
+if [[ -n "$hd" && "$hd" != *'\' && "$hd" == *'| "${seat_sh[@]}"'* ]]; then
+  ok_ 'P1 the seat pipeline is on the heredoc line (bash 5.1 would swallow a continued one)'
+else bad_ 'P1 heredoc line' "$hd"; fi
+
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))
