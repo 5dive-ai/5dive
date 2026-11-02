@@ -2059,7 +2059,7 @@ sys.exit(1)
 # DIVE-7333: a seat whose AI account refused the turn ("Credit balance too low",
 # a bad key) never fences either, and the "ignored the [reply-format]" verdict
 # sent a newcomer, on init's own first command, to look at formatting. [name]
-# turns on the seat's own transcript reading (seat_account_refusal); the pane
+# turns on the seat's own transcript reading (seat_turn_trouble); the pane
 # text arm covers a seat with no transcript. Lines carrying the question's own
 # marker are skipped, so a question ABOUT a login cannot trip it.
 ASK_PANE_REFUSAL_RE='credit balance (is )?too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled|billing_error|authentication_(error|failed)'
@@ -2068,19 +2068,25 @@ ASK_PANE_REFUSAL_RE='credit balance (is )?too low|invalid api key|not logged in|
 # message was not sent"). Not a refusal: the AI account was never asked.
 ASK_PANE_NOSEND_RE="couldn't start the model connection: .*|package is required for the [A-Za-z0-9_ -]+ provider"
 _ask_timeout_diag() { # <msg-id> <pane-file> [scoped] [warned] [name]
-  local mid="$1" f="$2" scoped="${3:-0}" warned="${4:-0}" name="${5:-}" refusal="" nosend="" pkg=""
+  local mid="$1" f="$2" scoped="${3:-0}" warned="${4:-0}" name="${5:-}" refusal="" nosend="" pkg="" filtered="" _tt=""
   if [[ -n "$name" ]] && declare -F hermes_missing_sdk >/dev/null 2>&1 && pkg=$(hermes_missing_sdk "$name" 2>/dev/null); then
     nosend="Hermes needs the '${pkg}' package for its AI provider and it is not installed; install it: ${HERMES_SDK_FIX}"
-  elif [[ -n "$name" ]] && declare -F seat_account_refusal >/dev/null 2>&1; then
-    refusal=$(seat_account_refusal "$name" "$(seat_started_epoch "$name")" 2>/dev/null) || refusal=""
+  elif [[ -n "$name" ]] && declare -F seat_turn_trouble >/dev/null 2>&1; then
+    _tt=$(seat_turn_trouble "$name" "$(seat_started_epoch "$name")" 2>/dev/null) || _tt=""
+    # DIVE-7527: the AI safety filter refusing the conversation is not a credit
+    # or login problem; a new conversation (a restart) answers.
+    if [[ "${_tt%%$'\t'*}" == content-refused ]]; then filtered="${_tt#*$'\t'}"
+    elif [[ -n "$_tt" ]]; then refusal="${_tt#*$'\t'}"; fi
   fi
-  if [[ -z "$refusal$nosend" && -r "$f" ]]; then
+  if [[ -z "$refusal$nosend$filtered" && -r "$f" ]]; then
     nosend=$(grep -vF -e "id=${mid}" -e "5dive-r:${mid}" "$f" 2>/dev/null \
       | grep -ioE "$ASK_PANE_NOSEND_RE" | head -1) || nosend=""
     [[ -n "$nosend" ]] || refusal=$(grep -vF -e "id=${mid}" -e "5dive-r:${mid}" "$f" 2>/dev/null \
       | grep -ioE "$ASK_PANE_REFUSAL_RE" | head -1) || refusal=""
   fi
-  if [[ -n "$nosend" ]]; then
+  if [[ -n "$filtered" ]]; then
+    printf '%s' " — the AI safety filter keeps REFUSING the seat's conversation (${filtered}): its login works, so this is not a credit or login problem. Restart the seat to start a new conversation: 5dive agent restart ${name}"
+  elif [[ -n "$nosend" ]]; then
     printf '%s' " — the seat NEVER SENT the question to its AI (${nosend%"${nosend##*[![:space:]]}"}): this is a setup problem, not a formatting or credit one${name:+. Check the seat: 5dive agent info ${name}}"
   elif [[ -n "$refusal" ]]; then
     printf '%s' " — the seat's AI account REFUSED the turn (${refusal}): this is a credit or login problem, not a formatting one, and no retry will answer until it is fixed. Top up or fix the AI account the seat runs on${name:+, then check it: 5dive agent auth status --agent=${name}}"

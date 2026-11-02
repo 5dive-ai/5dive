@@ -10078,6 +10078,17 @@ _hb_stuck_login_text() { # <login, "" = the box's shared login> <seats, comma-jo
 To fix it, sign in to it again in Settings → AI subscriptions. Or ask your lead agent to move them to another login."
 }
 
+# DIVE-7527 (teal-fox, 2026-10-31): a run of turns the AI safety filter refused
+# ("safeguards flagged this message") reads `content-refused`, not `failing`.
+# The login works, so "sign in again" sent the owner to a fix that does
+# nothing; the conversation is what is refused, and a new one (a restart)
+# answers. One message per SEAT, since it is that seat's conversation.
+_hb_content_refused_text() { # <seat>
+  printf '%s' "⚠️ $1 keeps having its conversation refused by the AI's safety filter. Its AI login works, so signing in again won't help.
+
+Restart $1 to start a new conversation: ask your lead agent, or run 5dive agent restart $1"
+}
+
 # One message through the owner's normal channel: the paired chat of the first
 # telegram seat, preferring one that is not stuck itself (its bot works either
 # way: a bot does not use the AI login). 0 only on a Bot API receipt.
@@ -10107,11 +10118,12 @@ _hb_stuck_login_sweep() { # <now> <registry json>
   [[ "$last" =~ ^[0-9]+$ ]] || last=0
   (( now - last >= ${HB_STUCK_LOGIN_EVERY_SEC:-600} )) || return 0
   printf '%s\n' "$now" >"$dir/.last" 2>/dev/null || true
-  local -A stuck=()
+  local -A stuck=() refused=()
   local name login t key f
   while IFS=$'\t' read -r name login; do
     [[ -n "$name" ]] || continue
     t=$(seat_turn_trouble "$name" "$(seat_started_epoch "$name")") || continue
+    [[ "${t%%$'\t'*}" == content-refused ]] && { refused[$name]=1; continue; }
     [[ "${t%%$'\t'*}" == failing ]] || continue
     key="${login:-default}"
     stuck[$key]+="${stuck[$key]:+, }${name}"
@@ -10133,6 +10145,24 @@ _hb_stuck_login_sweep() { # <now> <registry json>
     [[ -n "${stuck[$key]+x}" ]] && continue
     rm -f "$f"
     _hb_log "[stuck-login] login '${key}' works again (no seat on it is failing) (DIVE-7118)"
+  done
+  # DIVE-7527: the same stamp/clear rules, keyed per seat (content-<seat>).
+  for name in "${!refused[@]}"; do
+    f="$dir/content-${name//[^A-Za-z0-9._-]/_}"
+    [[ -e "$f" ]] && continue
+    if _hb_stuck_login_deliver "$(_hb_content_refused_text "$name")" "$name"; then
+      printf '%s\n' "$name" >"$f" 2>/dev/null || true
+      _hb_log "[content-refused] told the owner: ${name}'s conversation keeps being refused by the AI safety filter; restart it (DIVE-7527)"
+    else
+      _hb_log "[content-refused] ${name}'s conversation keeps being refused by the AI safety filter; the owner could not be reached, retrying next pass (DIVE-7527)"
+    fi
+  done
+  for f in "$dir"/content-*; do
+    [[ -e "$f" ]] || continue
+    name="${f##*/content-}"
+    [[ -n "${refused[$name]+x}" ]] && continue
+    rm -f "$f"
+    _hb_log "[content-refused] ${name} answers again (DIVE-7527)"
   done
   return 0
 }

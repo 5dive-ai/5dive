@@ -532,7 +532,7 @@ cmd_auth_status() {
   # moved it into a db the seed did not carry), and this said `ok` while every
   # message failed. The boot seed's breadcrumb is the seat's own verdict, so a
   # degraded one turns an `ok` into `stale` and says why.
-  local seat_reason="" seat_say=""
+  local seat_reason="" seat_say="" seat_kind="degraded"
   if [[ -n "$agent" ]] && declare -F _agent_startup_credential_health >/dev/null 2>&1; then
     local _hs
     _hs=$(_agent_startup_credential_health "$agent" 2>/dev/null || true)
@@ -554,10 +554,16 @@ cmd_auth_status() {
         seat_say="its own last turn was refused by its AI account: ${seat_reason}"
       elif [[ "${_rf%%$'\t'*}" == cannot-send ]]; then
         seat_say="${seat_reason}"
+      elif [[ "${_rf%%$'\t'*}" == content-refused ]]; then
+        # DIVE-7527: the login answered; the AI safety filter refused the
+        # conversation. The credential stays ok, and the fix is a restart.
+        seat_kind="content-refused"
+        seat_say="its conversation keeps being refused by the AI safety filter (the login works): ${seat_reason}. Restart it to start a new conversation: 5dive agent restart ${agent}"
       else
         seat_say="its own turns keep failing on its AI login: ${seat_reason}"
       fi
-      out=$(jq -c --arg t "$t" 'if .[$t] == "ok" then .[$t] = "stale" else . end' <<<"$out")
+      [[ "$seat_kind" == content-refused ]] \
+        || out=$(jq -c --arg t "$t" 'if .[$t] == "ok" then .[$t] = "stale" else . end' <<<"$out")
     fi
   fi
 
@@ -607,13 +613,13 @@ cmd_auth_status() {
   if (( JSON_MODE )); then
     echo "$out" | jq -c --arg k "$scope_kind" --arg l "$scope_label" \
       --arg a "$agent" --arg p "$profile" --argjson u "$uncovered" \
-      --arg us "$uncovered_status" --arg sr "$seat_reason" \
+      --arg us "$uncovered_status" --arg sr "$seat_reason" --arg sk "$seat_kind" \
       '{ok:true, data: ., scope:{kind:$k, label:$l,
                                  agent:(if $a == "" then null else $a end),
                                  authProfile:(if $p == "" then null else $p end),
                                  uncoveredAgents:$u,
                                  uncoveredStatus:$us}}
-       + (if $sr == "" then {} else {seat:{state:"degraded", reason:$sr}} end)'
+       + (if $sr == "" then {} else {seat:{state:$sk, reason:$sr}} end)'
     [[ "$uncovered_status" == "measured" ]] \
       || echo "COVERAGE UNKNOWN (${uncovered_status#unknown:}): this answer's blind spot could not be measured — it is NOT zero agents, it is unmeasured." >&2
   else
