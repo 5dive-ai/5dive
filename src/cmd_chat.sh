@@ -1,6 +1,10 @@
 # ---------------------------------------------------------------------------
 # DIVE-6878: encrypted 5dive web chat on a self-hosted (chat-only) server, the
-# root side. Protocol v1 and the seat's contract: the dashboard plugin's
+# root side. DIVE-7502: and on a 5dive server, where the API runs `enable -`
+# over the exec rail with the secret on stdin and runs `devices sync` after a
+# device publishes (no link reporter there); the box token is the same
+# connectord.env either way, and a standard seat sends sealed replies through
+# `_dashboard_relay event-e2e/status-e2e`. Protocol v1 and the seat's contract: the dashboard plugin's
 # docs/chat-e2e.md (DIVE-6876); the key directory is 5dive-api's (DIVE-6877).
 #
 #   5dive _chat_e2e                 the seat's rail: open / seal / seal-file, one
@@ -207,9 +211,9 @@ cmd_chat() {
     devices|device) _chat_cmd_devices "$@" ;;
     ""|-h|--help|help)
       cat <<'USAGE'
-5dive chat — encrypted chat in 5dive.app on this self-hosted server
+5dive chat — encrypted chat in 5dive.app on this server
 
-  sudo 5dive chat e2e enable <secret>    pair this server (the 5dive.app link line runs it)
+  sudo 5dive chat e2e enable <secret>    pair this server (5dive.app runs it for you)
   sudo 5dive chat e2e status
   sudo 5dive chat devices                list the browsers and phones, with their codes
   sudo 5dive chat devices approve <code> let a new browser or phone read the chat
@@ -233,7 +237,7 @@ _chat_cmd_e2e() {
       [[ "$secret" =~ ^[A-Za-z0-9_-]{43}$ ]] \
         || fail "$E_VALIDATION" "that is not the pairing code from 5dive.app. Copy the whole line again."
       [[ -n "$(_dash_relay_token)" ]] \
-        || fail "$E_AUTH_REQUIRED" "this server is not linked to 5dive.app yet. Run the whole line from 5dive.app."
+        || fail "$E_AUTH_REQUIRED" "this server is not connected to 5dive.app yet (no $(_sp_connectord_env)). Turn encrypted chat on from 5dive.app."
       live=$(_chat_e2e_live)
       dir=$(_chat_e2e_keydir)
       if [[ -z "$dir" ]]; then
@@ -258,7 +262,7 @@ _chat_cmd_e2e() {
       if [[ -d "$live" ]]; then
         echo "Encrypted chat is on. Server key: $(_chat_e2e_admin "$live" '{"op":"key"}' | jq -r .fp)"
       else
-        echo "Encrypted chat is ready: open 5dive.app in the browser you copied the line from. It pairs within a minute."
+        echo "Encrypted chat is ready: it turns on when the browser that asked for it pairs, within a minute. Keep 5dive.app open there."
       fi ;;
     status)
       local dir; dir=$(_chat_e2e_keydir)

@@ -90,7 +90,8 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"$LOGS/jq.argv"\nexec %q "$@
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"$LOGS/bun.argv"\nexec %q "$@"\n' "$REAL_BUN" >"$TMP/bin/bun"
 chmod +x "$TMP/bin/"*
 export PATH="$TMP/bin:$PATH" FIVEDIVE_CHAT_E2E_BUN="$TMP/bin/bun"
-_gate_uid_to_agent(){ case "$1" in 1042) printf 'tap' ;; *) printf '' ;; esac; }
+MYUID=$(id -u)
+_gate_uid_to_agent(){ case "$1" in 1042|"$MYUID") printf 'tap' ;; *) printf '' ;; esac; }
 _gate_is_root(){ [[ -z "${NOT_ROOT:-}" ]]; }
 # A browser or phone: its own key, its pairing proof, sealing and opening (secret from the env).
 cat >"$TMP/dev.ts" <<'TS'
@@ -146,7 +147,7 @@ check 'box key, proof and secret are 0600 files' \
   '[[ "$(stat -c %a "$PAIR/box.jwk") $(stat -c %a "$PAIR/box.proof") $(stat -c %a "$PAIR/pair.secret")" == "600 600 600" ]]'
 check 'nothing is turned on before a device pairs: no live dir, no box key published' \
   '[[ ! -e "$LIVE" ]] && ! grep -q "PUT" "$LOGS/calls"'
-check 'enable says what to do next' 'grep -q "open 5dive.app in the browser you copied the line from" "$TMP/out"'
+check 'enable says what to do next' 'grep -q "turns on when the browser that asked for it pairs" "$TMP/out"'
 
 # ── sync pairs the first device whose proof verifies ─────────────────────────
 DEV_SECRET="$SECRET" dev new dev-laptop1 >"$TMP/laptop.json"
@@ -200,6 +201,68 @@ check 'an approved device approves the phone: answer is the sealed list' \
 check 'the API mirror gets the approval; the seat never sees the mirror note' \
   'grep -q "POST /server/chat-e2e/box/devices/dev-phone001/approve" "$LOGS/calls" && ! jq -e "has(\"applied\")" "$TMP/out" >/dev/null'
 
+# ── DIVE-7502: the relay's sealed ops (a standard seat on a 5dive server) ────
+# The seat seals through its rail (real crypto above) and hands _dashboard_relay
+# only ciphertext. The relay posts it marked e2e, and refuses anything that is
+# not one box->device envelope, so nothing leaves it marked sealed in the clear.
+export DASHBOARD_OUTBOX="$TMP/outbox" FIVEDIVE_DASHBOARD_RELAY_DIR="$TMP/relay-seen"
+mkdir -p "$DASHBOARD_OUTBOX"
+relay(){ ( export SUDO_UID="${RUID:-$MYUID}"; printf '%s\0' "$@" | cmd_dashboard_relay ) >"$TMP/out" 2>"$TMP/err"; }
+rail '{"op":"seal","conv":"dashboard","m":"b-7502","msg":{"text":"sealed hello"}}'; RENV=$(jq -r .env "$TMP/out")
+rail '{"op":"seal-file","conv":"dashboard","m":"b-7502#f0","data":"aGVsbG8gZmlsZQ"}'
+BLOB="$DASHBOARD_OUTBOX/tap-1730000000000-0-a1b2c3d4e5f6.e2e"; jq -r .env "$TMP/out" >"$BLOB"
+check 'the seat sealed a reply and a file envelope to hand the relay' \
+  '[[ "$(jq -r .h.d <<<"$RENV")" == out && "$(jq -r .h.d "$BLOB")" == out ]]'
+last_body(){ tail -n 1 "$LOGS/bodies"; }
+: >"$LOGS/calls"; : >"$LOGS/bodies"
+relay event-e2e dashboard "$RENV" "$BLOB"; rc=$?
+check 'event-e2e: posts the envelope verbatim to the event URL, answer passed through' \
+  '[[ $rc == 0 && "$(head -n1 "$TMP/out")" == 200 ]] && [[ "$(calls)" == "POST /server/messages/event" ]] && [[ "$(last_body | jq -r .body)" == "$RENV" ]]'
+check 'event-e2e: the agent is the sudo caller, the metadata says e2e {v:1} and names the blob' \
+  '[[ "$(last_body | jq -c "[.agent, .metadata.chat_id, .metadata.e2e, .metadata.files]")" == "[\"tap\",\"dashboard\",{\"v\":1},[\"$BLOB\"]]" ]]'
+check 'event-e2e: the box laptop opens what the relay posted' \
+  '[[ "$(last_body | jq -r .body | dev open dev-laptop1 dashboard "$BOXPUB" | jq -r .text)" == "sealed hello" ]]'
+relay event-e2e dashboard "$RENV"; rc=$?
+check 'event-e2e: no files leaves files off and keeps e2e' '[[ $rc == 0 ]] && last_body | jq -e "(.metadata|has(\"files\")|not) and .metadata.e2e.v == 1" >/dev/null'
+: >"$LOGS/calls"
+relay event-e2e dashboard "plain words"; rc1=$?
+relay event-e2e dashboard "$ENV1"; rc2=$?
+relay event-e2e dashboard "$RENV$RENV"; rc3=$?
+relay event-e2e dashboard "$(jq -c --arg p "$(head -c 70000 /dev/zero | tr '\0' a)" '.ct = $p' <<<"$RENV")"; rc4=$?
+relay event-e2e 'bad chat!' "$RENV"; rc5=$?
+check 'event-e2e refuses plaintext, a device->box envelope, two envelopes, one over 64 KiB, a bad chat id: no call' \
+  '[[ "$rc1 $rc2 $rc3 $rc4 $rc5" == "$E_VALIDATION $E_VALIDATION $E_VALIDATION $E_VALIDATION $E_VALIDATION" && ! -s "$LOGS/calls" ]]'
+printf 'the plain photo' >"$DASHBOARD_OUTBOX/tap-1730000000001-photo.jpg"
+printf 'the plain photo' >"$DASHBOARD_OUTBOX/tap-1730000000002-0-ffffffffffff.e2e"
+cp "$BLOB" "$DASHBOARD_OUTBOX/other-1730000000003-0-ffffffffffff.e2e"
+cp "$BLOB" "$TMP/tap-1730000000004-0-ffffffffffff.e2e"
+ln -s "$BLOB" "$DASHBOARD_OUTBOX/tap-1730000000005-0-ffffffffffff.e2e"
+for f in tap-1730000000001-photo.jpg tap-1730000000002-0-ffffffffffff.e2e other-1730000000003-0-ffffffffffff.e2e tap-1730000000005-0-ffffffffffff.e2e; do
+  relay event-e2e dashboard "$RENV" "$DASHBOARD_OUTBOX/$f"; printf '%s ' "$?" >>"$TMP/rcs"
+done
+relay event-e2e dashboard "$RENV" "$TMP/tap-1730000000004-0-ffffffffffff.e2e"; printf '%s' "$?" >>"$TMP/rcs"
+check 'event-e2e refuses a plain file, a .e2e that is not an envelope, another seat'"'"'s blob, a symlink, a blob outside the outbox: no call' \
+  '[[ "$(cat "$TMP/rcs")" == "$E_VALIDATION $E_VALIDATION $E_VALIDATION $E_VALIDATION $E_VALIDATION" && ! -s "$LOGS/calls" ]]'
+rail '{"op":"seal","conv":"dashboard","m":"s-7502","status":{"label":"reading the logs"}}'; SENV=$(jq -r .env "$TMP/out")
+: >"$LOGS/bodies"
+relay status-e2e dashboard 1 "$SENV"; rc=$?
+check 'status-e2e 1 <envelope>: posts the sealed step to the status URL, marked e2e' \
+  '[[ $rc == 0 ]] && [[ "$(calls)" == "POST /server/messages/status" ]] && [[ "$(last_body | jq -c "[.agent, .chat_id, .active, (.label == \$e), .e2e]" --arg e "$SENV")" == "[\"tap\",\"dashboard\",true,true,{\"v\":1}]" ]]'
+relay status-e2e dashboard 0; rc=$?
+check 'status-e2e 0 (no envelope): label null, still marked e2e' \
+  '[[ $rc == 0 ]] && [[ "$(last_body | jq -c "[.active, .label, .e2e]")" == "[false,null,{\"v\":1}]" ]]'
+: >"$LOGS/calls"
+relay status-e2e dashboard 1 "reading the logs"; rc1=$?
+relay status-e2e dashboard 1 "$(jq -c --arg p "$(head -c 9000 /dev/zero | tr '\0' a)" '.ct = $p' <<<"$SENV")"; rc2=$?
+relay status-e2e dashboard 2 "$SENV"; rc3=$?
+check 'status-e2e refuses a plain label, one over 8 KiB, a bad flag: no call' \
+  '[[ "$rc1 $rc2 $rc3" == "$E_VALIDATION $E_VALIDATION $E_VALIDATION" && ! -s "$LOGS/calls" ]]'
+relay put "$BLOB"; rc=$?
+check 'put accepts the seat'"'"'s sealed .e2e blob (a chat-only box posts it to the files URL)' \
+  '[[ $rc == 0 && "$(head -n1 "$TMP/out")" == 200 ]] && grep -q "^POST /server/selfhost/files?path=.*a1b2c3d4e5f6.e2e$" "$LOGS/calls"'
+RUID=1077 relay event-e2e dashboard "$RENV"; check 'event-e2e from a uid that is not a seat is refused' '[[ $? == "$E_AUTH_REQUIRED" ]]'
+relay nope; check 'an unknown op names both sealed ops in its refusal' 'grep -q "event-e2e, status, status-e2e" "$TMP/err"'
+
 # ── devices approve <code>, revoke <code>, sync drops ────────────────────────
 dev new dev-tablet1 >"$TMP/tablet.json"
 jq -s '.' "$TMP/laptop.json" "$TMP/tablet.json" <(dev new dev-phone001x >/dev/null; jq -c '.device="dev-phone001" | .pub=$p | .proof=null' --arg p "$PHONEPUB" "$TMP/tablet.json") >"$DEVICES"
@@ -240,12 +303,40 @@ NOT_ROOT=1 run _chat_cmd_e2e heal; check 'heal as non-root is refused' '[[ $? ==
 check 'self-update calls the fresh binary to heal' \
   'grep -q "5dive\" chat e2e heal" "$SRC/cmd_selfupdate.sh"'
 
+# ── DIVE-7502: enable on a 5dive server (hosted) ─────────────────────────────
+# The API runs `5dive chat e2e enable -` over the exec rail with "<secret>\n" on
+# stdin and `5dive chat devices sync` after a device publishes. The box is a
+# hosted one: connectord.env as the installer writes it (three lines), no
+# chat-only mark. The token sent is that box's, and the pairing completes.
+SECRET2=$("$REAL_BUN" -e 'const b=crypto.getRandomValues(new Uint8Array(32));process.stdout.write(Buffer.from(b).toString("base64url"))')
+H="$TMP/hosted"; mkdir -p "$H/etc"; chmod 0755 "$H/etc"
+printf 'CONNECTORD_TOKEN=tok-hosted\nADMIN_PUBKEY_B64=\nAUTOMATION_TOKEN=auto-x\n' >"$H/connectord.env"
+hosted(){ FIVEDIVE_CHAT_E2E_DIR="$H/etc/chat-e2e" FIVEDIVE_CONNECTORD_ENV="$H/connectord.env" FIVEDIVE_CHAT_ONLY_MARK="$H/etc/chat-only" "$@"; }
+check 'the hosted fixture is not a chat-only box' '! hosted box_is_chat_only'
+echo '[]' >"$DEVICES"; : >"$LOGS/calls"; : >"$LOGS/curl.stdin"
+printf '%s\n' "$SECRET2" | run hosted _chat_cmd_e2e enable -; rc=$?
+check 'hosted: enable - (the API'"'"'s stdin shape) makes the pairing dir and publishes nothing yet' \
+  '[[ $rc == 0 && -d "$H/etc/chat-e2e.pairing" && ! -e "$H/etc/chat-e2e" ]] && ! grep -q PUT "$LOGS/calls"'
+DEV_SECRET="$SECRET2" dev new dev-hostweb1 >"$TMP/hostweb.json"; jq -s . "$TMP/hostweb.json" >"$DEVICES"
+: >"$LOGS/calls"
+run hosted _chat_cmd_devices sync; rc=$?
+check 'hosted: the sync after the publish pairs the browser and turns it on' \
+  '[[ $rc == 0 && -d "$H/etc/chat-e2e" && ! -e "$H/etc/chat-e2e.pairing" && ! -e "$H/etc/chat-e2e/pair.secret" ]] && grep -q "PUT /server/chat-e2e/box/key" "$LOGS/calls" && grep -q "dev-hostweb1/approve" "$LOGS/calls"'
+check 'hosted: every call carried THIS box'"'"'s token, and only it' \
+  'grep -q "^Authorization: Bearer tok-hosted$" "$LOGS/curl.stdin" && ! grep -q "tok-one\|auto-x" "$LOGS/curl.stdin"'
+run hosted _chat_cmd_e2e status; check 'hosted: status says on, one device' 'grep -q "on, 1 device" "$TMP/out"'
+printf 'ADMIN_PUBKEY_B64=\n' >"$H/connectord.env"; rm -rf "$H/etc/chat-e2e"; : >"$LOGS/calls"
+printf '%s\n' "$SECRET2" | run hosted _chat_cmd_e2e enable -; rc=$?
+check 'hosted: a box with no token is refused with no network call, and no key dir' \
+  '[[ $rc == "$E_AUTH_REQUIRED" && ! -e "$H/etc/chat-e2e.pairing" && ! -s "$LOGS/calls" ]] && grep -q "Turn encrypted chat on from 5dive.app" "$TMP/err"'
+
 # ── the secret ───────────────────────────────────────────────────────────────
 leaks(){ # <secret> -> 0 when it shows up anywhere this harness can see
   grep -rqF -- "$1" "$LOGS" "$TMP/out" "$TMP/err" "$TMP/etc" "$TMP/lib" "$TMP/tmpd" "$STATE_DIR" "$AUDIT_LOG" 2>/dev/null
 }
 check 'the logger saw real traffic (curl, jq and bun argv)' '[[ -s "$LOGS/curl.argv" && -s "$LOGS/jq.argv" && -s "$LOGS/bun.argv" ]]'
 check 'THE SECRET appears in no argv, curl stdin, body, output, log or file' '! leaks "$SECRET"'
+check 'DIVE-7502: nor the hosted box'"'"'s secret (it came in on stdin)' '! leaks "$SECRET2" && ! grep -rqF -- "$SECRET2" "$H"'
 # Control: the same check on a leaky shape (the secret handed to jq on its argv).
 jq -nc --arg s "$SECRET" '{secret:$s}' >/dev/null
 check 'control: the check goes red when the secret is on an argv' 'leaks "$SECRET"'
