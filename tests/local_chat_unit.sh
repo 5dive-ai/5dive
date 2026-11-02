@@ -28,7 +28,7 @@ trap 'rc=$?; [[ -n "$SRV_PID" ]] && kill "$SRV_PID" 2>/dev/null; rm -rf "$TMPD";
 export FIVE_LOCAL_ONLY_FILE="$TMPD/local-only"
 export FIVE_API_BASE_FILE="$TMPD/api-base"
 export FIVEDIVE_CONNECTORD_ENV="$TMPD/no-connectord.env"
-for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/local_only.sh cmd_local_chat.sh cmd_local_chat_server.sh cmd_dashboard_relay.sh; do source "src/$f"; done
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/local_only.sh cmd_local_chat.sh cmd_local_chat_server.sh cmd_local_panel.sh cmd_dashboard_relay.sh; do source "src/$f"; done
 set +e   # header.sh turns errexit on; this harness reads every rc itself
 JSON_MODE=0
 
