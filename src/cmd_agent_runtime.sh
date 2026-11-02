@@ -2071,12 +2071,14 @@ _ask_timeout_diag() { # <msg-id> <pane-file> [scoped] [warned] [name]
   local mid="$1" f="$2" scoped="${3:-0}" warned="${4:-0}" name="${5:-}" refusal="" nosend="" pkg="" filtered="" _tt=""
   if [[ -n "$name" ]] && declare -F hermes_missing_sdk >/dev/null 2>&1 && pkg=$(hermes_missing_sdk "$name" 2>/dev/null); then
     nosend="Hermes needs the '${pkg}' package for its AI provider and it is not installed; install it: ${HERMES_SDK_FIX}"
-  elif [[ -n "$name" ]] && declare -F seat_turn_trouble >/dev/null 2>&1; then
-    _tt=$(seat_turn_trouble "$name" "$(seat_started_epoch "$name")" 2>/dev/null) || _tt=""
+  elif [[ -n "$name" ]] && declare -F seat_account_refusal >/dev/null 2>&1; then
     # DIVE-7527: the AI safety filter refusing the conversation is not a credit
-    # or login problem; a new conversation (a restart) answers.
+    # or login problem; a new conversation (a restart) answers. The kind is read
+    # first; any other reading stays on seat_account_refusal, as before.
+    declare -F seat_turn_trouble >/dev/null 2>&1 \
+      && _tt=$(seat_turn_trouble "$name" "$(seat_started_epoch "$name")" 2>/dev/null) || _tt=""
     if [[ "${_tt%%$'\t'*}" == content-refused ]]; then filtered="${_tt#*$'\t'}"
-    elif [[ -n "$_tt" ]]; then refusal="${_tt#*$'\t'}"; fi
+    else refusal=$(seat_account_refusal "$name" "$(seat_started_epoch "$name")" 2>/dev/null) || refusal=""; fi
   fi
   if [[ -z "$refusal$nosend$filtered" && -r "$f" ]]; then
     nosend=$(grep -vF -e "id=${mid}" -e "5dive-r:${mid}" "$f" 2>/dev/null \
