@@ -37,6 +37,10 @@
 # invoked us (e.g. a session restarting itself).
 
 set -uo pipefail
+# DIVE-7557: local-only mode — this refresh fetches from the internet, so skip.
+if [[ -e "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" ]]; then
+  echo "$(basename "$0"): skipped — local-only mode is on"; exit 0
+fi
 
 CLAUDE_BIN="${CLAUDE_BIN:-/home/claude/.local/bin/claude}"
 # How many plugin-cache versions to retain per plugin during prune. >=2 keeps

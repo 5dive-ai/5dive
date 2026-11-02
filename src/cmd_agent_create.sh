@@ -3894,6 +3894,11 @@ cmd_create() {
   # of the 5dive-cli extra only.
   local -a skills_specs=()
   # DIVE-6751: and out of the default list every preseed branch seeds.
+  # DIVE-7557: default skills are fetched from GitHub, so local-only skips
+  # them (an explicit --with-skills is refused earlier, by the gate in main).
+  if (( ! no_skills )) && local_only_on; then
+    no_skills=1; echo "note: no default skills — local-only mode is on (they come from the internet)" >&2
+  fi
   NO_DEFAULT_SKILLS=$no_skills
   if (( no_skills )); then
     :

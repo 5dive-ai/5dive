@@ -196,6 +196,10 @@ cmd_crew_run() {
     shift
   done
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive crew run <name> [--input='{...}'] [--no-receipt]"
+  # DIVE-7557: a receipt goes to 5dive's servers, so local-only forces it off.
+  if local_only_on && (( ! no_receipt )); then
+    no_receipt=1; echo "note: no receipt — local-only mode is on" >&2
+  fi
   local dir; dir="$(_crew_dir "$name")"
   [[ -d "$dir" ]] || fail "$E_NOT_FOUND" "no crew '$name' (see: 5dive crew list)"
   local entry; entry="$(jq -r '.entry // empty' "$dir/crew.json" 2>/dev/null)"

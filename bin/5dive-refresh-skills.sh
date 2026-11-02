@@ -39,6 +39,10 @@
 #   REFRESH_SKILLS_PRINT_PLAN=1 /usr/local/bin/5dive-refresh-skills.sh  # list only, touch nothing
 
 set -uo pipefail
+# DIVE-7557: local-only mode — this refresh fetches from the internet, so skip.
+if [[ -e "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" ]]; then
+  echo "$(basename "$0"): skipped — local-only mode is on"; exit 0
+fi
 
 FIVE_BIN="${FIVE_BIN:-/usr/local/bin/5dive}"
 AGENTS_JSON="${FIVE_AGENTS_JSON:-/var/lib/5dive/agents.json}"

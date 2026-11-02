@@ -156,7 +156,9 @@ sudo 5dive agent create local-box --type=claude \
 
 `https://` is required — the API key rides that URL on every request. `http://` is
 accepted only for `localhost` / `127.0.0.1` / `[::1]`, where the traffic never leaves
-the box; a private-LAN address is still a real network and is refused. `--base-url`
+the box; a private-LAN address is still a real network and is refused. On a box in
+**local-only mode** (`sudo 5dive config local-only on`, below) a private-LAN address *is*
+accepted, and a model that is not on your network is refused instead. `--base-url`
 requires `--auth-profile`, like every claude BYO path, so the endpoint and its key
 are scoped to the agents you bind to that profile rather than to every claude agent
 on the host. In a `5dive compose` spec the key is `base_url`.
@@ -589,3 +591,19 @@ Want a scoped first thing to build? The control plane on top of the runtime is e
 ## License
 
 MIT. See [LICENSE](../LICENSE).
+
+## Local-only mode: nothing leaves your network
+
+For an office where nothing may leave the building, one command turns off every outside
+connection the box makes on its own, and refuses every command that would make one:
+
+```sh
+sudo 5dive config local-only on --ntp=192.168.1.1   # --ntp: your office time server (optional)
+sudo 5dive agent restart --all                       # agents pick up the quiet runtime settings
+sudo 5dive config local-only check                   # ok/LEAK per item, then a 60 s connection watch
+```
+
+While it is on, agents must use a model server on your network
+(`--base-url=http://<lan-ip>:<port>`); Telegram, a2a, cloud AI accounts, updates and installs
+from the internet are refused with a one-line reason. `sudo 5dive config local-only off`
+puts back exactly what it changed.
