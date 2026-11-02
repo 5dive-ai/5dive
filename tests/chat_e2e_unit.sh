@@ -398,6 +398,15 @@ printf '%s\n' "$SECRET2" | run hosted _chat_cmd_e2e enable -; rc=$?
 check 'hosted: a box with no token is refused with no network call, and no key dir' \
   '[[ $rc == "$E_AUTH_REQUIRED" && ! -e "$H/etc/chat-e2e.pairing" && ! -s "$LOGS/calls" ]] && grep -q "Turn encrypted chat on from 5dive.app" "$TMP/err"'
 
+# ── DIVE-7520: disable at the server leaves the off mark seats trust ────────
+D="$TMP/dis"; mkdir -p "$D/etc/chat-e2e"; echo '{}' >"$D/etc/chat-e2e/roster.json"
+FIVEDIVE_CHAT_E2E_DIR="$D/etc/chat-e2e" run _chat_cmd_e2e disable; rc=$?
+check 'disable: the off mark is written and the keys are moved aside, not deleted' \
+  '[[ $rc == 0 && -f "$D/etc/chat-e2e.off" && ! -e "$D/etc/chat-e2e" ]] && ls -d "$D"/etc/chat-e2e.disabled-* >/dev/null'
+NOT_ROOT=1 FIVEDIVE_CHAT_E2E_DIR="$D/etc/chat-e2e" run _chat_cmd_e2e disable; check 'disable as non-root is refused' '[[ $? == "$E_PERMISSION" ]]'
+printf '%s\n' "$SECRET2" | FIVEDIVE_CHAT_E2E_DIR="$D/etc/chat-e2e" run _chat_cmd_e2e enable -
+check 'enable again lifts the off mark' '[[ ! -e "$D/etc/chat-e2e.off" ]]'
+
 # ── the secret ───────────────────────────────────────────────────────────────
 leaks(){ # <secret> -> 0 when it shows up anywhere this harness can see
   grep -rqF -- "$1" "$LOGS" "$TMP/out" "$TMP/err" "$TMP/etc" "$TMP/lib" "$TMP/tmpd" "$STATE_DIR" "$AUDIT_LOG" 2>/dev/null

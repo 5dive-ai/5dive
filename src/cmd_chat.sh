@@ -260,6 +260,7 @@ cmd_chat() {
   sudo 5dive chat devices                list the browsers and phones, with their codes
   sudo 5dive chat devices approve <code> let a new browser or phone read the chat
   sudo 5dive chat devices revoke <code>  stop one
+  sudo 5dive chat e2e disable            turn encrypted chat off (only here, at the server)
 USAGE
       ;;
     *) fail "$E_USAGE" "chat: unknown subcommand '$sub' (e2e, devices)." ;;
@@ -281,6 +282,7 @@ _chat_cmd_e2e() {
       [[ -n "$(_dash_relay_token)" ]] \
         || fail "$E_AUTH_REQUIRED" "this server is not connected to 5dive.app yet (no $(_sp_connectord_env)). Turn encrypted chat on from 5dive.app."
       live=$(_chat_e2e_live)
+      rm -f -- "$live.off"   # DIVE-7520: turning it on again lifts the owner's off mark
       dir=$(_chat_e2e_keydir)
       if [[ -z "$dir" ]]; then
         dir="$live.pairing"
@@ -313,7 +315,21 @@ _chat_cmd_e2e() {
         echo "Encrypted chat: on, $(_chat_e2e_admin "$dir" '{"op":"roster"}' | jq -r '.devices | length') device(s). Server key: $(_chat_e2e_admin "$dir" '{"op":"key"}' | jq -r .fp)"
       else echo "Encrypted chat: waiting for the first browser to pair."
       fi ;;
-    *) fail "$E_USAGE" "chat e2e: unknown subcommand '$sub' (enable, status)." ;;
+    disable)
+      # DIVE-7520: the one way encrypted chat turns off once it was on. Every
+      # seat pins it on and reads a missing key dir as a fault, never as off,
+      # unless <dir>.off exists: root-owned, so only the owner at this server
+      # (never a seat, never the API) can say "off". The keys are kept aside.
+      local live; live=$(_chat_e2e_live)
+      [[ -d "$live" || -d "$live.pairing" ]] || { echo "Encrypted chat is already off."; return 0; }
+      ( umask 022; printf 'turned off at %s by sudo 5dive chat e2e disable\n' "$(date -u +%FT%TZ)" >"$live.off" ) \
+        || fail "$E_GENERIC" "cannot write $live.off."
+      local d
+      for d in "$live" "$live.pairing"; do
+        [[ -d "$d" ]] && { mv -T -- "$d" "$d.disabled-$(date -u +%Y%m%d%H%M%S)" || fail "$E_GENERIC" "could not move $d aside."; }
+      done
+      echo "Encrypted chat is off on this server. The agents stop sealing now. To turn it on again, pair a browser from 5dive.app." ;;
+    *) fail "$E_USAGE" "chat e2e: unknown subcommand '$sub' (enable, status, disable)." ;;
   esac
 }
 
