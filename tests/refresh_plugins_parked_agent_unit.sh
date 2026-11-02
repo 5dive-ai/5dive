@@ -288,6 +288,11 @@ bounced katya && ok_t "U7 an explicit null desiredState restarts" \
 # park must survive it. Its one start (step 7) reads the registry desiredState and
 # leaves a stopped agent down — tests/agent_switch_harness_unit.sh P1/P2.
 #
+# `src/cmd_account_custom.sh` (DIVE-7568) is GUARDED: `account add --provider=custom
+# --replace` moves an account to a new address and restarts every agent on it,
+# skipping one whose registry desiredState is exactly "stopped", so a park
+# survives the move — tests/dive7568_custom_ai_unit.sh PK arms.
+#
 # `scripts/init-smoke.sh` (DIVE-7337) is CANNOT-RESURRECT, read per call site:
 # its two `systemctl restart` lines (openclaw and hermes model pins) sit in
 # pin_model, which runs only after seat_up saw the unit is-active (a down seat
@@ -304,6 +309,7 @@ declare -A RESTART_PATHS=(
   [src/cmd_heartbeat.sh]=GUARDED
   [src/cmd_host.sh]=GUARDED
   [src/cmd_agent_switch.sh]=GUARDED
+  [src/cmd_account_custom.sh]=GUARDED
   [src/cmd_doctor.sh]=CANNOT-RESURRECT
   [scripts/init-smoke.sh]=CANNOT-RESURRECT
   [src/cmd_agent_lifecycle.sh]=OPERATOR-VERB

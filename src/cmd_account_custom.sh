@@ -143,14 +143,23 @@ cmd_account_add_custom() {
     fail "$E_CONFLICT" "account '$name' already points at ${had_url}. Re-run with --replace to move it (every agent on it moves on its next restart)."
   fi
   custom_ai_save "$name" "$harness" "$url" "$model" "$key"
-  # Seats already on the account pick the new address up on restart.
-  local _agent
-  while IFS= read -r _agent; do
+  # Seats already on the account pick the new address up on restart. An
+  # operator park (desiredState=="stopped", written only by `5dive agent stop`)
+  # survives the move: `systemctl restart` on a stopped unit STARTS it (DIVE-4399),
+  # so a parked agent is skipped and gets the new address when it is next started.
+  # Only the exact "stopped" skips; absent or anything else restarts (an unknown
+  # must not freeze the agent on the old address).
+  local _agent _parked
+  while IFS=$'\t' read -r _agent _parked; do
     [[ -n "$_agent" ]] || continue
+    if [[ "$_parked" == stopped ]]; then
+      step "Leaving 5dive-agent@${_agent}.service down (parked); it uses the new address when started"
+      continue
+    fi
     step "Restarting 5dive-agent@${_agent}.service"
     systemctl restart "5dive-agent@${_agent}.service" >&2 2>&1 \
       || warn "restart of agent '$_agent' failed — check journalctl -u 5dive-agent@${_agent}"
-  done < <(registry_read | jq -r --arg p "$name" '.agents | to_entries[] | select(.value.authProfile == $p) | .key')
+  done < <(registry_read | jq -r --arg p "$name" '.agents | to_entries[] | select(.value.authProfile == $p) | [.key, ((.value.desiredState // "") | tostring)] | @tsv')
   ok "account '$name' saved: ${harness} on ${url} (model ${model})${key:+, with a key}. New agent: sudo 5dive agent create <name> --type=${harness} --auth-profile=${name}" \
      '{name:$n, provider:"custom", harness:$h, baseUrl:$u, model:$m, hasKey:$k}' \
      --arg n "$name" --arg h "$harness" --arg u "$url" --arg m "$model" --argjson k "$([[ -n "$key" ]] && echo true || echo false)"

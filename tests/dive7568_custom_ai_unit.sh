@@ -92,6 +92,27 @@ out=$( (cmd_account_add_custom o3 --provider=custom --base-url=http://203.0.113.
 out=$( (cmd_account_add_custom o3 --provider=custom --base-url=http://10.0.0.5 --harness=pi) 2>&1); rc=$?
 [[ $rc -ne 0 && "$out" == *"--model=<name> is required"* ]] && ok_t "SAVE: no model is refused" || bad_t "SAVE: no model rc=$rc $out"
 
+# ── PARKED (quinn it2: --replace must not wake a parked agent) ───────────────
+# `systemctl restart` on a stopped unit STARTS it (DIVE-4399). Only the exact
+# desiredState "stopped" skips; absent, null or any other value restarts (an
+# unknown must not freeze an agent on the old address).
+profile_env_value() { echo "http://10.0.0.1:11434"; }
+registry_read() { echo '{"agents":{"katya":{"authProfile":"office","desiredState":"stopped"},"nova":{"authProfile":"office","desiredState":"running"},"ivy":{"authProfile":"office"},"zed":{"authProfile":"office","desiredState":"Stopped"},"rex":{"authProfile":"other","desiredState":"running"}}}'; }
+systemctl() { echo "$*" >> "$TMP/sysctl"; }
+mkdir -p "$TMP/profiles/office"; AUTH_PROFILES_DIR="$TMP/profiles"
+: > "$TMP/sysctl"
+out=$( (cmd_account_add_custom office --provider=custom --base-url=http://10.0.0.5:11434 --model=m --harness=pi --replace </dev/null) 2>&1); rc=$?
+eq_t "PK1 --replace saves (rc 0)" "0" "$rc"
+eq_t "PK2 --replace restarts the running, unknown-state and non-exact agents on the account, and only those" \
+  "restart 5dive-agent@ivy.service|restart 5dive-agent@nova.service|restart 5dive-agent@zed.service" "$(sort "$TMP/sysctl" | paste -sd'|')"
+grep -q katya "$TMP/sysctl" && bad_t "PK3 the parked agent was restarted (woken)" || ok_t "PK3 the parked agent (desiredState=stopped) is left down"
+: > "$TMP/sysctl"
+out=$( (cmd_account_add_custom office --provider=custom --base-url=http://10.0.0.5:11434 --model=m --harness=pi </dev/null) 2>&1); rc=$?
+[[ $rc -ne 0 && "$out" == *"--replace"* && ! -s "$TMP/sysctl" ]] && ok_t "PK4 control: without --replace a moved account is refused and nothing restarts" || bad_t "PK4 rc=$rc $out"
+profile_env_value() { echo ""; }
+registry_read() { echo '{"agents":{}}'; }
+systemctl() { :; }
+
 # ── RENDER ──────────────────────────────────────────────────────────────────
 START=bin/5dive-agent-start
 blk="$(sed -n '/^# >>> custom-ai renderers (DIVE-7568) >>>$/,/^# <<< custom-ai renderers (DIVE-7568) <<<$/p' "$START")"
