@@ -599,7 +599,7 @@ connection the box makes on its own, and refuses every command that would make o
 
 ```sh
 sudo 5dive config local-only on --ntp=192.168.1.1   # --ntp: your office time server (optional)
-sudo 5dive agent restart --all                       # agents pick up the quiet runtime settings
+sudo systemctl restart '5dive-agent@*'                       # agents pick up the quiet runtime settings
 sudo 5dive config local-only check                   # ok/LEAK per item, then a 60 s connection watch
 ```
 

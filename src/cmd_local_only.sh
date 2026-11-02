@@ -155,7 +155,7 @@ _lo_on() {
   _lo_have systemctl && systemctl daemon-reload >/dev/null 2>&1 || true
 
   printf '%s\n' "Local-only mode is ON. Nothing on this box will connect outside your network." \
-    "Restart your agents once so they pick it up: sudo 5dive agent restart --all" \
+    "Restart your agents once so they pick it up: sudo systemctl restart '5dive-agent@*'" \
     "Prove it any time: sudo 5dive config local-only check"
   (( warned )) && printf '%s\n' "Some system items could not be turned off (see the warnings above); check lists them."
   return 0
@@ -184,7 +184,7 @@ _lo_off() {
   _lo_have systemctl && [[ -z "$(_lo_root)" ]] && systemctl try-restart systemd-timesyncd >/dev/null 2>&1 || true
   rm -f -- "$flag"
   printf '%s\n' "Local-only mode is OFF. Everything it turned off is back as it was." \
-    "Restart your agents once so they pick it up: sudo 5dive agent restart --all"
+    "Restart your agents once so they pick it up: sudo systemctl restart '5dive-agent@*'"
 }
 
 # One line per item: "ok    <item>  <state>" or "LEAK  <item>  <state>".
