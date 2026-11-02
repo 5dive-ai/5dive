@@ -115,7 +115,10 @@ MOD_SEAT_LOADED_RE='hooks module mod@5dive-plugins loaded'
 #   user's config (plugin_seats.sh's header).
 mod_seat_probe_run() { # <name> <debug-file>
   local user="agent-${1:-}" dbg="${2:-}"
-  sudo -u "$user" -H env -u CLAUDE_CONFIG_DIR DBG="$dbg" \
+  # DIVE-7573 (D2): the local-only quiet env, as on every Claude Code run.
+  local -a quiet_env=()
+  declare -F local_only_claude_env >/dev/null && mapfile -t quiet_env < <(local_only_claude_env)
+  sudo -u "$user" -H env -u CLAUDE_CONFIG_DIR "${quiet_env[@]}" DBG="$dbg" \
     timeout "${MOD_SEAT_PROBE_TIMEOUT:-45}" bash -c '
       export NVM_DIR=/home/claude/.nvm; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1
       export PATH="/home/claude/.local/bin:$PATH"

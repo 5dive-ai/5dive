@@ -8,7 +8,7 @@
 #   1. the flag file /etc/5dive/local-only — FIRST, so the refusals hold even if
 #      a later OS step fails (fail closed);
 #   2. agent runtime: a drop-in on 5dive-agent@.service sets
-#      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 + DISABLE_AUTOUPDATER=1 for
+#      LOCAL_ONLY_CLAUDE_ENV + LOCAL_MODEL_SEAT_ENV (src/lib/local_only.sh) for
 #      every seat (telemetry, error reports, auto-update, feature flags), and
 #      /etc/codex/managed_config.toml turns off codex's update check, analytics
 #      and feedback (codex has no env knob for these; the managed layer wins
@@ -49,6 +49,36 @@ _lo_unit_state() { _lo_have systemctl || { printf 'absent'; return 0; }
 _lo_record() {   # <line> — append once
   local f; f=$(_lo_undo)
   grep -qxF -- "$1" "$f" 2>/dev/null || printf '%s\n' "$1" >> "$f"
+}
+
+# DIVE-7573: the drop-in's whole body, from the two lists in local_only.sh. D4:
+# every seat on a local-only box runs a local model, so tool search is off.
+_lo_dropin_body() {
+  local e
+  printf '%s\n' "# 5dive local-only (DIVE-7557): no telemetry, error reports, auto-update or" \
+    "# feature-flag calls from the agent runtime; tool search off for local models" \
+    "# (DIVE-7573). Removed by: 5dive config local-only off" \
+    "[Service]"
+  for e in "${LOCAL_ONLY_CLAUDE_ENV[@]}" "${LOCAL_MODEL_SEAT_ENV[@]}"; do printf 'Environment=%s\n' "$e"; done
+}
+
+# Every Claude Code seat home on the box: the agents and the claude user.
+_lo_seat_homes() {
+  local h
+  for h in "$(_lo_root)"/home/agent-* "$(_lo_root)/home/claude"; do
+    [[ -f "$h/.claude/settings.json" || -f "$h/.claude/plugins/known_marketplaces.json" ]] && printf '%s\n' "$h"
+  done
+  return 0
+}
+
+# Names of the GitHub/git marketplaces a seat still knows, comma-joined; empty = none.
+_lo_seat_remote_mkts() { # <home>
+  local out="" sel='to_entries[] | select((.value.source.source // "") != "directory") | .key'
+  [[ -f "$1/.claude/settings.json" ]] \
+    && out+=$(jq -r "(.extraKnownMarketplaces // {}) | $sel" "$1/.claude/settings.json" 2>/dev/null | tr '\n' ' ')
+  [[ -f "$1/.claude/plugins/known_marketplaces.json" ]] \
+    && out+=" "$(jq -r "$sel" "$1/.claude/plugins/known_marketplaces.json" 2>/dev/null | tr '\n' ' ')
+  printf '%s' "$out" | tr ' ' '\n' | sort -u | grep -v '^$' | paste -sd, - 2>/dev/null || true
 }
 
 _lo_usage() {
@@ -102,16 +132,22 @@ _lo_on() {
   touch "$(_lo_undo)"; chmod 0600 "$(_lo_undo)" 2>/dev/null || true
   local warned=0
 
-  # 2a. every seat's runtime env.
+  # 2a. every seat's runtime env. DIVE-7573: rewritten when it differs, so a
+  # box that turned the mode on before tool search was added gets it too.
   local di; di=$(_lo_dropin)
-  if [[ ! -f "$di" ]]; then
+  local want; want=$(_lo_dropin_body)
+  if [[ ! -f "$di" ]] || [[ "$(cat "$di" 2>/dev/null)" != "$want" ]]; then
+    local had=0; [[ -f "$di" ]] && had=1
     mkdir -p "$(dirname "$di")"
-    printf '%s\n' "# 5dive local-only (DIVE-7557): no telemetry, error reports, auto-update or" \
-      "# feature-flag calls from the agent runtime. Removed by: 5dive config local-only off" \
-      "[Service]" \
-      "Environment=CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1" \
-      "Environment=DISABLE_AUTOUPDATER=1" > "$di" && _lo_record "file $di"
+    printf '%s\n' "$want" > "$di" && { (( had )) || _lo_record "file $di"; }
   fi
+  # 2c. DIVE-7573 (D3): every seat's plugin marketplaces become its own
+  # checkouts, so no session start refreshes them from GitHub.
+  local h
+  while IFS= read -r h; do
+    seat_marketplaces_local "$h" on
+  done < <(_lo_seat_homes)
+  _lo_record "seat-marketplaces"
   # 2b. codex. An existing managed config is the owner's: never overwritten.
   local cx; cx=$(_lo_codex)
   if [[ ! -e "$cx" ]]; then
@@ -197,6 +233,8 @@ _lo_off() {
         nightly)   declare -F _su_nightly_on >/dev/null && { _su_nightly_on >/dev/null 2>&1 || warn "could not turn nightly self-update back on"; } ;;
         file)      rm -f -- "$rest" ;;
         local-chat) ( _lc_serve_stop ) >/dev/null 2>&1 || warn "could not stop the office chat" ;;
+        seat-marketplaces)
+          local h; while IFS= read -r h; do seat_marketplaces_local "$h" off; done < <(_lo_seat_homes) ;;
       esac
     done < <(tac "$f")
     rm -f -- "$f"
@@ -226,6 +264,14 @@ _lo_check() {
   else _lo_line LEAK "local-only switch" off; bad=1; fi
   if [[ -f "$(_lo_dropin)" ]]; then _lo_line ok "agent runtime background calls" off
   else _lo_line LEAK "agent runtime background calls" on; bad=1; fi
+  # DIVE-7573 (D3): a seat that still names a GitHub marketplace looks it up at
+  # every start.
+  local h rm
+  while IFS= read -r h; do
+    rm=$(_lo_seat_remote_mkts "$h")
+    if [[ -n "$rm" ]]; then _lo_line LEAK "plugin catalog refresh ($(basename "$h"))" "$rm"; bad=1
+    else _lo_line ok "plugin catalog refresh ($(basename "$h"))" "local copy"; fi
+  done < <(_lo_seat_homes)
   if [[ -f "$(_lo_codex)" ]] && grep -q 'check_for_update_on_startup *= *false' "$(_lo_codex)"; then
     _lo_line ok "codex update check + analytics" off
   else _lo_line LEAK "codex update check + analytics" on; bad=1; fi

@@ -512,6 +512,12 @@ JSON
       }
     }
   } + $sl | apply_effort($effort; $effort_ids)')
+  # DIVE-7573 (D3): a local-only seat names no GitHub marketplace — Claude Code
+  # refreshes every one it knows at each session start. The plugin install below
+  # registers the box's own copy as a `directory` marketplace instead.
+  if declare -F local_only_on >/dev/null && local_only_on; then
+    settings=$(jq 'del(.extraKnownMarketplaces)' <<<"$settings")
+  fi
   # channels is a comma-separable list (DIVE-856): build enabledPlugins from
   # membership so "telegram,dashboard" enables both.
   local enabled_plugins='{}'
@@ -1312,7 +1318,11 @@ install_channel_plugin_for_agent() {
   # text — cat printed it and nothing ran (install "succeeded" doing nothing), and
   # a command after the terminator other than `then` was a syntax error that broke
   # every verb of the bundle. 5.2 reads the joined line. Keep it one line.
-  local -a seat_sh=(sudo -u "$user" -H env PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo"
+  # DIVE-7573 (D2): this runs Claude Code as the seat outside its unit, so the
+  # local-only quiet env is passed by hand (it dialed api.anthropic.com here).
+  local -a quiet_env=()
+  declare -F local_only_claude_env >/dev/null && mapfile -t quiet_env < <(local_only_claude_env)
+  local -a seat_sh=(sudo -u "$user" -H env "${quiet_env[@]}" PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo"
     MKT_FROM="$mkt_from" DASH_NM="${FIVEDIVE_OFFLINE_DASHBOARD_DIR:-/usr/local/lib/5dive/dashboard}/node_modules"
     CLAUDE_BIN="${FIVEDIVE_CLAUDE_BIN:-/home/claude/.local/bin/claude}" bash -s)
   local install_rc=0
@@ -1342,7 +1352,7 @@ marketplace_checkout_settled "$MKT_REPO" "$MKT_DIR"
 MKT_REPO="$MKT_ORIGIN"
 [ -n "${MKT_FROM:-}" ] && git -C "$MKT_DIR" remote set-url origin "$MKT_REPO" 2>/dev/null || true
 MKT_SLUG=$(printf '%s' "$MKT_REPO" | sed -e 's#^https://github.com/##' -e 's#\.git$##')
-KM_FILE="$HOME/.claude/plugins/known_marketplaces.json" \
+KM_FILE="$HOME/.claude/plugins/known_marketplaces.json" MKT_LOCAL="${MKT_FROM:+1}" \
   MKT_NAME="$MARKETPLACE" MKT_SLUG="$MKT_SLUG" MKT_DIR="$MKT_DIR" python3 <<'PREREG'
 import json, os, datetime
 km = os.environ["KM_FILE"]
@@ -1352,11 +1362,24 @@ if os.path.exists(km):
         d = json.load(open(km))
     except Exception:
         d = {}
-d.setdefault(os.environ["MKT_NAME"], {
+entry = {
     "source": {"source": "github", "repo": os.environ["MKT_SLUG"]},
     "installLocation": os.environ["MKT_DIR"],
     "lastUpdated": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
-})
+}
+if os.environ.get("MKT_LOCAL"):
+    # DIVE-7573 (D3): local-only — the checkout read in place, never fetched.
+    entry["source"] = {"source": "directory", "path": os.environ["MKT_DIR"]}
+    d[os.environ["MKT_NAME"]] = entry
+    sp = os.path.expanduser("~/.claude/settings.json")
+    try:
+        s = json.load(open(sp))
+        s.setdefault("extraKnownMarketplaces", {})[os.environ["MKT_NAME"]] = {"source": entry["source"]}
+        json.dump(s, open(sp, "w"), indent=2)
+    except Exception:
+        pass
+else:
+    d.setdefault(os.environ["MKT_NAME"], entry)
 json.dump(d, open(km, "w"), indent=2)
 PREREG
 

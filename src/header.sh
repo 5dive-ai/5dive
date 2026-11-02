@@ -67,6 +67,11 @@ gh_org() {
   if [[ -z "${_GH_ORG_RESOLVED:-}" ]]; then
     if [[ -n "${GH_ORG:-}" ]]; then
       _GH_ORG_RESOLVED="$GH_ORG"
+    elif declare -F local_only_on >/dev/null && local_only_on; then
+      # DIVE-7573 (D1): a local-only box never probes GitHub (it was 32 SYNs per
+      # `agent create`), and the offline fallback below wrote the OLD org into
+      # the seat. The rename is done: the current org is the answer.
+      _GH_ORG_RESOLVED="5dive-ai"
     elif curl -fsI --max-time 8 "https://raw.githubusercontent.com/5dive-ai/5dive/main/install.sh" >/dev/null 2>&1; then
       _GH_ORG_RESOLVED="5dive-ai"
     else

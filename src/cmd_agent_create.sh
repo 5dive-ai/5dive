@@ -2064,6 +2064,16 @@ _apply_byo_claude() {
   # Custom endpoints (esp. z.ai during peak hours) can be slow; raise the
   # client-side request timeout so long tool turns don't get cut off.
   printf '%s' "3000000" | profile_set_var "$profile" API_TIMEOUT_MS
+  # DIVE-7573 (D4): a custom endpoint (no catalog row: self-hosted, Ollama, the
+  # office model) gets tool search OFF. Claude Code hides the chat's reply tool
+  # behind it and a small model never searches, so it never replies. Written only
+  # when the profile has no value, so an operator's own setting survives.
+  if [[ -z "$(claude_baseurl_catalog_provider "$base_url")" && -z "$(profile_env_value "$profile" ENABLE_TOOL_SEARCH)" ]]; then
+    local _tse
+    for _tse in "${LOCAL_MODEL_SEAT_ENV[@]:-ENABLE_TOOL_SEARCH=false}"; do
+      printf '%s' "${_tse#*=}" | profile_set_var "$profile" "${_tse%%=*}"
+    done
+  fi
   # DIVE-5255: OpenRouter pre-authorises every turn's max_tokens against what is
   # LEFT on the key. Claude Code asks for 128000 on an opus-named model, so a key
   # with about $1 left (the my.5dive demo key, a partner allowance near its end)

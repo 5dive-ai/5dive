@@ -123,7 +123,10 @@ _plugin_seat_mkt_repo() {
 # real, and only the privilege drop is stubbed.
 plugin_seat_run_as() { # plugin_seat_run_as <user> [VAR=VAL ...]  (script on stdin)
   local user="$1"; shift
-  sudo -u "$user" -H env "$@" bash -s
+  # DIVE-7573 (D2): every Claude Code run on a local-only box gets the quiet env.
+  local -a quiet_env=()
+  declare -F local_only_claude_env >/dev/null && mapfile -t quiet_env < <(local_only_claude_env)
+  sudo -u "$user" -H env "${quiet_env[@]}" "$@" bash -s
 }
 
 # Register one plugin with one CLAUDE seat, AT the box's version. Idempotent.
