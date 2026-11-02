@@ -1052,6 +1052,7 @@ _su_nightly_hint() {
   [[ "${FIVEDIVE_SELF_UPDATE_HINT:-1}" == "0" ]] && return 0
   _su_nightly_managed && return 0
   _su_nightly_is_on && return 0
+  local_only_on && return 0     # DIVE-7557: never recommend dialing out
   printf '\n%s\n' "$SU_NIGHTLY_HINT"
 }
 

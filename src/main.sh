@@ -1194,6 +1194,10 @@ main() {
   # the case below rejects — that path fails E_USAGE, which the hint never
   # fires on, so an unvalidated verb string never actually reaches it.
   CURRENT_VERB="$top"
+  # DIVE-7557: local-only mode. One stat when the switch is off; when it is on,
+  # a command that would connect outside the office is refused here, before any
+  # verb runs (src/lib/local_only.sh holds the table).
+  local_only_gate "$top" "$@"
   # Handle --version / -v / version before the dispatch table so it stays a
   # zero-dependency one-liner check (reviewers grep for it first).
   case "$top" in
@@ -1381,7 +1385,12 @@ main() {
       # root (cmd_box_config calls require_root itself) because the file it lands
       # in is root-owned and group-readable by every agent.
       AUDIT_CMD="config"; AUDIT_ARGS=("$@")
-      cmd_box_config "$@" ;;
+      if [[ "${1:-}" == local-only ]]; then
+        # DIVE-7557: `5dive config local-only on|off|status|check`.
+        shift; cmd_local_only "$@"
+      else
+        cmd_box_config "$@"
+      fi ;;
     whoami)
       # DIVE-2517 (v0.18 "Proof of who"): the one sealed actor derivation, printed
       # with the provenance of every field. Read-only — no state, no lock, and
@@ -1758,7 +1767,10 @@ main() {
         case "$1" in
           --on)  _su_nightly_on ;;
           --off) _su_nightly_off ;;
-          *)     _su_nightly_run ;;
+          *)     # DIVE-7557: a leftover timer on a local-only box skips quietly
+                 # (exit 0, so systemd does not mark the unit failed every night).
+                 if local_only_on; then echo "self-update: skipped — local-only mode is on"; exit 0; fi
+                 _su_nightly_run ;;
         esac
       else
         # On-demand "update everything + reload" for OSS self-hosters with no

@@ -80,6 +80,7 @@ CORE_FILES=(
   src/lib/self.sh
   src/lib/output.sh
   src/lib/validation.sh
+  src/lib/local_only.sh
   src/lib/models.sh
   src/lib/agent_setup.sh
   src/lib/plugin_seats.sh
@@ -138,6 +139,7 @@ LAZY_FILES=(
   src/cmd_compose.sh
   src/cmd_whoami.sh
   src/cmd_box_config.sh
+  src/cmd_local_only.sh
   src/task/dispatch.sh
   src/task/routing.sh
   src/task/crud.sh

@@ -1198,7 +1198,12 @@ valid_base_url() {
       # A bracketed IPv6 literal is full of colons, so the port strip has to
       # respect the brackets or `[::1]:8080` truncates to `[:`.
       if [[ "$host" == \[*\]* ]]; then host="${host%%\]*}]"; else host="${host%:*}"; fi
-      [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "[::1]" ]]
+      [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "[::1]" ]] && return 0
+      # DIVE-7557: in local-only mode the model server is SUPPOSED to be a GPU
+      # box on the office network, and the key it gets is a local one. There
+      # the LAN is the whole trust boundary the owner chose, so http:// to a
+      # private address is allowed; with the switch off this line never fires.
+      declare -F local_only_on >/dev/null && local_only_on && local_only_url_is_local "$url"
       return $? ;;
     *) return 1 ;;
   esac

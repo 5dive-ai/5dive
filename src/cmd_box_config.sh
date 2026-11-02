@@ -57,6 +57,7 @@ cmd_box_config() {
         "       5dive config mod-seat=on|off|default" \
         "       5dive config telegram-app=on|off|default" \
         "       5dive config seat-isolation=by-role|admin|standard|default" \
+        "       5dive config local-only on|off|status|check   # nothing leaves your network (see: 5dive config local-only --help)" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
         "             always          every standard row is graded" \
