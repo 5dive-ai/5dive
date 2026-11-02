@@ -1320,11 +1320,13 @@ install_channel_plugin_for_agent() {
   # every verb of the bundle. 5.2 reads the joined line. Keep it one line.
   # DIVE-7573 (D2): this runs Claude Code as the seat outside its unit, so the
   # local-only quiet env is passed by hand (it dialed api.anthropic.com here).
+  # It goes LAST, after the named vars: PLUGIN= stays right after `env`, the
+  # anchor tests/self_update_mcp_failure_cache_unit.sh A3 slices this block on.
   local -a quiet_env=()
   declare -F local_only_claude_env >/dev/null && mapfile -t quiet_env < <(local_only_claude_env)
-  local -a seat_sh=(sudo -u "$user" -H env "${quiet_env[@]}" PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo"
+  local -a seat_sh=(sudo -u "$user" -H env PLUGIN="$plugin" MARKETPLACE="$marketplace" MKT_REPO="$mkt_repo"
     MKT_FROM="$mkt_from" DASH_NM="${FIVEDIVE_OFFLINE_DASHBOARD_DIR:-/usr/local/lib/5dive/dashboard}/node_modules"
-    CLAUDE_BIN="${FIVEDIVE_CLAUDE_BIN:-/home/claude/.local/bin/claude}" bash -s)
+    CLAUDE_BIN="${FIVEDIVE_CLAUDE_BIN:-/home/claude/.local/bin/claude}" "${quiet_env[@]}" bash -s)
   local install_rc=0
   if ! { declare -f marketplace_checkout_settled; cat <<'AGENT_PLUGIN_INSTALL'; } | "${seat_sh[@]}" >&2; then
 set -euo pipefail
