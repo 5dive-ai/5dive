@@ -268,8 +268,8 @@ else bad_t "VERB: unknown flag accepted" "$(tail -3 "$WORK/verb.out")"; fi
 
 # ---------------------------------------------------------------- static guards
 I="$ROOT/install.sh"
-n_bun="$(grep -c 'bun install --production' "$I")"
-n_gated="$(grep -B1 'bun install --production' "$I" | grep -c 'offline_update ||')"
+n_bun="$(grep -c 'bun install --production' "$I")" || n_bun=0
+n_gated="$(grep -B1 'bun install --production' "$I" | grep -c 'offline_update ||')" || n_gated=0
 (( n_bun > 0 && n_bun == n_gated )) && ok_t "install.sh: all $n_bun bun installs are skipped under an update from a file" \
   || bad_t "install.sh: a bun install would dial npm offline" "$n_gated of $n_bun gated"
 for fn in build_relation legacy_release_build_sha; do

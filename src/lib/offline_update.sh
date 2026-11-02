@@ -139,7 +139,7 @@ _ou_verify() {
   want_set="$(jq -r '.files | keys[]' "$m" | LC_ALL=C sort)"
   [[ "$want_set" == "$(printf '%s\n' "${_OU_PAYLOAD[@]}" | LC_ALL=C sort)" ]] \
     || { _OU_WHY="the manifest does not list the four files an update holds"; return 1; }
-  have_set="$(printf '%s\n' "${!seen[@]}" | grep '^payload/' | LC_ALL=C sort)"
+  have_set="$(printf '%s\n' "${!seen[@]}" | grep '^payload/' | LC_ALL=C sort)" || have_set=""
   [[ "$have_set" == "$want_set" ]] \
     || { _OU_WHY="the files in the update do not match its manifest (one is missing or extra)"; return 1; }
   tar -xf "$file" -C "$stage" --no-same-owner "${_OU_PAYLOAD[@]}" 2>/dev/null \
