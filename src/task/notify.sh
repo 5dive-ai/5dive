@@ -1371,6 +1371,19 @@ _task_send_owner() {
     warn "refused a human task-send — the active task DB is not the prod DB; set FIVEDIVE_PROD_TASKS_DB if this IS prod"
     return 0
   fi
+  # DIVE-7558: on a local-only box the owner reads the office chat, not
+  # Telegram; a gate notice goes there and never to api.telegram.org. A notice
+  # the chat did not take is a failed send (the caller's not-delivered handling
+  # runs), never a fallback to Telegram.
+  if local_only_on; then
+    if local_chat_notice "" "$(local_chat_plain "${text_plain:-$text}")"; then
+      TASK_SEND_DELIVERED=1 TASK_SEND_TARGETS="office-chat"
+    else
+      TASK_SEND_FAILED=1
+      warn "local-only: the office chat did not take the notice (sudo 5dive local status)"
+    fi
+    return 0
+  fi
 
   local ptr_file="${access_file%/*}/last-human-chat.json"
   if [[ -r "$ptr_file" ]]; then
@@ -1480,6 +1493,19 @@ _task_send_gate_owner() {
   if ! _task_human_send_allowed; then
     TASK_SEND_FAILED=1
     warn "DIVE-1506: refused a human gate-send — active task DB (${TASKS_DB:-${STATE_DIR:-/var/lib/5dive}/tasks/tasks.db}) is not the prod DB (fail-closed; set FIVEDIVE_PROD_TASKS_DB if this IS prod)"
+    return 0
+  fi
+  # DIVE-7558: on a local-only box the owner reads the office chat, not
+  # Telegram; a gate notice goes there and never to api.telegram.org. A notice
+  # the chat did not take is a failed send (the caller's not-delivered handling
+  # runs), never a fallback to Telegram.
+  if local_only_on; then
+    if local_chat_notice "" "$(local_chat_plain "${text_plain:-$text}")"; then
+      TASK_SEND_DELIVERED=1 TASK_SEND_TARGETS="office-chat"
+    else
+      TASK_SEND_FAILED=1
+      warn "local-only: the office chat did not take the notice (sudo 5dive local status)"
+    fi
     return 0
   fi
 

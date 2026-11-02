@@ -1391,6 +1391,10 @@ main() {
       else
         cmd_box_config "$@"
       fi ;;
+    local)
+      # DIVE-7558: the office chat server (src/cmd_local_chat.sh).
+      AUDIT_CMD="local"; AUDIT_ARGS=("$@")
+      cmd_local "$@" ;;
     whoami)
       # DIVE-2517 (v0.18 "Proof of who"): the one sealed actor derivation, printed
       # with the provenance of every field. Read-only — no state, no lock, and

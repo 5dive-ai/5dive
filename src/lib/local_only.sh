@@ -18,6 +18,9 @@
 local_only_file() { printf '%s' "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}"; }
 local_only_on()   { [[ -e "$(local_only_file)" ]]; }
 
+# DIVE-7558: five_api_base / five_api_base_file live in src/header.sh (the relay
+# and partner harnesses source header.sh, not this file).
+
 # `_lo_host_is_local <host>` — 0 when the host is this box or on a private
 # network: loopback, RFC1918 (10/8, 172.16/12, 192.168/16), link-local, IPv6
 # loopback/ULA/link-local, `localhost`, a single-label name, or a name under a
@@ -174,6 +177,11 @@ local_only_gate() {
       # office with its own mirror installs as root with apt directly.
       [[ "$sub" == install ]] && local_only_refuse "Installing system packages from the internet" ;;
     buzz)           [[ "$sub" == enable ]] && local_only_refuse "Buzz" ;;
+    chat)
+      # DIVE-7558: the office chat on this box is the only server and TLS covers
+      # the network hop, so there is no outside server to seal against.
+      [[ "$sub" == e2e && "${2:-}" == enable ]] \
+        && local_only_refuse "End-to-end chat pairing with 5dive.app (the office chat on this server replaces it)" ;;
     account)
       case "$sub" in
         login) local_only_refuse "Signing in to a cloud AI account" ;;

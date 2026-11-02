@@ -140,6 +140,8 @@ LAZY_FILES=(
   src/cmd_whoami.sh
   src/cmd_box_config.sh
   src/cmd_local_only.sh
+  src/cmd_local_chat.sh
+  src/cmd_local_chat_server.sh
   src/task/dispatch.sh
   src/task/routing.sh
   src/task/crud.sh

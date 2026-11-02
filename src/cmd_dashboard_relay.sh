@@ -51,7 +51,7 @@
 # message it stores. The token is re-read on every call, so
 # a rotation by shelld is picked up with no reload.
 
-_dash_relay_api_base() { local b="${FIVE_API_BASE:-https://api.5dive.com}"; printf '%s' "${b%/}"; }
+_dash_relay_api_base() { five_api_base; }   # DIVE-7558: /etc/5dive/api-base wins (src/lib/local_only.sh)
 _dash_relay_outbox()   { local d="${DASHBOARD_OUTBOX:-/home/claude/chat-downloads}"; printf '%s' "${d%/}"; }
 _dash_relay_seen_dir() { printf '%s' "${FIVEDIVE_DASHBOARD_RELAY_DIR:-/var/lib/5dive/dashboard-relay}"; }
 
