@@ -98,11 +98,17 @@ _chat_e2e_stage() {
   return 0
 }
 
-# _chat_e2e_run <call|admin> <dir> [side-file] — the request on stdin, the answer on stdout.
+# _chat_e2e_run <call|admin> <dir> [side-file [agent]] — the request on stdin,
+# the answer on stdout. DIVE-7520: every run holds one root lock, so a device-
+# list change (read, check the revision, write) is atomic across seats.
 _chat_e2e_run() {
-  local bun; bun=$(_chat_e2e_bun)
+  local bun lock; bun=$(_chat_e2e_bun)
   _chat_e2e_stage
-  ( umask 077; "$bun" "$(_chat_e2e_lib)/chat-e2e.ts" "$@" )
+  lock="$(_chat_e2e_lib)/.lock"
+  ( umask 077
+    exec 9>>"$lock" || exit 1
+    flock -x -w 60 9 || { echo "chat-e2e: another key step is still running" >&2; exit 1; }
+    "$bun" "$(_chat_e2e_lib)/chat-e2e.ts" "$@" )
 }
 
 # _chat_e2e_admin <dir> <json> — one admin request; fails with bun's reason.
@@ -140,19 +146,55 @@ _chat_e2e_api_devices() {
 }
 
 # Post the device list, sealed, to every agent that has 5dive.app chat on, in its
-# own chat ("dashboard"): that is where an app reads it. Best effort.
+# own chat ("dashboard"): that is where an app reads it. DIVE-7520: a list that
+# did not get out is not forgotten. announced.json holds the last revision every
+# chat took; `devices sync` (every minute) and every seat call post again while
+# the list is newer than that, so a lost revoke is retried until it lands.
 _chat_e2e_announce() {
-  local dir="$1" agents ans env a n=0
+  local dir="$1" off="${2:-}" agents ans env a n=0 want=0 rev
   agents=$(registry_read | jq -r '.agents // {} | to_entries[] | select((.value.channels // "") | split(",") | index("dashboard")) | .key' 2>/dev/null | head -n 50) || agents=""
-  [[ -n "$agents" ]] || return 0
-  ans=$(_chat_e2e_admin "$dir" '{"op":"announce","convs":["dashboard"]}') || return 0
+  ans=$(_chat_e2e_admin "$dir" "{\"op\":\"announce\",\"convs\":[\"dashboard\"]${off:+,\"off\":true}}") || return 0
+  rev=$(jq -r '.n // empty' <<<"$ans")
   env=$(jq -c '.posts[0].env // empty' <<<"$ans") || return 0
-  [[ -n "$env" ]] || return 0
+  [[ -n "$env" && "$rev" =~ ^[0-9]+$ ]] || return 0
   while IFS= read -r a; do
     [[ "$a" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || continue
-    local body; body=$(jq -nc --arg a "$a" --arg b "$env" '{agent:$a, body:$b, metadata:{chat_id:"dashboard", e2e:{v:1}}}')
-    _dash_relay_call POST "$(_dash_relay_api_base)/server/messages/event" "$body" "$(_dash_relay_token)" >/dev/null 2>&1 && n=$((n + 1))
+    want=$((want + 1))
+    local body res; body=$(jq -nc --arg a "$a" --arg b "$env" '{agent:$a, body:$b, metadata:{chat_id:"dashboard", e2e:{v:1}}}')
+    res=$(_dash_relay_call POST "$(_dash_relay_api_base)/server/messages/event" "$body" "$(_dash_relay_token)" 2>/dev/null) || continue
+    [[ "${res%%$'\n'*}" =~ ^2[0-9][0-9]$ ]] && n=$((n + 1))
   done <<<"$agents"
+  if [[ -z "$off" ]] && (( n == want )); then _chat_e2e_admin "$dir" "{\"op\":\"announced\",\"n\":$rev}" >/dev/null 2>&1 || true; fi
+  return 0
+}
+
+# DIVE-7520: post the list again when the last one did not reach every chat.
+# Read straight from root's files (no bun run on the hot path of every call).
+_chat_e2e_announce_due() {
+  local dir="$1" have sent
+  have=$(jq -r '.n // 0' -- "$dir/roster.json" 2>/dev/null) || have=0
+  sent=$(jq -r '.n // 0' -- "$dir/announced.json" 2>/dev/null) || sent=0
+  [[ "$have" =~ ^[0-9]+$ && "$sent" =~ ^[0-9]+$ ]] || return 0
+  (( have > sent )) && _chat_e2e_announce "$dir"
+  [[ "$(jq -r '.queue | length' -- "$dir/mirror.json" 2>/dev/null)" =~ ^[1-9] ]] && _chat_e2e_mirror_flush "$dir"
+  return 0
+}
+
+# DIVE-7520: the API's copy of an approval or revoke a device made, queued by
+# root (mirror.json) and sent until the API takes it.
+_chat_e2e_mirror_flush() {
+  local dir="$1" q item t d ans code
+  q=$(_chat_e2e_admin "$dir" '{"op":"mirror"}' 2>/dev/null) || return 0
+  while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    t=$(jq -r '.t // empty' <<<"$item"); d=$(jq -r '.device // empty' <<<"$item")
+    [[ "$t" =~ ^(approve|revoke)$ && "$d" =~ ^[A-Za-z0-9_-]{8,64}$ ]] || continue
+    ans=$(_chat_e2e_api POST "/box/devices/${d}/${t}" 2>/dev/null) || continue
+    code=$(_chat_e2e_status_of "$ans")
+    if [[ "$code" == 200 || ( "$t" == revoke && "$code" == 404 ) ]]; then
+      _chat_e2e_admin "$dir" "$(jq -nc --argjson i "$item" '{op:"mirrored", item:$i}')" >/dev/null 2>&1 || true
+    fi
+  done < <(jq -c '.queue[]?' <<<"$q")
   return 0
 }
 
@@ -218,6 +260,7 @@ cmd_chat() {
   sudo 5dive chat devices                list the browsers and phones, with their codes
   sudo 5dive chat devices approve <code> let a new browser or phone read the chat
   sudo 5dive chat devices revoke <code>  stop one
+  sudo 5dive chat e2e disable            turn encrypted chat off (only here, at the server)
 USAGE
       ;;
     *) fail "$E_USAGE" "chat: unknown subcommand '$sub' (e2e, devices)." ;;
@@ -239,6 +282,7 @@ _chat_cmd_e2e() {
       [[ -n "$(_dash_relay_token)" ]] \
         || fail "$E_AUTH_REQUIRED" "this server is not connected to 5dive.app yet (no $(_sp_connectord_env)). Turn encrypted chat on from 5dive.app."
       live=$(_chat_e2e_live)
+      rm -f -- "$live.off"   # DIVE-7520: turning it on again lifts the owner's off mark
       dir=$(_chat_e2e_keydir)
       if [[ -z "$dir" ]]; then
         dir="$live.pairing"
@@ -271,7 +315,23 @@ _chat_cmd_e2e() {
         echo "Encrypted chat: on, $(_chat_e2e_admin "$dir" '{"op":"roster"}' | jq -r '.devices | length') device(s). Server key: $(_chat_e2e_admin "$dir" '{"op":"key"}' | jq -r .fp)"
       else echo "Encrypted chat: waiting for the first browser to pair."
       fi ;;
-    *) fail "$E_USAGE" "chat e2e: unknown subcommand '$sub' (enable, status)." ;;
+    disable)
+      # DIVE-7520: the one way encrypted chat turns off once it was on. Every
+      # seat pins it on and reads a missing key dir as a fault, never as off,
+      # unless <dir>.off exists: root-owned, so only the owner at this server
+      # (never a seat, never the API) can say "off". The keys are kept aside.
+      local live; live=$(_chat_e2e_live)
+      [[ -d "$live" || -d "$live.pairing" ]] || { echo "Encrypted chat is already off."; return 0; }
+      # Every device hears it from the box key first: an app believes no other "off".
+      [[ -f "$live/box.jwk" ]] && { _chat_e2e_announce "$live" off >/dev/null 2>&1 || true; }
+      ( umask 022; printf 'turned off at %s by sudo 5dive chat e2e disable\n' "$(date -u +%FT%TZ)" >"$live.off" ) \
+        || fail "$E_GENERIC" "cannot write $live.off."
+      local d
+      for d in "$live" "$live.pairing"; do
+        [[ -d "$d" ]] && { mv -T -- "$d" "$d.disabled-$(date -u +%Y%m%d%H%M%S)" || fail "$E_GENERIC" "could not move $d aside."; }
+      done
+      echo "Encrypted chat is off on this server. The agents stop sealing now. To turn it on again, pair a browser from 5dive.app." ;;
+    *) fail "$E_USAGE" "chat e2e: unknown subcommand '$sub' (enable, status, disable)." ;;
   esac
 }
 
@@ -342,7 +402,7 @@ _chat_cmd_devices() {
         [[ "$d" == "$just" ]] && continue
         _chat_e2e_api POST "/box/devices/${d}/approve" >/dev/null || true
       done
-      (( changed )) && _chat_e2e_announce "$dir"
+      if (( changed )); then _chat_e2e_announce "$dir"; else _chat_e2e_announce_due "$dir"; fi
       return 0 ;;
     *) fail "$E_USAGE" "chat devices: unknown subcommand '$sub' (ls, approve, revoke, sync)." ;;
   esac
@@ -352,9 +412,13 @@ _chat_cmd_devices() {
 cmd_chat_e2e_root() {
   _gate_is_root || fail "$E_PERMISSION" "_chat_e2e is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
   [[ $# -eq 0 ]] || fail "$E_USAGE" "_chat_e2e takes no arguments (the request is read from stdin)."
-  local ruid="${SUDO_UID:-}"
+  local ruid="${SUDO_UID:-}" agent=""
   if [[ -n "$ruid" ]]; then
-    [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 && "$(_gate_uid_to_agent "$ruid")" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
+    # DIVE-7520: the caller's agent is kept, and root opens and seals only for
+    # it: a message for another agent does not open, a file opens only for the
+    # agent that opened its message, and every sealed reply names its agent.
+    [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 ]] && agent=$(_gate_uid_to_agent "$ruid")
+    [[ "$agent" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] \
       || fail "$E_AUTH_REQUIRED" "_chat_e2e caller uid ${ruid} is not an agent seat."
   fi
   # DIVE-7440: a seat calls this when it cannot see the key dir; put the parent
@@ -366,19 +430,16 @@ cmd_chat_e2e_root() {
   local side out rc=0 applied
   side=$(mktemp) || fail "$E_GENERIC" "_chat_e2e: cannot create a temp file."
   # A file envelope is ~4/3 of the 20 MB cap; past 32 MB is not a request.
-  out=$(head -c 33554432 | _chat_e2e_run call "$live" "$side") || rc=$?
+  out=$(head -c 33554432 | _chat_e2e_run call "$live" "$side" "${agent:--}") || rc=$?
   if (( rc != 0 )); then rm -f -- "$side"; exit "$E_VALIDATION"; fi
   applied=$(cat -- "$side" 2>/dev/null); rm -f -- "$side"
-  if [[ -n "$applied" ]]; then
-    # An approved device changed the list: mirror it to the API (best effort;
-    # the API's copy is never what a reader trusts).
-    local t d
-    t=$(jq -r '.t // empty' <<<"$applied"); d=$(jq -r '.device // empty' <<<"$applied")
-    if [[ "$t" =~ ^(approve|revoke)$ && "$d" =~ ^[A-Za-z0-9_-]{8,64}$ ]]; then
-      _chat_e2e_api POST "/box/devices/${d}/${t}" >/dev/null 2>&1 || true
-    fi
-  fi
   printf '%s' "$out"
+  # An approved device changed the list (root queued the API's copy in
+  # mirror.json), or an earlier list never got out: send what is owed. The
+  # seat already has its answer; this never fails its call.
+  if [[ -n "$applied" ]]; then _chat_e2e_announce "$live" >/dev/null 2>&1 || true; _chat_e2e_mirror_flush "$live" >/dev/null 2>&1 || true
+  else _chat_e2e_announce_due "$live" >/dev/null 2>&1 || true; fi
+  return 0
 }
 
 _chat_e2e_root_ts() {
@@ -411,7 +472,17 @@ const CONV_RE = /^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,127}$/
 const MAX_DEVICES = 20
 const dec = new TextDecoder()
 
-export type Roster = { n: number; devices: Record<string, string> }
+// DIVE-7520: `owners` are the devices that may change the list. A device paired
+// with the link's secret, or approved here at the server by its code, is one; a
+// device another device let in is not. A list from before owners existed makes
+// every device on it one (nothing it could do before is taken away).
+export type Roster = { n: number; devices: Record<string, string>; owners?: string[] }
+// What root has applied (`applied.json`): every device-list command by its id
+// (sender + message id) with the revision it made. Kept apart from any seat's
+// replay record and never expires with it: the revision check refuses an old
+// command forever, this record answers a retry of the latest one.
+const APPLIED_MAX = 5000
+const OPENED_MAX = 5000
 
 class Refusal extends Error {}
 const refuse = (why: string): never => { throw new Refusal(why) }
@@ -433,8 +504,19 @@ async function checkPub(raw: unknown): Promise<string> {
 
 export function makeBox(dir: string) {
   const f = (name: string) => join(dir, name)
-  const roster = (): Roster => existsSync(f('roster.json')) ? JSON.parse(readFileSync(f('roster.json'), 'utf8')) : { n: 0, devices: {} }
+  const roster = (): Roster => {
+    const r: Roster = existsSync(f('roster.json')) ? JSON.parse(readFileSync(f('roster.json'), 'utf8')) : { n: 0, devices: {} }
+    if (!Array.isArray(r.owners)) r.owners = Object.keys(r.devices)
+    return r
+  }
   const saveRoster = (r: Roster) => writeSecret(f('roster.json'), JSON.stringify(r))
+  const readJson = <T,>(name: string, dflt: T): T => { try { return JSON.parse(readFileSync(f(name), 'utf8')) as T } catch { return dflt } }
+  const keepLast = (o: Record<string, unknown>, max: number) => Object.fromEntries(Object.entries(o).slice(-max))
+  const queueMirror = (t: string, device: string) => {
+    const q = readJson<{ queue: { t: string; device: string }[] }>('mirror.json', { queue: [] })
+    q.queue = q.queue.filter(x => x.device !== device).concat([{ t, device }]).slice(-50)
+    writeSecret(f('mirror.json'), JSON.stringify(q))
+  }
   const jwk = () => JSON.parse(readFileSync(f('box.jwk'), 'utf8')) as JsonWebKey
   const priv = () => crypto.subtle.importKey('jwk', jwk(), P256, false, ['deriveBits'])
   const pub = () => {
@@ -451,10 +533,10 @@ export function makeBox(dir: string) {
   }
   const sealOut = async (conv: string, m: string, plaintext: Uint8Array | string) =>
     E.seal({ senderId: BOX, senderPriv: await priv(), recipients: await recipients(), conv, msgId: m, dir: 'out', plaintext })
-  const rosterBody = (r: Roster) => JSON.stringify({ t: 'roster', n: r.n, devices: Object.entries(r.devices).map(([id, p]) => ({ id, pub: p })) })
+  const rosterBody = (r: Roster) => JSON.stringify({ t: 'roster', n: r.n, devices: Object.entries(r.devices).map(([id, p]) => ({ id, pub: p, ...(r.owners!.includes(id) ? { owner: true } : {}) })) })
 
-  /** Apply one device-list change; null when it changes nothing. */
-  async function change(add: { device: unknown; pub: unknown } | null, remove: unknown): Promise<Roster | null> {
+  /** Apply one device-list change; null when it changes nothing. `owner`: the added device may change the list too. */
+  async function change(add: { device: unknown; pub: unknown } | null, remove: unknown, owner = true): Promise<Roster | null> {
     const r = roster()
     if (add) {
       if (!isDevice(add.device)) refuse('bad device id')
@@ -465,10 +547,12 @@ export function makeBox(dir: string) {
       if (cur) refuse(`device ${add.device} is approved with another key: revoke it first`)
       if (Object.keys(r.devices).length >= MAX_DEVICES) refuse(`at most ${MAX_DEVICES} devices`)
       r.devices[add.device as string] = p
+      if (owner && !r.owners!.includes(add.device as string)) r.owners!.push(add.device as string)
     } else {
       if (!isDevice(remove)) refuse('bad device id')
       if (!r.devices[remove as string]) return null
       delete r.devices[remove as string]
+      r.owners = r.owners!.filter(x => x !== remove)
     }
     r.n++
     saveRoster(r)
@@ -476,7 +560,37 @@ export function makeBox(dir: string) {
   }
 
   // --- the seat's verb: open, seal, seal-file ------------------------------
-  async function call(req: any, side: string): Promise<Record<string, unknown>> {
+  /** One device-list command from a device: owner only, against the exact revision, applied at most once. */
+  async function command(inner: any, env: E.Envelope, conv: string, side: string): Promise<Record<string, unknown>> {
+    const id = `${env.h.s}\u0000${env.h.m}`
+    const applied = readJson<Record<string, number>>('applied.json', {})
+    let now = roster()
+    const answer = (r: Roster) => sealOut(conv, `roster-${r.n}`, rosterBody(r)).then(roster => ({ sender: env.h.s, m: env.h.m, roster }))
+    // "Send me the current list": any device on it may ask.
+    if (inner.t === 'sync') return answer(now)
+    if (id in applied) {
+      // A retry of the command that made this list (its post was lost): the
+      // list again. Anything older is a replay and is refused.
+      if (applied[id] === now.n) return answer(now)
+      refuse(`command ${env.h.m} was already applied`)
+    }
+    if (!now.owners!.includes(env.h.s)) refuse(`device ${env.h.s} may not change the device list (only an owner device may)`)
+    if (!Number.isInteger(inner.rev) || inner.rev !== now.n) refuse(`the device list changed (it is at ${now.n}, the command was made at ${inner.rev}): open the chat again`)
+    const r = inner.t === 'approve'
+      ? await change({ device: inner.device, pub: inner.pub }, null, false)
+      : await change(null, inner.device)
+    if (r) {
+      now = r
+      queueMirror(inner.t, inner.device)
+      // What the CLI needs to send the new list on; the seat never sees it.
+      writeSecret(side, JSON.stringify({ t: inner.t, device: inner.device }))
+    }
+    applied[id] = now.n
+    writeSecret(f('applied.json'), JSON.stringify(keepLast(applied, APPLIED_MAX)))
+    return answer(now)
+  }
+
+  async function call(req: any, side: string, agent = ''): Promise<Record<string, unknown>> {
     // DIVE-7440: a seat that cannot see the key dir asks root whether it is on.
     if (req?.op === 'state') return { on: true }
     const conv = String(req?.conv ?? '')
@@ -493,24 +607,26 @@ export function makeBox(dir: string) {
       try {
         pt = await E.open({ env, myId: BOX, myPriv: await priv(), senderPub: await E.importPublic(raw), expect: { conv, dir: 'in' } })
       } catch (err) { return refuse(`does not open: ${(err as Error).message}`) }
+      const opened = readJson<Record<string, string>>('opened.json', {})
       if (!isFile) {
         let inner: any = null
         try { inner = JSON.parse(dec.decode(pt)) } catch {}
-        if (inner?.t === 'approve' || inner?.t === 'revoke') {
-          const r = inner.t === 'approve'
-            ? await change({ device: inner.device, pub: inner.pub }, null)
-            : await change(null, inner.device)
-          const now = r ?? roster()
-          // What the API's mirror needs; the CLI reads it, the seat never sees it.
-          if (r) writeSecret(side, JSON.stringify({ t: inner.t, device: inner.device }))
-          return { sender: env.h.s, m: env.h.m, roster: await sealOut(conv, `roster-${now.n}`, rosterBody(now)) }
+        if (inner?.t === 'approve' || inner?.t === 'revoke' || inner?.t === 'sync') return command(inner, env, conv, side)
+        if (agent) {
+          // DIVE-7520: a message names the agents it is for, inside the seal.
+          if (!Array.isArray(inner?.to) || !inner.to.includes(agent)) refuse(`this message is not for ${agent}`)
+          opened[`${env.h.s}\u0000${env.h.m}`] = agent
+          writeSecret(f('opened.json'), JSON.stringify(keepLast(opened, OPENED_MAX)))
         }
+      } else if (agent) {
+        const parent = env.h.m.slice(0, env.h.m.indexOf('#'))
+        if (opened[`${env.h.s}\u0000${parent}`] !== agent) refuse(`this file is not in a message ${agent} opened`)
       }
       return { sender: env.h.s, m: env.h.m, pt: E.b64u(pt) }
     }
     if (req.op === 'seal') {
       const m = String(req.m ?? '')
-      if (!/^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,127}$/.test(m) || m.startsWith('roster-')) refuse('a seat may not use that message id')
+      if (!/^[A-Za-z0-9][A-Za-z0-9:_.@-]{0,127}$/.test(m) || m.startsWith('roster-') || m.startsWith('off-')) refuse('a seat may not use that message id')
       // Root writes the type: a seat can never make a body read as a device list.
       let inner: Record<string, unknown>
       if (req.status) inner = { t: 'status', label: String(req.status.label ?? '').slice(0, 200) }
@@ -520,6 +636,8 @@ export function makeBox(dir: string) {
         if (Array.isArray(msg.files)) inner.files = msg.files.slice(0, 10).map((x: any) => ({ path: String(x?.path ?? ''), name: String(x?.name ?? ''), size: Number(x?.size ?? 0) }))
         if (msg.question && typeof msg.question === 'object') inner.question = { id: String(msg.question.id ?? ''), options: Array.isArray(msg.question.options) ? msg.question.options.slice(0, 10) : [] }
       }
+      // DIVE-7520: root names the agent that sealed it; a seat cannot pose as another.
+      if (agent) inner.agent = agent
       return { env: await sealOut(conv, m, JSON.stringify(inner)) }
     }
     if (req.op === 'seal-file') {
@@ -578,19 +696,38 @@ export function makeBox(dir: string) {
       }
       case 'roster': {
         const r = roster()
-        return { n: r.n, devices: await Promise.all(Object.entries(r.devices).map(async ([id, p]) => ({ id, pub: p, fp: await E.fingerprint(p) }))) }
+        return { n: r.n, devices: await Promise.all(Object.entries(r.devices).map(async ([id, p]) => ({ id, pub: p, fp: await E.fingerprint(p), owner: r.owners!.includes(id) }))) }
       }
       case 'set': {
-        const r = req.add ? await change(req.add, null) : await change(null, req.remove)
+        // Root's own: paired with the secret or approved here by its code, so an owner.
+        const r = req.add ? await change(req.add, null, true) : await change(null, req.remove)
         return { changed: r !== null, n: (r ?? roster()).n }
+      }
+      case 'announced': {
+        if (!Number.isInteger(req.n)) refuse('bad revision')
+        const cur = readJson<{ n: number }>('announced.json', { n: 0 })
+        if (req.n > cur.n) writeSecret(f('announced.json'), JSON.stringify({ n: req.n }))
+        return { ok: true }
+      }
+      case 'mirror':
+        return readJson<{ queue: unknown[] }>('mirror.json', { queue: [] })
+      case 'mirrored': {
+        const q = readJson<{ queue: { t: string; device: string }[] }>('mirror.json', { queue: [] })
+        q.queue = q.queue.filter(x => !(x.t === req.item?.t && x.device === req.item?.device))
+        writeSecret(f('mirror.json'), JSON.stringify(q))
+        return { ok: true }
       }
       case 'announce': {
         // The device list, sealed to every device on it, for each conversation.
+        // DIVE-7520: `off` instead tells every device, under the box key, that
+        // the owner turned encryption off here (the one "off" an app believes).
         const r = roster()
         const posts: { conv: string; m: string; env: E.Envelope }[] = []
+        const id = req.off ? `off-${r.n}` : `roster-${r.n}`
+        const body = req.off ? JSON.stringify({ t: 'off', n: r.n }) : rosterBody(r)
         for (const conv of Array.isArray(req.convs) ? req.convs : []) {
           if (typeof conv !== 'string' || !CONV_RE.test(conv)) continue
-          posts.push({ conv, m: `roster-${r.n}`, env: await sealOut(conv, `roster-${r.n}`, rosterBody(r)) })
+          posts.push({ conv, m: id, env: await sealOut(conv, id, body) })
         }
         return { n: r.n, posts }
       }
@@ -604,14 +741,14 @@ export function makeBox(dir: string) {
 }
 
 if (import.meta.main) {
-  const [mode, dir, side] = process.argv.slice(2)
+  const [mode, dir, side, agent] = process.argv.slice(2)
   try {
     if (!dir || (mode !== 'call' && mode !== 'admin') || (mode === 'call' && !side)) refuse('usage: chat-e2e.ts call <dir> <side-file> | admin <dir>')
     const raw = await new Response(Bun.stdin.stream()).text()
     let req: unknown
     try { req = JSON.parse(raw) } catch { refuse('the request is not JSON') }
     const box = makeBox(dir)
-    const ans = mode === 'call' ? await box.call(req, side) : await box.admin(req)
+    const ans = mode === 'call' ? await box.call(req, side, agent && agent !== '-' ? agent : '') : await box.admin(req)
     process.stdout.write(JSON.stringify(ans))
   } catch (err) {
     process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`)

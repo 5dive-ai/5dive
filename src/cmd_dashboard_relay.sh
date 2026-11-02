@@ -150,6 +150,14 @@ _dash_relay_file_ok() {
 _dash_relay_uploads()    { local d="${FIVEDIVE_CHAT_UPLOADS:-/home/claude/chat-uploads}"; printf '%s' "${d%/}"; }
 _dash_relay_file_owner() { printf '%s' "${FIVEDIVE_CHAT_FILE_OWNER:-claude:claude}"; }
 _dash_relay_file_max()   { printf '%s' "${FIVEDIVE_CHAT_FILE_MAX:-20971520}"; }
+# DIVE-7520: the group that may read <uploads>/<seat>: that seat's own, so one
+# seat cannot read another's incoming files. Empty when the seat has no group
+# of its own (the old world-readable modes stay).
+_dash_relay_seat_group() {
+  if [[ -n "${FIVEDIVE_CHAT_SEAT_GROUP+x}" ]]; then printf '%s' "$FIVEDIVE_CHAT_SEAT_GROUP"; return 0; fi
+  getent group "agent-$1" >/dev/null 2>&1 && printf 'agent-%s' "$1"
+  return 0
+}
 _dash_relay_uri()        { jq -rn --arg p "$1" '$p|@uri'; }
 
 # _dash_relay_upload_ok <seat> <path> — a file name directly in this seat's own
@@ -171,10 +179,12 @@ _dash_relay_seat_dir() {
   [[ -e "$dir" || -L "$dir" ]] || install -d -m 0755 -o "${own%%:*}" -g "${own#*:}" -- "$dir" 2>/dev/null || return 1
   [[ -d "$dir" && ! -L "$dir" ]] || return 1
   [[ "$(realpath -e -- "$dir" 2>/dev/null)" == "$(realpath -e -- "$root" 2>/dev/null)/$seat" ]] || return 1
+  local grp; grp=$(_dash_relay_seat_group "$seat")
+  if [[ -n "$grp" ]]; then { chgrp -- "$grp" "$dir" && chmod 0750 -- "$dir"; } 2>/dev/null || return 1; fi
   printf '%s' "$dir"
 }
 
-# _dash_relay_fetch <url> <token> <dir> <dest> — download into a root-only temp
+# _dash_relay_fetch <url> <token> <dir> <dest> [seat] — download into a root-only temp
 # file in <dir>, then hand it to the files owner and rename it over <dest>.
 _dash_relay_fetch() {
   local url="$1" tok="$2" dir="$3" dest="$4" tmp code rc=0 size max own
@@ -196,7 +206,10 @@ _dash_relay_fetch() {
   if (( size < 0 || size > max )); then
     rm -f "$tmp"; printf '413\n{"error":"the file is over %s bytes"}' "$max"; return 0
   fi
-  if ! { chown -- "$own" "$tmp" && chmod 0644 -- "$tmp" && mv -fT -- "$tmp" "$dest"; } 2>/dev/null; then
+  # DIVE-7520: readable by the files owner and the seat it is for, nobody else.
+  local grp mode=0644; grp=$(_dash_relay_seat_group "${5:-}")
+  [[ -n "$grp" && -n "${5:-}" ]] && { own="${own%%:*}:$grp"; mode=0640; }
+  if ! { chown -- "$own" "$tmp" && chmod "$mode" -- "$tmp" && mv -fT -- "$tmp" "$dest"; } 2>/dev/null; then
     rm -f "$tmp"
     fail "$E_GENERIC" "_dashboard_relay fetch: could not write ${dest}."
   fi
@@ -443,7 +456,7 @@ cmd_dashboard_relay() {
         || fail "$E_VALIDATION" "_dashboard_relay fetch: the path must name a file in $(_dash_relay_uploads)/${seat}/ ($p)."
       dir=$(_dash_relay_seat_dir "$seat") \
         || fail "$E_VALIDATION" "_dashboard_relay fetch: $(_dash_relay_uploads)/${seat} is not a plain directory."
-      _dash_relay_fetch "${base}/server/selfhost/files?path=$(_dash_relay_uri "$p")" "$tok" "$dir" "$p" ;;
+      _dash_relay_fetch "${base}/server/selfhost/files?path=$(_dash_relay_uri "$p")" "$tok" "$dir" "$p" "$seat" ;;
     put)
       (( ${#wire[@]} == 2 )) || fail "$E_VALIDATION" "_dashboard_relay put takes one path."
       local p="${wire[1]}" real

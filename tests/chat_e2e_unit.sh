@@ -81,6 +81,8 @@ cat >>"$LOGS/curl.stdin"
 printf '%s %s\n' "$method" "${url#https://cp.example.test}" >>"$LOGS/calls"
 case "$method ${url#https://cp.example.test}" in
   "GET /server/chat-e2e/box/devices") jq -c '{devices: .}' "$DEVICES" >"$out" ;;
+  "POST /server/messages/event") if [[ -e "$LOGS/api-down" ]]; then printf '{"error":"down"}' >"$out"; printf 503; exit 0; fi; printf '{"ok":true}' >"$out" ;;
+  "POST /server/chat-e2e/box/devices/"*) if [[ -e "$LOGS/api-down" ]]; then printf '{"error":"down"}' >"$out"; printf 503; exit 0; fi; printf '{"ok":true}' >"$out" ;;
   *) printf '{"ok":true}' >"$out" ;;
 esac
 printf 200
@@ -91,7 +93,7 @@ printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"$LOGS/bun.argv"\nexec %q "$
 chmod +x "$TMP/bin/"*
 export PATH="$TMP/bin:$PATH" FIVEDIVE_CHAT_E2E_BUN="$TMP/bin/bun"
 MYUID=$(id -u)
-_gate_uid_to_agent(){ case "$1" in 1042|"$MYUID") printf 'tap' ;; *) printf '' ;; esac; }
+_gate_uid_to_agent(){ case "$1" in 1042|"$MYUID") printf 'tap' ;; 1043) printf 'other' ;; *) printf '' ;; esac; }
 _gate_is_root(){ [[ -z "${NOT_ROOT:-}" ]]; }
 # A browser or phone: its own key, its pairing proof, sealing and opening (secret from the env).
 cat >"$TMP/dev.ts" <<'TS'
@@ -171,7 +173,7 @@ run _chat_cmd_e2e status; check 'status says on, one device' 'grep -q "on, 1 dev
 
 # ── the seat's rail ──────────────────────────────────────────────────────────
 rail(){ ( export SUDO_UID="${UID_:-1042}"; printf '%s' "$1" | cmd_chat_e2e_root ) >"$TMP/out" 2>"$TMP/err"; }
-ENV1=$(printf '{"t":"msg","text":"hello box"}' | dev seal dev-laptop1 dashboard c-1 "$BOXPUB")
+ENV1=$(printf '{"t":"msg","text":"hello box","to":["tap"]}' | dev seal dev-laptop1 dashboard c-1 "$BOXPUB")
 rail "$(jq -nc --argjson e "$ENV1" '{op:"open", kind:"msg", conv:"dashboard", env:$e}')"; rc=$?
 check 'open: the box reads the laptop message' \
   '[[ $rc == 0 ]] && [[ "$(jq -r .pt "$TMP/out" | "$REAL_BUN" -e "process.stdout.write(Buffer.from(await Bun.stdin.text(),\"base64url\").toString())" | jq -r .text)" == "hello box" ]]'
@@ -193,13 +195,79 @@ check 'state: the rail puts a 0700 parent back to 0755' '[[ $? == 0 && "$(stat -
 FIVEDIVE_CHAT_E2E_DIR="$TMP/nope/chat-e2e" rail '{"op":"state"}'
 check 'state: off exits 4 (E_NOT_FOUND), the code the plugin reads as off' '[[ $? == 4 && $E_NOT_FOUND == 4 ]]'
 dev new dev-phone001 >/dev/null; PHONEPUB=$(dev pub dev-phone001)
-APPROVE=$(jq -nc --arg p "$PHONEPUB" '{t:"approve", device:"dev-phone001", pub:$p}' | dev seal dev-laptop1 dashboard c-2 "$BOXPUB")
+REV=$(_chat_e2e_admin "$LIVE" '{"op":"roster"}' | jq .n)
+APPROVE=$(jq -nc --arg p "$PHONEPUB" --argjson r "$REV" '{t:"approve", device:"dev-phone001", pub:$p, rev:$r}' | dev seal dev-laptop1 dashboard c-2 "$BOXPUB")
 : >"$LOGS/calls"
 rail "$(jq -nc --argjson e "$APPROVE" '{op:"open", kind:"msg", conv:"dashboard", env:$e}')"; rc=$?
 check 'an approved device approves the phone: answer is the sealed list' \
   '[[ $rc == 0 ]] && [[ "$(jq -c .roster "$TMP/out" | dev open dev-phone001 dashboard "$BOXPUB" | jq -r ".devices|map(.id)|sort|join(\",\")")" == "dev-laptop1,dev-phone001" ]]'
 check 'the API mirror gets the approval; the seat never sees the mirror note' \
   'grep -q "POST /server/chat-e2e/box/devices/dev-phone001/approve" "$LOGS/calls" && ! jq -e "has(\"applied\")" "$TMP/out" >/dev/null'
+
+# ── DIVE-7520: device-list commands, agent binding, a lost list ──────────────
+ids(){ _chat_e2e_admin "$LIVE" '{"op":"roster"}' | jq -r '.devices|map(.id)|sort|join(",")'; }
+rev(){ _chat_e2e_admin "$LIVE" '{"op":"roster"}' | jq .n; }
+openreq(){ jq -nc --argjson e "$1" '{op:"open", kind:"msg", conv:"dashboard", env:$e}'; }
+check 'the phone a device let in is NOT an owner; the laptop (paired) is' \
+  '[[ "$(_chat_e2e_admin "$LIVE" "{\"op\":\"roster\"}" | jq -r "[.devices[]|select(.owner)|.id]|join(\",\")")" == dev-laptop1 ]]'
+rail "$(openreq "$APPROVE")"; rc=$?
+check 'a retry of the command that made this list answers the list again, unchanged' \
+  '[[ $rc == 0 ]] && jq -e .roster "$TMP/out" >/dev/null && [[ "$(ids)" == dev-laptop1,dev-phone001 ]]'
+UID_=1043 rail "$(openreq "$APPROVE")"
+check 'the same command handed to ANOTHER seat applies nothing more' '[[ "$(ids)" == dev-laptop1,dev-phone001 ]]'
+STALE=$(jq -nc --arg p "$PHONEPUB" --argjson r "$((REV))" '{t:"revoke", device:"dev-phone001", rev:$r}' | dev seal dev-laptop1 dashboard c-3 "$BOXPUB")
+rail "$(openreq "$STALE")"; rc=$?
+check 'a command made against an older list revision is refused' '[[ $rc != 0 && "$(ids)" == dev-laptop1,dev-phone001 ]]'
+NOREV=$(jq -nc '{t:"revoke", device:"dev-phone001"}' | dev seal dev-laptop1 dashboard c-4 "$BOXPUB")
+rail "$(openreq "$NOREV")"; check 'a command that names no revision is refused' '[[ $? != 0 && "$(ids)" == dev-laptop1,dev-phone001 ]]'
+dev new dev-watch001 >/dev/null; WATCHPUB=$(dev pub dev-watch001)
+BYPHONE=$(jq -nc --arg p "$WATCHPUB" --argjson r "$(rev)" '{t:"approve", device:"dev-watch001", pub:$p, rev:$r}' | dev seal dev-phone001 dashboard p-1 "$BOXPUB")
+rail "$(openreq "$BYPHONE")"; check 'a device that is not an owner cannot let another one in' '[[ $? != 0 && "$(ids)" == dev-laptop1,dev-phone001 ]]'
+SYNC=$(printf '{"t":"sync"}' | dev seal dev-phone001 dashboard p-2 "$BOXPUB")
+rail "$(openreq "$SYNC")"; rc=$?
+check 'any device on the list may ask for the current list (sync), sealed to it' \
+  '[[ $rc == 0 ]] && [[ "$(jq -c .roster "$TMP/out" | dev open dev-phone001 dashboard "$BOXPUB" | jq -r .n)" == "$(rev)" ]]'
+# THE replay: the laptop approved the phone; the phone is revoked; its original
+# approval is replayed into a DIFFERENT seat, with and without root's record of it.
+REVOKE=$(jq -nc --argjson r "$(rev)" '{t:"revoke", device:"dev-phone001", rev:$r}' | dev seal dev-laptop1 dashboard c-5 "$BOXPUB")
+rail "$(openreq "$REVOKE")"; check 'the laptop revokes the phone' '[[ $? == 0 && "$(ids)" == dev-laptop1 ]]'
+UID_=1043 rail "$(openreq "$APPROVE")"; rc=$?
+check 'REPLAY: the revoked phone'"'"'s original approval, into another seat, is refused' '[[ $rc != 0 && "$(ids)" == dev-laptop1 ]]'
+rm -f "$LIVE/applied.json"
+UID_=1043 rail "$(openreq "$APPROVE")"; rc=$?
+check 'REPLAY: refused still with root'"'"'s applied record gone (the revision check alone)' '[[ $rc != 0 && "$(ids)" == dev-laptop1 ]]'
+check 'root keeps its command and open records 0600' \
+  '[[ "$(stat -c %a "$LIVE/opened.json") $(stat -c %a "$LIVE/roster.json")" == "600 600" ]]'
+# agent binding: tap's message and file do not open for the seat of agent "other".
+UID_=1043 rail "$(openreq "$ENV1")"; check 'agent B cannot open a message sealed for agent A' '[[ $? != 0 ]]'
+NOTO=$(printf '{"t":"msg","text":"no to"}' | dev seal dev-laptop1 dashboard c-6 "$BOXPUB")
+rail "$(openreq "$NOTO")"; check 'a message that names no agent does not open for a seat' '[[ $? != 0 ]]'
+FENV=$(printf 'file bytes' | dev seal dev-laptop1 dashboard 'c-1#f0' "$BOXPUB")
+UID_=1043 rail "$(jq -nc --argjson e "$FENV" '{op:"open", kind:"file", conv:"dashboard", env:$e}')"
+check 'agent B cannot open a file of a message agent A opened' '[[ $? != 0 ]]'
+rail "$(jq -nc --argjson e "$FENV" '{op:"open", kind:"file", conv:"dashboard", env:$e}')"
+check 'agent A opens its own message'"'"'s file' '[[ $? == 0 ]] && jq -e .pt "$TMP/out" >/dev/null'
+UID_=1043 rail '{"op":"seal","conv":"dashboard","m":"o-1","msg":{"text":"from other"}}'
+check 'a sealed reply names the agent that sealed it (root writes it)' \
+  '[[ "$(jq -r .env "$TMP/out" | jq -c . | dev open dev-laptop1 dashboard "$BOXPUB" | jq -r .agent)" == other ]]'
+# a lost list: the API is down when the revoke lands; the next sync posts it.
+dev new dev-tab0002 >/dev/null; TABPUB=$(dev pub dev-tab0002)
+ADD=$(jq -nc --arg p "$TABPUB" --argjson r "$(rev)" '{t:"approve", device:"dev-tab0002", pub:$p, rev:$r}' | dev seal dev-laptop1 dashboard c-7 "$BOXPUB")
+rail "$(openreq "$ADD")"
+DROP=$(jq -nc --argjson r "$(rev)" '{t:"revoke", device:"dev-tab0002", rev:$r}' | dev seal dev-laptop1 dashboard c-8 "$BOXPUB")
+touch "$LOGS/api-down"; : >"$LOGS/calls"; : >"$LOGS/bodies"
+rail "$(openreq "$DROP")"; rc=$?
+check 'LOST POST: the revoke applies while the API is down; the list and its mirror are owed' \
+  '[[ $rc == 0 && "$(ids)" == dev-laptop1 ]] && [[ "$(jq .n "$LIVE/announced.json")" -lt "$(rev)" ]] && jq -e ".queue|any(.device==\"dev-tab0002\" and .t==\"revoke\")" "$LIVE/mirror.json" >/dev/null'
+rm -f "$LOGS/api-down"; : >"$LOGS/calls"; : >"$LOGS/bodies"
+jq -s '.' "$TMP/laptop.json" >"$DEVICES"
+run _chat_cmd_devices sync; rc=$?
+check 'LOST POST: the next sync posts the new list and the API mirror, then owes nothing' \
+  '[[ $rc == 0 ]] && grep -q "POST /server/messages/event" "$LOGS/calls" && grep -q "dev-tab0002/revoke" "$LOGS/calls" && [[ "$(jq .n "$LIVE/announced.json")" == "$(rev)" && "$(jq ".queue|length" "$LIVE/mirror.json")" == 0 ]]'
+check 'LOST POST: what it posted is the list without the revoked tablet' \
+  '[[ "$(grep "\"agent\":\"tap\"" "$LOGS/bodies" | tail -1 | jq -r .body | dev open dev-laptop1 dashboard "$BOXPUB" | jq -r ".devices|map(.id)|join(\",\")")" == dev-laptop1 ]]'
+: >"$LOGS/calls"; run _chat_cmd_devices sync
+check 'a sync with nothing owed posts no list' '! grep -q "POST /server/messages/event" "$LOGS/calls"'
 
 # ── DIVE-7502: the relay's sealed ops (a standard seat on a 5dive server) ────
 # The seat seals through its rail (real crypto above) and hands _dashboard_relay
@@ -329,6 +397,21 @@ printf 'ADMIN_PUBKEY_B64=\n' >"$H/connectord.env"; rm -rf "$H/etc/chat-e2e"; : >
 printf '%s\n' "$SECRET2" | run hosted _chat_cmd_e2e enable -; rc=$?
 check 'hosted: a box with no token is refused with no network call, and no key dir' \
   '[[ $rc == "$E_AUTH_REQUIRED" && ! -e "$H/etc/chat-e2e.pairing" && ! -s "$LOGS/calls" ]] && grep -q "Turn encrypted chat on from 5dive.app" "$TMP/err"'
+
+# ── DIVE-7520: disable at the server leaves the off mark seats trust ────────
+rail '{"op":"seal","conv":"dashboard","m":"off-3","msg":{"text":"x"}}'; check 'seal: an off- id is refused (only root says off)' '[[ $? != 0 ]]'
+cp -a "$LIVE" "$TMP/live-copy"; : >"$LOGS/bodies"
+run _chat_cmd_e2e disable; rc=$?
+check 'disable on a live box: every device is told off, sealed under the box key' \
+  '[[ $rc == 0 && -f "$LIVE.off" ]] && [[ "$(grep "\"agent\":\"tap\"" "$LOGS/bodies" | tail -1 | jq -r .body | dev open dev-laptop1 dashboard "$BOXPUB" | jq -r .t)" == off ]]'
+rm -rf "$LIVE.off" "$LIVE".disabled-*; mv "$TMP/live-copy" "$LIVE"
+D="$TMP/dis"; mkdir -p "$D/etc/chat-e2e"; echo '{}' >"$D/etc/chat-e2e/roster.json"
+FIVEDIVE_CHAT_E2E_DIR="$D/etc/chat-e2e" run _chat_cmd_e2e disable; rc=$?
+check 'disable: the off mark is written and the keys are moved aside, not deleted' \
+  '[[ $rc == 0 && -f "$D/etc/chat-e2e.off" && ! -e "$D/etc/chat-e2e" ]] && ls -d "$D"/etc/chat-e2e.disabled-* >/dev/null'
+NOT_ROOT=1 FIVEDIVE_CHAT_E2E_DIR="$D/etc/chat-e2e" run _chat_cmd_e2e disable; check 'disable as non-root is refused' '[[ $? == "$E_PERMISSION" ]]'
+printf '%s\n' "$SECRET2" | FIVEDIVE_CHAT_E2E_DIR="$D/etc/chat-e2e" run _chat_cmd_e2e enable -
+check 'enable again lifts the off mark' '[[ ! -e "$D/etc/chat-e2e.off" ]]'
 
 # ── the secret ───────────────────────────────────────────────────────────────
 leaks(){ # <secret> -> 0 when it shows up anywhere this harness can see
