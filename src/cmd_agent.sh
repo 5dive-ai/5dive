@@ -33,7 +33,7 @@ _agent_operational_state() { # <active> <auth-state> <startup-state> [supervisor
   # it. Only `exhausted` gates — `unmeasured` is not evidence about the seat.
   [[ "$quota" == "exhausted" ]] && { printf 'quota-exhausted\n'; return 0; }
   case "$auth:$startup" in
-    needs_login:*|expired:*|refused:*|failing:*|cannot-send:*|*:degraded) printf 'degraded\n'; return 0 ;;
+    needs_login:*|expired:*|refused:*|failing:*|content-refused:*|cannot-send:*|*:degraded) printf 'degraded\n'; return 0 ;;
     unknown:*|*:unknown)               printf 'unknown\n'; return 0 ;;
   esac
   # The survey deliberately does not run the per-seat output queries. Say what
@@ -1092,10 +1092,14 @@ def startup_health(name):
 # src/lib/seat_refusal.sh (seat_turn_trouble); see that file for why the
 # transcript and the StopFailure 'stop' stamp, and not the probe or the
 # credential file, are the reading. Returns (kind, text): kind is "refused"
-# (the last turn was refused by the account) or "failing" (a run of turns that
-# stopped on an API error), or (None, None).
+# (the last turn was refused by the account), "failing" (a run of turns that
+# stopped on an API error), "content-refused" (such a run whose last error is
+# the model's safety filter, DIVE-7527), or (None, None).
 SEAT_REFUSAL_TEXT_RE = re.compile(r"credit balance is too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled", re.I)
 SEAT_PASSING_ERROR_RE = re.compile(r"overloaded|api error: 5[0-9][0-9]|internal server error|temporarily", re.I)
+# DIVE-7527: a run ending in the model's safety filter is a refused
+# conversation (a restart clears it), not a stuck login. See seat_refusal.sh.
+SEAT_CONTENT_REFUSED_RE = re.compile(r"safeguards flagged", re.I)
 SEAT_FAILING_TURNS = int(os.environ.get("SEAT_FAILING_TURNS") or 3)
 SEAT_FAILING_SECS = int(os.environ.get("SEAT_FAILING_SECS") or 3600)
 
@@ -1235,6 +1239,8 @@ def seat_refusal(name, since=0):
     first = outs[len(outs) - n]
     if n >= SEAT_FAILING_TURNS or (n >= 2 and last["t"] - first["t"] >= SEAT_FAILING_SECS):
         since_s = dt.datetime.fromtimestamp(first["t"], dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if SEAT_CONTENT_REFUSED_RE.search(last["text"]):
+            return "content-refused", f"{n} turns in a row were refused by the AI safety filter since {since_s}: {say(last)}"[:240]
         return "failing", f"{n} turns in a row failed since {since_s}: {say(last)}"[:240]
     return None, None
 
@@ -1394,7 +1400,7 @@ for name, value in agents.items():
         # `account usage` printed 101%. A distinct verdict, not a warning worn
         # under a green word.
         operational = "quota-exhausted"
-    elif auth_state in ("needs_login", "expired", "refused", "failing", "cannot-send") or startup_state == "degraded":
+    elif auth_state in ("needs_login", "expired", "refused", "failing", "content-refused", "cannot-send") or startup_state == "degraded":
         operational = "degraded"
     elif auth_state == "unknown" or startup_state == "unknown":
         operational = "unknown"
@@ -1486,7 +1492,8 @@ cmd_list() {
        ([.[] | select(.sudo.extraEntries)] | length),
        ([.[] | select(.health.auth.state == "refused") | .name] | join(", ")),
        ([.[] | select(.health.auth.state == "failing") | "\(.name) (\(.authProfile // "shared login"))"] | join(", ")),
-       ([.[] | select(.health.auth.state == "cannot-send") | .name] | join(", "))] | .[]' <<<"$merged")
+       ([.[] | select(.health.auth.state == "cannot-send") | .name] | join(", ")),
+       ([.[] | select(.health.auth.state == "content-refused") | .name] | join(", "))] | .[]' <<<"$merged")
     local -a _legend_values=()
     mapfile -t _legend_values <<<"$_legends"
     _lg_login="${_legend_values[0]:-0}"
@@ -1504,6 +1511,11 @@ cmd_list() {
     if [[ -n "${_legend_values[8]:-}" ]]; then
       echo
       echo "AUTH failing = the seat's last ${SEAT_FAILING_TURNS:-3} turns all stopped on an API error, so its login is stuck: ${_legend_values[8]}. Sign that login in again, or move the seat: 5dive agent recover <name> --to=<login>"
+    fi
+    # DIVE-7527: the login works; the conversation is what keeps being refused.
+    if [[ -n "${_legend_values[10]:-}" ]]; then
+      echo
+      echo "AUTH content-refused = the seat's conversation keeps being refused by the AI safety filter; its login works: ${_legend_values[10]}. Restart it to start a new conversation: 5dive agent restart <name>"
     fi
     if (( _lg_login || _lg_exp )); then
       echo
@@ -2350,7 +2362,7 @@ cmd_info() {
   _ha=$(agent_auth_health "$type" "$_info_prof" "$name" || true)
   # DIVE-7118: what the account said, for the warning below.
   local _ha_refusal=""
-  [[ "${_ha%%|*}" == refused || "${_ha%%|*}" == failing || "${_ha%%|*}" == cannot-send ]] \
+  [[ "${_ha%%|*}" == refused || "${_ha%%|*}" == failing || "${_ha%%|*}" == content-refused || "${_ha%%|*}" == cannot-send ]] \
     && { _ha_refusal=$(seat_account_refusal "$name" "$(seat_started_epoch "$name")" 2>/dev/null) || _ha_refusal=""; }
   [[ -n "$_ha" ]] || _ha='unknown|-|false'
   _ha_state="${_ha%%|*}"
@@ -2534,6 +2546,9 @@ cmd_info() {
        else empty end),
       (if .health.auth.state == "cannot-send" then
          "\nWARNING: this seat CANNOT SEND A MESSAGE: \(.health.auth.refusal // "its AI package is missing"). It starts, its credential is present, and it drops every message with \"Your message was not sent\" (DIVE-7373)."
+       else empty end),
+      (if .health.auth.state == "content-refused" then
+         "\nWARNING: the CONVERSATION on this seat KEEPS BEING REFUSED by the AI safety filter: \(.health.auth.refusal // "its recent turns were refused"). Its login works, so signing in again changes nothing. Restart it to start a new conversation: 5dive agent restart \(.name) (DIVE-7527)."
        else empty end),
       (if .health.auth.state == "failing" then
          "\nWARNING: the login this seat runs on is STUCK: \(.health.auth.refusal // "its recent turns failed"). Every wake stops with no reply, though the process runs and the credential file is present. Sign the login \(.authProfile // "(the shared box login)") in again, or move the seat to another login and restart it: 5dive agent recover \(.name) --to=<login> (DIVE-7118)."

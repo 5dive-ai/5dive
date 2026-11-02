@@ -63,6 +63,15 @@ seat_started_epoch() {
 SEAT_FAILING_TURNS="${SEAT_FAILING_TURNS:-3}"
 SEAT_FAILING_SECS="${SEAT_FAILING_SECS:-3600}"
 SEAT_PASSING_ERROR_RE='overloaded|api error: 5[0-9][0-9]|internal server error|temporarily'
+# DIVE-7527 (teal-fox, 2026-10-31): a run whose LAST failed turn is the model's
+# safety filter refusing the conversation is not a stuck login. Claude Code
+# writes it as error "invalid_request", text "API Error: <model>'s safeguards
+# flagged this message…"; the login works, and the next session (a restart)
+# answers. It reads `content-refused`, never `failing`, so nothing tells the
+# owner to sign in again. The match is the text alone (any error class), the
+# same words the heartbeat's _HB_CLAUDE_NOT_TRANSIENT already reads off a pane.
+# It is NOT a refusal of the account, so it stays out of SEAT_REFUSAL_TEXT_RE.
+SEAT_CONTENT_REFUSED_RE='safeguards flagged'
 
 # _seat_recent_records <name> — the tail of the seat's newest top-level
 # transcripts (subagent sidechains live one level deeper), oldest first, then one
@@ -130,8 +139,8 @@ hermes_missing_sdk() {
   printf 'anthropic\n'
 }
 
-# seat_turn_trouble <name> [since-epoch] — "<refused|failing|cannot-send>\t<what
-# happened>", rc 0, when the seat cannot answer; rc 1 for anything else,
+# seat_turn_trouble <name> [since-epoch] — "<refused|failing|content-refused|
+# cannot-send>\t<what happened>", rc 0, when the seat cannot answer; rc 1 for anything else,
 # including an unreadable transcript: no reading is not trouble, and this must
 # never turn a healthy seat red. Only turns at or after since count; a
 # cannot-send seat (DIVE-7373) is a fact about the box, not a turn, so it counts
@@ -147,6 +156,7 @@ seat_turn_trouble() {
   # A turn is a prompt (a user record that is not a tool result) and the last
   # assistant record after it. fromjson? because `tail` can cut a record.
   out=$(jq -R -n -r --argjson since "$since" --arg re "$SEAT_REFUSAL_TEXT_RE" --arg pass "$SEAT_PASSING_ERROR_RE" \
+          --arg content "$SEAT_CONTENT_REFUSED_RE" \
           --argjson want "$SEAT_FAILING_TURNS" --argjson secs "$SEAT_FAILING_SECS" '
     def ts: (.timestamp // "") | sub("\\.[0-9]+"; "") | (try fromdateiso8601 catch 0);
     def prompt: .type == "user" and (.isMeta != true)
@@ -178,9 +188,10 @@ seat_turn_trouble() {
                         | index(false)) // length) as $n
             | if $n == 0 then empty else
                 .[length - $n] as $first
-                | if $n >= $want or ($n >= 2 and ($last.t - $first.t) >= $secs)
-                  then "failing\t\($n) turns in a row failed since \($first.t | todate): \($last | say)"
-                  else empty end
+                | if ($n >= $want or ($n >= 2 and ($last.t - $first.t) >= $secs)) | not then empty
+                  elif $last.text | test($content; "i")
+                  then "content-refused\t\($n) turns in a row were refused by the AI safety filter since \($first.t | todate): \($last | say)"
+                  else "failing\t\($n) turns in a row failed since \($first.t | todate): \($last | say)" end
               end
           end
       end' <<<"$raw" 2>/dev/null) || return 1

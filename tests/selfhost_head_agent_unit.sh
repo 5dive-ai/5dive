@@ -347,6 +347,93 @@ eq_t "T5c control: on systemd 251+ it does not count either" ok "$(snap_sd 255 |
 eq_t "T6 control: a refusal after the start still counts on 22.04" refused "$(snap_sd 249 | jq -r '.[0].health.auth.state')"
 rm -f "$T"/*.jsonl
 
+echo '== C: a run of safety-filter refusals is a refused conversation, not a stuck login (DIVE-7527) =='
+# teal-fox 2026-10-31: 8 records like this in one conversation, 21:08Z-23:07Z; the
+# sweep told the owner login-1 had stopped working; a restart (new session) fixed it.
+SAFE="API Error: Opus 4.8's safeguards flagged this message. Please start a new session."
+sg_wakes() { # <last: safe|plain> — three wakes an hour apart; the first two refused by the filter
+  local i txt
+  for i in 1 2 3; do
+    txt="$SAFE"; [[ "$i" == 3 && "$1" == plain ]] && txt="API Error: 400 invalid_request_error"
+    { user_rec "2026-10-31T2${i}:00:00Z"; err_rec "2026-10-31T2${i}:00:05Z" invalid_request "$txt"; } > "$T/c$i.jsonl"
+    touch -d "2026-10-31T2${i}:00:05Z" "$T/c$i.jsonl"
+  done
+}
+clear_t; clear_s; sg_wakes safe
+eq_t "C1 three turns ending in a safeguards refusal read content-refused, not failing" content-refused "$(trouble)"
+eq_t "C1b ...and the reason names the safety filter and the run" yes \
+  "$(seat_account_refusal olivia 0 2>/dev/null | grep -q '^3 turns in a row were refused by the AI safety filter since 2026-10-31T21:00:05Z: API Error: Opus 4.8' && echo yes || echo no)"
+eq_t "C2 the agent list twin (python) returns the same kind" "content-refused|3 turns in a row were refused by the AI safety filter since 2026-10-31T21:00:05Z" \
+  "$(snap | jq -r '.[0].health.auth | "\(.state)|\((.refusal // "") | sub(": API Error.*$"; ""))"')"
+AH=$(agent_auth_health opencode "" olivia)
+eq_t "C3 agent_auth_health reads content-refused, and the verdict is degraded (the seat cannot answer)" "content-refused|degraded" \
+  "${AH%%|*}|$(_agent_operational_state active "${AH%%|*}" clear)"
+eq_t "C3b control: a restart (a new conversation) clears it" none "$(trouble "$(date -u -d 2026-10-31T23:30:00Z +%s)")"
+sg_wakes plain
+eq_t "C4 control: the same run ending in a plain invalid_request is still a stuck login" failing "$(trouble)"
+eq_t "C4b ...in the python twin too" failing "$(snap | jq -r '.[0].health.auth.state')"
+clear_t
+{ user_rec 2026-10-31T21:00:00Z; err_rec 2026-10-31T21:00:05Z invalid_request "$SAFE"; user_rec 2026-10-31T21:10:00Z; err_rec 2026-10-31T21:10:05Z invalid_request "$SAFE"; } > "$T/c1.jsonl"
+eq_t "C5 control: two refusals ten minutes apart are not yet a run (both twins)" "none|ok" "$(trouble)|$(snap | jq -r '.[0].health.auth.state')"
+{ user_rec 2026-10-31T21:00:00Z; err_rec 2026-10-31T21:00:05Z invalid_request "$SAFE"; user_rec 2026-10-31T21:10:00Z; ok_rec 2026-10-31T21:10:05Z; } > "$T/c1.jsonl"
+eq_t "C5b control: a turn that got through after a refusal ends it" none "$(trouble)"
+
+# auth status: the credential is fine, so ok stays ok and nothing says sign in.
+sg_wakes safe
+out=$(JSON_MODE=1 cmd_auth_status --agent=olivia --probe 2>/dev/null)
+eq_t "C6 auth status: the credential stays ok, the seat line names content-refused" "ok|content-refused" \
+  "$(jq -r '"\(.data.claude)|\(.seat.state)"' <<<"$out" 2>/dev/null)"
+err=$(cmd_auth_status --agent=olivia --probe 2>&1 >/dev/null)
+eq_t "C6b ...and the human line points at a restart, not a sign-in" "yes|no" \
+  "$(grep -q 'safety filter.*5dive agent restart olivia' <<<"$err" && echo yes || echo no)|$(grep -qi 'sign' <<<"$err" && echo yes || echo no)"
+sg_wakes plain
+out=$(JSON_MODE=1 cmd_auth_status --agent=olivia --probe 2>/dev/null)
+eq_t "C6c control: a stuck login still turns ok stale" "stale|degraded" "$(jq -r '"\(.data.claude)|\(.seat.state)"' <<<"$out" 2>/dev/null)"
+
+# The sweep: one message per seat per episode, naming the restart; never the sign-in.
+eval "$(awk '/^_hb_content_refused_text\(\) \{/,/^}$/' src/cmd_heartbeat.sh)"
+eval "$(awk '/^_hb_stuck_login_sweep\(\) \{/,/^}$/' src/cmd_heartbeat.sh)"
+any_c() { ls "$HB_STUCK_LOGIN_DIR"/content-* >/dev/null 2>&1 && echo yes || echo no; }
+: > "$DM"; clear_sent; rm -f "$HB_STUCK_LOGIN_DIR"/content-*; sg_wakes safe; sweep
+eq_t "C7 a safety-filter run sends ONE message, end to end through the reader" 1 "$(wc -l < "$DM")"
+eq_t "C7b ...naming the seat, the filter and the restart, and NOT the sign-in" "yes|no" \
+  "$(grep -q 'olivia keeps having its conversation refused by the AI.s safety filter\..*5dive agent restart olivia' "$DM" && echo yes || echo no)|$(grep -qE 'has stopped working|Settings → AI subscriptions' "$DM" && echo yes || echo no)"
+eq_t "C7c ...stamped per seat, and no stuck-login stamp" "yes|no" "$(any_c)|$(any_sent)"
+sweep; sweep
+eq_t "C8 later passes in the same episode: no second message" 1 "$(wc -l < "$DM")"
+clear_t; sweep
+eq_t "C8b the seat answers again (no reading): its stamp goes" no "$(any_c)"
+sg_wakes safe; sweep
+eq_t "C8c ...so the next episode is told, once" 2 "$(wc -l < "$DM")"
+: > "$DM"; rm -f "$HB_STUCK_LOGIN_DIR"/content-*; sg_wakes safe; D_UNREACHABLE=1 sweep
+eq_t "C8d control: an owner who could not be reached is retried next pass (no stamp)" "0|no" "$(wc -l < "$DM")|$(any_c)"
+: > "$DM"; clear_sent; rm -f "$HB_STUCK_LOGIN_DIR"/content-*; sg_wakes plain; sweep
+eq_t "C9 control: a run ending in a plain invalid_request still sends the stuck-login message" "1|0" \
+  "$(grep -c '"work" has stopped working' "$DM")|$(grep -c 'safety filter' "$DM")"
+: > "$DM"; clear_sent; clear_t; wakes rl; sweep; clear_t; wakes ovl; sweep
+eq_t "C9b control: rate limits and overloads still send nothing" 0 "$(wc -l < "$DM")"
+clear_t; clear_sent
+
+# Every place that turns `failing` into "sign in again" says restart for the new kind.
+info_w=$(grep -A1 'health.auth.state == "content-refused" then' src/cmd_agent.sh | tail -1)
+legend=$(grep -F 'AUTH content-refused =' src/cmd_agent.sh)
+eq_t "C10 agent info and the agent list legend name the restart, not a sign-in" "yes|yes|no" \
+  "$(grep -q 'agent restart' <<<"$info_w" && echo yes || echo no)|$(grep -q 'agent restart' <<<"$legend" && echo yes || echo no)|$(grep -qE 'Sign (the|that) login' <<<"$info_w$legend" && echo yes || echo no)"
+grep -qF '"${_ha%%|*}" == content-refused' src/cmd_agent.sh \
+  && ok_t "C10b agent info reads the reason for the new kind" || bad_t "C10b agent info reads the reason for the new kind" "the _ha_refusal guard does not list content-refused"
+# shellcheck source=/dev/null
+source src/cmd_agent_runtime.sh 2>/dev/null
+sg_wakes safe
+d=$(_ask_timeout_diag m1 /nonexistent 0 0 olivia)
+eq_t "C11 agent ask's timeout names the safety filter and a restart, not a credit or login problem" "yes|no" \
+  "$(grep -q 'safety filter.*agent restart olivia' <<<"$d" && echo yes || echo no)|$(grep -q 'credit or login problem, not' <<<"$d" && echo yes || echo no)"
+clear_t; { user_rec 2026-10-27T10:18:32Z; err_rec 2026-10-27T10:18:33Z billing_error "Credit balance is too low"; } > "$T/s1.jsonl"
+d=$(_ask_timeout_diag m1 /nonexistent 0 0 olivia)
+eq_t "C11b control: a billing refusal still reads as an account refusal" yes "$(grep -q 'AI account REFUSED the turn (Credit balance is too low)' <<<"$d" && echo yes || echo no)"
+clear_t
+_syn=""; for f in src/cmd_agent.sh src/cmd_auth.sh src/cmd_heartbeat.sh src/cmd_agent_runtime.sh src/lib/seat_refusal.sh; do bash -n "$f" 2>/dev/null || _syn+=" $f"; done
+eq_t "C12 every file this row touches parses" "" "$_syn"
+
 echo
-printf 'DIVE-7118 self-host head agent: %d passed, %d failed\n' "$PASS" "$FAIL"
+printf 'DIVE-7118/7527 self-host head agent: %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1
