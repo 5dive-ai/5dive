@@ -306,7 +306,12 @@ local_only_gate() {
     self-update|self_update|update)
       case "$sub" in
         --status|--off|--nightly|-h|--help|help) ;;   # --nightly: cmd skips quietly
-        *) local_only_refuse "Updating from the internet" ;;
+        --write-pubkey) ;;   # DIVE-7577: pins the key the CLI carries; no network
+        # DIVE-7577: a signed file from a disk. Only the two flags that verb takes,
+        # so `--check --from=x` (which would dial) is still refused.
+        --from=*|--allow-downgrade) for a in "$@"; do [[ "$a" == --from=* ]] && return 0; done
+           local_only_refuse "Updating from the internet (to update from a disk: sudo 5dive self-update --from=<file>)" ;;
+        *) local_only_refuse "Updating from the internet (to update from a disk: sudo 5dive self-update --from=<file>)" ;;
       esac ;;
     plugin|plugins)
       case "$sub" in

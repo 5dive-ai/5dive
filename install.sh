@@ -56,6 +56,13 @@ if [[ -z "${GH_ORG:-}" ]]; then
   fi
 fi
 
+# DIVE-7577: `5dive self-update --from=<file>` runs this installer from a signed
+# update file, with REPO and every tarball pointed at the unpacked file and
+# FIVEDIVE_OFFLINE_UPDATE=1. Every step that has no source in the file (bun
+# install — the file ships node_modules —, GitHub build ancestry, plugin
+# marketplace refreshes, Hermes's package fetch) is skipped under it.
+offline_update() { [[ "${FIVEDIVE_OFFLINE_UPDATE:-0}" == 1 ]]; }
+
 # >>> DIVE-1977 pin-resolution block (extracted verbatim by tests/install_pin_sha_unit.sh)
 # DIVE-1977: every path under raw.githubusercontent.com/<org>/5dive/main is an
 # INDEPENDENT CDN object with its own cache generation, so for a window after
@@ -666,6 +673,7 @@ bundle_build_sha() {
 legacy_release_build_sha() {
   local _version="$1" _json="" _line="" _sha=""
   release_version "$_version" || return 1
+  offline_update && return 1   # DIVE-7577: no GitHub; version ordering decides
   _json="$(curl -fsSL --max-time 10 \
     "https://api.github.com/repos/$GH_ORG/5dive/commits/v${_version}" 2>/dev/null)" || return 1
   _line="$(printf '%s\n' "$_json" | awk '/"parents"[[:space:]]*:/ { parents=1; next } parents && /"sha"[[:space:]]*:/ { print; exit }')"
@@ -677,6 +685,7 @@ legacy_release_build_sha() {
 # Prints ahead|behind|identical|diverged for installed...candidate.
 build_relation() {
   local _installed="$1" _candidate="$2" _json="" _status=""
+  offline_update && return 1   # DIVE-7577: no GitHub; version ordering decides
   _json="$(curl -fsSL --max-time 10 \
     "https://api.github.com/repos/$GH_ORG/5dive/compare/${_installed}...${_candidate}" 2>/dev/null)" || return 1
   _status="$(printf '%s\n' "$_json" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
@@ -1136,7 +1145,7 @@ TOOLENV
   # HERMES_SDK_STEP in src/header.sh. Skipped when there is no Hermes or the
   # package is there; a failure is a warning (other providers do not need it).
   _hsdk=/home/claude/.hermes/hermes-agent
-  if [[ -x /home/claude/.local/bin/hermes && -d "$_hsdk/tools" ]] \
+  if ! offline_update && [[ -x /home/claude/.local/bin/hermes && -d "$_hsdk/tools" ]] \
      && ! compgen -G "$_hsdk/venv/lib/python3*/site-packages/anthropic/__init__.py" >/dev/null; then
     if sudo -u claude -H bash -lc "cd $_hsdk && ./venv/bin/python -c 'from tools.lazy_deps import ensure; ensure(\"provider.anthropic\", prompt=False)'" >/dev/null 2>&1; then
       ok "Hermes: Anthropic package installed"
@@ -1260,7 +1269,7 @@ TOOLENV
     # server.ts + the hooks.
     if id -u claude >/dev/null 2>&1; then
       chown -R claude:claude "$LIB_DIR/telegram-codex" "$LIB_DIR/dashboard"
-      if sudo -u claude -H bash -lc \
+      if offline_update || sudo -u claude -H bash -lc \
           "cd $(printf %q "$LIB_DIR/telegram-codex") && bun install --production --ignore-scripts --no-progress --no-summary && cd $(printf %q "$LIB_DIR/dashboard") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
         chmod -R a+rX "$LIB_DIR/telegram-codex" "$LIB_DIR/dashboard"
         ok "Codex channel dispatcher and dashboard adapter"
@@ -1293,7 +1302,7 @@ TOOLENV
     cp -a "$_grk_tmp/plugins/telegram-grok/." "$LIB_DIR/telegram-grok/"
     if id -u claude >/dev/null 2>&1; then
       chown -R claude:claude "$LIB_DIR/telegram-grok"
-      if sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-grok") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
+      if offline_update || sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-grok") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
         chmod -R a+rX "$LIB_DIR/telegram-grok"
         ok "telegram-grok plugin"
       else
@@ -1325,7 +1334,7 @@ TOOLENV
     cp -a "$_agy_tmp/plugins/telegram-agy/." "$LIB_DIR/telegram-agy/"
     if id -u claude >/dev/null 2>&1; then
       chown -R claude:claude "$LIB_DIR/telegram-agy"
-      if sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-agy") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
+      if offline_update || sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-agy") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
         chmod -R a+rX "$LIB_DIR/telegram-agy"
         ok "telegram-agy plugin"
       else
@@ -1361,7 +1370,7 @@ TOOLENV
     cp -a "$_ocode_tmp/plugins/telegram-opencode/." "$LIB_DIR/telegram-opencode/"
     if id -u claude >/dev/null 2>&1; then
       chown -R claude:claude "$LIB_DIR/telegram-opencode"
-      if sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-opencode") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
+      if offline_update || sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-opencode") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
         chmod -R a+rX "$LIB_DIR/telegram-opencode"
         ok "telegram-opencode plugin"
       else
@@ -1396,7 +1405,7 @@ TOOLENV
     cp -a "$_pi_tmp/plugins/telegram-pi/." "$LIB_DIR/telegram-pi/"
     if id -u claude >/dev/null 2>&1; then
       chown -R claude:claude "$LIB_DIR/telegram-pi"
-      if sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-pi") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
+      if offline_update || sudo -u claude -H bash -lc "cd $(printf %q "$LIB_DIR/telegram-pi") && bun install --production --ignore-scripts --no-progress --no-summary" >/dev/null 2>&1; then
         chmod -R a+rX "$LIB_DIR/telegram-pi"
         ok "telegram-pi plugin"
       else
@@ -1967,6 +1976,9 @@ if [[ "${1:-}" == "--upgrade" ]]; then
 
   say "Upgrading 5dive CLI (skipping apt / nvm / bun / state setup)"
   refresh_managed_files
+  # DIVE-7577: pin the release update key this CLI carries (a CLI without one
+  # writes nothing). An older CLI refuses the flag and changes nothing.
+  "$BIN_DIR/5dive" self-update --write-pubkey >/dev/null 2>&1 || true
 
   # >>> DIVE-6618 host plugins (extracted verbatim by tests/plugin_host_auto_upgrade_unit.sh)
   # Box-wide plugins (/var/lib/5dive/plugins) were install-once on a self-installed
@@ -1979,7 +1991,7 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   # can SIGPIPE the CLI and read as "not supported". An older pinned CLI lacks
   # the verb, and then this step is skipped rather than failed.
   _hp_help="$("$BIN_DIR/5dive" plugin --help 2>/dev/null || true)"
-  if [[ "$_hp_help" == *"plugin auto-upgrade"* ]]; then
+  if ! offline_update && [[ "$_hp_help" == *"plugin auto-upgrade"* ]]; then
     say "Upgrading box plugins"
     "$BIN_DIR/5dive" plugin auto-upgrade 2>&1 | sed 's/^/  /' \
       || echo "warn: box plugins: some did not upgrade (the reason is on the lines above); the CLI upgrade went ahead" >&2
@@ -2013,7 +2025,7 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   # a box's first one-time secret link opens on the first tap instead of failing
   # TLS while the certificate is still being issued. No-op without Caddy or
   # FIVE_DOMAIN, idempotent once routed. Best-effort: never block an upgrade on it.
-  "$BIN_DIR/5dive" secret _prewarm >/dev/null 2>&1 || true
+  offline_update || "$BIN_DIR/5dive" secret _prewarm >/dev/null 2>&1 || true
 
   # >>> DIVE-5247 partner plugin migration (extracted verbatim by tests/sysadmin_core_seams_unit.sh)
   # `5dive sysadmin` left core for the partner plugin. A box that already has the
@@ -2024,7 +2036,7 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   # _broker`, reaches "unknown command". A box without the seat is untouched; a box
   # whose `sysadmin` already answers skips, so a failed add is retried next upgrade.
   # Best-effort: never block an upgrade on it.
-  if jq -e '.agents.sysadmin != null' "$STATE_DIR/agents.json" >/dev/null 2>&1 \
+  if ! offline_update && jq -e '.agents.sysadmin != null' "$STATE_DIR/agents.json" >/dev/null 2>&1 \
      && ! "$BIN_DIR/5dive" sysadmin --help >/dev/null 2>&1; then
     say "Installing the partner plugin (this box has the sysadmin seat)"
     "$BIN_DIR/5dive" plugin add "$GH_ORG/5dive-partner" --yes 2>&1 | tail -3 \
@@ -2224,6 +2236,7 @@ fi
 # all silently disabled.
 say "Installing CLI binaries, systemd unit, hooks, and skills"
 refresh_managed_files
+"$BIN_DIR/5dive" self-update --write-pubkey >/dev/null 2>&1 || true   # DIVE-7577
 
 echo
 echo "5dive installed successfully."

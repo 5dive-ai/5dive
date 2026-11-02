@@ -14,6 +14,7 @@ Maintenance:
   5dive init                                         # interactive first-run wizard (one agent)
   5dive company [--yes]                              # onboarding wizard: stand up a self-steering company (project + objective + planner)
   5dive self-update                                  # update the CLI + plugins, then restart agents
+  5dive self-update --from=<file>                    # install a signed update file from a USB disk (no network)
                                                      # (alias: 5dive update). On-demand upgrade for
                                                      # self-hosted boxes; managed boxes update nightly.
   5dive update --check                               # read-only: is the CLI behind/stale? (no root)
@@ -1761,7 +1762,13 @@ main() {
         printf '%s\n' "usage: 5dive self-update     # update the CLI + plugins, then restart agents (root; alias: 5dive update)" \
                        "       5dive update --check   # read-only: is the CLI behind/stale? (no root)" \
                        "       5dive self-update --on|--off   # nightly updates on a self-hosted box (root; off by default)" \
-                       "       5dive self-update --status     # are nightly updates on, and what did the last run do (no root)"
+                       "       5dive self-update --status     # are nightly updates on, and what did the last run do (no root)" \
+                       "       5dive self-update --from=<file> [--allow-downgrade]   # install a signed update file from a disk, no network (root)"
+      elif [[ "${1:-}" == "--write-pubkey" ]]; then
+        # DIVE-7577: install.sh pins the release update key on the box.
+        [[ $# -eq 1 ]] || fail "$E_USAGE" "self-update --write-pubkey takes no other arguments"
+        [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "self-update --write-pubkey must run as root"
+        _ou_write_pubkey
       elif [[ "${1:-}" == "--check" ]]; then
         shift
         cmd_update_check "$@"
