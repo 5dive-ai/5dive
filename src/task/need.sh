@@ -5789,7 +5789,34 @@ db "BEGIN IMMEDIATE;
       _nr_reason="no routing kind matched — the ask and the row TITLE did not read as an eng ship, and this row carries no 'Branch:' binding — and gate_builder_routing is ${_nr_pref}, so ${_nr_rev} was never considered. Bind the branch (5dive task set-branch ${ident} <branch>) or say 'push-for-review'/'pull request' in the ask, then re-file"
     fi
   fi
-  local _nr_note=" [NOT ROUTED — no lead was named, so this gate sits on the PAIRED HUMAN: ${_nr_reason}]"
+  # DIVE-7552: WHO it sits on is a lookup, not a constant. "the PAIRED HUMAN" was
+  # printed on every box, including one with no human linked and no chat connected,
+  # where the same OK line also said "UNNOTIFIED — nobody was pinged". Ask the
+  # recipient resolver the delivery path uses and print what it found. Called
+  # bare, never in $( ): it sets HUMAN_RECIPIENT_ID/BASIS as globals.
+  local _nr_who="" _nr_rid="" _nr_basis=""
+  HUMAN_RECIPIENT_ID=""; HUMAN_RECIPIENT_BASIS=""
+  if declare -F _human_gate_recipient >/dev/null 2>&1; then
+    _human_gate_recipient "$id" >/dev/null 2>&1 || true
+    _nr_rid="${HUMAN_RECIPIENT_ID:-}"; _nr_basis="${HUMAN_RECIPIENT_BASIS:-}"
+  else
+    _nr_basis="recipient resolver did not run"
+  fi
+  if [[ -n "$_nr_rid" ]]; then
+    _nr_who="human '${_nr_rid}' (basis: ${_nr_basis})"
+  elif [[ "$_nr_basis" == "recipient resolver did not run" || -z "$_nr_basis" ]]; then
+    _nr_who="an UNKNOWN human: the recipient resolver did not run"
+    _nr_basis="recipient resolver did not run"
+  elif _human_registry_active; then
+    _nr_who="NO ONE: no human is linked up the chain (${_nr_basis}) — link one: sudo 5dive human link <id> --agent=<seat>"
+  elif _task_deployment_has_channels; then
+    _nr_who="whoever reads this box's chat (legacy broadcast: no human accounts on this box)"
+    _nr_basis="legacy broadcast"
+  else
+    _nr_who="NO ONE: no human is linked and no chat is connected, so only 'task inbox' shows it"
+    _nr_basis="no human, no chat"
+  fi
+  local _nr_note=" [NOT ROUTED — no lead was named, so this gate sits on ${_nr_who}: ${_nr_reason}]"
   if [[ -n "$_offbox_owner" ]]; then
     dest_note=" [phone ping HELD — off-box gate owner '${_offbox_owner}' answers this box's approval/decision gates; nobody was paged]"
     _nr_note=""
@@ -5827,6 +5854,6 @@ db "BEGIN IMMEDIATE;
     else warn "$ident is filed, but browser ask $browser_ask is NOT on it: its yes will not approve the browser step"; fi
   fi
   ok "$ident needs a human ($type, tier $tier)${selfhost_note}${link_note}${floor_note}${prec_note}${unnotified_note}${dest_note}${_nr_note} — $ask" \
-     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), drop_link_expires_at:(($dle|select(length>0)) // null), selfhost_secret_url:(($shu|select(length>0)) // null), secret_link_url:(($slu|select(length>0)) // null), routed_to:null, route_declined:$rd, ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
-     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg dt "${TASK_SEND_TARGETS:-}" --arg dle "$_lk_iso" --arg shu "$_sh_url" --arg slu "$_ul_url" --arg rd "$_nr_reason" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
+     '{id:($i|tonumber), ident:$id, status:"blocked", need_type:$ty, tier:($tr|tonumber), tier_floored:($fl=="1"), floor_term:(($ft|select(length>0)) // null), needs_capability:(($nc|select(length>0)) // null), needs_human:($nh=="1"), rubber_stamp_ok:(($rs|select(length>0)) // null), notified:($nf=="1"), delivered_to:(($dt|select(length>0)) // null), drop_link_expires_at:(($dle|select(length>0)) // null), selfhost_secret_url:(($shu|select(length>0)) // null), secret_link_url:(($slu|select(length>0)) // null), routed_to:null, route_declined:$rd, human_recipient:(($hr|select(length>0)) // null), recipient_basis:(($hb|select(length>0)) // null), ask:$ak, need_options:(($op|select(length>0)) // null), recommend:(($rc|select(length>0)) // null), precedent_ref:(($pr|select(length>0)|tonumber?) // null), assignee:$ac}' \
+     --arg i "$id" --arg id "$ident" --arg ty "$type" --arg tr "$tier" --arg fl "$tier_floored" --arg ft "$floor_term" --arg nc "$needs" --arg nh "$_needs_human" --arg rs "$rubber_stamp" --arg nf "$notified" --arg dt "${TASK_SEND_TARGETS:-}" --arg dle "$_lk_iso" --arg shu "$_sh_url" --arg slu "$_ul_url" --arg rd "$_nr_reason" --arg hr "$_nr_rid" --arg hb "${_nr_note:+$_nr_basis}" --arg ak "$ask" --arg op "$options" --arg rc "$recommend" --arg pr "$precedent_ref" --arg ac "$actor"
 }

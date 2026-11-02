@@ -106,7 +106,7 @@ jq -e '.data.tasks[] | select(.ident=="DIVE-9501")' <<<"$ls_out" >/dev/null 2>&1
 grep -q 'hold:offbox:marketing' "$FIVEDIVE_GATE_NOTIFY_LOG" \
   && ok_t "1: the hold is recorded as a delivery row" \
   || fail_t "1: no hold row: $(tail -3 "$FIVEDIVE_GATE_NOTIFY_LOG")"
-grep -q 'off-box gate owner' <<<"$out" && ! grep -q 'sits on the PAIRED HUMAN' <<<"$out" \
+grep -q 'off-box gate owner' <<<"$out" && ! grep -q 'NOT ROUTED' <<<"$out" \
   && ok_t "1: the filer is told the ping is held for marketing, not that it sits on the human" \
   || fail_t "1: filer line: $out"
 

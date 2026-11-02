@@ -243,7 +243,9 @@ OUT=$(file_gate DIVE-120 dev --type=approval --ask="Push-for-review: land the br
 # ---------------------------------------------------------------------------
 seed DIVE-130 'gate routing bug report'
 OUT=$(file_gate DIVE-130 dev --type=approval --tier=1 --ask="$ASK_MISS")
-[[ "$OUT" == *"NOT ROUTED"* && "$OUT" == *"PAIRED HUMAN"* ]] \
+# DIVE-7552: WHO it lands on is the recipient resolver's answer, never the
+# constant "PAIRED HUMAN" (section F grades each answer).
+[[ "$OUT" == *"NOT ROUTED"* && "$OUT" == *"sits on "* && "$OUT" != *"PAIRED HUMAN"* ]] \
   && ok_t "E1 the unrouted receipt says NOT ROUTED and names who it lands on" \
   || bad_t "E1 unrouted receipt must be explicit" "out=$OUT"
 [[ "$OUT" == *"no routing kind matched"* && "$OUT" == *"main was never considered"* ]] \
@@ -295,6 +297,66 @@ OUT=$(file_gate DIVE-134 dev --type=approval --tier=1 --ask="$ASK_MISS")
 [[ "$OUT" != *"NOT ROUTED"* ]] \
   && ok_t "E5 a ROUTED gate carries no NOT-ROUTED note" \
   || bad_t "E5 routed gate must not claim it landed on the human" "out=$OUT"
+
+# ---------------------------------------------------------------------------
+# F. DIVE-7552: THE WHO CLAUSE ASKS THE RECIPIENT RESOLVER. Customer bug 647: a
+#    box with no human linked was told its gate "sits on the PAIRED HUMAN", on
+#    the same line that said nobody was pinged. One arm per resolver answer.
+#    CONNECTORS_DIR is pinned so the chat/no-chat arms do not read the host's.
+# ---------------------------------------------------------------------------
+CONN_EMPTY="$TMP/conn-empty"; CONN_TG="$TMP/conn-tg"
+mkdir -p "$CONN_EMPTY" "$CONN_TG"; : >"$CONN_TG/telegram-main.env"
+_SAVED_CONN="${CONNECTORS_DIR:-}"
+
+# F1 empty registry, no chat connected — the reported box.
+CONNECTORS_DIR="$CONN_EMPTY"
+seed DIVE-140 'gate routing bug report'
+OUT=$(file_gate DIVE-140 dev --type=approval --tier=1 --ask="$ASK_MISS")
+[[ "$OUT" == *"NOT ROUTED"* && "$OUT" == *"sits on NO ONE: no human is linked and no chat is connected"* ]] \
+  && ok_t "F1 no human, no chat: the receipt says the gate sits on no one" \
+  || bad_t "F1 must say no one" "out=$OUT"
+[[ "$OUT" != *"PAIRED HUMAN"* ]] \
+  && ok_t "F1 negative control: it no longer claims a PAIRED HUMAN (the pre-fix line fails here)" \
+  || bad_t "F1 still claims a paired human" "out=$OUT"
+J=$(JSON_MODE=1; actor_seam_as dev; seed DIVE-141 'gate routing bug report'; cmd_task_need DIVE-141 --type=approval --tier=1 --ask="$ASK_MISS" --from=dev 2>/dev/null)
+[[ "$(jq -r '.data.recipient_basis // empty' <<<"$J" 2>/dev/null)" == "no human, no chat" \
+   && "$(jq -r '.data.human_recipient' <<<"$J" 2>/dev/null)" == "null" ]] \
+  && ok_t "F1 JSON carries recipient_basis and a null human_recipient" \
+  || bad_t "F1 JSON fields" "json=${J:0:600}"
+
+# F2 empty registry, a chat IS connected — the legacy broadcast.
+CONNECTORS_DIR="$CONN_TG"
+seed DIVE-142 'gate routing bug report'
+OUT=$(file_gate DIVE-142 dev --type=approval --tier=1 --ask="$ASK_MISS")
+[[ "$OUT" == *"sits on whoever reads this box's chat (legacy broadcast"* ]] \
+  && ok_t "F2 no human, chat connected: it says legacy broadcast to the box's chat" \
+  || bad_t "F2 must name the broadcast" "out=$OUT"
+
+# F3 registry active, nobody linked up the chain (two humans, so no sole-human fallback).
+CONNECTORS_DIR="$CONN_EMPTY"
+db "INSERT INTO humans(id,telegram_id) VALUES('alice','111'),('bob','222');"
+seed DIVE-143 'gate routing bug report'
+OUT=$(file_gate DIVE-143 dev --type=approval --tier=1 --ask="$ASK_MISS")
+[[ "$OUT" == *"sits on NO ONE: no human is linked up the chain"* && "$OUT" == *"2 humans on record"* && "$OUT" == *"human link"* ]] \
+  && ok_t "F3 registry active, unlinked: sits on no one, names the basis and the link remedy" \
+  || bad_t "F3 must say unlinked" "out=$OUT"
+
+# F4 paired: alice owns main, dev reports to main — the resolver walks up to her.
+db "INSERT INTO human_agents(human_id,agent) VALUES('alice','main');"
+seed DIVE-144 'gate routing bug report'
+OUT=$(file_gate DIVE-144 dev --type=approval --tier=1 --ask="$ASK_MISS")
+[[ "$OUT" == *"sits on human 'alice' (basis: "* ]] \
+  && ok_t "F4 a linked human is named with the resolver's basis" \
+  || bad_t "F4 must name alice" "out=$OUT"
+
+# F5 resolver absent: say so, never guess.
+seed DIVE-145 'gate routing bug report'
+OUT=$(unset -f _human_gate_recipient; file_gate DIVE-145 dev --type=approval --tier=1 --ask="$ASK_MISS")
+[[ "$OUT" == *"recipient resolver did not run"* && "$OUT" != *"PAIRED HUMAN"* ]] \
+  && ok_t "F5 no resolver: the receipt says it did not run" \
+  || bad_t "F5 must say the resolver did not run" "out=$OUT"
+CONNECTORS_DIR="$_SAVED_CONN"
+db "DELETE FROM human_agents; DELETE FROM humans;"
 
 SUMMARY_PRINTED=1
 printf '\n%s\n' "PASS=$PASS FAIL=$FAIL"
