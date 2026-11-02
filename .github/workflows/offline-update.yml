@@ -1,0 +1,170 @@
+name: offline-update
+# DIVE-7577: the update file a local-only box installs from a USB disk.
+# `sudo 5dive self-update --from=/media/usb/5dive-offline-<version>.tar` checks it
+# and installs it with no network (src/lib/offline_update.sh).
+#
+# WHAT A PUBLISH IS. The newest release tag, packaged by
+# packaging/offline/build-offline.sh with: that tag's CLI tree, 5dive-plugins
+# main WITH every plugin's node_modules (an offline plugin start runs
+# `bun install` when they are missing, DIVE-7559), the skills repo main (the
+# same two branches every online box pulls), and the bun binary. The manifest
+# is signed with ed25519 and the file is attached to the tag's GitHub release.
+#
+# WHY workflow_run (the same reason as apt-repo.yml): release-cut.yml pushes its
+# tag with github.token, which starts no workflow. A tag whose release already
+# carries the file is skipped; workflow_dispatch rebuilds one by hand.
+#
+# ONE-TIME SETUP, by a repo admin (main/ops), never on a box and never in chat:
+#   openssl genpkey -algorithm ed25519 -out offline-update.pem
+#   gh secret set OFFLINE_UPDATE_SIGNING_KEY < offline-update.pem
+#   openssl pkey -in offline-update.pem -pubout   # paste into OFFLINE_UPDATE_PUBKEY_PEM
+#                                                 # in src/lib/offline_update.sh, then shred the file
+# Until the secret exists the file is built UNSIGNED and NOT attached: every box
+# refuses an unsigned file, so publishing one would only mislead. That is the
+# safe failure, chosen on purpose.
+#
+# Pull requests that touch this build and check a file signed with a throwaway
+# key against the CLI's own verifier, and publish nothing. Not a required check.
+on:
+  workflow_run:
+    workflows: [release-cut]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to package (vX.Y.Z). Empty = newest.'
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - 'packaging/offline/**'
+      - 'src/lib/offline_update.sh'
+      - '.github/workflows/offline-update.yml'
+
+concurrency:
+  group: offline-update-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # attach the file to the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: 5dive-ai/5dive-plugins
+          ref: main
+          path: _plugins
+      - uses: actions/checkout@v4
+        with:
+          repository: 5dive-ai/skills
+          ref: main
+          path: _skills
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Pick the tag
+        id: p
+        env:
+          WANT: ${{ inputs.tag }}
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          held="$(grep -oE '^v[0-9]+\.[0-9]+\.[0-9]+' .release-hold || true)"
+          if [[ -n "$WANT" ]]; then
+            git rev-parse -q --verify "refs/tags/$WANT" >/dev/null || { echo "::error::no release tag $WANT"; exit 1; }
+            tag="$WANT"
+          else
+            tag="$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vxF -f <(printf '%s\n' "$held") | sort -V | tail -1)"
+          fi
+          [[ -n "$tag" ]] || { echo "::error::no release tag"; exit 1; }
+          publish=false
+          case "$EVENT" in
+            workflow_dispatch) publish=true ;;
+            workflow_run)
+              if gh release view "$tag" --json assets -q '.assets[].name' 2>/dev/null | grep -qx "5dive-offline-${tag#v}.tar"; then
+                echo "$tag already carries its update file — nothing to publish"
+              else publish=true; fi ;;
+          esac
+          echo "tag: $tag  publish: $publish"
+          { echo "tag=$tag"; echo "publish=$publish"; } >> "$GITHUB_OUTPUT"
+
+      - name: Plugin packages (node_modules in every plugin)
+        run: |
+          set -euo pipefail
+          for d in _plugins/plugins/*/; do
+            [[ -f "$d/package.json" ]] || continue
+            (cd "$d" && bun install --production --ignore-scripts --no-progress --no-summary)
+          done
+
+      - name: Signing key
+        env:
+          PUBLISH: ${{ steps.p.outputs.publish }}
+          OFFLINE_UPDATE_SIGNING_KEY: ${{ secrets.OFFLINE_UPDATE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          k="$RUNNER_TEMP/offline-update.pem"
+          if [[ "$PUBLISH" == true ]]; then
+            if [[ -z "$OFFLINE_UPDATE_SIGNING_KEY" ]]; then
+              echo "::warning::repo secret OFFLINE_UPDATE_SIGNING_KEY is not set — building UNSIGNED and attaching nothing (every box refuses an unsigned file). See this workflow's ONE-TIME SETUP header (DIVE-7577)."
+              echo "SIGN_KEY=" >> "$GITHUB_ENV"; exit 0
+            fi
+            umask 077; printf '%s\n' "$OFFLINE_UPDATE_SIGNING_KEY" > "$k"
+          else
+            openssl genpkey -algorithm ed25519 -out "$k"
+          fi
+          openssl pkey -in "$k" -pubout -out "$RUNNER_TEMP/offline-update.pub.pem"
+          echo "SIGN_KEY=$k" >> "$GITHUB_ENV"
+
+      - name: Build the file
+        env:
+          TAG: ${{ steps.p.outputs.tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == pull_request ]]; then
+            # A PR is graded on ITS tree (the tags predate it): built, and given a
+            # throwaway release number the builder accepts.
+            git worktree add -q --detach "$RUNNER_TEMP/tree" HEAD
+            (cd "$RUNNER_TEMP/tree" && ./build.sh >/dev/null)
+            sed -i 's/^readonly FIVE_VERSION="[^"]*"/readonly FIVE_VERSION="0.0.1"/' "$RUNNER_TEMP/tree/5dive"
+          else
+            git worktree add -q --detach "$RUNNER_TEMP/tree" "$TAG"
+          fi
+          f="$(bash packaging/offline/build-offline.sh "$RUNNER_TEMP/tree" _plugins _skills "$(command -v bun)" "$RUNNER_TEMP/out" ${SIGN_KEY:+"$SIGN_KEY"})"
+          ls -la "$f"
+          echo "OFFLINE_FILE=$f" >> "$GITHUB_ENV"
+
+      - name: Arm — the CLI's verifier accepts it, and refuses it altered
+        if: env.SIGN_KEY != ''
+        run: |
+          set -euo pipefail
+          eval "$(sed -n '/^version_lt() {/,/^}/p' src/cmd_selfupdate.sh)"
+          warn() { echo "warn: $*" >&2; }
+          . src/lib/offline_update.sh
+          export OFFLINE_UPDATE_PUBKEY_FILE="$RUNNER_TEMP/offline-update.pub.pem"
+          st="$(mktemp -d)"
+          _ou_verify "$OFFLINE_FILE" "$st" 0.0.0 0 || { echo "::error::the built file is refused: $_OU_WHY"; exit 1; }
+          echo "accepted: version $_OU_VERSION"
+          bad="$(mktemp -d)"; tar -xf "$OFFLINE_FILE" -C "$bad"
+          printf x >> "$bad/payload/bun"
+          tar --no-recursion -cf "$RUNNER_TEMP/bad.tar" -C "$bad" manifest.json manifest.sig payload/bun payload/cli.tar.gz payload/plugins.tar.gz payload/skills.tar.gz
+          st2="$(mktemp -d)"
+          if _ou_verify "$RUNNER_TEMP/bad.tar" "$st2" 0.0.0 0; then echo "::error::an altered file was accepted"; exit 1; fi
+          echo "altered file refused: $_OU_WHY"
+
+      - name: Attach to the release
+        if: steps.p.outputs.publish == 'true' && env.SIGN_KEY != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.p.outputs.tag }}
+        run: gh release upload "$TAG" "$OFFLINE_FILE" --clobber
+
+      - name: Forget the key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/offline-update.pem"

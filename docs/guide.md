@@ -612,3 +612,18 @@ links, updates and installs from the internet (plugins, marketplaces, skills, pa
 install`) are refused with a one-line reason. A plugin marketplace from a folder on the box still
 works; an office apt mirror is used with plain `apt` as root. `sudo 5dive config local-only off`
 puts back exactly what it changed.
+
+### Updates by disk
+
+A local-only box takes a new release from one file. Download `5dive-offline-<version>.tar` from
+the release page on any connected computer, copy it to a USB stick, then on the box:
+
+```sh
+sudo 5dive self-update --from=/media/usb/5dive-offline-<version>.tar
+```
+
+The box checks the file's signature against 5dive's key, which was saved on the box when it was
+installed (never a key inside the file), then checks every file in it. Anything unsigned, signed by
+someone else or changed after signing is refused and nothing on the box changes. A file that is not
+newer than the installed version is refused too (`--allow-downgrade` to go back on purpose). The
+update makes no network connection and restarts only the agents whose plugins or settings changed.

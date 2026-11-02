@@ -43,6 +43,10 @@ set -uo pipefail
 if [[ -e "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" ]]; then
   echo "$(basename "$0"): skipped — local-only mode is on"; exit 0
 fi
+# DIVE-7577: an update from a file (self-update --from) has no internet either.
+if [[ "${FIVEDIVE_OFFLINE_UPDATE:-0}" == 1 ]]; then
+  echo "$(basename "$0"): skipped — updating from a file"; exit 0
+fi
 
 FIVE_BIN="${FIVE_BIN:-/usr/local/bin/5dive}"
 AGENTS_JSON="${FIVE_AGENTS_JSON:-/var/lib/5dive/agents.json}"

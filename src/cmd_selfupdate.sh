@@ -1193,17 +1193,49 @@ _su_nightly_run() {
 
 
 cmd_self_update() {
-  [[ $# -eq 0 ]] || fail "$E_USAGE" "self-update takes no arguments"
+  # DIVE-7577: `--from=<file>` installs a signed update file from a disk instead
+  # of the internet (src/lib/offline_update.sh). Everything after the installer
+  # step — the restart predicate, the busy deferral, the health gate — is the
+  # online path's, unchanged.
+  local from="" allow_down=0 a
+  for a in "$@"; do
+    case "$a" in
+      --from=*) from="${a#--from=}"; [[ -n "$from" ]] || fail "$E_USAGE" "--from needs a file: --from=/media/usb/5dive-offline-<version>.tar" ;;
+      --allow-downgrade) allow_down=1 ;;
+      *) fail "$E_USAGE" "self-update: unknown argument '$a' (usage: 5dive self-update [--from=<file> [--allow-downgrade]])" ;;
+    esac
+  done
+  [[ -n "$from" || "$allow_down" == 0 ]] || fail "$E_USAGE" "--allow-downgrade only applies to --from=<file>"
   command -v curl >/dev/null 2>&1 || fail "$E_NOT_FOUND" "curl is required for 5dive self-update"
 
-  local installer
-  installer=$(mktemp) || fail "$E_GENERIC" "failed to create temp file"
-  # shellcheck disable=SC2064
-  trap "rm -f '$installer'" RETURN
+  local installer="" stage="" old_ver="${FIVE_VERSION:-}"
+  local -a inst_env=()
+  local -A ou_force=()
+  if [[ -n "$from" ]]; then
+    local stage_parent="${OFFLINE_UPDATE_STAGE_PARENT:-${STATE_DIR:-/var/lib/5dive}}"
+    install -d -m 700 "$stage_parent" 2>/dev/null || true
+    # A stage is gone before every exit below (fail exits, so a RETURN trap
+    # alone would leave one per refused file); a crashed run's is swept here.
+    find "$stage_parent" -maxdepth 1 -name 'update-stage.*' -mmin +120 -exec rm -rf {} + 2>/dev/null || true
+    stage=$(mktemp -d "$stage_parent/update-stage.XXXXXX") || fail "$E_GENERIC" "could not create a staging folder in $stage_parent"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$stage'" RETURN
+    step "Checking the update file $from"
+    _ou_verify "$from" "$stage" "$old_ver" "$allow_down" \
+      || { rm -rf "$stage"; fail "$E_VALIDATION" "update refused: $_OU_WHY. Nothing was changed; this box stays on $old_ver."; }
+    step "Signature and every file check out — version $_OU_VERSION"
+    installer="$stage/cli/install.sh"
+    mapfile -t inst_env < <(_ou_installer_env "$stage")
+    inst_env+=(FIVE_ALLOW_DOWNGRADE="$allow_down")
+  else
+    installer=$(mktemp) || fail "$E_GENERIC" "failed to create temp file"
+    # shellcheck disable=SC2064
+    trap "rm -f '$installer'" RETURN
 
-  step "Fetching installer"
-  curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
-    || fail "$E_GENERIC" "failed to fetch installer"
+    step "Fetching installer"
+    curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
+      || fail "$E_GENERIC" "failed to fetch installer"
+  fi
 
   # DIVE-3173: pay off any restart still owed from a PREVIOUS run before taking
   # this run's fingerprints. An agent that was busy last night and idle now gets
@@ -1242,9 +1274,38 @@ cmd_self_update() {
   # The installer owns target resolution (override/canary/stable/last-known/floor).
   # Keep the caller explicit about the shared route instead of growing a second,
   # drifting resolver inside self-update.
-  CLI_VERSION_URL="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}" \
-    bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
+  if [[ -n "$stage" ]]; then
+    _ou_install_bun "$stage"
+    env "${inst_env[@]}" bash "$installer" --upgrade >&2 || { rm -rf "$stage"; fail "$E_GENERIC" "upgrade failed"; }
+  else
+    CLI_VERSION_URL="${CLI_VERSION_URL:-https://api.5dive.com/cli-version}" \
+      bash "$installer" --upgrade >&2 || fail "$E_GENERIC" "upgrade failed"
+  fi
   # <<< DIVE-4140 stable installer handoff
+
+  # DIVE-7577: install.sh refreshes the root-staged plugins; the 5dive-plugins
+  # checkouts the seats run in place (and the claude user's, which new agents
+  # are cloned from) are brought to the update's plugins here, and every seat
+  # whose checkout moved is restarted below (its fingerprint cannot see it).
+  # Only on a local-only box: there the checkouts are read in place and nothing
+  # else updates them. On an online box the next online update refreshes them
+  # from GitHub, and a local commit here would fork their history from it.
+  if [[ -n "$stage" ]] && ! { declare -F local_only_on >/dev/null && local_only_on; }; then
+    step "this box is not local-only — each agent's plugins update at its next online update"
+  elif [[ -n "$stage" ]]; then
+    local co_home co_name hr="${OFFLINE_UPDATE_HOME_ROOT:-/home}"
+    for co_home in "$hr"/claude "$hr"/agent-*; do
+      [[ -d "$co_home/.claude/plugins/marketplaces/5dive-plugins" ]] || continue
+      if _ou_refresh_checkout "$stage/plugins" "$co_home/.claude/plugins/marketplaces/5dive-plugins"; then
+        co_name="${co_home##*/}"; co_name="${co_name#agent-}"
+        ou_force[$co_name]=1
+        step "plugins updated for ${co_home##*/}"
+      else
+        warn "could not update the plugins in $co_home — that agent keeps its current ones"
+      fi
+    done
+  fi
+  [[ -n "$stage" ]] && rm -rf "$stage"   # everything is installed; $stage stays set as "this run is from a file"
 
   # Restart only the agents whose payload actually moved. Best-effort per unit —
   # one failed restart shouldn't abort the rest.
@@ -1291,7 +1352,7 @@ cmd_self_update() {
       fi
       continue
     fi
-    if ! _agent_restart_needed "$before" "$after" "$atype"; then
+    if [[ -z "${ou_force[$name]:-}" ]] && ! _agent_restart_needed "$before" "$after" "$atype"; then
       step "skipped $name (payload unchanged)"
       skipped+=("$name")
       continue
@@ -1301,7 +1362,9 @@ cmd_self_update() {
     # reading the nightly log has to be able to tell those apart — the second one
     # is the population a TYPE_CONFIG_FILE map would move into the first.
     why="payload changed"
-    if [[ -n "$before" && -n "$after" && "$before" == "$after" ]]; then
+    if [[ -n "${ou_force[$name]:-}" ]]; then
+      why="plugins updated from the update file"
+    elif [[ -n "$before" && -n "$after" && "$before" == "$after" ]]; then
       why="type '${atype:-unknown}' config not derivable — always restarts"
     fi
     # DIVE-3173: the payload moved and this agent is holding a row. Remember the
@@ -1472,7 +1535,11 @@ cmd_self_update() {
   # and the Mini App's My team read. Runs from the freshly-installed binary in its
   # own process, once per box (`--once` marker), and never fails the update.
   # Same bin seam as the health gate, so a fixture run never reaches the live CLI.
-  if (( EUID == 0 )) && [[ -x "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" ]]; then
+  # DIVE-7577: an update from a file skips the two once-per-box migrations
+  # (older releases only; they may reach out). The local repair still runs.
+  if [[ -n "$stage" ]] && (( EUID == 0 )) && [[ -x "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" ]]; then
+    timeout 30 "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" chat e2e heal >/dev/null 2>&1 || true
+  elif (( EUID == 0 )) && [[ -x "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" ]]; then
     timeout 180 "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" agent avatar backfill --once >/dev/null 2>&1 \
       || warn "avatar backfill did not finish (re-run: sudo 5dive agent avatar backfill)"
     # DIVE-6701: agents hired before their card name was seeded get it now. Once
@@ -1493,6 +1560,8 @@ cmd_self_update() {
   d=$(json_array "${deferred[@]}")
   pk=$(json_array "${parked[@]}")
   prose="self-update complete — ${#restarted[@]} agent(s) restarted"
+  # DIVE-7577: an update from a file says what it moved the box from and to.
+  [[ -n "$stage" ]] && prose="update from file complete — $old_ver -> $_OU_VERSION, ${#restarted[@]} agent(s) restarted"
   # Say the skip count out loud. "0 agents restarted" alone is emitted both by a
   # CLI-only night (the good case this change exists to produce) and by a box
   # with no agents running at all, and an operator reading the nightly log has to
