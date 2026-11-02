@@ -2885,6 +2885,30 @@ _resolve_inherit_sources() {
   done
 }
 
+# DIVE-7574: can the seat's chat plugin START? Run 3 of the fully-local proof
+# printed "self-check PASS" and `agent list` said ready while the office chat
+# plugin had no packages where Claude Code runs it, so the agent never heard a
+# message. Checked where Claude Code really runs it (the checkout, for a
+# directory-source marketplace) and Claude Code's own 15-minute failure cache.
+# Emits `ok:` / `issue:` lines; never fails. Root reads the seat's files.
+selfcheck_chat_plugin_ready() { # <name> <plugin>
+  local name="$1" plugin="$2" home d bad=""
+  home="${FIVEDIVE_AGENT_HOME_ROOT:-/home}/agent-${name}"
+  [[ -f "$home/.claude/plugins/installed_plugins.json" ]] || return 0
+  jq -e --arg k "$plugin@5dive-plugins" '.plugins | has($k)' "$home/.claude/plugins/installed_plugins.json" >/dev/null 2>&1 \
+    || return 0   # not a Claude Code plugin install (the install step reports its own failure)
+  while IFS= read -r d; do
+    plugin_deps_complete "$d" || bad="$d"
+  done < <(seat_plugin_run_dirs "$home" "$plugin@5dive-plugins")
+  if [[ -n "$bad" ]]; then
+    printf 'issue:%s\n' "$plugin chat plugin CANNOT START (agent is DEAF: no packages in $bad) — run: sudo 5dive self-update while online, then sudo 5dive agent restart $name"
+  elif jq -e --arg k "plugin:$plugin:$plugin" 'has($k)' "$home/.claude/mcp-needs-auth-cache.json" >/dev/null 2>&1; then
+    printf 'issue:%s\n' "$plugin chat plugin FAILED to start (agent is DEAF; Claude Code will skip it for 15 min) — run: sudo rm $home/.claude/mcp-needs-auth-cache.json && sudo 5dive agent restart $name"
+  else
+    printf 'ok:%s\n' "$plugin chat plugin can start"
+  fi
+}
+
 # DIVE-2025: can the agent actually READ its credential?
 #
 # The self-check used to answer this by reading `defer_auth` — a flag recording
@@ -4819,6 +4843,19 @@ cmd_create() {
         issue:*) _hc_issues+=("${_cred_line#issue:}") ;;
       esac
     done < <(selfcheck_cred_reached_agent "$name" "$type" "$profile" "$byo_provider")
+  fi
+  # DIVE-7574: the chat plugin itself, where Claude Code runs it.
+  if [[ "$type" == claude ]]; then
+    local _cp _cp_line
+    for _cp in dashboard buzz; do
+      channel_in_list "$_cp" "$channels" || continue
+      while IFS= read -r _cp_line; do
+        case "$_cp_line" in
+          ok:*)    _hc_ok+=("${_cp_line#ok:}") ;;
+          issue:*) _hc_issues+=("${_cp_line#issue:}") ;;
+        esac
+      done < <(selfcheck_chat_plugin_ready "$name" "$_cp")
+    done
   fi
   # DIVE-7330: the harness itself, run the way the seat runs it (its own uid and
   # HOME). Hermes 0.21.6+ died on every seat's first start while the unit, the

@@ -27,8 +27,14 @@ local_only_on()   { [[ -e "$(local_only_file)" ]]; }
 # marketplace (Google storage, then a git clone of GitHub) until that succeeds —
 # offline it never does, so every start dialed out (named in Claude Code
 # 2.1.316's own strings: "Attempting to auto-install official marketplace").
+# DIVE-7574 (N2): the fourth. Claude Code's `plugin install` runs `bun install
+# --frozen-lockfile` on the plugin, and bun looks up registry.npmjs.org at every
+# install even when every package is already there ("no changes"): 696 lookup
+# lines offline under strace, 60 s of a 109 s create in the DIVE-7560 run 3. With
+# the registry on this box's own discard port, the same install made 0 lookups and
+# still passed; a missing package then fails in milliseconds instead of hanging.
 LOCAL_ONLY_CLAUDE_ENV=(CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1
-  CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1)
+  CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1 NPM_CONFIG_REGISTRY=http://127.0.0.1:9/)
 # DIVE-7573 (D4): a seat on a local/custom model. Claude Code defers the chat's
 # reply tool behind tool search, and a small model never calls the search: 0 of
 # 4 replies from qwen3:8b in the DIVE-7560 run, every one with this set.
@@ -51,6 +57,7 @@ local_only_claude_env() {
 # extraKnownMarketplaces and plugins/known_marketplaces.json, keeping each file's
 # owner and mode. `off` puts our two marketplaces back on GitHub, as a seat
 # created online has them. Idempotent both ways; never fails the caller.
+# `on` also gives each installed plugin's checkout folder its packages (DIVE-7574).
 seat_marketplaces_local() { # <home> on|off
   local home="$1" mode="$2" s k mk have='[]' n org tmp
   s="$home/.claude/settings.json"; k="$home/.claude/plugins/known_marketplaces.json"
@@ -91,6 +98,82 @@ seat_marketplaces_local() { # <home> on|off
     [[ -n "$tmp" ]] || continue
     printf '%s\n' "$tmp" > "$f" 2>/dev/null || true   # in place: owner and mode kept
   done
+  # DIVE-7574 (N1): a seat switched to its checkout now runs its plugins from
+  # there, so the checkout needs the packages its cache copy had.
+  if [[ "$mode" == on ]]; then
+    local miss
+    while IFS= read -r miss; do
+      [[ -n "$miss" ]] && printf 'warning: %s: %s\n' "$(basename "$home")" "$miss" >&2
+    done < <(seat_plugin_packages_local "$home")
+  fi
+  return 0
+}
+
+# DIVE-7574 (N1): a directory-source plugin runs IN PLACE, from the seat's
+# marketplace checkout, not from the cache copy 5dive gave its packages to. That
+# checkout is a git clone (node_modules is gitignored), so the plugin started with
+# none, tried `bun install` offline and the seat never heard the office chat.
+#
+# `plugin_deps_complete <dir>` — 0 when every dependency the plugin's package.json
+# names has node_modules/<dep>/package.json (a plugin with no package.json, or no
+# dependencies, is complete). An empty node_modules — what a failed install
+# leaves — is NOT complete.
+plugin_deps_complete() { # <dir>
+  local d="$1" dep
+  [[ -f "$d/package.json" ]] || return 0
+  while IFS= read -r dep; do
+    [[ -n "$dep" ]] || continue
+    [[ -f "$d/node_modules/$dep/package.json" ]] || return 1
+  done < <(jq -r '(.dependencies // {}) | keys[]' "$d/package.json" 2>/dev/null || printf '%s\n' '<unreadable package.json>')
+  return 0
+}
+
+# `seat_plugin_run_dirs <home> <plugin@marketplace>` — every folder Claude Code
+# may run that installed plugin from, one per line: its installPath (the cache
+# copy) and, when the marketplace is a directory source, the plugin's folder in
+# that checkout (where Claude Code actually runs it).
+seat_plugin_run_dirs() { # <home> <plugin@marketplace>
+  local home="$1" key="$2" p m ip mdir src
+  p="${key%@*}"; m="${key#*@}"
+  ip=$(jq -r --arg k "$key" '.plugins[$k][0].installPath // empty' "$home/.claude/plugins/installed_plugins.json" 2>/dev/null)
+  [[ -n "$ip" && -d "$ip" ]] && printf '%s\n' "$ip"
+  mdir=$(jq -r --arg m "$m" '.[$m] | select((.source.source // "") == "directory") | .source.path // empty' \
+    "$home/.claude/plugins/known_marketplaces.json" 2>/dev/null)
+  [[ -n "$mdir" && -f "$mdir/.claude-plugin/marketplace.json" ]] || return 0
+  src=$(jq -r --arg p "$p" '.plugins[]? | select(.name == $p) | .source | strings' "$mdir/.claude-plugin/marketplace.json" 2>/dev/null | head -1)
+  [[ -n "$src" && "$src" != /* && "$src" != *..* ]] || return 0
+  src="$mdir/${src#./}"
+  [[ -d "$src" && "$src" != "$ip" ]] && printf '%s\n' "$src"
+  return 0
+}
+
+# `seat_plugin_packages_local <home>` — gives every installed plugin's run
+# folders their packages, from the box itself: the plugin's own cache copy when
+# that one is complete (an online install put them there), else the root-staged
+# dashboard copy for the dashboard plugin. Owner of the folder kept. Also drops
+# Claude Code's 15-minute failure cache, which a deaf first start wrote. Never
+# fails the caller; prints one line per folder it could not fill.
+seat_plugin_packages_local() { # <home>
+  local home="$1" key dirs d from dash owner
+  dash="${FIVEDIVE_OFFLINE_DASHBOARD_DIR:-/usr/local/lib/5dive/dashboard}/node_modules"
+  [[ -f "$home/.claude/plugins/installed_plugins.json" ]] || return 0
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    mapfile -t dirs < <(seat_plugin_run_dirs "$home" "$key")
+    from=""
+    for d in "${dirs[@]}"; do plugin_deps_complete "$d" && [[ -d "$d/node_modules" ]] && { from="$d/node_modules"; break; }; done
+    [[ -z "$from" && "${key%@*}" == dashboard && -d "$dash" ]] && from="$dash"
+    for d in "${dirs[@]}"; do
+      plugin_deps_complete "$d" && continue
+      if [[ -n "$from" ]]; then
+        owner=$(stat -c '%u:%g' "$d" 2>/dev/null) || owner=""
+        rm -rf -- "$d/node_modules" && cp -a -- "$from" "$d/node_modules" \
+          && { [[ -z "$owner" ]] || chown -R "$owner" "$d/node_modules" 2>/dev/null || true; }
+      fi
+      plugin_deps_complete "$d" || printf '%s\n' "no packages for ${key%@*} in $d (this box holds no copy to give it)"
+    done
+  done < <(jq -r '(.plugins // {}) | keys[]' "$home/.claude/plugins/installed_plugins.json" 2>/dev/null)
+  rm -f -- "$home/.claude/mcp-needs-auth-cache.json" 2>/dev/null || true
   return 0
 }
 

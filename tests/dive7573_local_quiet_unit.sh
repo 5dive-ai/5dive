@@ -229,7 +229,7 @@ grep -q 'ANTHROPIC_BASE_URL' "$cap" && ! grep -q ENABLE_TOOL_SEARCH "$cap" \
 : >"$cap"; PROFILE_ENV_SEED=true; ( _apply_byo_claude custom k office-llm qwen3:8b "$CUSTOM_URL" ) >/dev/null 2>&1
 grep -q 'ANTHROPIC_BASE_URL' "$cap" && ! grep -q ENABLE_TOOL_SEARCH "$cap" \
   && ok_ "T4 an operator's own ENABLE_TOOL_SEARCH is never overwritten" || bad_ 'T4 operator value' "$(cat "$cap")"
-[[ "$(_lo_dropin_body | grep -c '^Environment=')" == 4 ]] \
+[[ "$(_lo_dropin_body | grep -c '^Environment=')" == 5 ]] \
   && ok_ 'T5 the drop-in body is the two env lists, one Environment= line each' || bad_ 'T5 body' "$(_lo_dropin_body)"
 
 echo "PASS=$PASS FAIL=$FAIL"

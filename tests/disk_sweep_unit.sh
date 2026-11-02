@@ -296,6 +296,20 @@ jq '.last_sweep_at -= 7200' "$STATE_DIR/disk.json" >"$STATE_DIR/d" && mv "$STATE
 FIVEDIVE_DISK_FAKE_DF="95 5" tick
 check "at 5% free (under the pressure line, not yet the alarm) a tick sweeps again after 1h"  '[[ $(sweeps) == 2 ]]' "sweeps=$(sweeps)"
 
+echo "== local-only: the snap class never wakes snapd (DIVE-7574 N3)"
+(
+  mkdir -p "$TMP/snapbin"; printf '#!/usr/bin/env bash\necho "snap $*" >>"%s/snap-calls"\n' "$TMP" >"$TMP/snapbin/snap"
+  chmod +x "$TMP/snapbin/snap"; export PATH="$TMP/snapbin:$PATH"; : >"$TMP/snap-calls"
+  source "$SRC/cmd_disk.sh"
+  _disk_is_root() { return 0; }; apt-get() { return 0; }
+  local_only_on() { return 0; }
+  _DISK_FREED_KB=0; _disk_sweep_system 0 >/dev/null
+  grep -q 'class=snap skipped=local-only' "$DISK_SWEEP_LOG" && [[ ! -s "$TMP/snap-calls" ]] || exit 1
+  local_only_on() { return 1; }
+  _disk_sweep_system 0 >/dev/null; grep -q 'snap list --all' "$TMP/snap-calls"
+); rc=$?
+check "local-only on: the sweep runs no snap command (snap list woke snapd → Snap Store lookups); off: it still sweeps snaps" '[[ $rc == 0 ]]' "rc=$rc calls=$(cat "$TMP/snap-calls" 2>&1)"
+
 echo "== wiring"
 check "build.sh bundles src/cmd_disk.sh"                   'grep -qx "  src/cmd_disk.sh" build.sh'
 check "main dispatches the disk verb"                      'grep -qE "^    disk\)" src/main.sh && grep -q "cmd_disk \"\$@\"" src/main.sh'

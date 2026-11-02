@@ -213,6 +213,7 @@ UNITS_ON=(apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service mo
 for u in "${UNITS_ON[@]}"; do echo enabled > "$TMPD/units/$u"; done
 echo disabled > "$TMPD/units/whoopsie.service"      # the owner had this off
 mkdir -p "$TMPD/root/etc/default"; printf 'ENABLED=1\n' > "$TMPD/root/etc/default/motd-news"
+mkdir -p "$TMPD/root/var/lib/snapd/snaps"; : > "$TMPD/root/var/lib/snapd/snaps/core24_1.snap"   # a snap is installed
 ( _lo_on ) >"$TMPD/on.out" 2>&1; rc=$?
 [[ $rc == 0 && -e "$FIVE_LOCAL_ONLY_FILE" ]] && ok_ "ONOFF: on exits 0 and writes the flag file" || bad_ "ONOFF on" "rc=$rc $(cat "$TMPD/on.out")"
 n=0; for u in "${UNITS_ON[@]}"; do [[ $(cat "$TMPD/units/$u") == disabled ]] || { n=$((n+1)); echo "  still on: $u"; }; done
@@ -223,14 +224,36 @@ grep -q CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 "$(_lo_dropin)" && grep -q DI
 grep -q 'check_for_update_on_startup = false' "$(_lo_codex)" && ok_ "ONOFF: codex managed config turns off update check" || bad_ "ONOFF codex" "missing"
 grep -q '^ENABLED=0' "$TMPD/root/etc/default/motd-news" && grep -q 'snap refresh --hold' "$TMPD/units/.log" \
   && ok_ "ONOFF: motd-news off and snap refresh held" || bad_ "ONOFF motd/snap" "not changed"
+# DIVE-7574 (N3): a woken snapd asks the Snap Store for its catalog; the hold does not stop that.
+grep -q 'snap set system store.access=offline' "$TMPD/units/.log" && ! grep -q 'systemctl mask' "$TMPD/units/.log" \
+  && ( _lo_check --watch=0 --status ) 2>/dev/null | grep -qE '^ok +snap store +offline' \
+  && ok_ "SNAP1: snaps installed → snapd put offline (store.access), not masked; status says so" \
+  || bad_ "SNAP1 offline" "$(grep -E 'snap|mask' "$TMPD/units/.log")"
 
 ( _lo_off ) >"$TMPD/off.out" 2>&1; rc=$?
 n=0; for u in "${UNITS_ON[@]}"; do [[ $(cat "$TMPD/units/$u") == enabled ]] || { n=$((n+1)); echo "  not restored: $u"; }; done
 [[ $rc == 0 && $n == 0 && ! -e "$FIVE_LOCAL_ONLY_FILE" && ! -e "$(_lo_dropin)" && ! -e "$(_lo_codex)" && ! -e "$(_lo_undo)" ]] \
   && grep -q '^ENABLED=1' "$TMPD/root/etc/default/motd-news" && grep -q 'snap refresh --unhold' "$TMPD/units/.log" \
+  && grep -q 'snap unset system store.access' "$TMPD/units/.log" \
   && ok_ "ONOFF: off restores every recorded change and removes flag, drop-in, codex file, undo record" \
   || bad_ "ONOFF off" "rc=$rc n=$n $(cat "$TMPD/off.out")"
 [[ $(cat "$TMPD/units/whoopsie.service") == disabled ]] && ok_ "ONOFF: off never turns on a unit the owner had off" || bad_ "ONOFF owner-off" "whoopsie re-enabled"
+
+# DIVE-7574 (N3): no snap installed → snapd masked (never started, not even at
+# boot by snapd.seeded), and no `snap` command runs (any one wakes snapd).
+rm -f "$TMPD/root/var/lib/snapd/snaps/"*.snap; : > "$TMPD/units/.log"
+( _lo_on ) >"$TMPD/on.out" 2>&1; rc=$?
+st=$( ( _lo_check --watch=0 --status ) 2>/dev/null)
+[[ $rc == 0 ]] && grep -q 'systemctl mask --now snapd.service snapd.socket snapd.seeded.service' "$TMPD/units/.log" \
+  && ! grep -q '^snap ' "$TMPD/units/.log" && grep -qx snapd-mask "$(_lo_undo)" \
+  && grep -qE '^ok +snapd \(no snaps installed\) +off' <<<"$st" && ! grep -q LEAK.*snap <<<"$st" \
+  && ok_ "SNAP2: no snap installed → snapd masked, no snap command run, status ok" \
+  || bad_ "SNAP2 mask" "rc=$rc $(cat "$TMPD/units/.log") / $st"
+( _lo_off ) >/dev/null 2>&1
+grep -q 'systemctl unmask snapd.service snapd.socket snapd.seeded.service' "$TMPD/units/.log" && grep -q 'systemctl start snapd.socket' "$TMPD/units/.log" \
+  && ok_ "SNAP3: off unmasks snapd and starts its socket again" || bad_ "SNAP3 unmask" "$(cat "$TMPD/units/.log")"
+for u in "${UNITS_ON[@]}"; do echo enabled > "$TMPD/units/$u"; done
+: > "$TMPD/root/var/lib/snapd/snaps/core24_1.snap"
 
 mkdir -p "$TMPD/root/etc/codex"; printf 'model = "mine"\n' > "$(_lo_codex)"
 ( _lo_on && _lo_off ) >/dev/null 2>&1

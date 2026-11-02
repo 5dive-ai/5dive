@@ -398,7 +398,12 @@ _disk_sweep_system() {
     _DISK_FREED_KB=$(( _DISK_FREED_KB + freed ))
     _disk_log "disk-sweep class=apt freed_kb=$freed"
   fi
-  if command -v snap >/dev/null 2>&1; then
+  # DIVE-7574 (N3): `snap list` wakes snapd, and a woken snapd asks the Snap
+  # Store for its catalog: on a local-only box that is an outside lookup from a
+  # cron job. Old snap revisions wait for the box to be online again.
+  if command -v snap >/dev/null 2>&1 && declare -F local_only_on >/dev/null && local_only_on; then
+    _disk_log "disk-sweep class=snap skipped=local-only"
+  elif command -v snap >/dev/null 2>&1; then
     before=$(_disk_kb /var/lib/snapd/snaps)
     while read -r name rev; do
       [[ -n "$name" && "$rev" =~ ^[0-9]+$ ]] || continue
