@@ -345,6 +345,22 @@ PI_OVERRIDE=""
 if [[ "$TYPE" == "pi" && "$CHANNELS" == "telegram" ]]; then
   PI_OVERRIDE="export PI_BIN=$(printf %q "/home/claude/.local/bin/pi") PI_PROJECT_DIR=$(printf %q "$WORKDIR"); "
 fi
+# DIVE-7592: a hermes seat runs in Hermes' own approve-all mode, as grok
+# (--always-approve) and antigravity (--dangerously-skip-permissions) do. Without
+# it the model's first command Hermes calls dangerous (`python3 -c ...`: "script
+# execution via -e/-c flag") opens Hermes' Allow/Deny dialog in the pane, and
+# nobody is at a 5dive pane: the seat stops answering tasks, heartbeats, a2a
+# and agent send until someone attaches. The seat's Linux user and tier stay the
+# boundary; Hermes' hardline floor (rm -rf /, mkfs, ...) and approvals.deny still
+# block under it. HERMES_YOLO_MODE is what `hermes --yolo` sets, read once at
+# import; the env form is used because an older hermes ignores an unknown
+# variable but would refuse an unknown flag (and the seat would crash-loop).
+# Exported in the pane's shell only: the gateway this script starts beside a seat
+# (below) does not inherit it, so Telegram approvals keep their buttons.
+HERMES_OVERRIDE=""
+if [[ "$TYPE" == "hermes" ]]; then
+  HERMES_OVERRIDE="export HERMES_YOLO_MODE=1; "
+fi
 # DIVE-2137 (gh#214) defect A — MAKE A FAILED SEED OBSERVABLE.
 #
 # Every `warn: could not seed ...` below goes to stderr, which lands in the
@@ -2284,7 +2300,7 @@ else
   LOOP="while true; do ${CMD_STR}; sleep 2; done"
 fi
 
-INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${OPENCLAW_PATH_OVERRIDE}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PI_OVERRIDE}${PRELUDE}${LOOP}"
+INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${OPENCLAW_PATH_OVERRIDE}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PI_OVERRIDE}${HERMES_OVERRIDE}${PRELUDE}${LOOP}"
 [[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
 
 # DIVE-4036: DECLARE how dispatched work reaches this agent, then launch.
