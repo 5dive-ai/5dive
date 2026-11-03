@@ -92,25 +92,30 @@ done
 if (( ${#missing[@]} )); then
   (( os_ok )) || die "this server lacks ${missing[*]} and is not Ubuntu 24.04, so the packages in this file may not fit it. Install those packages, then run the file again."
   say "Installing system packages from the file: ${missing[*]}"
-  sel=()
-  for d in "$work"/debs/*.deb; do
-    [[ -f "$d" ]] || continue
-    n="$(dpkg-deb -f "$d" Package)"
-    installed "$n" || sel+=("$d")
-  done
-  (( ${#sel[@]} )) || die "the file holds no package for: ${missing[*]}"
+  compgen -G "$work/debs/*.deb" >/dev/null || die "the file holds no package for: ${missing[*]}"
   # apt, not a bare `dpkg -i`: dpkg unpacks in the order it is given, so a
   # package whose Pre-Depends sorts after it (python3-minimal before
   # python3.12-minimal) is refused and everything above it fails (DIVE-7598 CI).
-  # apt orders them. It sees ONLY these files: no package source, an empty list
-  # folder of its own and --no-download, so it can never reach a mirror; a
-  # dependency missing from the file is an error here, not a download.
+  # The .debs become a flat local package source (an index written here with
+  # dpkg-deb, which every Ubuntu has), and apt is pointed at ONLY that source,
+  # with its own empty list and cache folders: there is no other source, so it
+  # cannot reach a mirror, and a dependency missing from the file is an error.
+  # Not --no-download: with it apt 2.7 dies "Pathname to install is not
+  # absolute" on every package (DIVE-7598 CI run 41595689732).
+  : > "$work/debs/Packages"
+  for d in "$work"/debs/*.deb; do
+    { dpkg-deb -f "$d" | sed '/^$/d'
+      printf 'Filename: ./%s\nSize: %s\nSHA256: %s\n\n' "${d##*/}" "$(stat -c %s "$d")" "$(sha256sum "$d" | cut -d' ' -f1)"
+    } >> "$work/debs/Packages" || die "this file is damaged (a package in it cannot be read)"
+  done
   a="$work/apt"; mkdir -p "$a/sources.d" "$a/lists/partial" "$a/cache/archives/partial"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends --no-download \
-    -o Dir::Etc::SourceList="$a/sources.list" -o Dir::Etc::SourceParts="$a/sources.d" \
-    -o Dir::State::Lists="$a/lists" -o Dir::Cache="$a/cache" -o APT::Sandbox::User=root \
-    "${sel[@]}" >"$work/apt.log" 2>&1 \
-    || { grep -E '^(E:|dpkg: |Errors were| [a-z0-9.+-]+ : Depends)' "$work/apt.log" | tail -25 >&2 || tail -25 "$work/apt.log" >&2
+  echo "deb [trusted=yes] file:$work/debs ./" > "$a/sources.list"
+  ao=(-o Dir::Etc::SourceList="$a/sources.list" -o Dir::Etc::SourceParts="$a/sources.d"
+      -o Dir::State::Lists="$a/lists" -o Dir::Cache="$a/cache" -o APT::Sandbox::User=root)
+  { apt-get update -q "${ao[@]}" \
+      && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${ao[@]}" "${missing[@]}"
+  } >"$work/apt.log" 2>&1 \
+    || { grep -E '^(E:|W:|dpkg: |Errors were| [a-z0-9.+-]+ : Depends)' "$work/apt.log" | tail -25 >&2 || tail -25 "$work/apt.log" >&2
          die "the system packages did not install (above)"; }
   for p in "${missing[@]}"; do
     installed "$p" || die "package $p did not install"

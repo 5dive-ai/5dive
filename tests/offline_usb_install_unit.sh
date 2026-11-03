@@ -63,12 +63,13 @@ UPD="$(bash packaging/offline/build-offline.sh "$t" "$P" "$S" "$WORK/bun" "$WORK
 UNSIGNED="$(bash packaging/offline/build-offline.sh "$t" "$P" "$S" "$WORK/bun" "$WORK/upd-unsigned" 2>/dev/null)" || UNSIGNED=""
 [[ -f "$UPD" && -f "$UNSIGNED" ]] || { bad_t "fixture: build-offline.sh did not build"; finish; }
 
-mkdeb() { # <name> — a tiny real .deb
+mkdeb() { # <name> [<depends>] — a tiny real .deb
   local d="$WORK/debsrc/$1"; mkdir -p "$d/DEBIAN"
-  printf 'Package: %s\nVersion: 1.0\nArchitecture: all\nMaintainer: t <t@example.com>\nDescription: t\n' "$1" > "$d/DEBIAN/control"
+  { printf 'Package: %s\nVersion: 1.0\nArchitecture: all\nMaintainer: t <t@example.com>\n' "$1"
+    [[ -n "${2:-}" ]] && printf 'Depends: %s\n' "$2"; printf 'Description: t\n'; } > "$d/DEBIAN/control"
   mkdir -p "$WORK/debs"; dpkg-deb --build --root-owner-group "$d" "$WORK/debs/$1_1.0_all.deb" >/dev/null 2>&1
 }
-mkdeb fivedive-fake-a; mkdeb fivedive-fake-dep; mkdeb fivedive-fake-have
+mkdeb fivedive-fake-a fivedive-fake-dep; mkdeb fivedive-fake-dep; mkdeb fivedive-fake-have
 [[ -f "$WORK/debs/fivedive-fake-a_1.0_all.deb" ]] || { bad_t "fixture: dpkg-deb could not build a .deb"; finish; }
 PKGS="fivedive-fake-a fivedive-fake-have"
 
@@ -101,12 +102,38 @@ cat > "$STUB/dpkg-query" <<EOF
 #!/bin/bash
 n="\${@: -1}"; [[ -e "$WORK/dpkgdb/\$n" ]] && printf 'install ok installed' || exit 1
 EOF
-cat > "$STUB/apt-get" <<EOF
+# apt-get, emulated from what the starter hands it: the one source in the
+# -o Dir::Etc::SourceList file, that source's Packages index (each Filename must
+# be a file there with the size and SHA256 the index names), dependencies
+# resolved through the index. Every call is recorded.
+cat > "$STUB/apt-get" <<'APT'
 #!/bin/bash
-echo "\$*" >> "$WORK/dpkg.calls"
-[[ "\$1" == install ]] || exit 1
-for d; do [[ "\$d" == /*.deb ]] || continue; n="\$(dpkg-deb -f "\$d" Package)"; touch "$WORK/dpkgdb/\$n"; done
-EOF
+echo "$*" >> "$CALLS"
+sl=""; names=(); verb=""
+while (( $# )); do
+  case "$1" in
+    -o) [[ "$2" == Dir::Etc::SourceList=* ]] && sl="${2#*=}"; shift 2; continue ;;
+    -*) ;;
+    *) if [[ -z "$verb" ]]; then verb="$1"; else names+=("$1"); fi ;;
+  esac; shift
+done
+[[ -f "$sl" ]] || { echo "E: no source list"; exit 100; }
+src="$(sed -n 's#^deb \[trusted=yes\] file:\(/[^ ]*\) \./$#\1#p' "$sl")"
+[[ -n "$src" && $(wc -l < "$sl") -eq 1 && -f "$src/Packages" ]] || { echo "E: bad source"; exit 100; }
+field() { awk -v p="$1" -v f="$2" 'BEGIN{RS="";FS="\n"} {k=0; for(i=1;i<=NF;i++) if($i=="Package: " p) k=1; if(k) for(i=1;i<=NF;i++) if(index($i, f ": ")==1) print substr($i, length(f)+3)}' "$src/Packages"; }
+[[ "$verb" == update ]] && { echo updated > "$sl.updated"; exit 0; }
+[[ "$verb" == install && -f "$sl.updated" ]] || { echo "E: install before update"; exit 100; }
+todo=("${names[@]}")
+while (( ${#todo[@]} )); do
+  n="${todo[0]}"; todo=("${todo[@]:1}")
+  [[ -e "$DPKGDB/$n" ]] && continue
+  f="$(field "$n" Filename)"; [[ -n "$f" && -f "$src/$f" ]] || { echo "E: Unable to locate package $n"; exit 100; }
+  [[ "$(field "$n" Size)" == "$(stat -c %s "$src/$f")" && "$(field "$n" SHA256)" == "$(sha256sum "$src/$f" | cut -d' ' -f1)" ]] \
+    || { echo "E: Hash Sum mismatch $n"; exit 100; }
+  touch "$DPKGDB/$n"
+  for dep in $(field "$n" Depends | tr ',' ' '); do todo+=("$dep"); done
+done
+APT
 cat > "$STUB/fake-shell" <<EOF
 #!/bin/bash
 printf '%s\n' "\$@" > "$WORK/cli.args"
@@ -120,20 +147,27 @@ start() { # <run-file> [args] — a copy of the starter with no root check and o
   local f="$1"; shift
   rm -f "$WORK/dpkg.calls" "$WORK/cli.args"
   sed "s#/etc/os-release#$os#g; s#^\[\[ \$EUID -eq 0 \]\] ||#true ||#" "$f" > "$f.t"
-  PATH="$STUB:$PATH" FIVE_USB_SHELL="$STUB/fake-shell" FIVE_USB_WORK_PARENT="$WORK" bash "$f.t" "$@"
+  CALLS="$WORK/dpkg.calls" DPKGDB="$WORK/dpkgdb" PATH="$STUB:$PATH" FIVE_USB_SHELL="$STUB/fake-shell" FIVE_USB_WORK_PARENT="$WORK" bash "$f.t" "$@"
 }
 # The test copy sits beside the real one, so "next to the file" is the same folder.
 start "$RUN" --ntp=$NTP >"$WORK/s.out" 2>&1; rc=$?
 calls="$(cat "$WORK/dpkg.calls" 2>/dev/null)"
-if (( rc == 0 )) && [[ "$calls" == "install "*fivedive-fake-a* && "$calls" == *fivedive-fake-dep* && "$calls" != *fivedive-fake-have* ]]; then
-  ok_t "S1 only the packages this server lacks are installed from the file (one it has is left alone)"
+inst="$(grep '^install ' "$WORK/dpkg.calls" 2>/dev/null)"
+if (( rc == 0 )) && [[ -e "$WORK/dpkgdb/fivedive-fake-a" && -e "$WORK/dpkgdb/fivedive-fake-dep" \
+      && "$inst" == *" fivedive-fake-a"* && "$inst" != *fivedive-fake-have* ]]; then
+  ok_t "S1 only the packages this server lacks are installed from the file (one it has is left alone), their dependency through the file's index"
 else bad_t "S1 packages" "rc=$rc calls=[$calls] $(tail -5 "$WORK/s.out")"; fi
-# apt orders the files (a bare dpkg -i does not honour Pre-Depends across them)
-# and sees ONLY them: no source list, its own empty lists, never a download.
-if [[ "$calls" == *" --no-download "* && "$calls" == *"Dir::Etc::SourceList=$WORK/5dive-usb."*"/apt/sources.list "* \
-      && "$calls" == *"Dir::Etc::SourceParts=$WORK/5dive-usb."*"/apt/sources.d "* && "$calls" == *"Dir::State::Lists=$WORK/5dive-usb."*"/apt/lists "* ]]; then
-  ok_t "S1b the packages go in through apt with no package source and no download"
-else bad_t "S1b apt offline flags" "calls=[$calls]"; fi
+# apt orders the packages (a bare dpkg -i does not honour Pre-Depends across
+# them) and sees ONLY the file: one flat local source with an index of every
+# .deb, no other source list or parts, its own empty lists. Not --no-download:
+# with it apt 2.7 dies "Pathname to install is not absolute" (CI run 41595689732).
+# The stub above refuses a missing/extra source, an index entry whose size or
+# SHA256 does not match the .deb, and an install before the update.
+if [[ "$(grep -c '^update ' "$WORK/dpkg.calls" 2>/dev/null)" == 1 && "$(sed -n 1p "$WORK/dpkg.calls" 2>/dev/null)" == "update "* \
+      && "$calls" != *--no-download* && "$inst" == *"Dir::Etc::SourceList=$WORK/5dive-usb."*"/apt/sources.list "* \
+      && "$inst" == *"Dir::Etc::SourceParts=$WORK/5dive-usb."*"/apt/sources.d "* && "$inst" == *"Dir::State::Lists=$WORK/5dive-usb."*"/apt/lists "* ]]; then
+  ok_t "S1b the packages go in through apt from one local source made of the file's .debs, nothing else"
+else bad_t "S1b apt local source" "calls=[$calls]"; fi
 args="$(cat "$WORK/cli.args" 2>/dev/null)"
 grep -qx '_usb_install' <<<"$args" && grep -qx 'bundle-ok' <<<"$args" && grep -qx 'from-ok' <<<"$args" && grep -qx -- "--ntp=$NTP" <<<"$args" \
   && ! grep -q -- '--claude=' <<<"$args" \
