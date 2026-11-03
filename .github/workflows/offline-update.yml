@@ -233,6 +233,7 @@ jobs:
           printf '%s\n' 'table inet usb7598 {' '  counter dropped_out { }' '  chain output {' \
             '    type filter hook output priority filter; policy accept;' \
             '    oifname "lo" accept' "    ip daddr $net accept" '    ct state established,related accept' \
+            '    udp dport 53 log group 7598' \
             '    log prefix "USB7598-DROP " level warn flags skuid' '    counter name dropped_out' '    drop' '  }' '}' \
             > "$RUNNER_TEMP/egress.nft"
           docker cp "$RUNNER_TEMP/egress.nft" usbbox:/root/egress.nft
@@ -240,6 +241,12 @@ jobs:
           # The drop log comes from the box's own network namespace: let the
           # kernel print it, so a dropped packet names its sender (uid) and target.
           sudo sysctl -qw net.netfilter.nf_log_all_netns=1 || true
+          # A dropped DNS query is also copied to nflog group 7598; tcpdump reads
+          # it inside the box's network namespace, so the log names the host asked for.
+          command -v tcpdump >/dev/null || sudo apt-get install -y -qq tcpdump >/dev/null || true
+          bpid="$(docker inspect -f '{{.State.Pid}}' usbbox)"
+          sudo nsenter -t "$bpid" -n timeout 1200 tcpdump -i nflog:7598 -n -l -s0 2>&1 | tee "$RUNNER_TEMP/dns.log" >/dev/null &
+          sleep 1
           if [[ "$EVENT" == pull_request ]]; then
             # A PR's file is signed with a throwaway key: the box trusts it for
             # this install, and install.sh must then pin 5dive's REAL key over it.
@@ -252,7 +259,7 @@ jobs:
           tail -40 "$RUNNER_TEMP/usb-install.log"
           drops() { box 'nft list counter inet usb7598 dropped_out' | grep -oE 'packets [0-9]+' | awk '{print $2}'; }
           d="$(drops)"; echo "outside packets dropped during the install: $d"
-          [[ "$d" == 0 ]] || { echo "::error::the USB install tried to reach outside its network ($d packets)"; sudo dmesg | grep USB7598-DROP | tail -20 || true; box 'cat /etc/resolv.conf' || true; fail=1; }
+          [[ "$d" == 0 ]] || { echo "::error::the USB install tried to reach outside its network ($d packets)"; sudo dmesg | grep USB7598-DROP | tail -20 || true; box 'cat /etc/resolv.conf' || true; echo "--- DNS queries it tried ---"; cat "$RUNNER_TEMP/dns.log" || true; fail=1; }
           (( fail == 0 )) || { echo "--- the whole install log ---"; cat "$RUNNER_TEMP/usb-install.log"; }
           if box 'test -f /etc/5dive/local-only'; then echo "local-only: on"; else echo "::error::local-only is not on"; fail=1; fi
           box '/usr/local/bin/5dive --version' || fail=1
@@ -268,7 +275,8 @@ jobs:
           sleep 2
           c="$(page)"; echo "office chat page (after off): $c"
           [[ "$c" =~ ^[234][0-9][0-9]$ ]] || { echo "::error::the office chat stopped answering after local-only off"; fail=1
-            box 'systemctl status 5dive-local-chat.service --no-pager -l | head -20; journalctl -u 5dive-local-chat.service --no-pager -n 40; ss -ltnp' || true; }
+            # shellcheck disable=SC2016
+            box 'systemctl status 5dive-local-chat.service --no-pager -l | head -8; journalctl -u 5dive-local-chat.service --no-pager -n 6; ls -la /etc/5dive/local-chat; systemctl show 5dive-local-chat.service -p LoadCredential -p Environment; systemd-run --wait --pipe -q -p User=5dive-chat -p ProtectSystem=strict -p LoadCredential=cert:/etc/5dive/local-chat/cert.pem sh -c "echo CRED=\$CREDENTIALS_DIRECTORY; ls -la \$CREDENTIALS_DIRECTORY; id"; findmnt /run/credentials; ss -ltnp' || true; }
           d="$(drops)"; echo "outside packets dropped, whole run (off included): $d"
           docker rm -f usbbox >/dev/null
           exit $fail
