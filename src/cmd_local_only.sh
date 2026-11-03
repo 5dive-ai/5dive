@@ -275,7 +275,7 @@ _lo_off() {
 }
 
 # One line per item: "ok    <item>  <state>" or "LEAK  <item>  <state>".
-_lo_line() { printf '%-5s %-34s %s\n' "$1" "$2" "$3"; }
+_lo_line() { printf '%-5s %-34s  %s\n' "$1" "$2" "$3"; }   # DIVE-7579 (m2): two spaces always (the panel splits on them)
 
 _lo_check() {
   local watch=60 status_only=0 a

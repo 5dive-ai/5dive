@@ -62,6 +62,8 @@ case "\$args" in
   *" config local-only check "*) printf 'ok    local-only switch                  on\nLEAK  snap store                         online\n' ;;
   *" self-update --help "*) echo 'usage: 5dive self-update' ;;
   *" agent create "*) echo '{"ok":false,"error":{"message":"agent create stub refused"}}'; exit 1 ;;
+  *" self-update --from="*) for a in "\$@"; do [[ "\$a" == --from=* ]] && cat "\${a#--from=}" >"$TMPD/installed.bytes"; done; echo '{"ok":true,"data":{"restarted":[]}}' ;;
+  *" --version "*) echo '{"ok":true,"data":{"version":"0.117.0"}}' ;;
   *) echo '{"ok":true,"data":{"done":true}}' ;;
 esac
 FAKE
@@ -85,7 +87,7 @@ check 'A5a … ran `agent restart alice`' 'grep -qx -- "--json agent restart ali
 okv 'A6 agent-remove' '.data.done' agent-remove bob
 check 'A6a … ran `agent rm bob`' 'grep -qx -- "--json agent rm bob " <<<"$(tail -1 "$LOG")"'
 out=$(pe agent-add paralegal)
-check 'A7 agent-add runs create on the local AI account (harness + account from the profile)' 'grep -qx -- "--json agent create paralegal --type=claude --auth-profile=office-ai " <<<"$(tail -1 "$LOG")"'
+check 'A7 agent-add runs create on the local AI account, in the office chat (DIVE-7579)' 'grep -qx -- "--json agent create paralegal --type=claude --auth-profile=office-ai --channels=dashboard " <<<"$(tail -1 "$LOG")"'
 check 'A7a … and a CLI failure comes back as the error, not ok' '[[ "$(jq -r .ok <<<"$out")" == false ]] && [[ "$(jq -r .error <<<"$out")" == "agent create stub refused" ]]'
 okv 'A8 gate-answer with a listed option' '.data.done' gate-answer DIVE-2 'Send it today'
 check 'A8a … runs task answer as a human from the panel, the value as ONE argument' 'grep -qxF -- "--json task answer DIVE-2 --value=Send\\ it\\ today --human --from=office-panel " <<<"$(tail -1 "$LOG")"'
@@ -187,7 +189,7 @@ _local_chat_server_ts >"$TMPD/server.ts"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 -subj "/CN=t" \
   -addext "subjectAltName=IP:127.0.0.1" -keyout "$TMPD/key.pem" -out "$TMPD/cert.pem" >/dev/null 2>&1
 printf 'CONNECTORD_TOKEN="boxtok"\n' >"$TMPD/tok.env"; printf '["alice"]\n' >"$TMPD/agents.json"
-STATE="$TMPD/state"; mkdir -p "$STATE"
+STATE="$(_lc_state)"; mkdir -p "$STATE"   # DIVE-7579: the folder root reads the upload from
 # A db from before roles existed: one device, no role column.
 "$BUN" -e 'import { Database } from "bun:sqlite"; const d = new Database(process.argv[1] + "/chat.db", { create: true });
   d.exec("CREATE TABLE devices (id TEXT PRIMARY KEY, name TEXT NOT NULL, cookie_hash TEXT NOT NULL UNIQUE, created INTEGER NOT NULL, last_seen INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0); CREATE TABLE pair_codes (hash TEXT PRIMARY KEY, expires INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0);");
@@ -200,6 +202,8 @@ export FIVE_LOCAL_CHAT_ROOT="$FIVE_LOCAL_CHAT_ROOT" FIVE_PANEL_CLI="$FIVE_PANEL_
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh cmd_local_chat.sh cmd_local_panel.sh; do source "src/\$f"; done
 set +e; require_root() { :; }; AUTH_PROFILES_DIR="$TMPD/profiles"; TOOLS_ENV_FILE="$TOOLS_ENV_FILE"
 $(declare -f _tool_set_vars)
+systemctl() { return 1; }                                   # no update unit running
+_lp_spawn_update() { ( _lp_update_run ) >/dev/null 2>&1; }  # the transient unit, run in place
 _lp_exec --socket
 PEX
 chmod +x "$TMPD/panel-exec.sh"
@@ -216,7 +220,7 @@ SOCKD
 python3 -I "$TMPD/sockd.py" "$PSOCK" "$TMPD/panel-exec.sh" >"$TMPD/sockd.log" 2>&1 & PIDS+=($!)
 LAN=$((20000 + RANDOM % 20000)); LOOP=$((LAN + 1))
 LC_STATE="$STATE" LC_LAN_ADDR=127.0.0.1 LC_LAN_PORT=$LAN LC_LOOP_PORT=$LOOP LC_CERT="$TMPD/cert.pem" LC_KEY="$TMPD/key.pem" \
-  LC_TOKEN_FILE="$TMPD/tok.env" LC_AGENTS_FILE="$TMPD/agents.json" LC_PANEL_SOCK="$PSOCK" \
+  LC_TOKEN_FILE="$TMPD/tok.env" LC_AGENTS_FILE="$TMPD/agents.json" LC_PANEL_SOCK="$PSOCK" LC_FILE_MAX=65536 LC_UPDATE_MAX=1048576 \
   "$BUN" "$TMPD/server.ts" serve >"$TMPD/server.log" 2>&1 & PIDS+=($!)
 for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$LOOP/" && [[ -S "$PSOCK" ]] && break; sleep 0.1; done
 W="https://127.0.0.1:$LAN"
@@ -237,7 +241,7 @@ cw() { curl -sSk -b "$TMPD/chat.jar" -H 'x-local-chat: 1' "$@"; }
 ow() { curl -sSk -b "$TMPD/owner.jar" -H 'x-local-chat: 1' "$@"; }
 before_aud=$(wc -l <"$AUD")
 n403=0; nroutes=0
-for rt in "GET team" "POST team" "GET board" "POST answer" "GET secrets" "POST secrets" "GET settings" "POST test" "POST revoke" "GET nope"; do
+for rt in "GET team" "POST team" "GET board" "POST answer" "GET secrets" "POST secrets" "GET settings" "POST test" "POST revoke" "GET update" "POST update" "GET nope"; do
   m=${rt% *}; pth=/api/panel/${rt#* }; nroutes=$((nroutes + 1))
   if [[ $m == GET ]]; then c=$(code -b "$TMPD/chat.jar" "$W$pth")
   else c=$(code -b "$TMPD/chat.jar" -H 'x-local-chat: 1' -H 'content-type: application/json' -d '{"action":"restart","name":"alice","ident":"DIVE-3","value":"approve","account":"office-ai","id":"abcdef12"}' "$W$pth"); fi
@@ -266,6 +270,22 @@ sed -n '/<script>/,/<\/script>/p' "$TMPD/panel.html" | sed '1d;$d' >"$TMPD/panel
 check 'B21 the panel page script parses' '"$BUN" build --no-bundle "$TMPD/panel.js" >/dev/null'
 curl -sk "$W/" | sed -n '/<script>/,/<\/script>/p' | sed '1d;$d' >"$TMPD/chat.js"
 check 'B22 the chat page script still parses' '"$BUN" build --no-bundle "$TMPD/chat.js" >/dev/null'
+# DIVE-7579 (D4): install an update file from the panel, end to end over the socket.
+head -c 200000 /dev/urandom >"$TMPD/upd.tar"
+u=$(curl -sSk -b "$TMPD/owner.jar" -H 'x-local-chat: 1' --data-binary @"$TMPD/upd.tar" "$W/api/panel/update")
+check 'B24 owner: an uploaded update file is taken and the install starts' '[[ "$(jq -r .ok <<<"$u")" == true && "$(jq -r .data.state <<<"$u")" == running ]]'
+for _ in $(seq 1 30); do st=$(ow "$W/api/panel/update"); [[ "$(jq -r .data.state <<<"$st")" == running ]] || break; sleep 0.2; done
+check 'B25 … the bytes self-update installed are the bytes the browser sent' 'cmp -s "$TMPD/upd.tar" "$TMPD/installed.bytes"'
+check 'B26 … the page reads done with the new version; no copy is left in either folder' '[[ "$(jq -r .data.state <<<"$st")" == done && "$(jq -r .data.to <<<"$st")" == 0.117.0 ]] && [[ ! -e "$STATE/update/incoming.tar" && ! -e "$(_lp_update_dir)/update.tar" ]]'
+check 'B27 … audited with the owner device' 'grep -qP "\t${OWNER_ID}\tupdate-install\t\tok$" "$AUD"'
+head -c 1100000 /dev/zero >"$TMPD/big.tar"
+check 'B28 an update file over the cap is refused (413)' '[[ "$(code -b "$TMPD/owner.jar" -H "x-local-chat: 1" --data-binary @"$TMPD/big.tar" "$W/api/panel/update")" == 413 ]]'
+head -c 100000 /dev/zero | tr '\0' a >"$TMPD/mid.json"
+check 'B29 only the update route takes a big body: 100 KB to messages is 413' '[[ "$(code -b "$TMPD/owner.jar" -H "x-local-chat: 1" -H "content-type: application/json" --data-binary @"$TMPD/mid.json" "$W/api/messages")" == 413 ]]'
+check 'B30 a POST with no length (chunked) is refused (411)' '[[ "$(code -b "$TMPD/owner.jar" -H "x-local-chat: 1" -H "Transfer-Encoding: chunked" --data-binary @"$TMPD/upd.tar" "$W/api/panel/update")" == 411 ]]'
+s=$(ow "$W/api/panel/settings")
+check 'B31 settings carry the running version for the Update card' '[[ "$(jq -r ".data | has(\"version\")" <<<"$s")" == true ]]'
+check 'B32 the panel page has the Update card, the hidden tab bar rule and the collapsed check list' 'grep -q "Install update" "$TMPD/panel.html" && grep -qF "nav.tabs[hidden]{display:none}" "$TMPD/panel.html" && grep -q "What was checked" "$TMPD/panel.html"'
 kill "${PIDS[0]}" 2>/dev/null; sleep 0.3; rm -f "$PSOCK"
 r=$(ow "$W/api/panel/team")
 check 'B23 helper down: a plain error, the chat page still serves' '[[ "$(jq -r .error <<<"$r")" == *"not running"* ]] && [[ "$(code "$W/")" == 200 ]]'

@@ -113,6 +113,11 @@ auth_probe_output() {
     local pf="${AUTH_PROFILES_DIR}/${profile}/combined.env"
     env_src+="[ -r $pf ] && set -a && . $pf && set +a; "
   fi
+  # DIVE-7579 (D7): the local-only quiet env, last, so no file above unsets it.
+  local qv
+  if declare -F local_only_claude_env >/dev/null 2>&1; then
+    while IFS= read -r qv; do [[ -n "$qv" ]] && env_src+="export $(printf '%q' "$qv"); "; done < <(local_only_claude_env)
+  fi
   # </dev/null (DIVE-5098): with a stdin attached, `claude --print` spent ~3 of
   # the 5s waiting on it, and a probe that times out prints nothing — which the
   # matcher below reads as ok.

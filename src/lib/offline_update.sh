@@ -208,7 +208,8 @@ _ou_replace_tree() {
 # claude user's, which new agents are cloned from) to the update's plugins.
 # Each plugin folder is replaced whole, the catalog file copied, the owner kept,
 # and the result committed so a clone of it carries the new code (a clone takes
-# HEAD, not the working tree). 0 = replaced.
+# HEAD, not the working tree). 0 = replaced. DIVE-7579 (m1): 3 = replaced, and
+# git sees no difference from what it had (the seat need not restart for it).
 _ou_refresh_checkout() {
   local src="$1" co="$2" owner d n
   [[ -f "$co/.claude-plugin/marketplace.json" && -d "$src/plugins" ]] || return 1
@@ -220,11 +221,15 @@ _ou_refresh_checkout() {
   install -d "$co/.claude-plugin" && cp -f "$src/.claude-plugin/marketplace.json" "$co/.claude-plugin/marketplace.json" || return 1
   [[ -n "$owner" ]] && chown -R "$owner" "$co/plugins" "$co/.claude-plugin" 2>/dev/null
   if [[ -d "$co/.git" ]]; then
-    local u="${owner%%:*}" ver="${_OU_VERSION:-}"
+    local u="${owner%%:*}" ver="${_OU_VERSION:-}" st
     local -a as=(); [[ -n "$u" && "$u" != "$(id -un)" ]] && as=(sudo -u "$u" -H)
-    "${as[@]}" git -c safe.directory='*' -C "$co" add -A plugins .claude-plugin >/dev/null 2>&1 \
-      && "${as[@]}" git -c safe.directory='*' -C "$co" -c user.name=5dive -c user.email=support@5dive.com \
-           commit -qm "5dive update from file${ver:+ ($ver)}" >/dev/null 2>&1 || true
+    if "${as[@]}" git -c safe.directory='*' -C "$co" add -A plugins .claude-plugin >/dev/null 2>&1 \
+       && st=$("${as[@]}" git -c safe.directory='*' -C "$co" status --porcelain -- plugins .claude-plugin 2>/dev/null) \
+       && [[ -z "$st" ]]; then
+      return 3
+    fi
+    "${as[@]}" git -c safe.directory='*' -C "$co" -c user.name=5dive -c user.email=support@5dive.com \
+      commit -qm "5dive update from file${ver:+ ($ver)}" >/dev/null 2>&1 || true
   fi
   return 0
 }

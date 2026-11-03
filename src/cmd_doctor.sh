@@ -2007,7 +2007,10 @@ cmd_doctor() {
         doctor_add types "$type" ok "$bin installed"
         continue
       fi
-      if (( DOCTOR_REPAIR )) && [[ -n "$recipe" ]]; then
+      if (( DOCTOR_REPAIR )) && [[ -n "$recipe" ]] && declare -F local_only_on >/dev/null 2>&1 && local_only_on; then
+        # DIVE-7579 (D7): every recipe downloads; local-only promises nothing does.
+        doctor_add types "$type" warn "$bin missing (local-only mode is on: an update file brings it, not an internet install)" false false
+      elif (( DOCTOR_REPAIR )) && [[ -n "$recipe" ]]; then
         step "Installing $type CLI"
         if sudo -u claude -i bash -lc "$recipe" >&2 && [[ -x "$bin" ]]; then
           doctor_add types "$type" ok "$type installed at $bin" true true
