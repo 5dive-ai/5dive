@@ -75,7 +75,7 @@ fi
 # --- 4. the config staging gate knows buzz's marketplace --------------------
 # Without this, channels_changed_to=buzz hits `*) continue` and the restart
 # proceeds into a session whose plugin cache may not be staged — a deaf agent.
-if grep -qE 'telegram\|dashboard\|buzz\) gate_marketplace="5dive-plugins"' "$SRC/cmd_agent_config.sh"; then
+if grep -qE 'telegram\|dashboard\|buzz(\|[a-z]+)*\) gate_marketplace="5dive-plugins"' "$SRC/cmd_agent_config.sh"; then
   ok_t "cmd_agent_config staging gate covers buzz"
 else
   bad_t "cmd_agent_config staging gate covers buzz" \
@@ -374,10 +374,12 @@ if command -v jq >/dev/null 2>&1; then
 
   # 8a. THE REGRESSION ARM. This fixture is exactly a pre-buzz box: enabled, both
   # older fork channels present, buzz absent. Before this fix the check read [ok].
+  # (DIVE-7658: teams, added after buzz, is present so buzz is the ONE missing.)
   cat >"$MS" <<'JSON'
 {"channelsEnabled":true,
  "allowedChannelPlugins":[{"plugin":"telegram","marketplace":"5dive-plugins"},
                           {"plugin":"dashboard","marketplace":"5dive-plugins"},
+                          {"plugin":"teams","marketplace":"5dive-plugins"},
                           {"plugin":"telegram","marketplace":"claude-plugins-official"}]}
 JSON
   if managed_settings_channels_ok "$MS"; then
@@ -415,7 +417,8 @@ JSON
 {"channelsEnabled":true,
  "allowedChannelPlugins":[{"plugin":"telegram","marketplace":"5dive-plugins"},
                           {"plugin":"dashboard","marketplace":"5dive-plugins"},
-                          {"plugin":"buzz","marketplace":"claude-plugins-official"}]}
+                          {"plugin":"buzz","marketplace":"claude-plugins-official"},
+                          {"plugin":"teams","marketplace":"5dive-plugins"}]}
 JSON
   managed_settings_channels_ok "$MS" \
     && bad_t "NEGATIVE: gate refuses buzz on the WRONG marketplace" \

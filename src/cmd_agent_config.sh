@@ -1,7 +1,7 @@
 cmd_config() {
   # Usage: 5dive agent config <name> set <key>=<value> [<key>=<value>...]
   #   keys:
-  #     channels                  (none|telegram|discord|dashboard|buzz, comma-
+  #     channels                  (none|telegram|discord|dashboard|buzz|teams, comma-
   #                                separable — "telegram,dashboard" runs both;
   #                                dashboard is token-free for claude/codex;
   #                                buzz is claude-only and token-free)
@@ -125,6 +125,9 @@ cmd_config() {
         # can't be left declaring buzz by a call that was always going to fail.
         if [[ "$type" != "claude" ]] && channel_in_list buzz "$v"; then
           fail "$E_VALIDATION" "channels=buzz is claude-only (agent '$name' is type $type)"
+        fi
+        if [[ "$type" != "claude" ]] && channel_in_list teams "$v"; then
+          fail "$E_VALIDATION" "channels=teams is claude-only for now (agent '$name' is type $type)"
         fi
         reg=$(jq --arg n "$name" --arg v "$v" '.agents[$n].channels = $v' <<<"$reg")
         channels_changed_to="$v"
@@ -623,6 +626,13 @@ cmd_config() {
     step "Installing buzz channel for agent '$name' (type=$type)"
     _config_install_channel "$prev_channels" "$type" buzz "$name" ""
   fi
+  # DIVE-7658 teams attach: the same token-free shape. Its per-agent settings
+  # (bot id, tenant, secret) are written by `5dive agent teams connect`, which
+  # is what calls this.
+  if [[ -n "$channels_changed_to" ]] && channel_in_list teams "$channels_changed_to"; then
+    step "Installing teams channel for agent '$name' (type=$type)"
+    _config_install_channel "$prev_channels" "$type" teams "$name" ""
+  fi
   if [[ -n "$new_model" ]]; then
     step "Writing model=$new_model into $type runtime config"
     write_runtime_model "$type" "$name" "$new_model"
@@ -655,7 +665,7 @@ cmd_config() {
     local gate_ch gate_marketplace gate_dir gate_waited
     for gate_ch in ${channels_changed_to//,/ }; do
       case "$gate_ch" in
-        telegram|dashboard|buzz) gate_marketplace="5dive-plugins" ;;
+        telegram|dashboard|buzz|teams) gate_marketplace="5dive-plugins" ;;
         discord)            gate_marketplace="claude-plugins-official" ;;
         *) continue ;;
       esac

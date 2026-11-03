@@ -1337,7 +1337,7 @@ def channel_plugins(name, channels):
             out.append((market, "telegram"))
         elif ch == "discord":
             out.append(("claude-plugins-official", "discord"))
-        elif ch in ("dashboard", "buzz"):
+        elif ch in ("dashboard", "buzz", "teams"):
             out.append(("5dive-plugins", ch))
     return out
 

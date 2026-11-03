@@ -287,7 +287,7 @@ declare -A TYPE_CHANNELS=(
 # install.sh cannot source this (it is curl-piped and must work before jq is on
 # the box), so it keeps its own two copies — guarded against drift by
 # tests/buzz_channel_wiring_unit.sh, which diffs them against this constant.
-readonly FIVEDIVE_CHANNEL_PLUGINS_JSON='[{"plugin":"telegram","marketplace":"5dive-plugins"},{"plugin":"dashboard","marketplace":"5dive-plugins"},{"plugin":"buzz","marketplace":"5dive-plugins"}]'
+readonly FIVEDIVE_CHANNEL_PLUGINS_JSON='[{"plugin":"telegram","marketplace":"5dive-plugins"},{"plugin":"dashboard","marketplace":"5dive-plugins"},{"plugin":"buzz","marketplace":"5dive-plugins"},{"plugin":"teams","marketplace":"5dive-plugins"}]'
 
 # DIVE-4900: first-party plugins published from their OWN repo, with no copy in
 # the 5dive-plugins registry — `5dive market --kind=plugin` lists them beside the

@@ -315,7 +315,7 @@ _lo_channels_outside() {   # <csv> → 0 when it names a channel that dials out
   local c
   IFS=',' read -r -a _lo_cs <<<"$1"
   for c in "${_lo_cs[@]}"; do
-    case "$c" in telegram|discord|buzz) return 0 ;; esac
+    case "$c" in telegram|discord|buzz|teams) return 0 ;; esac
   done
   return 1
 }
@@ -327,7 +327,7 @@ _lo_channel_flags_ok() {
   for a in "$@"; do
     case "$a" in
       --telegram-*|--discord-token=*) local_only_refuse "Telegram and Discord" ;;
-      --channels=*) _lo_channels_outside "${a#--channels=}" && local_only_refuse "Telegram, Discord and Buzz" ;;
+      --channels=*) _lo_channels_outside "${a#--channels=}" && local_only_refuse "Telegram, Discord, Buzz and Microsoft Teams" ;;
     esac
   done
   return 0
@@ -419,6 +419,8 @@ local_only_gate() {
         _tg_connect_greet|_telegram_open|telegram-*|team-bot|team-group|pair|topic|cos)
                     local_only_refuse "Telegram" ;;
         buzz)       [[ "${1:-}" == enable || "${2:-}" == enable ]] && local_only_refuse "Buzz" ;;
+        # DIVE-7658: Teams messages go through Microsoft's cloud.
+        teams)      [[ "${1:-}" == connect || "${2:-}" == connect ]] && local_only_refuse "Microsoft Teams (it goes through Microsoft's cloud)" ;;
         install)    local_only_refuse "Installing an agent program from the internet" ;;
         pack-sync)  local_only_refuse "Updating agent packs from the internet" ;;
         switch)     local_only_refuse "Switching an agent to another AI service" ;;
@@ -461,7 +463,7 @@ local_only_gate() {
           for a in "${@:3}"; do
             case "$a" in
               telegram.*|discord.*) local_only_refuse "Telegram and Discord" ;;
-              channels=*) _lo_channels_outside "${a#channels=}" && local_only_refuse "Telegram, Discord and Buzz" ;;
+              channels=*) _lo_channels_outside "${a#channels=}" && local_only_refuse "Telegram, Discord, Buzz and Microsoft Teams" ;;
             esac
           done ;;
         auth)

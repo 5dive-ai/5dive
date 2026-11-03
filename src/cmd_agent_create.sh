@@ -3469,7 +3469,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--own-login] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz|teams[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--own-login] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -3578,7 +3578,7 @@ cmd_create() {
   if [[ "$type" == "grok" ]]; then
     warn "arm marker present ($grok_arm_marker), bypassing the DIVE-1221 Grok exfiltration freeze. Owner risk acceptance (lodar 2026-08-10 for managed boxes, or this server's owner via 5dive grok enable), NOT a patch — the xAI upload path is still unfixed and unpinnable."
   fi
-  valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz, comma-separable)"
+  valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz|teams, comma-separable)"
   # DIVE-5406: dashboard chat is OPT-IN. DIVE-856 used to fold `dashboard`
   # into every claude create on a box with connectord.env (unset --channels
   # became "dashboard", an explicit list got ",dashboard" appended). Mini App
@@ -4341,6 +4341,10 @@ cmd_create() {
       # the create path did not.
       buzz)
         install_channel_for_agent "$type" buzz "$name" "" ;;
+      # DIVE-7658: the plugin is installed here; it stays quiet until
+      # `5dive agent teams connect` writes the bot's settings.
+      teams)
+        install_channel_for_agent "$type" teams "$name" "" ;;
     esac
   done
   # DIVE-5306: a sandboxed claude seat starts on the lite Telegram bot profile;
@@ -4851,7 +4855,7 @@ cmd_create() {
   # DIVE-7574: the chat plugin itself, where Claude Code runs it.
   if [[ "$type" == claude ]]; then
     local _cp _cp_line
-    for _cp in dashboard buzz; do
+    for _cp in dashboard buzz teams; do
       channel_in_list "$_cp" "$channels" || continue
       while IFS= read -r _cp_line; do
         case "$_cp_line" in

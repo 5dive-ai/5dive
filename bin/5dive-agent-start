@@ -301,6 +301,14 @@ case "$CH" in
       claude) ARGS+=(--channels "plugin:buzz@5dive-plugins") ;;
       *) echo "channels=buzz is claude-only (got type=$TYPE)" >&2; exit 2 ;;
     esac ;;
+  # DIVE-7658 Microsoft Teams — claude-only for now. The plugin reads the bot's
+  # ids, secret and port from ~/.claude/channels/teams/config.json (written by
+  # `5dive agent teams connect`), so nothing is passed in argv.
+  teams)
+    case "$TYPE" in
+      claude) ARGS+=(--channels "plugin:teams@5dive-plugins") ;;
+      *) echo "channels=teams is claude-only for now (got type=$TYPE)" >&2; exit 2 ;;
+    esac ;;
   *) echo "unknown channels: $CH" >&2; exit 2 ;;
 esac
 done

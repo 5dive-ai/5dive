@@ -1288,7 +1288,7 @@ install_channel_plugin_for_agent() {
   # SSH key configured. Explicit https URL sidesteps the shorthand
   # resolver entirely.
   local mkt_repo="https://github.com/anthropics/claude-plugins-official.git"
-  if [[ "$plugin" == "telegram" || "$plugin" == "dashboard" || "$plugin" == "buzz" ]]; then
+  if [[ "$plugin" == "telegram" || "$plugin" == "dashboard" || "$plugin" == "buzz" || "$plugin" == "teams" ]]; then
     marketplace="5dive-plugins"
     mkt_repo="https://github.com/$(gh_org)/5dive-plugins.git"
   fi
@@ -2911,6 +2911,10 @@ install_channel_for_agent() {
   # the failure names the reason, rather than at 5dive-agent-start's dispatch.
   if [[ "$plugin" == "buzz" && "$type" != "claude" ]]; then
     fail "$E_VALIDATION" "channels=buzz is claude-only (agent '$name' is type $type)"
+  fi
+  # DIVE-7658: Teams is a Claude Code channel plugin for now (other harnesses later).
+  if [[ "$plugin" == "teams" && "$type" != "claude" ]]; then
+    fail "$E_VALIDATION" "channels=teams is claude-only for now (agent '$name' is type $type)"
   fi
   case "$type" in
     claude)      install_channel_plugin_for_agent "$plugin" "$name" "$allowed_users" "$token" ;;
