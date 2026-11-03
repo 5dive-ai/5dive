@@ -1,6 +1,153 @@
 # Changelog
 
-## Unreleased — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
+## v0.115.0 — fix(local): the office chat on a never-linked, offline box — serve, pair, uploads, offline agent create (DIVE-7566)
+
+The DIVE-7560 end-to-end proof ran a fully-local box behind a drop-all firewall. The no-traffic half held; the chat half needed workarounds. Fixed:
+
+- **A box never linked to 5dive.app starts its office chat.** `sudo 5dive local serve` mints the chat's own token (`/etc/5dive/local-chat/token.env`, root 0600) when there is no `connectord.env`; that file is never written, since other parts of 5dive read its presence as "linked". The agents' chat rail uses the minted token only for the office chat's loopback address, never api.5dive.com.
+- **`config local-only on` never says ON when the chat did not start.** It now ends with the plain reason and exits 1; the switch itself stays in force.
+- **`sudo 5dive local serve` no longer dies (rc 2) on first run**, before its config file exists.
+- **`sudo 5dive local pair` no longer dies (rc 141) every time.** The code was cut from `/dev/urandom` through a pipe that took SIGPIPE under pipefail.
+- **The agent can read a file sent from the chat.** The relay wrote it readable by the seat's own group, but the agent runs with `Group=claude` and is not in that group (EACCES). The seat now owns each upload; its folder is 0751 (no listing for other seats). This hit chat-only boxes too.
+- **`agent create --channels=dashboard` works offline.** On a local-only box the plugin catalog comes from the claude user's own checkout, else from the staged `/usr/local/lib/5dive/dashboard` (never another seat's copy); no GitHub, no npm.
+- **Docs:** the `--base-url` examples now pass `--provider=custom`; the key needs 10+ characters.
+
+Harness: `tests/local_chat_unit.sh` C1–C10, B11a–c (10 red on the pre-fix tree), `tests/local_only_unit.sh` CHAT ×2, `tests/dashboard_relay_unit.sh` 2 arms, new `tests/local_offline_create_unit.sh` (12; 8 red pre-fix, C1 control). The long poll and upload fetch are in 5dive-plugins (dashboard 0.5.25), same branch.
+
+## v0.115.0 — fix(chat): encrypted chat hardened after an outside review (#1526)
+
+- **Old device approvals cannot be replayed.** A device-list command names the list revision it was made against. Root checks and bumps that revision under one lock, and keeps its own record of applied commands, so an old approval is refused whichever agent it is handed to.
+- **Owner devices.** Only a device paired with the link, or approved at the server by its code, may let others in or take them off.
+- **A lost device list is retried** on every agent call and every minute's sync, along with the API's copy of the change. A device can ask for the current list.
+- **Each agent opens and seals only its own chat.** A message opens only for the agent it names, and a file only for the agent that opened its message. Root names the agent in every reply. Incoming files are readable only by their own agent.
+- **`sudo 5dive chat e2e disable`** is the one way to turn it off. Every device hears it under the server's key, and agents refuse to fall back to plain chat for any other reason.
+
+Release after the matching 5dive-frontend change is live: this root refuses messages from an older app.
+
+## v0.115.0 — feat(self-update): updates by disk — `sudo 5dive self-update --from=<file>` installs a signed release file from a USB stick with no network (DIVE-7577)
+
+A local-only box (an office where nothing may leave the building) could not take a new release at
+all: `self-update` downloads, so local-only refused it. It now takes one file,
+`5dive-offline-<version>.tar`, built and signed by the new `offline-update` workflow and attached to
+each GitHub release. It holds the release's CLI tree, the 5dive plugins with their `node_modules`
+(an offline plugin start without them dials the npm registry), the skills, and the bun binary.
+
+The file is trusted only by an ed25519 signature checked against the key pinned on the box
+(`/etc/5dive/update-pubkey.pem`, written by the installer from the key compiled into the CLI) —
+never a key carried in the file. Then every payload file's sha256 is checked against the signed
+manifest, the file's member list must match it exactly (no extra, missing, duplicate, link or
+special members), and a version not newer than the installed one is refused unless
+`--allow-downgrade`. Only then is it unpacked to a stage and handed to the same `install.sh
+--upgrade` the online update runs, with every source pointed at the stage and the steps that have
+no offline source (bun install, GitHub ancestry lookups, marketplace refreshes) skipped. Seats'
+plugin checkouts are replaced from the file and those agents restarted through the existing
+restart, busy-deferral and health-gate path.
+
+**Until the release signing key exists, the compiled key is empty and every box refuses every
+file** — the safe failure, on purpose. A repo admin generates it once (the workflow header has the
+three commands); until then the workflow builds the file unsigned and attaches nothing.
+
+## v0.115.0 — feat(local): the office control panel — manage agents, approvals, secrets and settings from the office network, no internet (DIVE-7576)
+
+The office chat (DIVE-7558) now serves `/panel` beside the chat page, on the same port, certificate and pairing. A local-only box no longer needs my.5dive.ai to be managed.
+
+- **Owner devices.** `sudo 5dive local pair --owner` mints a code for a device that may also manage the server; a plain `local pair` stays chat-only and gets 403 on every panel route. `local devices ls` shows the role; revoke works for both. Devices paired before this release are chat-only (the column is added in place).
+- **Four tabs:** Team (agents with state; add one on the box's own AI account, restart, remove), Approvals (waiting gates with their options, one tap to answer; open work), Secrets (add or replace a key every agent reads; write-only, names listed, values never shown), Settings (the `config local-only check` list, the local AI with a Test button, connected devices with remove). "Install update from file" appears once the CLI carries the offline update verb.
+- **One root entry.** The server stays the sandboxed `5dive-chat` user. Panel actions cross to root only through `/run/5dive-local-panel.sock` (root:5dive-chat 0660, socket-activated `5dive-local-panel@.service`) running `5dive local panel-exec`: a fixed verb table, a pattern per argument, a gate answer checked against the gate's own options, secret values on stdin only, and one audit line per call in `/var/log/5dive/local-panel.log`. A socket instead of a sudoers grant because the chat unit's `NoNewPrivileges`/`ProtectSystem=strict` would block sudo and keep a root child read-only.
+- **Gate evidence.** A gate answered from an owner device counts as a human answer: the panel's unit is the third accepted principal in `_gate_cgroup_human_capable`, beside the dashboard and a login session.
+
+## v0.115.0 — fix(local-only): the office chat works on a new agent, and nothing on the box asks the internet for npm or snap (DIVE-7574)
+
+The DIVE-7560 run 3 proof failed: a new agent on a local-only box never heard one office-chat message, and the box tried outside 340 times in 31 minutes.
+
+- **The office chat starts on a new agent.** Claude Code runs the chat plugin from the agent's own copy of the plugin catalog, which had no packages. That copy now gets the packages the box already holds, at `agent create` and for every existing agent when `local-only on` runs. An empty packages folder left by a failed start is refilled.
+- **No npm lookup at `agent create`.** Claude Code's plugin install runs a package install that looked up the npm registry even with every package present (60 s of the create). Local-only mode points that registry at the box itself.
+- **snapd stays quiet.** With no snap installed, `local-only on` turns snapd off (not even started at boot); with snaps, it puts snapd in its offline mode as well as holding refreshes. The daily disk sweep no longer runs `snap list` in local-only mode. `off` undoes both.
+- **The create self-check tells the truth about the chat.** It now fails when the chat plugin cannot start where Claude Code runs it, instead of printing PASS over a deaf agent.
+
+## v0.115.0 — fix(local-only): a fully-local box stops dialing out on agent create and at every agent start; local models reply (DIVE-7573)
+
+The DIVE-7560 run 2 proof counted 494 blocked outbound tries in 38 minutes on a local-only box, and `local-only check` said "NOT fully local".
+
+- **No GitHub lookup at `agent create`.** The org probe is skipped with local-only on, and the seat gets the current org name (it used to fall back to the old one offline).
+- **Claude Code stays quiet outside the unit too.** The plugin install at create, plugin registration and the mod probe now run with the local-only env, plus a new switch that stops Claude Code from trying to install its official plugin catalog at every start.
+- **No plugin catalog refresh at start.** A local-only seat's plugin catalogs are its own copies on the box (read in place, never fetched). `local-only on` rewrites existing agents, `off` puts them back, and `check` names an agent that still has an online one.
+- **Local models reply.** Tool search is off for every agent on a local-only box and for any agent on a custom AI server, so a small model sees the chat's reply tool. `local-only on` updates a box that turned the mode on before this.
+
+Harness: `tests/dive7573_local_quiet_unit.sh` (20 arms; 14 red on the pre-fix tree, the 6 green are online controls).
+
+## v0.115.0 — feat(account): your own AI on every harness, and `account test` (DIVE-7568)
+
+- `5dive account add <name> --provider=custom --base-url=<url> --model=<m> --harness=<h> [--api-key=-]`
+  saves your own AI server (Ollama, vLLM, LM Studio, an office GPU box) as an
+  account, for claude, codex, hermes, openclaw, pi or opencode. The key is
+  optional. Agents bound to the account get the server written into their own
+  harness config at every start, so moving the account moves them.
+- `5dive account test --base-url --model --harness [--api-key=-] --json` sends one
+  request that needs a tool call and answers `{ok, format, reason}`: the format
+  the server speaks (anthropic or openai, detected), and why it will not work
+  (`unreachable`, `bad_key`, `no_such_model`, `no_tools`, `wrong_format`).
+- `http://` to a private address (10.x, 172.16-31.x, 192.168.x, 127.x) is
+  accepted for a model server without local-only mode. A public `http://`
+  address is still refused.
+- What each harness needs: claude the Anthropic format, codex the OpenAI
+  Responses API (it refuses chat completions), the other four OpenAI chat
+  completions. `account test` says which one a server is missing.
+
+## v0.115.0 — feat(local): the office chat server — a local-only box serves its own chat page on the office network (DIVE-7558)
+
+A local-only box (DIVE-7557) had no chat page: the hosted app and api.5dive.com are outside the office. `sudo 5dive local serve` now runs one on the box itself, and `sudo 5dive config local-only on` starts it (`--no-chat` leaves it off; `off` stops it from the undo record).
+
+- **One bun process, two listeners.** Loopback answers the same endpoints the dashboard adapter's root rail calls on api.5dive.com (`/server/messages/pending` with long poll, `pending/ack`, `event`, `status`, `/server/selfhost/files`, `/server/selfhost/heard`) with the box-token bearer, so the agent side is unchanged. The office listener (self-signed TLS on the box's private address, port 8443) serves a mobile-first chat page: agent list, thread, files both ways, the live "working" line, question buttons, long poll while open.
+- **`/etc/5dive/api-base`** (root 0644, one URL) is the control-plane base the root rail (`_dashboard_relay`, chat) and the partner rail now read before `FIVE_API_BASE`; `serve` points it at the loopback listener. sudo resets the environment, so the root-owned file is the only redirect a standard seat cannot forge.
+- **Pairing.** `sudo 5dive local pair` prints a one-time code (15 minutes) and the certificate fingerprint; the device gets an HttpOnly cookie. `sudo 5dive local devices ls|revoke <id>`; `5dive local status`.
+- **Runs as `5dive-chat`, never root.** The box token, cert and key reach it as systemd credentials; the unit is sandboxed (`ProtectSystem=strict`, `NoNewPrivileges`).
+- **Gate notices and owner questions** go to the office chat (a "5dive" notices thread, or the asking agent's thread) while local-only is on, never to Telegram; a notice the chat refuses is a failed send, not a Telegram fallback.
+- **No end-to-end sealing in this mode:** `chat e2e enable` is refused while local-only is on, and the server refuses a sealed envelope (409).
+
+`tests/local_chat_unit.sh`: 52 arms — 19 bash (api-base file, the e2e refusal, the notice route with Telegram stubbed out, unit text) and 33 against the real server on bun over loopback (pairing, cross-site guard, pending/ack/long-poll shape, question + file round-trip, revoke).
+
+## v0.115.0 — feat(config): local-only mode — one switch, nothing leaves the office (DIVE-7557)
+
+`sudo 5dive config local-only on` turns a self-hosted box into one that makes no outside
+connection on its own, and refuses every command that would. It writes `/etc/5dive/local-only`
+(the one file the CLI, the plugins and the office chat server all read), then:
+
+- **refuses**, with one plain sentence, Telegram (every connect/pair/team-bot path), a2a,
+  partner hire, first-job, bug *sending* (the preview still works), self-update, `update
+  --check`, nightly opt-in, plugin/skill/pack installs and plugin marketplaces from the
+  internet (a folder on the box still works), `pkg install` (apt mirrors), hire links, the
+  market, Buzz, cloud and Google sign-in, and any agent/account model that is not on the office
+  network;
+- **allows** `--base-url=http://<private address>` (RFC 1918, ULA, `.lan`/`.local`/`.internal`)
+  while it is on — a GPU server elsewhere on the office LAN now works; off, the old
+  loopback-only rule is unchanged;
+- sets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and `DISABLE_AUTOUPDATER=1` for every seat
+  (a drop-in on `5dive-agent@.service`) and turns off codex's update check, analytics and
+  feedback (`/etc/codex/managed_config.toml`, only if the owner has none);
+- forces crew receipts off, skips default skills on create, skips the skills/plugins refresh;
+- turns off the OS's own calls: apt timers + unattended-upgrades, snap refresh (held),
+  motd-news, apport/whoopsie, ubuntu-advantage/landscape, fwupd refresh, and NTP (pointed at
+  `--ntp=<office server>`, else timesyncd off).
+
+`off` reverses exactly what `on` recorded in `/etc/5dive/local-only.undo` — a timer the owner
+had off before is never turned on. `check` prints one ok/LEAK line per item, then watches
+connections for 60 s (`--watch=<s>`) and exits 1 on any peer that is not loopback or LAN.
+
+`tests/local_only_unit.sh` (26 arms, ~2 s): every refusal with the switch on and off, the
+allowed office-network shapes, the URL classifier both ways, on/off/ntp against a mocked root
+with stubbed systemctl/snap, and `check` over a replayed `ss`, with two mutant arms.
+
+## v0.115.0 — fix(task): a gate that did not route says who it really waits on (DIVE-7552)
+
+When a gate was filed and no lead picked it up, the receipt always said it "sits on the PAIRED
+HUMAN", even on a box with no person linked and no chat connected, on the same line that said
+nobody was pinged. The receipt now asks the same recipient lookup the alert uses and names what
+it found: the person and why it is theirs, no one (with the `5dive human link` remedy), the box's
+chat as a legacy broadcast, or that the lookup did not run. `--json` adds `human_recipient` and
+`recipient_basis`. Harness: `tests/gate_row_state_routing_unit.sh` section F.
+
+## v0.115.0 — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
 
 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The nightly installs the
 release and then restarts every agent, so every box that took it **emptied itself, unattended**,
@@ -38,7 +185,7 @@ first agent it restarts:
 
 `self-update`'s JSON gains a `health_gate` object; every existing field keeps its meaning.
 
-## Unreleased — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
+## v0.115.0 — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
 
 `5dive team import <slug>` provisioned a **roster**, not a working company. Agents, roles and
 reporting lines came up with nothing recurring on the board, so an imported team sat idle
@@ -95,7 +242,7 @@ functional against a real sqlite task store with a stub CLI, not source greps; e
 (kill the reconcile, drop the title arm, fold loop errors into `errors`, move the pass above
 the creates, strip the template's loops, …) were each run alone and each went red.
 
-## Unreleased — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
+## v0.115.0 — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
 
 All four bundled team templates hard-set `defaults.type: claude`, so `5dive team import
 content-studio` could only ever produce Claude Code seats — even though `agent create` has
@@ -134,7 +281,7 @@ long accepted every harness in `TYPE_BIN` and per-agent `type:` was already read
 and `cmd_team` themselves, each with a no-flag negative control. The wiring arms are not decoration: a
 mutation that parses `--type` and never applies it survived every transform-level arm.
 
-## Unreleased — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
+## v0.115.0 — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
 
 DIVE-3885 shipped the right rule — *a checker that could not RUN is `unknown`, never `stale`,
 because a broken instrument must not accuse a true fact* — and encoded it as a list of EXIT CODES
@@ -165,7 +312,7 @@ cases that must be classified oppositely share an exit code. **Parseability is t
 - 3 new harness sections (74/74 green), including the **negative control that decides the design**:
   an rc=2 check that PARSES must stay `stale`.
 
-## Unreleased — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
+## v0.115.0 — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
 
 Item 3 of the memory-janitor plan is a `check:` whose exit code re-derives a fact, plus a pass that
 flips it stale. It looked buildable on the existing `--evidence=<kind>:<ref>`: `cmd:` *is* a check,
@@ -203,7 +350,7 @@ arm through the built binary — that arm is what caught the stale exit code bei
 "this is a bug in the CLI" by the `lib/output.sh` backstop, which would have buried the digest a
 nightly pass exists to produce.
 
-## Unreleased — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
+## v0.115.0 — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
 
 `agent info` printed **⚠ NOT TRANSACTING (quota-exhausted)** about a seat that was executing the very
 command that read the flag. Measured 2026-09-01 14:17Z on `ops`: the pane refusal it quoted said
@@ -232,7 +379,7 @@ Undated pane lines resolve to the NEAREST of yesterday/today/tomorrow at that ti
 at 23:55 is tomorrow and `11pm` read at 00:05 is yesterday. Residual, stated rather than hidden: a refusal
 still on screen more than ~12h later reads as the same time-of-day today.
 
-## Unreleased — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
+## v0.115.0 — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
 
 Two rails, each correct, that intersect on a seat which can satisfy neither:
 
@@ -266,7 +413,7 @@ STATUS proves the merge". Nothing read it.
 
 Not touched: only-the-verifier-closes stays exactly as it is.
 
-## Unreleased — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
+## v0.115.0 — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
 
 `task show` printed a row's gate at the TAIL of the record, below the body; `task ls` printed nothing at
 all. So the board could not answer the one question a fleet with a paired human is most often asked —
@@ -304,7 +451,7 @@ all. So the board could not answer the one question a fleet with a paired human 
   fleet-wide by DEFAULT since DIVE-3224, so the flag OSS-36 specified was never built and anyone reaching
   for it got `unknown flag: --fleet` — a hard error where the view they wanted was already on screen.
 
-## Unreleased — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
+## v0.115.0 — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
 
 On 2026-08-28 05:00Z the board read **31 open rows** and `5dive-ai/5dive` main had not moved in **~42h**
 (`5816e7a` / `v0.23.0`, since 2026-08-26 10:23Z). Of the 31: 30 `blocked`, exactly **1 `todo`**. A reader
@@ -345,7 +492,7 @@ Complements the heartbeat's `_hb_blocked_sweep` (DIVE-1355) rather than replacin
 a2a at most once per 24h and covers two of these four classes. A throttled push to one seat's inbox is a
 different job from an operator looking at a stalled board now.
 
-## Unreleased — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
+## v0.115.0 — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
 
 The **v0.23 headline capability**. The theme was ratified 2026-08-26 as "Liveness you cannot fake"
 (DIVE-3738); v0.23.0 shipped its substrate — courier-routed alarms (DIVE-3727) and the rung-4
@@ -390,7 +537,7 @@ both directions — the third state folded UP into `alive`, folded DOWN into `no
 freshness window removed — each asserted to have applied and to turn a *named* arm red while leaving
 the others green, so no arm's green is the fixture's doing.
 
-## Unreleased — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
+## v0.115.0 — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
 
 On 2026-08-26 the supervisor printed `ESCALATE <seat> (poller-dead: rung-4-needed)` for `marketing`,
 `main`, `dev` and `olivia`. The detection was correct, it fired on time — and **nothing served rung 4**,
@@ -446,7 +593,7 @@ out of sqlite), `poller_liveness_unit` (41), `supervisor_classify_unit` (37),
 case, the tick dispatch entry, the counter exclusion, the limiter and the retired remedy text each red
 exactly the arms that claim them.
 
-## Unreleased — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
+## v0.115.0 — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
 
 INST-4 made the *record* of an action idempotent (`lifecycle_events` has a UNIQUE index on
 `idem_key`). INST-5 bounded *who* may act and *what* they may act on. Neither could answer the
@@ -493,7 +640,7 @@ next (email / pay / publish) would have been double-send, double-pay, double-pub
   the double-claim refusal must go red), the inversion arm with its live control, and a realistic
   pre-INST-8 store fixture for the migration.
 
-## Unreleased — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
+## v0.115.0 — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
 
 `5dive memory consolidate` had produced atoms **once across the entire fleet** while
 `/var/log/5dive-heartbeat.log` reported `13 seat(s) distilled, 4 failed, 0 not due` every six hours
@@ -533,7 +680,7 @@ it is a liveness check wearing a productivity label; and **hand-written artifact
 are not evidence the pipeline ran** — a populated output directory reads exactly like a working
 extractor, and only the ledger tells them apart.
 
-## Unreleased — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
+## v0.115.0 — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
 
 A session window dies and everything it learned dies with it, because "compile before you close" is
 a HABIT and a habit is not a mechanism. The motivating case is on the record: the very
@@ -601,7 +748,7 @@ Tests: `tests/memory_consolidate_unit.sh`, 53 assertions, offline by constructio
 an injected seam). Four mutants — the live-session skip, the dry-run ledger guard, the ledger skip,
 and the errexit fix — each red exactly the arm meant to catch it.
 
-## Unreleased — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
+## v0.115.0 — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
 
 DIVE-3172 made the nightly restart conditional on the agent payload actually moving, which takes a
 CLI-only night to zero restarts. This is the belt for the nights the payload genuinely moves: those
@@ -640,7 +787,7 @@ concern - our nightly updates kills some active agents mid tasks"*).
   three sweeps of one marker — parked mid-task is NOT restarted and keeps its marker; the row closes
   and the SAME marker fires the bounce; the next sweep does not bounce it again.
 
-## Unreleased — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
+## v0.115.0 — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
 
 Since DIVE-1935 the mandatory auto-detect merge gate has said so when its repo scan cannot
 complete: it warns, writes a `task.merge-gate-unverified` row to the audit log, and lets the close
@@ -672,7 +819,7 @@ never read is a receipt, not a control.
 - **Exit status is the consumable signal** (1 when any stamped close still has an open PR), because
   a stamp with no consumer is the whole defect.
 
-## Unreleased — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
+## v0.115.0 — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
 
 `--apply` was already safe: it deletes only on a closed PR whose head SHA equals the branch's
 current SHA, and age never entered that path. **The digest above it was the problem.** Its
@@ -736,7 +883,7 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
   the invariant `branch-hygiene-report.sh` greps for when it runs this same script against
   `lodar/5dive-api` and `lodar/5dive-frontend`.
 
-## Unreleased — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
+## v0.115.0 — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
 
 The constitution validator and the authority reader accepted **disjoint** subsets of YAML, so the
 key was unsettable through any path: `council amend` threw `use inline arrays in constitution v0`
@@ -762,7 +909,7 @@ worked example — so the template failed the validator shipping beside it.
   *"no motion could have succeeded"*, not *"nobody convened one"* — an instrument that measured its
   own writer.
 
-## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
+## v0.115.0 — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
 
 lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
 delegated push himself and burns your token for approval?"* An approval gate whose ask is an
@@ -796,7 +943,7 @@ permanent gate record and digest line intact, and **no ping to anyone**.
 - **`5dive task pfr-autoclear [on|off|status]`**, default **on**, restores the lead ping with no
   release.
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.115.0 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -826,7 +973,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.115.0 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -850,7 +997,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.115.0 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -883,7 +1030,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.115.0 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -917,7 +1064,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.115.0 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -959,7 +1106,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.115.0 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -1023,7 +1170,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.115.0 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
