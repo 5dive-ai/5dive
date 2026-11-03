@@ -137,7 +137,11 @@ else
   bad_t "an absent pane did not read no-signal" "rc=$(pane_rc)"
 fi
 # _hb_agent_idle's fallback IS the probe: same pane, same rc.
+# DIVE-7626: and no dispatcher either (a pane seat, which `main` is) -- the same
+# pin Part B makes below. Unpinned, the dispatcher probe's own `sudo cat` would
+# eat the first scripted sample. Part C overrides it.
 _hb_agent_native_state() { return 1; }
+_agent_delivery_inbox() { return 1; }
 panes MID_TURN MID_TURN; _hb_agent_idle main 0; a_rc=$?
 panes DONE_QUOTING DONE_QUOTING; _hb_agent_idle main 0; b_rc=$?
 if [[ "$a_rc" == 1 && "$b_rc" == 0 ]]; then
