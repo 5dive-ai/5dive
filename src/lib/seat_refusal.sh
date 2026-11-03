@@ -25,7 +25,70 @@
 # seat_refusal); tests/selfhost_head_agent_unit.sh drives both on one fixture.
 
 # The text arm is for a Claude Code that does not tag `error` yet.
-SEAT_REFUSAL_TEXT_RE='credit balance is too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled'
+SEAT_REFUSAL_TEXT_RE='credit balance is too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled|eligibility check failed|not eligible for antigravity'
+
+# DIVE-7615 (live box arm, 2026-11-03, agy 1.4.12): a Google account that has not
+# passed Google's age check signs in fine (the token is real, every file check
+# reads ok), and then agy answers EVERY message with "Eligibility check failed:
+# Your current account is not eligible for Antigravity. To use Antigravity you
+# must be 18 years old or older...". agy keeps no transcript we read, so the one
+# place that says so is the seat's own screen, read for agy's refusal FRAME
+# (seat_pane_refusal / seat_agy_frame_seen); SEAT_AGY_PANE_RE is the loose words,
+# used only to turn a refusal already read into plain words. The words the owner sees are SEAT_AGY_INELIGIBLE_MSG, not
+# agy's, because "verify your age and log in again" does not say where.
+SEAT_AGY_PANE_RE='eligibility check failed|not eligible for antigravity'
+SEAT_AGY_INELIGIBLE_MSG="This Google account can't use Antigravity yet: Google needs to verify the account holder is 18+. Verify it at myaccount.google.com, or sign in with another account."
+
+# seat_refusal_plain <text> — the owner's words for a refusal text: agy's
+# eligibility refusal becomes SEAT_AGY_INELIGIBLE_MSG, anything else is printed
+# as it came.
+seat_refusal_plain() {
+  if grep -qiE "$SEAT_AGY_PANE_RE" <<<"$1"; then printf '%s\n' "$SEAT_AGY_INELIGIBLE_MSG"
+  else printf '%s\n' "$1"; fi
+}
+
+# _seat_pane <name> — the seat's visible screen (no scrollback: a restart, which
+# is what a new sign-in does, starts a clean one). Test seam: SEAT_PANE_DIR
+# holding <name>.pane.
+_seat_pane() {
+  local name="$1"
+  if [[ -n "${SEAT_PANE_DIR:-}" ]]; then cat "$SEAT_PANE_DIR/${name}.pane" 2>/dev/null; return; fi
+  sudo -n -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p 2>/dev/null
+}
+
+# seat_agy_frame_seen <pane-text> — rc 0 when the text holds agy's OWN refusal
+# frame: a column-0 "⚠  Eligibility Check" header, or its
+# "⎿  Eligibility check failed:" line. Loose words are never enough (a reply or
+# a question can quote them). Lines inside a 5dive message are skipped: from the
+# "5dive-msg" header to the question's own "</5dive-r:" marker (or the first
+# column-0 line, if that marker wrapped apart; agy indents a question's wrapped
+# lines), and a reply from its opening "<5dive-r:ID>" line to its closing one.
+# The text is a here-string: no writer process, nothing to SIGPIPE.
+# Same reading as seat_pane_refusal in src/cmd_agent.sh (python).
+seat_agy_frame_seen() {
+  awk '
+    /5dive-msg / { q = 1; r = 0; next }
+    q { if (index($0, "</5dive-r:")) { q = 0; next }
+        if ($0 ~ /^[^ \t]/) q = 0; else next }
+    r { if (index($0, "</5dive-r:")) r = 0; next }
+    /^[ \t]*<5dive-r:[0-9A-Za-z]+>[ \t]*$/ { r = 1; next }
+    /^⚠[ \t]+[Ee]ligibility [Cc]heck[ \t]*$/ || /^[ \t]*⎿[ \t]+[Ee]ligibility check failed:/ { seen = 1; exit }
+    END { exit !seen }
+  ' <<<"$1"
+}
+
+# seat_pane_refusal <name> — SEAT_AGY_INELIGIBLE_MSG, rc 0, when <name> is an
+# Antigravity seat whose screen shows agy's eligibility refusal frame
+# (seat_agy_frame_seen). Only Antigravity seats are read: on any other harness
+# the words are just text someone typed.
+seat_pane_refusal() {
+  local name="$1" pane
+  declare -F agent_type >/dev/null 2>&1 || return 1
+  [[ "$(agent_type "$name" 2>/dev/null)" == antigravity ]] || return 1
+  pane=$(_seat_pane "$name") || pane=""
+  [[ -n "$pane" ]] && seat_agy_frame_seen "$pane" || return 1
+  printf '%s\n' "$SEAT_AGY_INELIGIBLE_MSG"
+}
 
 # seat_started_epoch <name> — when the seat's unit last became active, 0 when
 # that cannot be read (0 counts every refusal: unknown is not "restarted since").
@@ -144,12 +207,17 @@ hermes_missing_sdk() {
 # including an unreadable transcript: no reading is not trouble, and this must
 # never turn a healthy seat red. Only turns at or after since count; a
 # cannot-send seat (DIVE-7373) is a fact about the box, not a turn, so it counts
-# whenever it is read.
+# whenever it is read, and so does an Antigravity seat's screen (DIVE-7615).
 seat_turn_trouble() {
   local name="$1" since="${2:-0}" raw out pkg
   [[ "$since" =~ ^[0-9]+$ ]] || since=0
   if pkg=$(hermes_missing_sdk "$name"); then
     printf "cannot-send\tHermes cannot send a message: the '%s' package its AI provider needs is not installed. Install it: %s\n" "$pkg" "$HERMES_SDK_FIX"
+    return 0
+  fi
+  # DIVE-7615: an Antigravity seat has no transcript here; its screen is the reading.
+  if pkg=$(seat_pane_refusal "$name"); then
+    printf 'refused\t%s\n' "$pkg"
     return 0
   fi
   raw=$(_seat_recent_records "$name") || return 1

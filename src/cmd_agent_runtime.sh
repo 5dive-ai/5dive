@@ -1905,6 +1905,34 @@ _agent_submit_unconfirmed_reason() {
   printf '%s\n' 'the composer still holds unsent text after two Enters — the payload was typed but the submit could not be verified (DIVE-4246; was the DIVE-147 paste-placeholder poll)'
 }
 
+# DIVE-7615: an unconfirmed submit on a seat whose AI account REFUSED the
+# question is not "the composer still holds unsent text". agy shows its
+# eligibility refusal under the question it DID send, and the changed screen is
+# what made the submit check doubt it; the old receipt sent the owner to look at
+# the composer of an agent that will never answer. Read the seat's refusal (its
+# transcript or, for agy, its screen: seat_account_refusal) a few times, because
+# the refusal renders a beat after the submit. Prints the refusal, rc 0;
+# rc 1 when there is none. Test seam: ASK_REFUSAL_TRIES (default 3, 1s apart).
+_ask_unconfirmed_refusal() { # <name> <msg-id>
+  local name="$1" r="" i tries="${ASK_REFUSAL_TRIES:-3}"
+  declare -F seat_account_refusal >/dev/null 2>&1 || return 1
+  for (( i = 1; i <= tries; i++ )); do
+    r=$(seat_account_refusal "$name" "$(seat_started_epoch "$name")" 2>/dev/null) || r=""
+    [[ -n "$r" ]] && { printf '%s\n' "$r"; return 0; }
+    (( i < tries )) && sleep 1
+  done
+  return 1
+}
+
+# The receipt for that case: the question reached the seat and its AI account
+# refused it. sent stays false (nothing will answer this call) and refused:true
+# is additive; reason is the refusal, in the owner's words.
+_agent_ask_refused() { # <name> <sender> <msg-id> <refusal>
+  ok "question to agent '$1' was refused by its AI account — ${4%.}." \
+     '{name:$n, sent:false, refused:true, from:$s, msg_id:$i, reason:$r}' \
+     --arg n "$1" --arg s "$2" --arg i "$3" --arg r "$4"
+}
+
 # `ask` has no successful reply to return when its initial submit cannot be
 # confirmed. Use the same non-fatal receipt as `send`: the payload may actually
 # have landed, but neither a caller nor a person should mistake that for proof.
@@ -2062,7 +2090,7 @@ sys.exit(1)
 # turns on the seat's own transcript reading (seat_turn_trouble); the pane
 # text arm covers a seat with no transcript. Lines carrying the question's own
 # marker are skipped, so a question ABOUT a login cannot trip it.
-ASK_PANE_REFUSAL_RE='credit balance (is )?too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled|billing_error|authentication_(error|failed)'
+ASK_PANE_REFUSAL_RE='credit balance (is )?too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled|billing_error|authentication_(error|failed)|eligibility check failed|not eligible for antigravity'
 # DIVE-7373: the seat could not open its model connection, so the question
 # never left the box (Hermes: "couldn't start the model connection: ... Your
 # message was not sent"). Not a refusal: the AI account was never asked.
@@ -2085,6 +2113,8 @@ _ask_timeout_diag() { # <msg-id> <pane-file> [scoped] [warned] [name]
       | grep -ioE "$ASK_PANE_NOSEND_RE" | head -1) || nosend=""
     [[ -n "$nosend" ]] || refusal=$(grep -vF -e "id=${mid}" -e "5dive-r:${mid}" "$f" 2>/dev/null \
       | grep -ioE "$ASK_PANE_REFUSAL_RE" | head -1) || refusal=""
+    # DIVE-7615: agy's age-check refusal, in the owner's words.
+    [[ -n "$refusal" ]] && declare -F seat_refusal_plain >/dev/null 2>&1 && refusal=$(seat_refusal_plain "$refusal")
   fi
   if [[ -n "$filtered" ]]; then
     printf '%s' " — the AI safety filter keeps REFUSING the seat's conversation (${filtered}): its login works, so this is not a credit or login problem. Restart the seat to start a new conversation: 5dive agent restart ${name}"
@@ -4092,7 +4122,12 @@ cmd_ask() {
         AUDIT_ARGS+=("queued=1")
         _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason" 1
       else
-        _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
+        local _refused
+        if _refused=$(_ask_unconfirmed_refusal "$name" "$msg_id"); then
+          _agent_ask_refused "$name" "$sender" "$msg_id" "$_refused"
+        else
+          _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
+        fi
       fi
       return 0
     fi
@@ -4140,7 +4175,12 @@ cmd_ask() {
     elif (( _rc != 0 )); then
       local _reason; _reason="$(_agent_submit_unconfirmed_reason "$name" "$_rc")" \
         || _reason="the payload was typed but the submit could not be verified"   # DIVE-6586
-      _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
+      local _refused
+      if _refused=$(_ask_unconfirmed_refusal "$name" "$msg_id"); then   # DIVE-7615
+        _agent_ask_refused "$name" "$sender" "$msg_id" "$_refused"
+      else
+        _agent_ask_unconfirmed "$name" "$sender" "$msg_id" "$_reason"
+      fi
       return 0
     fi
   fi

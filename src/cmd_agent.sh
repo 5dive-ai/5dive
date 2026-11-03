@@ -1095,7 +1095,61 @@ def startup_health(name):
 # (the last turn was refused by the account), "failing" (a run of turns that
 # stopped on an API error), "content-refused" (such a run whose last error is
 # the model's safety filter, DIVE-7527), or (None, None).
-SEAT_REFUSAL_TEXT_RE = re.compile(r"credit balance is too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled", re.I)
+SEAT_REFUSAL_TEXT_RE = re.compile(r"credit balance is too low|invalid api key|not logged in|please run /login|oauth token (has expired|revoked)|organization has been disabled|eligibility check failed|not eligible for antigravity", re.I)
+# DIVE-7615: an Antigravity seat whose Google account failed Google's age check.
+# agy keeps no transcript we read, so its screen is the reading. Same reading,
+# same words as src/lib/seat_refusal.sh (seat_pane_refusal).
+SEAT_AGY_INELIGIBLE_MSG = "This Google account can't use Antigravity yet: Google needs to verify the account holder is 18+. Verify it at myaccount.google.com, or sign in with another account."
+SEAT_PANE_DIR = os.environ.get("SEAT_PANE_DIR") or ""
+
+def seat_pane_refusal(name):
+    if SEAT_PANE_DIR:
+        try:
+            with open(os.path.join(SEAT_PANE_DIR, f"{name}.pane"), "r", encoding="utf-8", errors="replace") as fh:
+                pane = fh.read()
+        except OSError:
+            return None
+    else:
+        try:
+            cp = subprocess.run(["/usr/bin/sudo", "-n", "-u", f"agent-{name}", "tmux", "capture-pane", "-t", f"agent-{name}", "-p"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if cp.returncode != 0:
+            return None
+        pane = cp.stdout
+    return SEAT_AGY_INELIGIBLE_MSG if seat_agy_frame_seen(pane) else None
+
+# agy's OWN refusal frame, never loose words (a reply or a question can quote
+# them); lines inside a 5dive message are skipped. Same reading as
+# seat_agy_frame_seen in src/lib/seat_refusal.sh: keep the two in step.
+SEAT_AGY_FRAME_RE = re.compile(r"^\u26a0[ \t]+eligibility check[ \t]*$|^[ \t]*\u23bf[ \t]+eligibility check failed:", re.I)
+SEAT_AGY_REPLY_OPEN_RE = re.compile(r"^[ \t]*<5dive-r:[0-9A-Za-z]+>[ \t]*$")
+
+def seat_agy_frame_seen(pane):
+    q = r = False
+    for line in pane.splitlines():
+        if "5dive-msg " in line:
+            q, r = True, False
+            continue
+        if q:
+            if "</5dive-r:" in line:
+                q = False
+                continue
+            if line[:1] not in ("", " ", "\t"):
+                q = False
+            else:
+                continue
+        if r:
+            if "</5dive-r:" in line:
+                r = False
+            continue
+        if SEAT_AGY_REPLY_OPEN_RE.match(line):
+            r = True
+            continue
+        if SEAT_AGY_FRAME_RE.search(line):
+            return True
+    return False
 SEAT_PASSING_ERROR_RE = re.compile(r"overloaded|api error: 5[0-9][0-9]|internal server error|temporarily", re.I)
 # DIVE-7527: a run ending in the model's safety filter is a refused
 # conversation (a restart clears it), not a stuck login. See seat_refusal.sh.
@@ -1383,6 +1437,10 @@ for name, value in agents.items():
     asleep = value.get("heartbeat", {}).get("enabled", False) is not True if isinstance(value.get("heartbeat"), dict) else True
     auth_state, auth_exp, auth_refresh = auth_health(agent_type, profile)
     trouble, refusal = seat_refusal(name, unit_started_epoch(started.get(name, "")))
+    if agent_type == "antigravity" and not trouble:
+        agy = seat_pane_refusal(name)
+        if agy:
+            trouble, refusal = "refused", agy
     if agent_type == "hermes" and hermes_missing_sdk(name):
         trouble, refusal = "cannot-send", "Hermes cannot send a message: the 'anthropic' package its AI provider needs is not installed. Install it: sudo 5dive agent install hermes --upgrade"
     if trouble:
