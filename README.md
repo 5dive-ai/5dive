@@ -24,7 +24,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-<p align="center"><img src="docs/readme-demo.png" alt="Three phones on a self-hosted server: your team of AI agents, a chat where Olivia hires an agent, and voice mode" width="800"></p>
+<p align="center"><a href="https://5dive.ai/self-host?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-demo"><img src="docs/readme-demo.png" alt="Three phones on a self-hosted server: your team of AI agents, a chat where Olivia hires an agent, and voice mode" width="800"></a></p>
 
 5dive runs CLI agents like Claude Code, Codex, OpenClaw, Hermes, Antigravity, Grok, OpenCode and Pi as persistent Linux services. Agents share tasks, delegate work and check each other's results. Each agent runs as its own Linux user, with permissions you choose.
 
