@@ -51,6 +51,11 @@ _ou_refresh_checkout "$src" "$co2"; r=$?
 check 'N2f packages an earlier update committed leave the index; the files stay on disk' '(( r == 0 )) && [[ -z "$(g "$co2" ls-files | grep node_modules)" ]] && [[ -f "$co2/plugins/dashboard/node_modules/@m/sdk/index.js" ]]'
 
 # ── N3. the panel update keeps its install output ──────────────────────────
+# The subshell only RUNS the install (it sources the panel's code, which must
+# not leak into this shell); every check runs here, so PASS/FAIL never leave
+# this shell. A dead subshell leaves no install.log/status.json: N3a-c go red.
+# shellcheck disable=SC2034  # st is read inside the check strings
+d="$TMPD/root/var/lib/5dive/panel-update"; st="$d/status.json"
 (
   set +u
   . src/lib/error_codes.sh 2>/dev/null; . src/lib/output.sh 2>/dev/null
@@ -68,15 +73,13 @@ echo '{"ok":true,"data":null}'
 CLI
   chmod +x "$FIVE_PANEL_CLI"
   require_root() { :; }; _lp_audit() { :; }
-  d=$(_lp_update_dir); install -d "$d"; printf 'x' >"$d/update.tar"
+  [[ "$(_lp_update_dir)" == "$d" ]] || exit 1
+  install -d "$d"; printf 'x' >"$d/update.tar"
   _lp_update_run
-  st="$d/status.json"
-  check 'N3a the whole install output is kept (install.log, 0600)' '[[ "$(grep -c "" "$d/install.log")" == 9 && "$(stat -c %a "$d/install.log")" == 600 ]]'
-  check 'N3b the status the Update card reads carries the warning, not just the last 3 lines' 'jq -e ".state == \"done\" and (.log | contains(\"failed to stage\")) and (.log | contains(\"stage 1\"))" "$st"'
-  check 'N3c the install runs marked as the panel (so its refusals name no terminal flag)' 'jq -e ".log | contains(\"panel=1\")" "$st"'
-  printf 'PASS=%s FAIL=%s\n' "$PASS" "$FAIL" >"$TMPD/n3.counts"
-)
-eval "$(sed -n 's/^PASS=\([0-9]*\) FAIL=\([0-9]*\)$/PASS=\1; FAIL=\2/p' "$TMPD/n3.counts" 2>/dev/null)"
+) >/dev/null 2>&1
+check 'N3a the whole install output is kept (install.log, 0600)' '[[ "$(grep -c "" "$d/install.log")" == 9 && "$(stat -c %a "$d/install.log")" == 600 ]]'
+check 'N3b the status the Update card reads carries the warning, not just the last 3 lines' 'jq -e ".state == \"done\" and (.log | contains(\"failed to stage\")) and (.log | contains(\"stage 1\"))" "$st"'
+check 'N3c the install runs marked as the panel (so its refusals name no terminal flag)' 'jq -e ".log | contains(\"panel=1\")" "$st"'
 pg=src/cmd_local_chat_server.sh
 check 'N3e the Update card shows what the last install said, also after a reload' 'grep -q "What the last install said" "$pg" && grep -q "else if (u && u.state !== \"none\") updateDone(u)" "$pg"'
 check 'N3f the page promises no agent restart before the verdict (a refusal restarts nothing)' '! grep -q "Agents restart once" "$pg"'
