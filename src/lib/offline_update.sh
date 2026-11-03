@@ -360,7 +360,9 @@ cmd_usb_install() {
   [[ -n "$claude" && -z "$man" ]] && man="$(dirname "$claude")/manifest.json"
   local cli="${FIVE_USB_CLI:-/usr/local/bin/5dive}" home="${FIVE_USB_CLAUDE_HOME:-/home/claude}"
   local have=""
-  [[ -f "$cli" ]] && have="$(grep -m1 'readonly FIVE_VERSION=' "$cli" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')"
+  if [[ -f "$cli" ]]; then
+    have="$(grep -m1 'readonly FIVE_VERSION=' "$cli" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || have=""
+  fi
 
   local parent="${FIVE_USB_STAGE_PARENT:-/var/tmp}" stage
   install -d "$parent" 2>/dev/null || true

@@ -5,7 +5,7 @@
 # The file is built by the REAL builders (build-offline.sh, then build-usb.sh)
 # from throwaway trees and a throwaway signing key, and its REAL starter
 # (packaging/offline/usb-install.sh, as the builder fills it in) is run with
-# dpkg stubbed and the final 5dive call recorded. The verb the starter hands to,
+# apt-get stubbed and the final 5dive call recorded. The verb the starter hands to,
 # `5dive _usb_install`, runs from the SHIPPED src/lib/offline_update.sh against a
 # stand-in install.sh that records what it was given.
 #
@@ -27,7 +27,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; cd "$ROOT" || exit 1
 PASS=0; FAIL=0
 ok_t(){ PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t(){ FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
-finish(){ echo "$PASS passed, $FAIL failed"; (( FAIL == 0 )); exit $?; }
+finish(){ echo "$PASS passed, $FAIL failed"; exit $(( FAIL > 0 )); }   # fixture aborts
 for t in openssl jq dpkg-deb sha256sum; do
   command -v "$t" >/dev/null || { echo "SKIP: $t not installed"; exit 0; }
 done
@@ -101,11 +101,11 @@ cat > "$STUB/dpkg-query" <<EOF
 #!/bin/bash
 n="\${@: -1}"; [[ -e "$WORK/dpkgdb/\$n" ]] && printf 'install ok installed' || exit 1
 EOF
-cat > "$STUB/dpkg" <<EOF
+cat > "$STUB/apt-get" <<EOF
 #!/bin/bash
 echo "\$*" >> "$WORK/dpkg.calls"
-[[ "\$1" == -i ]] || exit 1; shift
-for d; do n="\$(dpkg-deb -f "\$d" Package)"; touch "$WORK/dpkgdb/\$n"; done
+[[ "\$1" == install ]] || exit 1
+for d; do [[ "\$d" == /*.deb ]] || continue; n="\$(dpkg-deb -f "\$d" Package)"; touch "$WORK/dpkgdb/\$n"; done
 EOF
 cat > "$STUB/fake-shell" <<EOF
 #!/bin/bash
@@ -125,9 +125,15 @@ start() { # <run-file> [args] — a copy of the starter with no root check and o
 # The test copy sits beside the real one, so "next to the file" is the same folder.
 start "$RUN" --ntp=$NTP >"$WORK/s.out" 2>&1; rc=$?
 calls="$(cat "$WORK/dpkg.calls" 2>/dev/null)"
-if (( rc == 0 )) && [[ "$calls" == "-i "*fivedive-fake-a* && "$calls" == *fivedive-fake-dep* && "$calls" != *fivedive-fake-have* ]]; then
+if (( rc == 0 )) && [[ "$calls" == "install "*fivedive-fake-a* && "$calls" == *fivedive-fake-dep* && "$calls" != *fivedive-fake-have* ]]; then
   ok_t "S1 only the packages this server lacks are installed from the file (one it has is left alone)"
 else bad_t "S1 packages" "rc=$rc calls=[$calls] $(tail -5 "$WORK/s.out")"; fi
+# apt orders the files (a bare dpkg -i does not honour Pre-Depends across them)
+# and sees ONLY them: no source list, its own empty lists, never a download.
+if [[ "$calls" == *" --no-download "* && "$calls" == *"Dir::Etc::SourceList=$WORK/5dive-usb."*"/apt/sources.list "* \
+      && "$calls" == *"Dir::Etc::SourceParts=$WORK/5dive-usb."*"/apt/sources.d "* && "$calls" == *"Dir::State::Lists=$WORK/5dive-usb."*"/apt/lists "* ]]; then
+  ok_t "S1b the packages go in through apt with no package source and no download"
+else bad_t "S1b apt offline flags" "calls=[$calls]"; fi
 args="$(cat "$WORK/cli.args" 2>/dev/null)"
 grep -qx '_usb_install' <<<"$args" && grep -qx 'bundle-ok' <<<"$args" && grep -qx 'from-ok' <<<"$args" && grep -qx -- "--ntp=$NTP" <<<"$args" \
   && ! grep -q -- '--claude=' <<<"$args" \
@@ -231,4 +237,5 @@ g "no package-mirror fetch from the file (packages missing → stop, no apt-get 
 g "Node.js (nvm) is skipped from the file" '^if offline_update; then$'
 g "bun's web installer is never run from the file" "^if ! sudo -u claude bash -lc 'command -v bun' >/dev/null 2>&1 && offline_update; then$"
 g "the certificate pre-warm is skipped from the file" '^offline_update \|\| 5dive secret _prewarm'
-finish
+echo "$PASS passed, $FAIL failed"
+exit $(( FAIL > 0 ))
