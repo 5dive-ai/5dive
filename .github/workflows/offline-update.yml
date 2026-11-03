@@ -24,7 +24,8 @@ name: offline-update
 # safe failure, chosen on purpose.
 #
 # Pull requests that touch this build and check a file signed with a throwaway
-# key against the CLI's own verifier, and publish nothing. Not a required check.
+# key against the CLI's own verifier, install the USB file (DIVE-7598) on a fresh
+# firewalled Ubuntu 24.04, and publish nothing. Not a required check.
 on:
   workflow_run:
     workflows: [release-cut]
@@ -158,12 +159,121 @@ jobs:
           if _ou_verify "$RUNNER_TEMP/bad.tar" "$st2" 0.0.0 0; then echo "::error::an altered file was accepted"; exit 1; fi
           echo "altered file refused: $_OU_WHY"
 
+      # ---- DIVE-7598: the USB file that installs a NEW server with no internet ----
+      # 5dive-usb-<version>.run = packaging/offline/usb-install.sh + the signed
+      # update file + the .deb files a fresh Ubuntu 24.04 may lack (install.sh's
+      # APT_PKGS and openssl, with their dependencies, as a clean ubuntu:24.04
+      # downloads them). Claude Code is NOT in it (its licence is "All rights
+      # reserved"); the owner adds Anthropic's own two files to the stick.
+      - name: USB file — system packages
+        if: env.SIGN_KEY != ''
+        id: usb
+        run: |
+          set -euo pipefail
+          bundle="$(tar -xOf "$OFFLINE_FILE" payload/cli.tar.gz | tar -xzO ./5dive)"
+          if ! grep -q '^cmd_usb_install()' <<<"$bundle"; then
+            echo "::warning::this tag's 5dive predates the USB install (DIVE-7598) — no USB file for it"
+            echo "build=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          pkgs="$(sed -n 's/^APT_PKGS="\(.*\)"$/\1/p' "$RUNNER_TEMP/tree/install.sh") openssl"
+          [[ "$pkgs" == *jq* ]] || { echo "::error::APT_PKGS not found in install.sh"; exit 1; }
+          install -d "$RUNNER_TEMP/debs"
+          docker run --rm -v "$RUNNER_TEMP/debs:/out" -e PKGS="$pkgs" ubuntu:24.04 bash -euo pipefail -c '
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --download-only --no-install-recommends $PKGS >/dev/null
+            cp /var/cache/apt/archives/*.deb /out/
+            cd /out && apt-get download $PKGS >/dev/null'   # the named ones even when the image has them
+          sudo chown -R "$(id -u)" "$RUNNER_TEMP/debs"
+          du -sh "$RUNNER_TEMP/debs"; ls "$RUNNER_TEMP/debs" | wc -l
+          { echo "build=true"; echo "pkgs=$pkgs"; } >> "$GITHUB_OUTPUT"
+
+      - name: USB file — build
+        if: steps.usb.outputs.build == 'true'
+        env:
+          PKGS: ${{ steps.usb.outputs.pkgs }}
+        run: |
+          set -euo pipefail
+          f="$(bash packaging/offline/build-usb.sh "$OFFLINE_FILE" "$RUNNER_TEMP/debs" "$PKGS" "$RUNNER_TEMP/usb")"
+          ls -la "$f"; cat "$f.sha256"
+          echo "USB_FILE=$f" >> "$GITHUB_ENV"
+
+      # The proof (arm 2): a fresh Ubuntu 24.04 system container, booted with
+      # systemd, holding only what a minimal server has (no jq, git, tmux,
+      # sqlite3, cron…). Every new packet that leaves it for anything but its
+      # own network is logged and dropped from BEFORE the install to the end,
+      # and the count must stay 0. Anthropic's Claude Code files sit on the
+      # "stick" beside the .run, as the guide says. Then local-only off: the
+      # office chat page must still answer (DIVE-7598 item 5).
+      - name: USB file — install on a fresh server with no internet
+        if: steps.usb.outputs.build == 'true'
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          stick="$RUNNER_TEMP/stick"; install -d "$stick"
+          cp "$USB_FILE" "$stick/"
+          v="$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest)"
+          curl -fsSL -o "$stick/manifest.json" "https://downloads.claude.ai/claude-code-releases/$v/manifest.json"
+          curl -fsSL -o "$stick/claude" "https://downloads.claude.ai/claude-code-releases/$v/linux-x64/claude"
+          printf '%s\n' 'FROM ubuntu:24.04' \
+            'RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends systemd systemd-sysv dbus iproute2 nftables sudo ca-certificates curl >/dev/null && apt-get clean' \
+            > "$RUNNER_TEMP/Dockerfile"
+          docker build -q -t usbbox "$RUNNER_TEMP" >/dev/null
+          docker run -d --name usbbox --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
+            -v "$stick:/media/usb:ro" usbbox /sbin/init >/dev/null
+          st=""
+          for i in $(seq 60); do st="$(docker exec usbbox systemctl is-system-running 2>/dev/null || true)"; [[ "$st" == running || "$st" == degraded ]] && break; sleep 2; done
+          echo "box: $st"
+          box() { docker exec usbbox bash -c "$1"; }
+          box 'for p in jq git tmux sqlite3 cron; do command -v $p >/dev/null && echo "box already has $p"; done; true'
+          net="$(box "ip -4 -o addr show eth0 | awk '{print \$4}'")"; echo "office network: $net"
+          printf '%s\n' 'table inet usb7598 {' '  counter dropped_out { }' '  chain output {' \
+            '    type filter hook output priority filter; policy accept;' \
+            '    oifname "lo" accept' "    ip daddr $net accept" '    ct state established,related accept' \
+            '    log prefix "USB7598-DROP " level warn flags skuid' '    counter name dropped_out' '    drop' '  }' '}' \
+            > "$RUNNER_TEMP/egress.nft"
+          docker cp "$RUNNER_TEMP/egress.nft" usbbox:/root/egress.nft
+          box 'nft -f /root/egress.nft && nft list table inet usb7598 | head -3'
+          if [[ "$EVENT" == pull_request ]]; then
+            # A PR's file is signed with a throwaway key: the box trusts it for
+            # this install, and install.sh must then pin 5dive's REAL key over it.
+            docker cp "$RUNNER_TEMP/offline-update.pub.pem" usbbox:/root/pr.pem
+            box 'install -d /etc/5dive && install -m 644 /root/pr.pem /etc/5dive/update-pubkey.pem'
+          fi
+          run="/media/usb/$(basename "$USB_FILE")"
+          fail=0
+          box "bash $run" > "$RUNNER_TEMP/usb-install.log" 2>&1 || { echo "::error::the USB install failed"; fail=1; }
+          tail -40 "$RUNNER_TEMP/usb-install.log"
+          drops() { box 'nft list counter inet usb7598 dropped_out' | grep -oE 'packets [0-9]+' | awk '{print $2}'; }
+          d="$(drops)"; echo "outside packets dropped during the install: $d"
+          [[ "$d" == 0 ]] || { echo "::error::the USB install tried to reach outside its network ($d packets)"; sudo dmesg | grep USB7598-DROP | tail -20 || true; fail=1; }
+          if box 'test -f /etc/5dive/local-only'; then echo "local-only: on"; else echo "::error::local-only is not on"; fail=1; fi
+          box '/usr/local/bin/5dive --version' || fail=1
+          box 'sudo -u claude -H /home/claude/.local/bin/claude --version' || { echo "::error::Claude Code did not install"; fail=1; }
+          want="$(sed -n "/^OFFLINE_UPDATE_PUBKEY_PEM='/,/'\$/p" src/lib/offline_update.sh | sed "s/^OFFLINE_UPDATE_PUBKEY_PEM='//; s/'\$//")"
+          if [[ "$(box 'cat /etc/5dive/update-pubkey.pem')" == "$want" ]]; then echo "update key pinned: 5dive's release key"
+          else echo "::error::the box does not pin 5dive's release key"; fail=1; fi
+          box '5dive config local-only check --watch=20' || { echo "::error::local-only check is not fully local"; fail=1; }
+          addr="${net%/*}"
+          page() { box "curl -sk -o /dev/null -w '%{http_code}' https://$addr:8443/" || true; }
+          echo "office chat page (on): $(page)"
+          box '5dive config local-only off' | tail -3 || true
+          sleep 2
+          c="$(page)"; echo "office chat page (after off): $c"
+          [[ "$c" =~ ^[234][0-9][0-9]$ ]] || { echo "::error::the office chat stopped answering after local-only off"; fail=1; }
+          d="$(drops)"; echo "outside packets dropped, whole run (off included): $d"
+          docker rm -f usbbox >/dev/null
+          exit $fail
+
       - name: Attach to the release
         if: steps.p.outputs.publish == 'true' && env.SIGN_KEY != ''
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.p.outputs.tag }}
-        run: gh release upload "$TAG" "$OFFLINE_FILE" --clobber
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" "$OFFLINE_FILE" --clobber
+          if [[ -n "${USB_FILE:-}" ]]; then gh release upload "$TAG" "$USB_FILE" "$USB_FILE.sha256" --clobber; fi
 
       - name: Forget the key
         if: always()

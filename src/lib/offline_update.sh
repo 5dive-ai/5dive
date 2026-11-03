@@ -271,3 +271,147 @@ _ou_write_pubkey() {
   rm -f "$f.tmp.$$"; warn "could not write the update key to $f"
   return 0
 }
+
+# -------- a NEW box from a USB stick: `5dive _usb_install` (DIVE-7598) --------
+#
+# A fresh Ubuntu 24.04 server with no internet becomes a local-only 5dive box
+# from one file, 5dive-usb-<version>.run (packaging/offline/build-usb.sh). That
+# file's starter (packaging/offline/usb-install.sh) puts in the system packages
+# from the stick, then runs THIS verb from the 5dive inside the update file:
+#
+#   1. the update file is checked exactly as `self-update --from=` checks it
+#      (_ou_verify, the key compiled into this CLI — the same key install.sh then
+#      pins on the box);
+#   2. the local-only switch file is written BEFORE anything is installed, so
+#      every refusal holds from the first second (fail closed);
+#   3. bun, then the SAME install.sh a `curl install.5dive.ai` runs — a fresh
+#      install, not --upgrade — with every source pointed at the file and
+#      FIVEDIVE_OFFLINE_UPDATE=1 (install.sh skips each step that has no source
+#      in it: Node.js, bun's web installer, package mirrors, the cert pre-warm);
+#   4. Claude Code, when the owner put Anthropic's own file on the stick (5dive
+#      may not hand it out: its licence is "All rights reserved"), placed where
+#      Anthropic's installer puts it, after its checksum matches Anthropic's
+#      manifest.json;
+#   5. `config local-only on` — the full switch, office chat included.
+#
+# Test seams: FIVE_USB_CLI (the installed CLI step 5 runs), FIVE_USB_CLAUDE_HOME
+# (the claude user's home), FIVE_USB_STAGE_PARENT, FIVE_USB_INSTALLER_SHELL.
+
+# _ou_claude_platform — Anthropic's platform name for this processor.
+_ou_claude_platform() {
+  case "${OFFLINE_UPDATE_ARCH:-$(uname -m)}" in
+    x86_64|amd64) printf 'linux-x64' ;;
+    aarch64|arm64) printf 'linux-arm64' ;;
+    *) return 1 ;;
+  esac
+}
+
+# _ou_place_claude <binary> <manifest.json> <home> — check Anthropic's file
+# against Anthropic's manifest, then lay it out as their installer does:
+# <home>/.local/share/claude/versions/<version> and <home>/.local/bin/claude
+# pointing at it. 1 = refused, _OU_WHY says why.
+_ou_place_claude() {
+  local bin="$1" man="$2" home="$3" plat ver want got owner
+  _OU_WHY=""
+  [[ -f "$bin" && -s "$bin" ]] || { _OU_WHY="no Claude Code file at $bin"; return 1; }
+  [[ -f "$man" ]] || { _OU_WHY="Claude Code's manifest.json is not next to it ($man) — download both files from Anthropic"; return 1; }
+  plat="$(_ou_claude_platform)" || { _OU_WHY="this processor ($(uname -m)) has no Claude Code build"; return 1; }
+  ver="$(jq -r '.version // empty' "$man" 2>/dev/null)" || ver=""
+  [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { _OU_WHY="$man is not Claude Code's manifest (no version in it)"; return 1; }
+  want="$(jq -r --arg p "$plat" '.platforms[$p].checksum // empty' "$man" 2>/dev/null)" || want=""
+  [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { _OU_WHY="Claude Code's manifest has no $plat build — download the $plat file"; return 1; }
+  got="$(_ou_sha256 "$bin")"
+  [[ "$got" == "$want" ]] || { _OU_WHY="the Claude Code file does not match Anthropic's checksum for $plat $ver (wrong file, or damaged)"; return 1; }
+  owner="$(stat -c '%u:%g' "$home" 2>/dev/null)" || owner=""
+  install -d "$home/.local/share/claude/versions" "$home/.local/bin" \
+    && install -m 755 "$bin" "$home/.local/share/claude/versions/$ver" \
+    && ln -sfn "$home/.local/share/claude/versions/$ver" "$home/.local/bin/claude" \
+    || { _OU_WHY="could not copy Claude Code into $home"; return 1; }
+  [[ -n "$owner" ]] && chown -h "$owner" "$home/.local" "$home/.local/share" "$home/.local/share/claude" \
+    "$home/.local/share/claude/versions" "$home/.local/share/claude/versions/$ver" "$home/.local/bin" "$home/.local/bin/claude" 2>/dev/null
+  _OU_CLAUDE_VERSION="$ver"
+  return 0
+}
+
+_ou_usb_usage() {
+  printf '%s\n' \
+    "usage: sudo bash 5dive-usb-<version>.run [--claude=<file>] [--ntp=<office time server>] [--no-chat]" \
+    "" \
+    "Installs 5dive on this server from the file alone, with no internet, and leaves it" \
+    "in local-only mode. --claude is Anthropic's Claude Code file (with its manifest.json" \
+    "beside it); a claude file next to the .run file is found by itself."
+}
+
+cmd_usb_install() {
+  local from="" claude="" man="" a
+  local -a lo=()
+  for a in "$@"; do
+    case "$a" in
+      --from=*)   from="${a#--from=}" ;;
+      --claude=*) claude="${a#--claude=}" ;;
+      --claude-manifest=*) man="${a#--claude-manifest=}" ;;
+      --ntp=*|--no-chat) lo+=("$a") ;;
+      -h|--help) _ou_usb_usage; return 0 ;;
+      *) fail "$E_USAGE" "unknown flag: $a ($(_ou_usb_usage | head -1))" ;;
+    esac
+  done
+  [[ -n "$from" ]] || fail "$E_USAGE" "--from=<5dive-offline-<version>.tar> is required"
+  require_root
+  [[ -n "$claude" && -z "$man" ]] && man="$(dirname "$claude")/manifest.json"
+  local cli="${FIVE_USB_CLI:-/usr/local/bin/5dive}" home="${FIVE_USB_CLAUDE_HOME:-/home/claude}"
+  local have=""
+  [[ -f "$cli" ]] && have="$(grep -m1 'readonly FIVE_VERSION=' "$cli" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')"
+
+  local parent="${FIVE_USB_STAGE_PARENT:-/var/tmp}" stage
+  install -d "$parent" 2>/dev/null || true
+  stage=$(mktemp -d "$parent/5dive-usb-stage.XXXXXX") || fail "$E_GENERIC" "could not create a staging folder in $parent"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$stage'" RETURN
+  step "Checking the 5dive file"
+  _ou_verify "$from" "$stage" "" 0 \
+    || { rm -rf "$stage"; fail "$E_VALIDATION" "install refused: $_OU_WHY. Nothing was installed."; }
+  if [[ "$have" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && version_lt "$_OU_VERSION" "$have"; then
+    rm -rf "$stage"; fail "$E_CONFLICT" "5dive $have is already installed here, newer than this file ($_OU_VERSION). Nothing was changed."
+  fi
+  step "Signature and every file check out — 5dive $_OU_VERSION"
+  # Claude Code is checked BEFORE anything is installed, so a wrong file stops
+  # the install with the box untouched.
+  if [[ -n "$claude" ]]; then
+    local cst; cst=$(mktemp -d "$stage/claude-check.XXXXXX")
+    _ou_place_claude "$claude" "$man" "$cst" || { rm -rf "$stage"; fail "$E_VALIDATION" "Claude Code refused: $_OU_WHY. Nothing was installed."; }
+    step "Claude Code $_OU_CLAUDE_VERSION checks out against Anthropic's manifest"
+  fi
+
+  # 2. the switch, first (the same file and words `config local-only on` writes).
+  local flag; flag="$(local_only_file)"
+  if [[ ! -e "$flag" ]]; then
+    install -d -m 755 "$(dirname "$flag")" \
+      && printf 'on since %s — turn off: sudo 5dive config local-only off\n' "$(date -u +%FT%TZ)" > "$flag" \
+      && chmod 0644 "$flag" || { rm -rf "$stage"; fail "$E_GENERIC" "could not write $flag"; }
+  fi
+
+  # 3. bun, then the installer.
+  _ou_install_bun "$stage"
+  local -a inst_env=(); mapfile -t inst_env < <(_ou_installer_env "$stage")
+  step "Installing 5dive $_OU_VERSION (no internet)"
+  env "${inst_env[@]}" "${FIVE_USB_INSTALLER_SHELL:-bash}" "$stage/cli/install.sh" \
+    || { rm -rf "$stage"; fail "$E_GENERIC" "the install did not finish (the error is above). Local-only mode is on; run the file again once it is fixed."; }
+
+  # 4. Claude Code.
+  if [[ -n "$claude" ]]; then
+    _ou_place_claude "$claude" "$man" "$home" || { rm -rf "$stage"; fail "$E_GENERIC" "Claude Code: $_OU_WHY"; }
+    step "Claude Code $_OU_CLAUDE_VERSION installed for $home"
+  fi
+  rm -rf "$stage"
+
+  # 5. the full switch.
+  step "Turning on local-only mode"
+  local lrc=0
+  "$cli" config local-only on "${lo[@]}" || lrc=$?
+  printf '\n%s\n' "5dive $_OU_VERSION is installed and local-only: nothing on this server connects outside your network."
+  [[ -n "$claude" ]] || printf '%s\n' "Claude Code is not installed: put Anthropic's Claude Code file and its manifest.json on the stick and run the file again (see the guide, \"No internet at all\")."
+  printf '%s\n' "Next: add an agent that uses your office AI server:" \
+    "  sudo 5dive agent create <name> --type=claude --base-url=http://<AI server on your network>:<port> --model=<model>" \
+    "Going online later (for a Claude subscription): sudo 5dive config local-only off"
+  return "$lrc"
+}

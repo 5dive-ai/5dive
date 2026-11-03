@@ -282,7 +282,12 @@ _lc_serve() { return 0; }
 ( FIVE_LOCAL_ONLY_CHAT=1 _lo_on ) >"$TMPD/chat.out" 2>&1; rc=$?
 [[ $rc == 0 ]] && grep -q 'Local-only mode is ON' "$TMPD/chat.out" && grep -qx 'local-chat' "$(_lo_undo)" \
   && ok_ "CHAT: the office chat started → ON, rc 0, recorded for off" || bad_ "CHAT started" "rc=$rc $(cat "$TMPD/chat.out")"
-( _lo_off ) >/dev/null 2>&1
+# DIVE-7598 (5): off keeps the office chat running (LAN-only), and says so.
+_lc_serve_stop() { echo STOPPED >>"$TMPD/chat.stops"; }
+rm -f "$TMPD/chat.stops"
+( _lo_off ) >"$TMPD/chat.off" 2>&1; rc=$?
+[[ $rc == 0 && ! -e "$TMPD/chat.stops" ]] && grep -q 'office chat is still on' "$TMPD/chat.off" && [[ ! -e "$FIVE_LOCAL_ONLY_FILE" ]] \
+  && ok_ "CHAT: off leaves the office chat running and says how to stop it" || bad_ "CHAT off" "rc=$rc stops=$(cat "$TMPD/chat.stops" 2>/dev/null) $(cat "$TMPD/chat.off")"
 unset -f _lc_serve _lc_serve_stop
 
 # ── NTP ──────────────────────────────────────────────────────────────────────

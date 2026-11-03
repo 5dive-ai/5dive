@@ -81,7 +81,7 @@ check 'A15 unit hands the token in as a credential' 'grep -qx "LoadCredential=to
 check 'A16 unit is sandboxed (NoNewPrivileges, ProtectSystem=strict)' 'grep -qx "NoNewPrivileges=yes" <<<"$unit" && grep -qx "ProtectSystem=strict" <<<"$unit"'
 check 'A17 build.sh bundles both modules' 'grep -qx "  src/cmd_local_chat.sh" build.sh && grep -qx "  src/cmd_local_chat_server.sh" build.sh'
 check 'A18 main dispatches `local`' 'grep -q "cmd_local \"\$@\"" src/main.sh'
-check 'A19 local-only on starts it and off stops it (undo record)' 'grep -q "_lo_record \"local-chat\"" src/cmd_local_only.sh && grep -q "local-chat) ( _lc_serve_stop )" src/cmd_local_only.sh'
+check 'A19 local-only on starts it; off KEEPS it running (DIVE-7598)' 'grep -q "_lo_record \"local-chat\"" src/cmd_local_only.sh && grep -q "local-chat) chat_kept=1" src/cmd_local_only.sh && ! grep -q "local-chat) ( _lc_serve_stop )" src/cmd_local_only.sh'
 
 # ── C. DIVE-7566: `local serve` as the CLI runs it (set -euo pipefail) ────────
 # The DIVE-7560 proof: a never-linked box could not start the chat (no

@@ -2112,7 +2112,11 @@ apt_need=0
 for p in $APT_PKGS; do
   dpkg -s "$p" >/dev/null 2>&1 || { apt_need=1; break; }
 done
-if (( apt_need )); then
+if (( apt_need )) && offline_update; then
+  # DIVE-7598: an install from the USB file never reaches a package mirror. Its
+  # starter (packaging/offline/usb-install.sh) puts these in from the stick first.
+  die "these packages are missing and this install has no internet: $(for p in $APT_PKGS; do dpkg -s "$p" >/dev/null 2>&1 || printf '%s ' "$p"; done)— the USB file installs them itself; run it again with: sudo bash 5dive-usb-<version>.run"
+elif (( apt_need )); then
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $APT_PKGS
   ok "$APT_PKGS"
@@ -2167,6 +2171,12 @@ LOCALBIN
 fi
 
 # nvm + node (needed for codex agent type)
+# DIVE-7598: not from the USB file. Node serves the codex and pi agent types
+# only; a Claude Code seat never runs it. A box that goes online later gets it
+# with its first `agent create --type=codex`.
+if offline_update; then
+  ok "Node.js skipped (installing from a file with no internet; only codex/pi agents need it)"
+else
 say "Installing nvm + Node.js"
 if [[ ! -f /home/claude/.nvm/nvm.sh ]]; then
   sudo -u claude bash -c 'curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | PROFILE=/dev/null bash'
@@ -2184,10 +2194,13 @@ NVM_INIT
 fi
 sudo -u claude bash -lc "nvm install $NODE_VERSION && nvm alias default $NODE_VERSION" 2>&1 | grep -E "Downloading|Now using|default" || true
 ok "Node.js $NODE_VERSION"
+fi
 
 # bun (needed for telegram plugin)
 say "Installing bun"
-if ! sudo -u claude bash -lc 'command -v bun' >/dev/null 2>&1; then
+if ! sudo -u claude bash -lc 'command -v bun' >/dev/null 2>&1 && offline_update; then
+  die "bun is missing and this install has no internet — the USB file puts it in itself; run it again with: sudo bash 5dive-usb-<version>.run"   # DIVE-7598
+elif ! sudo -u claude bash -lc 'command -v bun' >/dev/null 2>&1; then
   # DIVE-1263: install system-wide to /usr/local/bin (BUN_INSTALL=/usr/local),
   # matching ensure_bun_for_agent. The old default install dropped bun at
   # ~claude/.bun/bin/bun, which 5dive-agent-start's hardcode missed → pi/opencode
@@ -2298,7 +2311,7 @@ fi
 
 # DIVE-5372: same pre-warm as the --upgrade path — the secrets.<domain> route
 # and its certificate exist before the first secret gate needs a link.
-5dive secret _prewarm >/dev/null 2>&1 || true
+offline_update || 5dive secret _prewarm >/dev/null 2>&1 || true
 
 echo
 # DIVE-7333: one step, the wizard. It installs the agent's CLI, signs it in and
