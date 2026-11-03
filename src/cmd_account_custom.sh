@@ -160,7 +160,13 @@ cmd_account_add_custom() {
     systemctl restart "5dive-agent@${_agent}.service" >&2 2>&1 \
       || warn "restart of agent '$_agent' failed — check journalctl -u 5dive-agent@${_agent}"
   done < <(registry_read | jq -r --arg p "$name" '.agents | to_entries[] | select(.value.authProfile == $p) | [.key, ((.value.desiredState // "") | tostring)] | @tsv')
-  ok "account '$name' saved: ${harness} on ${url} (model ${model})${key:+, with a key}. New agent: sudo 5dive agent create <name> --type=${harness} --auth-profile=${name}" \
+  # DIVE-7659: the same call the office panel makes (cmd_local_panel.sh agent-add).
+  # agent create defaults to channels=none, so without --channels=dashboard the
+  # new agent has no chat at all, in the office chat or in 5dive.app. Only for a
+  # harness that has a web chat; pi and opencode take no chat channel.
+  local chat_flag=""
+  type_has_web_chat "$harness" && chat_flag=" --channels=dashboard"
+  ok "account '$name' saved: ${harness} on ${url} (model ${model})${key:+, with a key}. New agent: sudo 5dive agent create <name> --type=${harness} --auth-profile=${name}${chat_flag}" \
      '{name:$n, provider:"custom", harness:$h, baseUrl:$u, model:$m, hasKey:$k}' \
      --arg n "$name" --arg h "$harness" --arg u "$url" --arg m "$model" --argjson k "$([[ -n "$key" ]] && echo true || echo false)"
 }
