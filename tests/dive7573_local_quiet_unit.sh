@@ -14,6 +14,9 @@
 #   D4  T1-T5   tool search off for a custom-endpoint profile (never for a
 #               catalog vendor, never over the operator's own value) and in the
 #               local-only drop-in, which `on` rewrites on a box that has the old one
+#   DIVE-7624 Q5-Q9  a custom-endpoint profile (also via the Your-own-AI save)
+#               gets DISABLE_TELEMETRY + DISABLE_ERROR_REPORTING with local-only
+#               OFF; never a catalog vendor, never over the operator's own value
 #
 # Seams: curl/git/claude/systemctl are PATH stubs, sudo/chown/id are functions;
 # no root, no network, no real seat. Every path is under a temp dir; the custom
@@ -231,6 +234,38 @@ grep -q 'ANTHROPIC_BASE_URL' "$cap" && ! grep -q ENABLE_TOOL_SEARCH "$cap" \
   && ok_ "T4 an operator's own ENABLE_TOOL_SEARCH is never overwritten" || bad_ 'T4 operator value' "$(cat "$cap")"
 [[ "$(_lo_dropin_body | grep -c '^Environment=')" == 5 ]] \
   && ok_ 'T5 the drop-in body is the two env lists, one Environment= line each' || bad_ 'T5 body' "$(_lo_dropin_body)"
+
+
+# ── DIVE-7624: no usage stats or error reports from a custom-endpoint seat, ──
+# on ANY box (local-only off here). Q5-Q7 are red on the pre-fix tree.
+rm -f "$FIVE_LOCAL_ONLY_FILE"
+declare -A SEED=()
+profile_env_value() { printf '%s' "${SEED[$2]:-}"; return 0; }
+quiet_both() { grep -qx "$1 DISABLE_TELEMETRY=1" "$cap" && grep -qx "$1 DISABLE_ERROR_REPORTING=1" "$cap"; }
+: >"$cap"; ( _apply_byo_claude custom k office-llm qwen3:8b "$CUSTOM_URL" ) >/dev/null 2>&1
+quiet_both office-llm && ! grep -q DISABLE_AUTOUPDATER "$cap" && ! grep -q NONESSENTIAL "$cap" \
+  && ok_ 'Q5 a custom endpoint profile gets DISABLE_TELEMETRY=1 + DISABLE_ERROR_REPORTING=1, updates left on (local-only off)' \
+  || bad_ 'Q5 custom quiet' "$(cat "$cap")"
+: >"$cap"; ( _apply_byo_claude openrouter sk-or-x or-prof "" ) >/dev/null 2>&1
+grep -q 'ANTHROPIC_BASE_URL' "$cap" && ! grep -q 'DISABLE_TELEMETRY\|DISABLE_ERROR_REPORTING' "$cap" \
+  && ok_ 'Q6 a catalog vendor (openrouter) gets neither' || bad_ 'Q6 catalog quiet' "$(cat "$cap")"
+: >"$cap"; SEED[DISABLE_TELEMETRY]=0
+( _apply_byo_claude custom k office-llm qwen3:8b "$CUSTOM_URL" ) >/dev/null 2>&1
+! grep -q 'DISABLE_TELEMETRY' "$cap" && grep -qx 'office-llm DISABLE_ERROR_REPORTING=1' "$cap" \
+  && grep -qx 'office-llm ENABLE_TOOL_SEARCH=false' "$cap" \
+  && ok_ "Q7 an operator's own DISABLE_TELEMETRY survives; the unset vars are still written" \
+  || bad_ 'Q7 operator value' "$(cat "$cap")"
+SEED=()
+# The «Your own AI» tile's save (DIVE-7568/7569: `account add --provider=custom
+# --harness=claude`) reaches the same branch.
+source src/cmd_account_custom.sh
+ensure_profile_dir() { return 0; }
+: >"$cap"; ( custom_ai_save my-ai claude http://192.168.1.20:11434 qwen3:8b "" ) >/dev/null 2>&1
+quiet_both my-ai && grep -q '^my-ai ANTHROPIC_BASE_URL=http://192.168.1.20:11434' "$cap" \
+  && ok_ 'Q8 the Your-own-AI save (harness claude) writes both vars' || bad_ 'Q8 tile path' "$(cat "$cap")"
+: >"$cap"; ( custom_ai_save my-ai codex http://192.168.1.20:11434 qwen3:8b "" ) >/dev/null 2>&1
+! grep -q 'DISABLE_TELEMETRY' "$cap" && grep -q FIVEDIVE_CUSTOM_HARNESS=codex "$cap" \
+  && ok_ 'Q9 a non-Claude harness on the same save is untouched' || bad_ 'Q9 codex' "$(cat "$cap")"
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))

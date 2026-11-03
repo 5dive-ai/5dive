@@ -39,6 +39,12 @@ LOCAL_ONLY_CLAUDE_ENV=(CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUP
 # reply tool behind tool search, and a small model never calls the search: 0 of
 # 4 replies from qwen3:8b in the DIVE-7560 run, every one with this set.
 LOCAL_MODEL_SEAT_ENV=(ENABLE_TOOL_SEARCH=false)
+# DIVE-7624: a seat on a local/custom model sends its prompts only to that model,
+# so it sends Anthropic nothing else either: no usage stats, no error reports.
+# Written into every custom-endpoint profile (_apply_byo_claude), local-only or
+# not. Auto-update is NOT here: outside local-only mode updates stay on, and
+# local-only's own list already silences all of it (NONESSENTIAL_TRAFFIC).
+LOCAL_MODEL_QUIET_ENV=(DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1)
 
 # `local_only_claude_env` — one `VAR=VALUE` per line when local-only is on,
 # nothing when off. Callers: mapfile -t qe < <(local_only_claude_env); env "${qe[@]}" …

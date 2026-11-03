@@ -2066,11 +2066,15 @@ _apply_byo_claude() {
   printf '%s' "3000000" | profile_set_var "$profile" API_TIMEOUT_MS
   # DIVE-7573 (D4): a custom endpoint (no catalog row: self-hosted, Ollama, the
   # office model) gets tool search OFF. Claude Code hides the chat's reply tool
-  # behind it and a small model never searches, so it never replies. Written only
-  # when the profile has no value, so an operator's own setting survives.
-  if [[ -z "$(claude_baseurl_catalog_provider "$base_url")" && -z "$(profile_env_value "$profile" ENABLE_TOOL_SEARCH)" ]]; then
+  # behind it and a small model never searches, so it never replies.
+  # DIVE-7624: and no usage stats or error reports to Anthropic, local-only or
+  # not (LOCAL_MODEL_QUIET_ENV). Each var is written only when the profile has no
+  # value for it, so an operator's own setting survives.
+  if [[ -z "$(claude_baseurl_catalog_provider "$base_url")" ]]; then
     local _tse
-    for _tse in "${LOCAL_MODEL_SEAT_ENV[@]:-ENABLE_TOOL_SEARCH=false}"; do
+    for _tse in "${LOCAL_MODEL_SEAT_ENV[@]:-ENABLE_TOOL_SEARCH=false}" \
+                ${LOCAL_MODEL_QUIET_ENV[@]+"${LOCAL_MODEL_QUIET_ENV[@]}"}; do
+      [[ -z "$(profile_env_value "$profile" "${_tse%%=*}")" ]] || continue
       printf '%s' "${_tse#*=}" | profile_set_var "$profile" "${_tse%%=*}"
     done
   fi
