@@ -1034,7 +1034,7 @@ _agent_verb_dispatch() {
 }
 
 _account_verb_dispatch() {
-      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|default|usage|poll|add|rename|remove|login|set|set-model|set-active-provider|test"
+      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|default|usage|poll|add|rename|remove|login|set|set-model|set-active-provider|test|scan"
       local acctcmd="$1"; shift
       # `--help` after a subverb is a question about THAT verb, not an unknown
       # flag. Answered before the dispatch, through the same helper `task`
