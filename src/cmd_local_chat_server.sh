@@ -881,7 +881,8 @@ const views = {
       '<div class="card"><h3>Connected devices</h3><button class="btn" id="inv" style="margin:6px 0 4px">＋ Invite a person</button>' + d.devices.map((v) =>
         '<div class="item"><div class="grow"><b>' + esc(v.name) + (v.id === d.me ? " (this one)" : "") + '</b><span>' + (v.role === "owner" ? "Can manage" : "Chat only") + ' · last seen ' + esc(seen(v.last_seen)) + '</span></div><button class="btn red" data-rv="' + esc(v.id) + '">Remove</button></div>').join("") + '</div>' +
       (d.updateFromFile ? '<div class="card"><h3>Update</h3><p class="mute">This server runs 5dive ' + esc(d.version || "") + '. Got an update file from your IT team? Pick it and install.</p>' +
-        '<input type="file" id="uf" accept=".tar"><button class="btn" id="ub">Install update</button><p id="us" class="mute"></p></div>' : "");
+        '<input type="file" id="uf" accept=".tar"><button class="btn" id="ub">Install update</button><p id="us" class="mute"></p>' +
+        '<details id="ul" hidden><summary class="mute">What the last install said</summary><pre id="ulog" class="mute" style="white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px"></pre></details></div>' : "");
     app.onclick = async (e) => {
       const t = e.target.closest("button[data-test]"), r = e.target.closest("button[data-rv]");
       if (t) {
@@ -894,7 +895,7 @@ const views = {
       if (e.target.id === "ub") installUpdate();
       if (e.target.id === "inv") invite();
     };
-    if (d.updateFromFile) { try { const u = await api("/api/panel/update"); if (u && u.state === "running") watchUpdate(); } catch (er) {} }
+    if (d.updateFromFile) { try { const u = await api("/api/panel/update"); if (u && u.state === "running") watchUpdate(); else if (u && u.state !== "none") updateDone(u); } catch (er) {} }
   },
 };
 // DIVE-7599: invite a person. Their name, Chat or Manage, then the one-time
@@ -976,6 +977,13 @@ async function setup() {
 // ends. The install restarts the agents and this server, so a failed poll is
 // retried, not reported.
 function updateSay(t) { const e = $("#us"); if (e) e.textContent = t; }
+// DIVE-7603 (n3): the last install's verdict and what it printed, also after a reload.
+function updateLog(u) { const d = $("#ul"), p = $("#ulog"); if (!d || !p) return; p.textContent = (u && u.log) || ""; d.hidden = !(u && u.log); }
+function updateDone(u) {
+  updateLog(u);
+  if (u.state === "done") updateSay("✅ " + (u.message || "Updated."));
+  if (u.state === "failed") updateSay("⚠️ " + (u.message || "The update was not installed."));
+}
 function installUpdate() {
   const f = $("#uf") && $("#uf").files[0], b = $("#ub");
   if (!f) { toast("Pick the update file first."); return; }
@@ -995,15 +1003,16 @@ function installUpdate() {
 }
 async function watchUpdate() {
   const b = $("#ub"); if (b) b.disabled = true;
-  updateSay("Installing… this takes about a minute. Agents restart once.");
+  updateLog(null);
+  updateSay("Checking the file… if it is newer, it installs in about a minute.");
   const until = Date.now() + 15 * 60 * 1000;
   while (Date.now() < until) {
     await new Promise((r) => setTimeout(r, 3000));
     let u = null;
     try { const r = await fetch("/api/panel/update", { credentials: "same-origin" }); const j = await r.json(); if (r.ok) u = j.data; } catch (er) { continue; }
     if (!u || u.state === "running") continue;
-    if (u.state === "done") { updateSay("✅ " + (u.message || "Updated.")); toast(u.message || "Updated"); return; }
-    if (u.state === "failed") { updateSay("⚠️ " + (u.message || "The update was not installed.")); if (b) b.disabled = false; return; }
+    if (u.state === "done") { updateDone(u); toast(u.message || "Updated"); return; }
+    if (u.state === "failed") { updateDone(u); if (b) b.disabled = false; return; }
     return;
   }
   updateSay("Still not finished after 15 minutes. Reload this page to check.");

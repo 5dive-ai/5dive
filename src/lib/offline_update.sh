@@ -83,7 +83,7 @@ _ou_sha256() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
 # words. <stage> must be an empty directory the caller owns.
 _ou_verify() {
   local file="$1" stage="$2" installed="$3" allow_down="${4:-0}"
-  _OU_WHY="" _OU_VERSION=""
+  _OU_WHY="" _OU_VERSION="" _OU_NOT_NEWER=0
   [[ -f "$file" && -r "$file" ]] || { _OU_WHY="no readable file at $file"; return 1; }
   [[ -d "$stage" ]] || { _OU_WHY="internal: no stage directory"; return 1; }
   command -v openssl >/dev/null 2>&1 || { _OU_WHY="openssl is not installed, so the signature cannot be checked"; return 1; }
@@ -157,7 +157,10 @@ _ou_verify() {
   # 3. The version.
   if [[ "$allow_down" != 1 ]] && [[ "$installed" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     if [[ "$ver" == "$installed" ]] || version_lt "$ver" "$installed"; then
-      _OU_WHY="this file is version $ver and this box already runs $installed — nothing newer to install (--allow-downgrade to install it anyway)"
+      # DIVE-7603 (n5): no terminal flag here — the office panel shows this
+      # line to an owner with no terminal. `self-update` adds the flag itself.
+      _OU_WHY="this file is version $ver and this box already runs $installed — nothing newer to install"
+      _OU_NOT_NEWER=1
       return 1
     fi
   fi
@@ -223,6 +226,16 @@ _ou_refresh_checkout() {
   if [[ -d "$co/.git" ]]; then
     local u="${owner%%:*}" ver="${_OU_VERSION:-}" st
     local -a as=(); [[ -n "$u" && "$u" != "$(id -un)" ]] && as=(sudo -u "$u" -H)
+    # DIVE-7603 (n2): packages stay out of the checkout's history. A checkout
+    # built offline (git init, no .gitignore) took every plugin's node_modules
+    # into its first update commit: 41,682 files, +38 MB. The exclude is local
+    # (.git/info/exclude, never committed), and packages an earlier update
+    # committed leave the index. Seats get packages from the box, not from git.
+    if ! grep -qx 'node_modules/' "$co/.git/info/exclude" 2>/dev/null; then
+      "${as[@]}" mkdir -p "$co/.git/info" 2>/dev/null
+      printf 'node_modules/\n' | "${as[@]}" tee -a "$co/.git/info/exclude" >/dev/null 2>&1
+    fi
+    "${as[@]}" git -c safe.directory='*' -C "$co" rm -r -q --cached --ignore-unmatch -- ':(glob)**/node_modules/**' >/dev/null 2>&1
     if "${as[@]}" git -c safe.directory='*' -C "$co" add -A plugins .claude-plugin >/dev/null 2>&1 \
        && st=$("${as[@]}" git -c safe.directory='*' -C "$co" status --porcelain -- plugins .claude-plugin 2>/dev/null) \
        && [[ -z "$st" ]]; then

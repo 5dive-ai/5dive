@@ -1222,7 +1222,10 @@ cmd_self_update() {
     trap "rm -rf '$stage'" RETURN
     step "Checking the update file $from"
     _ou_verify "$from" "$stage" "$old_ver" "$allow_down" \
-      || { rm -rf "$stage"; fail "$E_VALIDATION" "update refused: $_OU_WHY. Nothing was changed; this box stays on $old_ver."; }
+      || { rm -rf "$stage"
+           # DIVE-7603 (n5): the downgrade flag is named on a terminal only, never in the office panel.
+           local hint=""; [[ "${_OU_NOT_NEWER:-0}" == 1 && "${FIVEDIVE_PANEL_UPDATE:-0}" != 1 ]] && hint=" (--allow-downgrade to install it anyway)"
+           fail "$E_VALIDATION" "update refused: $_OU_WHY$hint. Nothing was changed; this box stays on $old_ver."; }
     step "Signature and every file check out — version $_OU_VERSION"
     installer="$stage/cli/install.sh"
     mapfile -t inst_env < <(_ou_installer_env "$stage")
