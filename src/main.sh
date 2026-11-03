@@ -226,6 +226,8 @@ Agents:
                                                      # handle instead of numeric id.
   5dive agent <name> tui                             # attach to an interactive agent tmux session (dispatcher-only seats explain the alternative)
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
+  5dive agent logs <name> --screen                   # one frame of the agent's own window, with colours (root).
+                                                     # A capture, never an attach: the agent's size never changes.
   5dive agent peek <name> [--lines=N]                # a TEAMMATE's live pane (default 80 lines, max 500); works
                                                      # from a standard seat: a team you share, or one manages the other.
   5dive agent send <name> --message-file=<path>|--message-file=-|--message=<text>|<text...>

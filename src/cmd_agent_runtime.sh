@@ -223,6 +223,43 @@ _logs_lines_envelope() {   # <name> <source> <captured-text>
   fi
 }
 
+# DIVE-7652: one frame of the agent's OWN terminal window, with its colours, for
+# the app's "What it's doing" > Screen view (polled about once a second).
+#
+# CAPTURE, NEVER ATTACH. `5dive wall` attaches (`tmux attach -r`), and under
+# `window-size latest` every attached client RESIZES the agent's session: a phone
+# attaching through the in-app terminal would squeeze the live agent to ~45
+# columns while it works, and a writable attach is one stray key from a Ctrl-C
+# into the unit. `capture-pane` is no client at all: nothing to resize, no input
+# path. `-e` keeps the SGR colours; no `-S`, so it is exactly the visible grid
+# (on a TUI seat that is the screen, wiki
+# a-pane-capture-is-a-screenshot-on-a-tui-seat-and-a-transcript-on-a-plain-one).
+#
+# ROOT ONLY (require_root in cmd_logs): the screen of a working seat shows
+# whatever it is working on, so it is the owner's (and an admin seat's) view,
+# the same people who can read its journal. The exec tunnel runs as root.
+_logs_screen() {   # <name>
+  local n="$1" u="agent-$1" geo frame cols rows
+  geo=$(sudo -n -u "$u" tmux display-message -p -t "$u" '#{pane_width} #{pane_height}' 2>/dev/null) \
+    || fail "$E_NOT_RUNNING" "tmux session '$u' not found (is the agent running?)"
+  read -r cols rows <<<"$geo"
+  [[ "$cols" =~ ^[0-9]+$ && "$rows" =~ ^[0-9]+$ ]] \
+    || fail "$E_NOT_RUNNING" "tmux session '$u' did not report its size (is the agent running?)"
+  frame=$(sudo -n -u "$u" tmux capture-pane -p -e -t "$u" 2>/dev/null) \
+    || fail "$E_NOT_RUNNING" "tmux session '$u' not found (is the agent running?)"
+  if (( JSON_MODE )); then
+    if [[ -n "$frame" ]]; then
+      jq -Rn --arg n "$n" --argjson c "$cols" --argjson r "$rows" \
+        '{ok:true, data:{name:$n, source:"screen", cols:$c, rows:$r, lines:[inputs]}}' <<<"$frame"
+    else
+      jq -n --arg n "$n" --argjson c "$cols" --argjson r "$rows" \
+        '{ok:true, data:{name:$n, source:"screen", cols:$c, rows:$r, lines:[]}}'
+    fi
+  else
+    printf '%s\n' "$frame"
+  fi
+}
+
 # journalctl for the agent's unit, or a tmux scrollback capture with --tmux.
 # --follow streams until the caller hangs up; in the /agents/exec path the
 # shelld timeout caps this, so the dashboard should prefer the WS session for
@@ -230,24 +267,33 @@ _logs_lines_envelope() {   # <name> <source> <captured-text>
 #
 # JSON output:
 #   --tmux     -> {ok:true, data:{name, source:"tmux",    lines:[...]}}
+#   --screen   -> {ok:true, data:{name, source:"screen", cols, rows, lines:[...]}}
 #   default    -> {ok:true, data:{name, source:"journal", lines:[...]}}
 #   --follow   -> NDJSON, one {line:"..."} per event on stdout. (Not wrapped
 #                 in an envelope because it is an unbounded stream; consumers
 #                 watch exit code for the envelope-less failure signal.)
 cmd_logs() {
-  local name="" follow=0 lines=200 tmux_mode=0
+  local name="" follow=0 lines=200 tmux_mode=0 screen_mode=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --follow|-f) follow=1 ;;
       --lines=*)   lines="${1#--lines=}" ;;
       --tmux)      tmux_mode=1 ;;
+      --screen)    screen_mode=1 ;;
       -*)          fail "$E_USAGE" "unknown flag: $1" ;;
       *)           [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent logs <name> [--follow] [--lines=N] [--tmux]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent logs <name> [--follow] [--lines=N] [--tmux|--screen]"
   [[ "$lines" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "invalid --lines (must be a positive integer)"
+  if (( screen_mode )); then
+    (( follow || tmux_mode )) && fail "$E_USAGE" "--screen is one frame of the agent's window: it takes no --follow or --tmux (the app polls it)"
+    require_root
+    require_agent "$name"
+    _logs_screen "$name"
+    return 0
+  fi
   require_agent "$name"
 
   if (( tmux_mode )); then
