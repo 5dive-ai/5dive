@@ -529,7 +529,7 @@ docker run -d --name 5dive-demo --privileged 5dive
 docker exec -it 5dive-demo bash
 ```
 
-**Offline / air-gapped.** `install.sh` reads from `$REPO` (default GitHub raw). Override with `REPO=file:///path/to/local/tree` and pre-install apt deps. The fetched files are listed at the top of `install.sh`.
+**Offline / air-gapped.** A server with no internet at all installs from one file on a USB stick: see [No internet at all](#no-internet-at-all-install-from-a-usb-stick). (For a mirror of your own, `install.sh` also reads from `REPO=file:///path/to/local/tree`; the files it fetches are listed at the top of `install.sh`.)
 
 **Updating.** 5dive doesn't auto-update by default, you stay in control of when code changes land:
 ```sh
@@ -620,7 +620,51 @@ While it is on, agents must use a model server on your network
 links, updates and installs from the internet (plugins, marketplaces, skills, packs, `pkg
 install`) are refused with a one-line reason. A plugin marketplace from a folder on the box still
 works; an office apt mirror is used with plain `apt` as root. `sudo 5dive config local-only off`
-puts back exactly what it changed.
+puts back exactly what it changed, except the office chat: it keeps running, because it only
+answers on your office network (stop it with `sudo 5dive local serve --stop`).
+
+### No internet at all: install from a USB stick
+
+A new Ubuntu 24.04 server that has never been online becomes a local-only 5dive box from one file.
+
+On any computer with internet, put these on a USB stick:
+
+1. `5dive-usb-<version>.run` from the [release page](https://github.com/5dive-ai/5dive/releases)
+   (check it: `sha256sum -c 5dive-usb-<version>.run.sha256`).
+2. Claude Code, from Anthropic. 5dive is not allowed to hand it out, so download Anthropic's two
+   files and keep their names:
+
+   ```sh
+   v=$(curl -fsSL https://downloads.claude.ai/claude-code-releases/latest)
+   curl -fsSLO https://downloads.claude.ai/claude-code-releases/$v/manifest.json
+   curl -fsSLo claude https://downloads.claude.ai/claude-code-releases/$v/linux-x64/claude
+   ```
+
+On the server, with the stick plugged in:
+
+```sh
+sudo bash /media/usb/5dive-usb-<version>.run --ntp=192.168.1.1   # --ntp: your office time server (optional)
+```
+
+It puts in the system packages 5dive needs from the file, installs 5dive and Claude Code (after
+checking Claude Code against Anthropic's checksum), saves 5dive's update key on the box, and turns
+on local-only mode with the office chat. It never connects to anything. Then add an agent that uses
+your office AI server (`sudo 5dive agent create <name> --type=claude
+--base-url=http://<AI server>:<port> --model=<model>`).
+
+What the file holds, and what it leaves out:
+
+- About 200 MB: 5dive, its plugins with their packages, its skills, bun, and the system packages a
+  fresh server may lack (jq, sqlite3, tmux, git and the like). Only the ones the server does not
+  already have are installed.
+- Not Claude Code (licence above; about 120 MB to download, 330 MB on disk), and not Node.js or
+  the other agent programs: Codex (about 460 MB, plus Node.js), OpenCode (about 215 MB) and Pi
+  (about 11 MB, plus Node.js) install the normal way once the server is online.
+- The first install trusts the stick, like any installer: compare the checksum before you copy it.
+  Every update after that is checked against 5dive's key saved on the box.
+
+**Going online later**, for example to use a Claude subscription: `sudo 5dive config local-only off`,
+then sign in as on any box. The office chat stays on your office network.
 
 ### Updates by disk
 

@@ -1703,6 +1703,11 @@ main() {
       # DIVE-6781: hidden, read-only. install.sh prints the phone-app block
       # through this, so the installer and `init` share one copy of the words.
       cmd_app_hint ;;
+    _usb_install)
+      # DIVE-7598: hidden. Run by the USB file's starter, from the 5dive inside
+      # the update file, to install a new box with no internet.
+      AUDIT_CMD="_usb_install"; AUDIT_ARGS=("$@")
+      cmd_usb_install "$@" ;;
     _self_update_hint)
       # DIVE-6799: hidden, read-only. The last line install.sh prints: nightly
       # updates are off and recommended. Silent on a managed box or when on.

@@ -86,6 +86,20 @@ if ! bash "$B" "$WORK/rel-old" "$P" "$S" "$WORK/bun" "$WORK/out-old" "$WORK/key.
   grep -q 'predates updates from a file' "$WORK/e" && ok_t "builder: a tag whose install.sh predates the offline skips is refused" \
     || bad_t "builder refused an old tag for another reason" "$(cat "$WORK/e")"
 else bad_t "builder packaged a tag whose installer would dial out"; fi
+# A 5dive whose 5dive.sha256 no longer matches is refused at BUILD time: install.sh
+# would refuse it on the box (DIVE-7598 — CI rewrote the version, kept the hash).
+mk_release "$WORK/rel-sum" 2.0.0
+sha256sum "$WORK/rel-sum/5dive" | awk '{print $1}' > "$WORK/rel-sum/5dive.sha256"
+if bash "$B" "$WORK/rel-sum" "$P" "$S" "$WORK/bun" "$WORK/out-sum" "$WORK/key.pem" >/dev/null 2>"$WORK/e" \
+   && [[ "$(tar -xOf "$WORK/out-sum/5dive-offline-2.0.0.tar" payload/cli.tar.gz | tar -xzO ./5dive.sha256 | tr -d '[:space:]')" \
+         == "$(sha256sum "$WORK/rel-sum/5dive" | awk '{print $1}')" ]]; then
+  ok_t "builder: a matching 5dive.sha256 is packed beside 5dive"
+else bad_t "builder: matching 5dive.sha256 not packed" "$(cat "$WORK/e")"; fi
+sed -i 's/^readonly FIVE_VERSION="2.0.0"/readonly FIVE_VERSION="2.0.1"/' "$WORK/rel-sum/5dive"
+if ! bash "$B" "$WORK/rel-sum" "$P" "$S" "$WORK/bun" "$WORK/out-sum2" "$WORK/key.pem" >/dev/null 2>"$WORK/e"; then
+  grep -q '5dive.sha256 does not match' "$WORK/e" && ok_t "builder: a 5dive changed after hashing is refused (the box would refuse it)" \
+    || bad_t "builder refused a stale hash for another reason" "$(cat "$WORK/e")"
+else bad_t "builder packed a 5dive whose 5dive.sha256 no longer matches"; fi
 # A plugin without its packages is refused at BUILD time (DIVE-7559).
 rm -rf "$WORK/p-nodeps"; cp -a "$P" "$WORK/p-nodeps"; rm -rf "$WORK/p-nodeps/plugins/dashboard/node_modules"
 if ! bash "$B" "$WORK/rel2" "$WORK/p-nodeps" "$S" "$WORK/bun" "$WORK/out-x" "$WORK/key.pem" >/dev/null 2>"$WORK/e"; then

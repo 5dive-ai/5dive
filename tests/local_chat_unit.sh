@@ -79,9 +79,10 @@ unit=$(FIVEDIVE_CONNECTORD_ENV=/etc/5dive/connectord.env _lc_unit_text /usr/loca
 check 'A14 unit runs as the dedicated user, never root' 'grep -qx "User=5dive-chat" <<<"$unit"'
 check 'A15 unit hands the token in as a credential' 'grep -qx "LoadCredential=token:/etc/5dive/connectord.env" <<<"$unit"'
 check 'A16 unit is sandboxed (NoNewPrivileges, ProtectSystem=strict)' 'grep -qx "NoNewPrivileges=yes" <<<"$unit" && grep -qx "ProtectSystem=strict" <<<"$unit"'
+check 'A16b DIVE-7598: the unit also copies token, cert and key into its own 0700 runtime folder (credentials folder not visible in a container)' 'grep -qx "RuntimeDirectory=5dive-local-chat" <<<"$unit" && grep -qx "RuntimeDirectoryMode=0700" <<<"$unit" && [[ "$(grep -c "^ExecStartPre=-+/usr/bin/install -m 0400 -o 5dive-chat -g 5dive-chat .* %t/5dive-local-chat/\(token\|cert\|key\)$" <<<"$unit")" == 3 ]] && grep -qx "LoadCredential=key:/etc/5dive/local-chat/key.pem" <<<"$unit"'
 check 'A17 build.sh bundles both modules' 'grep -qx "  src/cmd_local_chat.sh" build.sh && grep -qx "  src/cmd_local_chat_server.sh" build.sh'
 check 'A18 main dispatches `local`' 'grep -q "cmd_local \"\$@\"" src/main.sh'
-check 'A19 local-only on starts it and off stops it (undo record)' 'grep -q "_lo_record \"local-chat\"" src/cmd_local_only.sh && grep -q "local-chat) ( _lc_serve_stop )" src/cmd_local_only.sh'
+check 'A19 local-only on starts it; off KEEPS it running (DIVE-7598)' 'grep -q "_lo_record \"local-chat\"" src/cmd_local_only.sh && grep -q "local-chat) chat_kept=1" src/cmd_local_only.sh && ! grep -q "local-chat) ( _lc_serve_stop )" src/cmd_local_only.sh'
 
 # ── C. DIVE-7566: `local serve` as the CLI runs it (set -euo pipefail) ────────
 # The DIVE-7560 proof: a never-linked box could not start the chat (no
@@ -224,6 +225,19 @@ check 'B31 devices-ls shows the paired device' '[[ "$("$BUN" "$TMPD/server.ts" a
 "$BUN" "$TMPD/server.ts" admin devices-revoke "$DEV" >/dev/null
 check 'B32 a revoked device gets 401' '[[ "$(code -b "$JAR" "$W/api/agents")" == 401 ]]'
 check 'B33 revoking twice says no such active device (rc 3)' '! "$BUN" "$TMPD/server.ts" admin devices-revoke "$DEV" >/dev/null'
+
+# DIVE-7598: CREDENTIALS_DIRECTORY set but absent (systemd in a container), the
+# files in RUNTIME_DIRECTORY: the server still serves TLS with the box token.
+RUND="$TMPD/run-lc"; mkdir -p "$RUND"
+cp "$TMPD/cert.pem" "$RUND/cert"; cp "$TMPD/key.pem" "$RUND/key"; cp "$TMPD/connectord.env" "$RUND/token"
+LAN2=$((LAN + 2)); LOOP2=$((LAN + 3))
+env -u LC_CERT -u LC_KEY -u LC_TOKEN_FILE LC_STATE="$TMPD/state2" LC_LAN_PORT=$LAN2 LC_LOOP_PORT=$LOOP2 \
+  CREDENTIALS_DIRECTORY="$TMPD/no-such-credentials" RUNTIME_DIRECTORY="$RUND" \
+  "$BUN" "$TMPD/server.ts" serve >"$TMPD/server2.log" 2>&1 & SRV2=$!
+for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$LOOP2/" && break; sleep 0.1; done
+check 'B40 no visible credentials folder: the server serves TLS from its runtime folder' '[[ "$(curl -sk "https://127.0.0.1:$LAN2/" | grep -c "Connect this device")" -ge 1 ]]'
+check 'B41 ... and reads the box token from there' '[[ "$(code -H "Authorization: Bearer boxtok-123" "http://127.0.0.1:$LOOP2/server/messages/pending?agent=alice")" != 401 && "$(code "http://127.0.0.1:$LOOP2/server/messages/pending?agent=alice")" == 401 ]]'
+kill "$SRV2" 2>/dev/null; wait "$SRV2" 2>/dev/null
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))

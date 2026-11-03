@@ -157,6 +157,27 @@ else
   bad_t "the reference resolver returns the published head sha" "rc=$rc out=$out"
 fi
 
+# 9b. DIVE-7598: on a local-only box the resolver never runs git against a
+#     network remote (the DNS lookup is an outside packet); file:// still works.
+_lo_saved=$(declare -f local_only_on 2>/dev/null || true)
+local_only_on() { return 0; }
+git() { [[ "${1:-}" == ls-remote ]] && echo "$*" >> "$TMP/git-dialed"; command git "$@"; }
+rm -f "$TMP/git-dialed"
+out=$(doctor_marketplace_reference_sha "https://github.com/5dive-ai/5dive-plugins.git" main); rc=$?
+if (( rc != 0 )) && [[ -z "$out" && ! -s "$TMP/git-dialed" ]]; then
+  ok_t "local-only: the resolver reads UNKNOWN without dialing the network remote"
+else
+  bad_t "local-only: the resolver dialed or answered" "rc=$rc out=$out dialed=$(cat "$TMP/git-dialed" 2>/dev/null)"
+fi
+out=$(doctor_marketplace_reference_sha "file://$UP" main); rc=$?
+if (( rc == 0 )) && [[ "$out" == "$NEW_SHA" ]]; then
+  ok_t "local-only: a file:// remote still resolves (it is on this box)"
+else
+  bad_t "local-only: a file:// remote still resolves" "rc=$rc out=$out"
+fi
+unset -f git local_only_on
+[[ -n "$_lo_saved" ]] && eval "$_lo_saved"
+
 # --- SEAT-OWNED CLONES ------------------------------------------------------
 # Every clone this check reads lives under ANOTHER uid's $HOME, and doctor runs
 # as root. Since CVE-2022-24765 git refuses a repository owned by another user,

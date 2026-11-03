@@ -247,7 +247,7 @@ _lo_off() {
   require_root
   local flag; flag="$(local_only_file)"
   local f; f=$(_lo_undo)
-  local kind rest
+  local kind rest chat_kept=0
   if [[ -f "$f" ]]; then
     # Reverse order: the last change is undone first.
     while IFS=' ' read -r kind rest; do
@@ -260,7 +260,11 @@ _lo_off() {
         motd-news) [[ -f "$(_lo_motd)" ]] && sed -i 's/^ENABLED=0/ENABLED=1/' "$(_lo_motd)" ;;
         nightly)   declare -F _su_nightly_on >/dev/null && { _su_nightly_on >/dev/null 2>&1 || warn "could not turn nightly self-update back on"; } ;;
         file)      rm -f -- "$rest" ;;
-        local-chat) ( _lc_serve_stop ) >/dev/null 2>&1 || warn "could not stop the office chat" ;;
+        # DIVE-7598 (5): the office chat stays ON. It listens on the office
+        # address only (_lc_lan_addr never picks a public one), so going online
+        # for a Claude subscription exposes nothing, and stopping it left the
+        # owner with no chat page. Stop it by hand: sudo 5dive local serve --stop
+        local-chat) chat_kept=1 ;;
         seat-marketplaces)
           local h; while IFS= read -r h; do seat_marketplaces_local "$h" off; done < <(_lo_seat_homes) ;;
       esac
@@ -272,6 +276,8 @@ _lo_off() {
   rm -f -- "$flag"
   printf '%s\n' "Local-only mode is OFF. Everything it turned off is back as it was." \
     "Restart your agents once so they pick it up: sudo systemctl restart '5dive-agent@*'"
+  (( chat_kept )) && printf '%s\n' "The office chat is still on, reachable from your network only. Stop it: sudo 5dive local serve --stop"
+  return 0
 }
 
 # One line per item: "ok    <item>  <state>" or "LEAK  <item>  <state>".

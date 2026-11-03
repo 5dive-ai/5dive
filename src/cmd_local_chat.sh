@@ -277,12 +277,17 @@ _lc_unit_text() {
     "User=$(_lc_user)" \
     "Group=$(_lc_user)" \
     "ExecStartPre=-+/usr/local/bin/5dive local _agents" \
+    "ExecStartPre=-+/usr/bin/install -m 0400 -o $(_lc_user) -g $(_lc_user) ${tokf} %t/5dive-local-chat/token" \
+    "ExecStartPre=-+/usr/bin/install -m 0400 -o $(_lc_user) -g $(_lc_user) $(_lc_etc)/cert.pem %t/5dive-local-chat/cert" \
+    "ExecStartPre=-+/usr/bin/install -m 0400 -o $(_lc_user) -g $(_lc_user) $(_lc_etc)/key.pem %t/5dive-local-chat/key" \
     "ExecStart=${bun} $(_lc_lib)/server.ts serve" \
     "Environment=LC_STATE=$(_lc_state) LC_LAN_ADDR=${addr} LC_LAN_PORT=${port} LC_LOOP_PORT=${loop}" \
     "Environment=LC_AGENTS_FILE=$(_lc_etc)/agents.json" \
     "LoadCredential=token:${tokf}" \
     "LoadCredential=cert:$(_lc_etc)/cert.pem" \
     "LoadCredential=key:$(_lc_etc)/key.pem" \
+    "RuntimeDirectory=5dive-local-chat" \
+    "RuntimeDirectoryMode=0700" \
     "StateDirectory=5dive-local-chat" \
     "StateDirectoryMode=0700" \
     "NoNewPrivileges=yes" \

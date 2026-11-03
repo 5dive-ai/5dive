@@ -455,7 +455,8 @@ mv "$TMP/prov.off2" "$SECRET_DROP_PROVISIONING"
 [[ $rc -eq 0 ]] && cmp -s "$SECRET_DROP_CADDYFILE" "$TMP/cf.nodomain" \
   && ok_t "L11h _prewarm on a box with no FIVE_DOMAIN: rc 0, Caddyfile untouched" \
   || bad_t "L11h _prewarm on a box with no FIVE_DOMAIN: rc 0, Caddyfile untouched" "rc=$rc"
-n=$(grep -c '5dive" secret _prewarm >/dev/null 2>&1 || true\|^5dive secret _prewarm >/dev/null 2>&1 || true' install.sh)
+# DIVE-7598: the fresh path skips it from the USB file (no internet), like --upgrade from a file.
+n=$(grep -c '5dive" secret _prewarm >/dev/null 2>&1 || true\|^offline_update || 5dive secret _prewarm >/dev/null 2>&1 || true' install.sh)
 [[ "$n" == 2 ]] \
   && ok_t "L11i install.sh pre-warms on both the fresh-install and the --upgrade path, best-effort" \
   || bad_t "L11i install.sh pre-warms on both the fresh-install and the --upgrade path, best-effort" "matches=$n"
