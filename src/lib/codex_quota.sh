@@ -43,14 +43,25 @@
 # for "this profile is near its wall" (HEADROOM_MAX_PCT, cmd_account.sh).
 CODEX_QUOTA_NEAR_PCT="${CODEX_QUOTA_NEAR_PCT:-90}"
 
-# codex_quota_rollout <home> — the seat's newest rollout file, or nothing.
+# codex_quota_rollout <home> [n] — the seat's newest rollout file (or its n
+# newest, newest first), or nothing.
 codex_quota_rollout() {
-  local home="${1:-}" root
+  local home="${1:-}" n="${2:-1}" root
+  [[ "$n" =~ ^[1-9][0-9]?$ ]] || n=1
   root="${home}/.codex/sessions"
   [[ -n "$home" && -d "$root" ]] || return 0
   { find "$root" -type f -name 'rollout-*.jsonl' -printf '%T@ %p\n' 2>/dev/null || true; } \
-    | sort -rn | head -1 | cut -d' ' -f2-
+    | sort -rn | head -n "$n" | cut -d' ' -f2-
 }
+
+# DIVE-7626 — how many OLDER rollouts the reader may search for the last
+# rate-limit reading when the newest one has none. Measured on leo 2026-11-03:
+# the heartbeat woke the seat with fresh=true, the dispatcher opened a NEW
+# rollout, and its first and only turn was refused. That file holds the refusal
+# and the empty `premium` record, nothing else, so the reset time was "unknown",
+# the park fell to the rolling 6h cap, and the seat sat dead 2h24m past a reset
+# the PREVIOUS rollout had recorded to the second (13:25:13Z).
+CODEX_QUOTA_OLDER_ROLLOUTS="${CODEX_QUOTA_OLDER_ROLLOUTS:-3}"
 
 # codex_quota_read <home> — one compact JSON measurement, or nothing when the
 # seat has no rollout. Shape:
@@ -59,17 +70,28 @@ codex_quota_rollout() {
 #                      primary:   null | {usedPct, windowMin, resetsAt},
 #                      secondary: null | {usedPct, windowMin, resetsAt},
 #                      credits:   null | {hasCredits, unlimited, balance}},
-#    lastTurn: null | {at, error}}          # error: codex_error_info or null
+#    lastTurn: null | {at, error, retryAt}}  # error: codex_error_info or null
 # The file is read BACKWARDS and the scan stops once both records are found, so
 # a 40MB rollout costs one tail read, not a full parse, on every supervisor tick.
+#
+# DIVE-7626, two fallbacks for a refused turn whose rollout carries no reading:
+#   * snapshot.olderFile — the reading came from an OLDER rollout (at most
+#     CODEX_QUOTA_OLDER_ROLLOUTS of them). Only searched when the newest turn
+#     was refused, so a healthy seat reads exactly as before.
+#   * lastTurn.retryAt — the epoch the refusal's own prose names ("try again at
+#     1:25 PM", or the dated "try again at Nov 4th, 2026 1:25 PM"), resolved in
+#     the host's zone FORWARD from the refused turn, as codex renders it.
 codex_quota_read() {
   local home="${1:-}" file
-  file=$(codex_quota_rollout "$home")
+  local -a files=()
+  mapfile -t files < <(codex_quota_rollout "$home" "$(( 1 + ${CODEX_QUOTA_OLDER_ROLLOUTS:-3} ))")
+  file="${files[0]:-}"
   [[ -n "$file" && -r "$file" ]] || return 0
-  CQ_FILE="$file" python3 - <<'PY' 2>/dev/null || true
-import os, json, datetime as dt
+  CQ_FILE="$file" CQ_OLDER="$(printf '%s\n' "${files[@]:1}")" python3 - <<'PY' 2>/dev/null || true
+import os, re, json, datetime as dt
 
 path = os.environ["CQ_FILE"]
+older = [p for p in os.environ.get("CQ_OLDER", "").split("\n") if p]
 
 def to_epoch(s):
     try:
@@ -111,37 +133,104 @@ def window(w, at):
             "windowMin": w.get("window_minutes"),
             "resetsAt": int(reset) if reset is not None else None}
 
-snap = turn = None
-with open(path, "rb") as f:
-    for raw in lines_backwards(f):
-        if snap is not None and turn is not None:
-            break
-        if b'"token_count"' not in raw and b'"task_complete"' not in raw:
-            continue
+MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+RETRY_RE = re.compile(
+    r"try again at\s+(?:([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(?:(\d{4}),?\s+)?)?"
+    r"(\d{1,2}):(\d{2})\s*([AaPp])\.?[Mm]")
+
+def retry_at(msg, at):
+    """The reset the refusal prints, as an epoch after `at`, or None."""
+    m = RETRY_RE.search(msg or "") if isinstance(msg, str) else None
+    if not m or at is None:
+        return None
+    mon, day, year, hh, mm, ap = m.groups()
+    hh, mm = int(hh), int(mm)
+    if not (1 <= hh <= 12 and mm <= 59):
+        return None
+    if ap.lower() == "a":
+        hh = 0 if hh == 12 else hh
+    else:
+        hh = hh if hh == 12 else hh + 12
+    base = dt.datetime.fromtimestamp(at)          # naive, host zone (codex's Local)
+    try:
+        if mon:
+            mi = MONTHS.get(mon.lower())
+            if not mi:
+                return None
+            y = int(year) if year else base.year
+            e = int(dt.datetime(y, mi, int(day), hh, mm).timestamp())
+            if not year and e < at - 86400:
+                e = int(dt.datetime(y + 1, mi, int(day), hh, mm).timestamp())
+        else:
+            e = int(base.replace(hour=hh, minute=mm, second=0, microsecond=0).timestamp())
+            # The printed minute can be the refusal's own minute (reset 13:25:13,
+            # refused 13:25:05, printed "1:25 PM"): that is today, not tomorrow.
+            if e + 60 <= at:
+                e += 86400
+    except Exception:
+        return None
+    # Codex prints the reset to the minute and drops the seconds, so the real
+    # reset lies inside that minute: answer its END, never a moment before it.
+    e += 60
+    # No codex window is longer than 7 days: a later date is not this wall's.
+    if e <= at or e - at > 8 * 86400:
+        return None
+    return e
+
+def reading(p, at):
+    rl = p.get("rate_limits") or {}
+    # The refused turn's own record is `premium` with both windows null
+    # — see the header. It is not a reading; keep looking.
+    if not (rl.get("primary") or rl.get("secondary")):
+        return None
+    c = rl.get("credits")
+    return {"at": at, "limitId": rl.get("limit_id"), "planType": rl.get("plan_type"),
+            "reachedType": rl.get("rate_limit_reached_type"),
+            "primary": window(rl.get("primary"), at),
+            "secondary": window(rl.get("secondary"), at),
+            "credits": ({"hasCredits": c.get("has_credits"), "unlimited": c.get("unlimited"),
+                         "balance": c.get("balance")} if isinstance(c, dict) else None)}
+
+def scan(fpath, want_turn):
+    snap = turn = None
+    with open(fpath, "rb") as f:
+        for raw in lines_backwards(f):
+            if snap is not None and (turn is not None or not want_turn):
+                break
+            if b'"token_count"' not in raw and b'"task_complete"' not in raw:
+                continue
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            p = o.get("payload") or {}
+            at = to_epoch(o.get("timestamp"))
+            if o.get("type") != "event_msg" or at is None:
+                continue
+            if p.get("type") == "task_complete" and turn is None and want_turn:
+                err = p.get("error") or {}
+                code = err.get("codex_error_info") if isinstance(err, dict) else None
+                turn = {"at": at, "error": code}
+                if code:
+                    r = retry_at(err.get("message"), at)
+                    if r is not None:
+                        turn["retryAt"] = r
+            elif p.get("type") == "token_count" and snap is None:
+                snap = reading(p, at)
+    return snap, turn
+
+snap, turn = scan(path, True)
+if snap is None and turn is not None and turn.get("error") == "usage_limit_exceeded":
+    for op in older:
         try:
-            o = json.loads(raw)
+            s2, _ = scan(op, False)
         except Exception:
             continue
-        p = o.get("payload") or {}
-        at = to_epoch(o.get("timestamp"))
-        if o.get("type") != "event_msg" or at is None:
-            continue
-        if p.get("type") == "task_complete" and turn is None:
-            err = p.get("error") or {}
-            turn = {"at": at, "error": err.get("codex_error_info") if isinstance(err, dict) else None}
-        elif p.get("type") == "token_count" and snap is None:
-            rl = p.get("rate_limits") or {}
-            # The refused turn's own record is `premium` with both windows null
-            # — see the header. It is not a reading; keep looking.
-            if not (rl.get("primary") or rl.get("secondary")):
-                continue
-            c = rl.get("credits")
-            snap = {"at": at, "limitId": rl.get("limit_id"), "planType": rl.get("plan_type"),
-                    "reachedType": rl.get("rate_limit_reached_type"),
-                    "primary": window(rl.get("primary"), at),
-                    "secondary": window(rl.get("secondary"), at),
-                    "credits": ({"hasCredits": c.get("has_credits"), "unlimited": c.get("unlimited"),
-                                 "balance": c.get("balance")} if isinstance(c, dict) else None)}
+        if s2 is not None:
+            s2["olderFile"] = op
+            snap = s2
+            break
 
 print(json.dumps({"source": "codex-rollout", "file": path, "snapshot": snap, "lastTurn": turn},
                  separators=(",", ":")))
@@ -188,13 +277,21 @@ codex_quota_state() {
     | if ($t.error // "") == "usage_limit_exceeded" then
         ($ws | sort_by(.usedPct, (.resetsAt // 0)) | last) as $hit
         | (if $hit != null and $hit.resetsAt != null and $hit.resetsAt > $t.at
-           then $hit.resetsAt else null end) as $d
+           then $hit.resetsAt else null end) as $hd
+        # DIVE-7626: the time the refusal itself printed. A reading from the SAME
+        # rollout still wins (98 of 98 walls printed exactly its resets_at); one
+        # borrowed from an OLDER rollout wins only when the print agrees with it.
+        | ($t.retryAt // null) as $ra
+        | (if $hd != null and ($s.olderFile == null or $ra == null
+                               or ((($hd - $ra) | fabs) <= 120))
+           then $hd else $ra end) as $d
+        | ($hit.name // "usage") as $hn
         | if $d != null and $d <= $now then
-            out("recovered"; $hit.name; ($hit.usedPct | floor); $d; $asof;
-                "the \($hit.name) window that refused the last turn reset at \($d) — capacity is back, no turn run since")
+            out("recovered"; ($hit.name // null); (($hit.usedPct // 100) | floor); $d; $asof;
+                "the \($hn) window that refused the last turn reset at \($d) — capacity is back, no turn run since")
           elif $d != null then
-            out("exhausted"; $hit.name; 100; $d; $asof;
-                "last turn refused usage_limit_exceeded; the \($hit.name) window resets at \($d)")
+            out("exhausted"; ($hit.name // null); 100; $d; $asof;
+                "last turn refused usage_limit_exceeded; the \($hn) window resets at \($d)")
           else
             out("exhausted"; ($hit.name // null); 100; null; $asof;
                 "last turn refused usage_limit_exceeded; no reading predates the refusal, so its reset time is unknown")

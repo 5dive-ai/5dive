@@ -3646,6 +3646,24 @@ _hb_agent_idle() {
     busy)       _hb_busy_pane_is_done "$name" "$gap" && return 0; return 1 ;;
     blocked:*)  _HB_IDLE_REASON="${native#blocked:}"; return 3 ;;
   esac
+  # DIVE-7626: a DISPATCHER seat (codex on telegram/dashboard) answers for
+  # itself. Its pane is the dispatcher's log stream: byte-stable at rest and
+  # never showing codex's composer glyph, so the pane-scrape below read it
+  # "working" FOREVER. Measured on leo 2026-11-03: its turn ended on a usage-
+  # limit refusal at 11:20:34Z, and `wake-task` was refused as "mid-turn"
+  # before AND after `agent restart` while health.json said no turn was active.
+  # The dispatcher's health record names the active turn and the queue depth
+  # (DIVE-5608 reads the same record for the restart check). Only a definite
+  # reading is taken; none (no dispatcher, a stale or unparseable record)
+  # falls through to the pane exactly as before.
+  local disp=""
+  if declare -F _agent_dispatcher_turn_state >/dev/null 2>&1 \
+     && disp=$(_agent_dispatcher_turn_state "$name" 2>/dev/null); then
+    case "$disp" in
+      idle) return 0 ;;
+      busy) return 1 ;;
+    esac
+  fi
   # Fallback: pane-scrape (codex/grok/agy/opencode, or native unavailable).
   _hb_agent_pane_idle "$name" "$gap"
 }
@@ -4204,22 +4222,37 @@ _hb_quota_parked() {
 # moved a clock, which is the caller's signal that any row ages it read before
 # the un-park are now stale and must be re-read.
 _hb_quota_unpark() {  # <name> <everyMin> [<prefetched record>] — rc is ALWAYS 0; never aborts a tick
-  local name="$1" everyMin="${2:-5}" row cls dl_ep until_epoch now restamped held
+  local name="$1" everyMin="${2:-5}" row cls dl_ep dl_st cx_err until_epoch now restamped held
   _HB_UNPARK_RESTAMPED=0
   if (( $# >= 3 )); then
     row="$3"
   else
     row=$(db "SELECT classification || '|' ||
-                     COALESCE(json_extract(signals, '\$.signals.quotaDeadlineEpoch'), '')
+                     COALESCE(json_extract(signals, '\$.signals.quotaDeadlineEpoch'), '') || '|' ||
+                     COALESCE(json_extract(signals, '\$.signals.quotaDeadline'), '') || '|' ||
+                     COALESCE(json_extract(signals, '\$.signals.codexQuota.lastTurn.error'), '')
                 FROM supervisor_events
                WHERE agent=$(sqlq "$name")
                ORDER BY id DESC LIMIT 1;" 2>/dev/null) || return 0
   fi
   [[ -n "$row" ]] || return 0
-  cls="${row%%|*}"; dl_ep="${row#*|}"
-  [[ "$cls" == "quota-exhausted" ]] || return 0
+  IFS='|' read -r cls dl_ep dl_st cx_err <<<"$row"
   [[ "$dl_ep" =~ ^[0-9]+$ ]] || return 0
-  until_epoch=$(( dl_ep + everyMin * 60 ))
+  if [[ "$cls" == "quota-exhausted" ]]; then
+    until_epoch=$(( dl_ep + everyMin * 60 ))
+  elif [[ "$dl_st" == "lapsed" && "$cx_err" == "usage_limit_exceeded" ]]; then
+    # DIVE-7626 — THE OBSERVATION AFTER THE RESET IS NO LONGER quota-exhausted.
+    # Once the reset passes, the codex join says `recovered` -> `lapsed`, the
+    # classifier disarms its quota branch, and the arm above can never match:
+    # the supervisor re-observes every 10 min, so the one-tick grace always
+    # outlived the last quota-exhausted row and this function never fired on a
+    # codex seat. The rollout record is first-hand: the NEWEST turn was refused
+    # and its window has since reset, so no turn ran after the wall. A codex
+    # seat never retries on its own, so there is no grace to wait out.
+    until_epoch="$dl_ep"
+  else
+    return 0
+  fi
   now=$(date -u +%s)
   # Still inside the park (including the deliberate one-tick grace that lets the
   # seat resume on its own before anything is taken off it) — nothing to do.
@@ -4531,7 +4564,9 @@ _hb_reclaim() {
                FROM tasks
                WHERE assignee=$(sqlq "$name") AND status='in_progress';"
   local _q_sql="SELECT 'Q|' || classification || '|' ||
-                       COALESCE(json_extract(signals, '\$.signals.quotaDeadlineEpoch'), '')
+                       COALESCE(json_extract(signals, '\$.signals.quotaDeadlineEpoch'), '') || '|' ||
+                       COALESCE(json_extract(signals, '\$.signals.quotaDeadline'), '') || '|' ||
+                       COALESCE(json_extract(signals, '\$.signals.codexQuota.lastTurn.error'), '')
                   FROM supervisor_events
                  WHERE agent=$(sqlq "$name")
                  ORDER BY id DESC LIMIT 1;"
