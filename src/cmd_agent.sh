@@ -1099,7 +1099,6 @@ SEAT_REFUSAL_TEXT_RE = re.compile(r"credit balance is too low|invalid api key|no
 # DIVE-7615: an Antigravity seat whose Google account failed Google's age check.
 # agy keeps no transcript we read, so its screen is the reading. Same reading,
 # same words as src/lib/seat_refusal.sh (seat_pane_refusal).
-SEAT_AGY_PANE_RE = re.compile(r"eligibility check failed|not eligible for antigravity", re.I)
 SEAT_AGY_INELIGIBLE_MSG = "This Google account can't use Antigravity yet: Google needs to verify the account holder is 18+. Verify it at myaccount.google.com, or sign in with another account."
 SEAT_PANE_DIR = os.environ.get("SEAT_PANE_DIR") or ""
 
@@ -1119,12 +1118,38 @@ def seat_pane_refusal(name):
         if cp.returncode != 0:
             return None
         pane = cp.stdout
+    return SEAT_AGY_INELIGIBLE_MSG if seat_agy_frame_seen(pane) else None
+
+# agy's OWN refusal frame, never loose words (a reply or a question can quote
+# them); lines inside a 5dive message are skipped. Same reading as
+# seat_agy_frame_seen in src/lib/seat_refusal.sh: keep the two in step.
+SEAT_AGY_FRAME_RE = re.compile(r"^\u26a0[ \t]+eligibility check[ \t]*$|^[ \t]*\u23bf[ \t]+eligibility check failed:", re.I)
+SEAT_AGY_REPLY_OPEN_RE = re.compile(r"^[ \t]*<5dive-r:[0-9A-Za-z]+>[ \t]*$")
+
+def seat_agy_frame_seen(pane):
+    q = r = False
     for line in pane.splitlines():
-        if "5dive-msg " in line or "5dive-r:" in line:
+        if "5dive-msg " in line:
+            q, r = True, False
             continue
-        if SEAT_AGY_PANE_RE.search(line):
-            return SEAT_AGY_INELIGIBLE_MSG
-    return None
+        if q:
+            if "</5dive-r:" in line:
+                q = False
+                continue
+            if line[:1] not in ("", " ", "\t"):
+                q = False
+            else:
+                continue
+        if r:
+            if "</5dive-r:" in line:
+                r = False
+            continue
+        if SEAT_AGY_REPLY_OPEN_RE.match(line):
+            r = True
+            continue
+        if SEAT_AGY_FRAME_RE.search(line):
+            return True
+    return False
 SEAT_PASSING_ERROR_RE = re.compile(r"overloaded|api error: 5[0-9][0-9]|internal server error|temporarily", re.I)
 # DIVE-7527: a run ending in the model's safety filter is a refused
 # conversation (a restart clears it), not a stuck login. See seat_refusal.sh.

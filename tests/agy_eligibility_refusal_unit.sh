@@ -20,6 +20,11 @@
 #   C1  control: a normal agy reply is no refusal (shell, python, ask)
 #   C2  control: the same words on a Claude seat's screen are not read
 #   C3  control: a question QUOTING the words is not a refusal
+#   C4  control: a WRAPPED question quoting the words (header alone on its line,
+#       the words on the next; even agy's frame lines), normal reply: no refusal
+#   C5  control: a normal reply that QUOTES the words and the frame: no refusal
+#   H3  the same wrapped question, refused: the frame under it is still read
+#   P1  pipeline-free: seat_pane_refusal never pipes the screen into grep -q
 #
 # Offline: fixture panes through SEAT_PANE_DIR; no tmux, no sudo.
 #   bash tests/agy_eligibility_refusal_unit.sh
@@ -103,6 +108,49 @@ printf '%s\n' '> [5dive-msg from=ask id=aa11bb22 tier=standard] what does "Eligi
   '' '  It means the Google account has not verified its age.' '' '>' > "$SEAT_PANE_DIR/qa7615agy.pane"
 seat_turn_trouble qa7615agy 0 >/dev/null; eq_t "C3 a question quoting the words is not a refusal" 1 "$?"
 eq_t "C3b ...nor in the health snapshot" null "$(snap_agent antigravity | cut -d'|' -f2)"
+
+Q1='> [5dive-msg from=ask id=cc33dd44 tier=standard via=telegram]'
+Q2=(
+  '  my other agent printed "Eligibility check failed: Your current account is not'
+  '  eligible for Antigravity" and then this:'
+  '  ⚠  Eligibility Check'
+  '    ⎿  Eligibility check failed: Your current account is not eligible for'
+  '  what does it mean? [reply-format] Put your answer between these two marker'
+  '  lines: <5dive-r:cc33dd44></5dive-r:cc33dd44> — the opening marker alone on one'
+  '  line, your answer next, the closing marker alone on the last line.')
+REPLY=(
+  ''
+  '  <5dive-r:cc33dd44>'
+  '  That screen means Google has not verified the account holder is 18+:'
+  '  ⚠  Eligibility Check'
+  '  ⎿  Eligibility check failed: Your current account is not eligible for'
+  '     Antigravity. Verify the age at myaccount.google.com, then log in again.'
+  '  </5dive-r:cc33dd44>'
+  '' '>')
+REFUSED=(
+  '⚠  Eligibility Check'
+  '  ⎿  Eligibility check failed: Your current account is not eligible for'
+  '     Antigravity. To use Antigravity you must be 18 years old or older.'
+  '' '>')
+printf '%s\n' "$Q1" "${Q2[@]}" "${REPLY[@]}" > "$SEAT_PANE_DIR/qa7615agy.pane"
+seat_turn_trouble qa7615agy 0 >/dev/null; eq_t "C4 a wrapped question quoting the words and the frame, normal reply: no refusal" 1 "$?"
+eq_t "C4b ...nor in the health snapshot" null "$(snap_agent antigravity | cut -d'|' -f2)"
+printf '%s\n' '> [5dive-msg from=ask id=cc33dd44 tier=standard] what does the age check mean?' \
+  '  [reply-format] ... <5dive-r:cc33dd44></5dive-r:cc33dd44> ...' "${REPLY[@]}" > "$SEAT_PANE_DIR/qa7615agy.pane"
+seat_turn_trouble qa7615agy 0 >/dev/null; eq_t "C5 a normal reply quoting the words and the frame: no refusal" 1 "$?"
+eq_t "C5b ...nor in the health snapshot" null "$(snap_agent antigravity | cut -d'|' -f2)"
+printf '%s\n' "$Q1" "${Q2[@]}" "${REFUSED[@]}" > "$SEAT_PANE_DIR/qa7615agy.pane"
+eq_t "H3 the same wrapped question, refused: the frame under it is read" "refused	$PLAIN" "$(seat_turn_trouble qa7615agy 0)"
+H3=$(snap_agent antigravity)
+eq_t "H3b ...and by the health snapshot" "refused|$PLAIN" "$H3"
+# the question's own marker wrapped apart: the column-0 frame still ends the question
+printf '%s\n' "$Q1" '  question [reply-format] ... <5dive-r:cc33dd44></5dive-' '  r:cc33dd44> — ...' "${REFUSED[@]}" > "$SEAT_PANE_DIR/qa7615agy.pane"
+eq_t "H4 the question's closing marker wrapped apart: the frame is still read" "refused	$PLAIN" "$(seat_turn_trouble qa7615agy 0)"
+eq_t "H4b ...and by the health snapshot" "refused|$PLAIN" "$(snap_agent antigravity)"
+
+_body=$(awk '/^seat_pane_refusal\(\) \{/,/^\}/' src/lib/seat_refusal.sh)
+grep -qE '\| *grep -q' <<<"$_body" && bad_t "P1 seat_pane_refusal pipes the screen into grep -q (SIGPIPE under pipefail)" "$_body" \
+  || ok_t "P1 seat_pane_refusal reads the screen from a variable, no pipe into grep -q"
 
 _syn=""; for f in src/cmd_agent.sh src/cmd_agent_runtime.sh src/lib/seat_refusal.sh; do bash -n "$f" 2>/dev/null || _syn+=" $f"; done
 eq_t "S1 the touched files parse" "" "$_syn"

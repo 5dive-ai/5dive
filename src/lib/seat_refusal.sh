@@ -32,8 +32,9 @@ SEAT_REFUSAL_TEXT_RE='credit balance is too low|invalid api key|not logged in|pl
 # reads ok), and then agy answers EVERY message with "Eligibility check failed:
 # Your current account is not eligible for Antigravity. To use Antigravity you
 # must be 18 years old or older...". agy keeps no transcript we read, so the one
-# place that says so is the seat's own screen. SEAT_AGY_PANE_RE is that reading
-# (seat_pane_refusal); the words the owner sees are SEAT_AGY_INELIGIBLE_MSG, not
+# place that says so is the seat's own screen, read for agy's refusal FRAME
+# (seat_pane_refusal / seat_agy_frame_seen); SEAT_AGY_PANE_RE is the loose words,
+# used only to turn a refusal already read into plain words. The words the owner sees are SEAT_AGY_INELIGIBLE_MSG, not
 # agy's, because "verify your age and log in again" does not say where.
 SEAT_AGY_PANE_RE='eligibility check failed|not eligible for antigravity'
 SEAT_AGY_INELIGIBLE_MSG="This Google account can't use Antigravity yet: Google needs to verify the account holder is 18+. Verify it at myaccount.google.com, or sign in with another account."
@@ -55,16 +56,37 @@ _seat_pane() {
   sudo -n -u "agent-${name}" tmux capture-pane -t "agent-${name}" -p 2>/dev/null
 }
 
+# seat_agy_frame_seen <pane-text> — rc 0 when the text holds agy's OWN refusal
+# frame: a column-0 "⚠  Eligibility Check" header, or its
+# "⎿  Eligibility check failed:" line. Loose words are never enough (a reply or
+# a question can quote them). Lines inside a 5dive message are skipped: from the
+# "5dive-msg" header to the question's own "</5dive-r:" marker (or the first
+# column-0 line, if that marker wrapped apart; agy indents a question's wrapped
+# lines), and a reply from its opening "<5dive-r:ID>" line to its closing one.
+# The text is a here-string: no writer process, nothing to SIGPIPE.
+# Same reading as seat_pane_refusal in src/cmd_agent.sh (python).
+seat_agy_frame_seen() {
+  awk '
+    /5dive-msg / { q = 1; r = 0; next }
+    q { if (index($0, "</5dive-r:")) { q = 0; next }
+        if ($0 ~ /^[^ \t]/) q = 0; else next }
+    r { if (index($0, "</5dive-r:")) r = 0; next }
+    /^[ \t]*<5dive-r:[0-9A-Za-z]+>[ \t]*$/ { r = 1; next }
+    /^⚠[ \t]+[Ee]ligibility [Cc]heck[ \t]*$/ || /^[ \t]*⎿[ \t]+[Ee]ligibility check failed:/ { seen = 1; exit }
+    END { exit !seen }
+  ' <<<"$1"
+}
+
 # seat_pane_refusal <name> — SEAT_AGY_INELIGIBLE_MSG, rc 0, when <name> is an
-# Antigravity seat whose screen shows agy's eligibility refusal. Lines that carry
-# a 5dive message header or reply marker are skipped, so a question ABOUT the
-# check cannot trip it. Only Antigravity seats are read: on any other harness the
-# words are just text someone typed.
+# Antigravity seat whose screen shows agy's eligibility refusal frame
+# (seat_agy_frame_seen). Only Antigravity seats are read: on any other harness
+# the words are just text someone typed.
 seat_pane_refusal() {
-  local name="$1"
+  local name="$1" pane
   declare -F agent_type >/dev/null 2>&1 || return 1
   [[ "$(agent_type "$name" 2>/dev/null)" == antigravity ]] || return 1
-  _seat_pane "$name" | grep -vE '5dive-msg |5dive-r:' | grep -qiE "$SEAT_AGY_PANE_RE" || return 1
+  pane=$(_seat_pane "$name") || pane=""
+  [[ -n "$pane" ]] && seat_agy_frame_seen "$pane" || return 1
   printf '%s\n' "$SEAT_AGY_INELIGIBLE_MSG"
 }
 
