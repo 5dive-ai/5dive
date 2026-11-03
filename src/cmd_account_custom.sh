@@ -365,3 +365,111 @@ cmd_account_test() {
   fi
   return 0
 }
+
+# ---------------------------------------------------------------------------
+# account scan (DIVE-7599)
+# ---------------------------------------------------------------------------
+# Find AI model servers on the office network, for the office panel's first-run
+# setup: the owner has no terminal, so typing `account add --base-url=...` is
+# not an option. ONE GET of <host>:<port>/v1/models per address (Ollama,
+# LM Studio, vLLM and llama.cpp all serve it), and only to addresses on a
+# PRIVATE network (this box, 10/8, 172.16/12, 192.168/16): the scan never
+# leaves the building, so a local-only box stays local-only.
+#
+#   5dive account scan [--url=<address>] [--json]
+#
+# Without --url: this box itself, then the /24 around each private address the
+# box has (a wider office subnet is narrowed to the box's own /24: 65k probes is
+# a port scan, 254 is a lookup). With --url: just that address, to read which
+# models it serves. JSON: {servers:[{url, kind, models:[...]}], scanned:<n>}.
+#
+# Test seams: FIVE_AI_SCAN_HOSTS (hosts instead of the box's subnets; still
+# private-only) and FIVE_AI_SCAN_PORTS.
+CUSTOM_AI_SCAN_PORTS="11434 1234 8000 8080"
+
+_custom_ai_scan_kind() {
+  case "$1" in
+    11434) printf 'Ollama' ;;
+    1234)  printf 'LM Studio' ;;
+    *)     printf 'AI server' ;;
+  esac
+}
+
+# The hosts to look at, one per line: this box, then each private /24.
+_custom_ai_scan_hosts() {
+  local h a
+  if [[ -n "${FIVE_AI_SCAN_HOSTS:-}" ]]; then
+    for h in $FIVE_AI_SCAN_HOSTS; do printf '%s\n' "$h"; done
+    return 0
+  fi
+  printf '127.0.0.1\n'
+  local seen=" "
+  while read -r _ a; do
+    [[ -n "$a" ]] || continue
+    a="${a%.*}"
+    [[ "$seen" == *" $a "* ]] && continue
+    seen+="$a "
+    for (( h = 1; h <= 254; h++ )); do printf '%s.%d\n' "$a" "$h"; done
+  done < <(_lc_private_addrs)
+}
+
+# _custom_ai_scan_one <url> — print one JSON server object when <url>/v1/models
+# answers as a model list, nothing otherwise.
+_custom_ai_scan_one() {
+  local u="$1" out
+  out=$(curl -sS --connect-timeout 1 --max-time 4 --max-filesize 1000000 "$(custom_ai_openai_url "$u")/models" 2>/dev/null) || return 0
+  jq -ec --arg u "$u" --arg k "${2:-AI server}" \
+    'select((.data | type) == "array") | {url:$u, kind:$k, models:([.data[]?.id | select(type == "string")] | .[:50])}' <<<"$out" 2>/dev/null || true
+}
+
+cmd_account_scan() {
+  local url=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --url=*) url="${1#--url=}" ;;
+      -h|--help) printf '%s\n' "usage: 5dive account scan [--url=<address>] [--json]   # find AI servers on the office network"; return 0 ;;
+      *) fail "$E_USAGE" "unknown argument: ${1:0:40} (usage: 5dive account scan [--url=<address>])" ;;
+    esac
+    shift
+  done
+  local -a targets=(); local h p n=0 host
+  if [[ -n "$url" ]]; then
+    _custom_ai_check_url "$url"
+    host="${url#*://}"; host="${host%%/*}"; host="${host%:*}"
+    # Same rule as the sweep: a name or a public address is not looked up here.
+    valid_base_url_private_ipv4 "$host" || [[ "$host" == localhost ]] \
+      || fail "$E_VALIDATION" "only an address on the office network can be checked here (10.x, 172.16-31.x, 192.168.x or this box)"
+    targets=("$url")
+  else
+    while IFS= read -r h; do
+      valid_base_url_private_ipv4 "$h" || continue
+      for p in ${FIVE_AI_SCAN_PORTS:-$CUSTOM_AI_SCAN_PORTS}; do
+        [[ "$p" =~ ^[0-9]{1,5}$ ]] && targets+=("http://${h}:${p}")
+      done
+    done < <(_custom_ai_scan_hosts)
+  fi
+  n=${#targets[@]}
+  # 32 at a time: a full /24 on four ports is ~1000 GETs, most refused at once.
+  local tmpd; tmpd=$(mktemp -d) || fail "$E_GENERIC" "cannot make a scratch folder"
+  local i=0 t port
+  for t in "${targets[@]}"; do
+    port="${t##*:}"; port="${port%%/*}"
+    ( _custom_ai_scan_one "$t" "$(_custom_ai_scan_kind "$port")" >"$tmpd/$i" ) &
+    i=$((i + 1))
+    (( i % 32 == 0 )) && wait
+  done
+  wait
+  local servers
+  servers=$(cat "$tmpd"/* 2>/dev/null | jq -sc '.' 2>/dev/null) || servers='[]'
+  rm -rf -- "$tmpd"
+  [[ -n "$servers" ]] || servers='[]'
+  if (( JSON_MODE )); then
+    ok "found $(jq length <<<"$servers") AI server(s)" '{servers:$s, scanned:$n}' --argjson s "$servers" --argjson n "$n"
+    return 0
+  fi
+  if [[ "$(jq length <<<"$servers")" == 0 ]]; then
+    printf 'No AI server answered (%d addresses looked at). Type its address: 5dive account scan --url=http://<address>:<port>\n' "$n"
+  else
+    jq -r '.[] | "\(.url)  \(.kind)  \(.models | join(", "))"' <<<"$servers"
+  fi
+}

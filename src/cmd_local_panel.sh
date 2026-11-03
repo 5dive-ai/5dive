@@ -38,6 +38,16 @@
 # detached because it restarts the agents and the office chat itself, which
 # would cut the page's request; `update-status` is what the page polls.
 #
+# DIVE-7599 INVITE A PERSON, AND FIRST-RUN AI SETUP. The owner has no
+# terminal, so two things `sudo 5dive` did are now panel verbs:
+#   device-invite <name> <chat|owner>  → `local pair --name=<name> [--owner]`:
+#       the same one-use, 15-minute code, the device takes the typed name. The
+#       code rides back in the reply only; the audit line has name and role.
+#   ai-scan [<address>]                → `account scan`: model servers on the
+#       office's private networks (or the models at one typed address).
+#   ai-setup <address> <model> <agent> → test it, save it as the box's AI
+#       account (office-ai), create the first agent on it in the office chat.
+#
 # Test seams: FIVE_LOCAL_CHAT_ROOT prefixes every path; with it set,
 # FIVE_PANEL_CLI names the 5dive binary the verbs call.
 
@@ -60,6 +70,14 @@ readonly LP_IDENT_RE='^[A-Z][A-Z0-9]{0,9}-[0-9]{1,7}$'
 readonly LP_SECRET_RE='^[A-Z][A-Z0-9_]{1,63}$'
 readonly LP_ACCOUNT_RE='^[a-z][a-z0-9_-]{0,31}$'
 readonly LP_DEVICE_RE='^[a-f0-9]{8,32}$'
+# DIVE-7599: a person's name (same as `local pair --name`), a device role, an AI
+# server address on a private network (checked again by valid_base_url and the
+# private-address rule in `account scan`), a model name.
+readonly LP_PERSON_RE="^[A-Za-z0-9]([A-Za-z0-9 ._'-]{0,38}[A-Za-z0-9._'-])?$"
+readonly LP_ROLE_RE='^(chat|owner)$'
+readonly LP_URL_RE='^https?://[A-Za-z0-9][A-Za-z0-9.-]{0,252}(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]{0,100})?$'
+readonly LP_MODEL_RE='^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$'
+readonly LP_SETUP_ACCOUNT=office-ai
 readonly LP_VALUE_MAX=8192
 
 # The verb table: <verb> → the pattern for each argument, in order. A verb not
@@ -73,6 +91,9 @@ _lp_spec() {
     secret-set)    printf 'secret' ;;
     account-test)  printf 'account' ;;
     device-revoke) printf 'device' ;;
+    device-invite) printf 'person role' ;;
+    ai-scan)       printf 'url?' ;;
+    ai-setup)      printf 'url model agent' ;;
     *) return 1 ;;
   esac
 }
@@ -86,6 +107,10 @@ _lp_arg_ok() {
     secret)  [[ "$v" =~ $LP_SECRET_RE ]] ;;
     account) [[ "$v" =~ $LP_ACCOUNT_RE ]] ;;
     device)  [[ "$v" =~ $LP_DEVICE_RE ]] ;;
+    person)  [[ "$v" =~ $LP_PERSON_RE ]] ;;
+    role)    [[ "$v" =~ $LP_ROLE_RE ]] ;;
+    url)     [[ "$v" =~ $LP_URL_RE ]] ;;
+    model)   [[ "$v" =~ $LP_MODEL_RE ]] ;;
     # A gate answer is checked again against the gate's own options before it
     # runs; this is the shape floor: 1-200 chars, no leading dash, no control
     # character, none of ; $ ` | < > \ (Turkish and other letters pass).
@@ -224,10 +249,49 @@ _lp_run() {
         _lp_cli_json account test --base-url="$u" --model="$m" --harness="$h" </dev/null
       fi ;;
     device-revoke) _lp_cli_json local devices revoke "$1" </dev/null ;;
+    device-invite)
+      local -a fl=("--name=$1"); [[ "$2" == owner ]] && fl+=(--owner)
+      _lp_cli_json local pair "${fl[@]}" </dev/null ;;
+    ai-scan)
+      if [[ -n "${1:-}" ]]; then _lp_cli_json account scan --url="$1" </dev/null
+      else _lp_cli_json account scan </dev/null; fi ;;
+    ai-setup) _lp_ai_setup "$@" ;;
     update-install) _lp_update_install ;;
     update-status)  _lp_update_status ;;
     *) printf 'unknown verb'; return 1 ;;
   esac
+}
+
+# ai-setup <address> <model> <agent> — the first-run sheet's one button. Only on
+# a box with no AI account yet: a second owner tapping it later cannot move the
+# office's AI from the panel (that stays `account add --replace`, on purpose).
+# Claude first (Ollama speaks its format); a server that only speaks OpenAI's
+# gets hermes. Nothing is saved until the test passes.
+_lp_ai_setup() {
+  local url="$1" model="$2" agent="$3" t h="" r reason=""
+  [[ "$(_lp_accounts)" == "[]" ]] || { printf 'This server already has its AI. Change it in Settings.'; return 1; }
+  for t in claude hermes; do
+    r=$(_lp_cli_json account test --base-url="$url" --model="$model" --harness="$t" </dev/null) || { printf '%s' "$r"; return 1; }
+    if [[ "$(jq -r '.ok' <<<"$r")" == true ]]; then h="$t"; break; fi
+    reason=$(jq -r '.reason // ""' <<<"$r")
+    [[ "$reason" == wrong_format ]] || break
+  done
+  if [[ -z "$h" ]]; then
+    case "$reason" in
+      unreachable)   printf 'Nothing answered at %s. Is the AI server on?' "$url" ;;
+      bad_key)       printf 'That server wants a key. Set it up from a terminal for now.' ;;
+      no_such_model) printf 'That server does not have %s.' "$model" ;;
+      no_tools)      printf '%s answered, but cannot use tools, so an agent could not act. Pick another model.' "$model" ;;
+      *)             printf '%s' "$(jq -r '.message // "That server did not answer like an AI server."' <<<"$r")" ;;
+    esac
+    return 1
+  fi
+  _lp_cli_json account add "$LP_SETUP_ACCOUNT" --provider=custom --base-url="$url" --model="$model" --harness="$h" </dev/null >/dev/null \
+    || { printf 'The AI answered, but it could not be saved.'; return 1; }
+  r=$(_lp_cli_json agent create "$agent" --type="$h" --auth-profile="$LP_SETUP_ACCOUNT" --channels=dashboard </dev/null) \
+    || { printf 'Your AI is saved, but %s could not be created: %s' "$agent" "$r"; return 1; }
+  jq -cn --arg a "$LP_SETUP_ACCOUNT" --arg h "$h" --arg u "$url" --arg m "$model" --arg n "$agent" \
+    '{account:$a, harness:$h, baseUrl:$u, model:$m, agent:$n}'
 }
 
 # "Install update from file" rides `self-update --from=<file>` (DIVE-7577). It

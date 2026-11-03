@@ -15,8 +15,15 @@
 #      activation that runs the real panel-exec. A chat-only device gets 403
 #      on every /api/panel route; an owner device works; the audit names it.
 #   N. no new outbound host in the server or the panel module.
+#   I. (DIVE-7599) invite a person: the owner gets a one-time code that pairs
+#      ONE device under the typed name and role; reuse and expiry refused; a
+#      chat device gets 403; the code is in no log.
+#   F. (DIVE-7599) first-run AI setup: the scan finds a stub model server on a
+#      second loopback address (127.0.0.2), the setup tests it, saves it and
+#      makes the first agent; a model without tools saves nothing; a public
+#      address is never dialed (203.0.113.9, a documentation address).
 #
-# Needs bun, openssl, curl, jq. Every address here is loopback; no network.
+# Needs bun, openssl, curl, jq, python3. Every address dialed is loopback.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
@@ -35,7 +42,7 @@ export FIVE_LOCAL_CHAT_ROOT="$TMPD/root"
 export FIVE_PANEL_CLI="$TMPD/fake5dive"
 export FIVE_LOCAL_ONLY_FILE="$TMPD/local-only" FIVE_API_BASE_FILE="$TMPD/api-base" FIVEDIVE_CONNECTORD_ENV="$TMPD/no-connectord.env"
 mkdir -p "$TMPD/root/etc/systemd/system" "$TMPD/root/etc/5dive/local-chat" "$TMPD/profiles/office-ai" "$TMPD/profiles/claude-main"
-for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/local_only.sh cmd_local_chat.sh cmd_local_chat_server.sh cmd_local_panel.sh; do source "src/$f"; done
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/local_only.sh cmd_local_chat.sh cmd_local_chat_server.sh cmd_local_panel.sh cmd_account_custom.sh; do source "src/$f"; done
 set +e
 JSON_MODE=0
 require_root() { :; }
@@ -45,6 +52,26 @@ eval "$(sed -n '/^_tool_set_vars() {/,/^}/p' src/cmd_tool.sh)"
 printf "export GITHUB_TOKEN='x'\nexport OPENAI_API_KEY='y'\n" >"$TOOLS_ENV_FILE"
 printf 'FIVEDIVE_CUSTOM_HARNESS=claude\nFIVEDIVE_CUSTOM_BASE_URL=http://gpu.office:11434\nFIVEDIVE_CUSTOM_MODEL=qwen3\n' >"$TMPD/profiles/office-ai/combined.env"
 printf 'CLAUDE_CODE_OAUTH_TOKEN=z\n' >"$TMPD/profiles/claude-main/combined.env"
+
+# DIVE-7599: the REAL `local pair`, `account scan` and `account test` (the
+# stub's address only), behind the stand-in CLI: the invite makes a code in
+# the live server's own db, the scan and the test dial the stub.
+BUN0=$(command -v bun || echo /usr/local/bin/bun)
+cat >"$TMPD/real5dive.sh" <<REAL
+#!/usr/bin/env bash
+cd "$PWD"
+export FIVE_LOCAL_CHAT_ROOT="$FIVE_LOCAL_CHAT_ROOT" FIVE_LOCAL_ONLY_FILE="$FIVE_LOCAL_ONLY_FILE"
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/local_only.sh cmd_local_chat.sh cmd_account_custom.sh; do source "src/\$f"; done
+set +e; JSON_MODE=1; require_root() { :; }; CUSTOM_AI_TEST_TIMEOUT=10
+_lc_admin() { LC_STATE="\$(_lc_state)" "$BUN0" "$TMPD/server.ts" admin "\$@"; }
+[[ "\${1:-}" == --json ]] && shift
+case "\${1:-} \${2:-}" in
+  "local pair")   shift 2; _lc_pair "\$@" ;;
+  "account scan") shift 2; cmd_account_scan "\$@" ;;
+  "account test") shift 2; cmd_account_test "\$@" ;;
+esac
+REAL
+chmod +x "$TMPD/real5dive.sh"
 
 # The stand-in CLI: logs each argv (%q, one line per call) and keeps its stdin;
 # answers the shapes the panel reads.
@@ -58,10 +85,16 @@ case "\$args" in
   *" task ls "*)     echo '{"ok":true,"data":{"tasks":[{"ident":"DIVE-1","title":"Draft the NDA","status":"in_progress","assignee":"alice"}]}}' ;;
   *" task inbox "*)  echo '{"ok":true,"data":{"inbox":[{"ident":"DIVE-2","need_type":"decision","need_options":"Send it today|Wait for the client","recommend":"Send it today","ask":"Send the NDA?"},{"ident":"DIVE-3","need_type":"approval","need_options":"","ask":"Merge?"}]}}' ;;
   *" secret write "*) cat >"$TMPD/secret.stdin"; echo '{"ok":true,"data":{"key":"X"}}' ;;
+  *" local pair "*|*" account scan "*|*" account test --base-url=http://127.0.0.2:"*) exec "$TMPD/real5dive.sh" "\$@" ;;
   *" account test "*) cat >"$TMPD/test.stdin"; echo '{"ok":true,"data":{"ok":true,"reason":"answered"}}' ;;
+  *" account add "*)
+    n="\$4"; for a in "\$@"; do case "\$a" in --base-url=*) u="\${a#*=}" ;; --model=*) m="\${a#*=}" ;; --harness=*) h="\${a#*=}" ;; esac; done
+    mkdir -p "$TMPD/profiles/\$n"
+    printf 'FIVEDIVE_CUSTOM_HARNESS=%s\nFIVEDIVE_CUSTOM_BASE_URL=%s\nFIVEDIVE_CUSTOM_MODEL=%s\n' "\$h" "\$u" "\$m" >"$TMPD/profiles/\$n/combined.env"
+    echo '{"ok":true,"data":{}}' ;;
   *" config local-only check "*) printf 'ok    local-only switch                  on\nLEAK  snap store                         online\n' ;;
   *" self-update --help "*) echo 'usage: 5dive self-update' ;;
-  *" agent create "*) echo '{"ok":false,"error":{"message":"agent create stub refused"}}'; exit 1 ;;
+  *" agent create paralegal "*) echo '{"ok":false,"error":{"message":"agent create stub refused"}}'; exit 1 ;;
   *" self-update --from="*) for a in "\$@"; do [[ "\$a" == --from=* ]] && cat "\${a#--from=}" >"$TMPD/installed.bytes"; done; echo '{"ok":true,"data":{"restarted":[]}}' ;;
   *" --version "*) echo '{"ok":true,"data":{"version":"0.117.0"}}' ;;
   *) echo '{"ok":true,"data":{"done":true}}' ;;
@@ -139,6 +172,20 @@ out=$(pe gate-answer DIVE-9 approve)
 check 'R12 a row with no open gate is refused' '[[ "$(jq -r .error <<<"$out")" == *"not waiting"* ]] && ! grep -q "task answer" <<<"$(tail -1 "$LOG")"'
 out=$(head -c 9000 /dev/zero | tr '\0' a | ( _lp_exec secret-set BIG_API_KEY ))
 check 'R13 a secret value over 8 KB is refused' '[[ "$(jq -r .ok <<<"$out")" == false ]] && ! grep -q BIG_API_KEY <<<"$(tail -1 "$LOG")"'
+# DIVE-7599: the invite and setup verbs refuse every bad shape before the CLI.
+for shape in 'Ana;id' 'A$(id)' '-x' $'Ana\nBob' "$(printf 'a%.0s' $(seq 1 41))" ' Ana' 'Ana ' 'Ana"' 'Ana`id`'; do
+  refused "R14 invite name refused: $(printf '%q' "$shape" | head -c 30)" device-invite "$shape" chat
+done
+refused 'R15 invite role must be chat or owner' device-invite Ana root
+for shape in 'file:///etc/passwd' 'http://a;id' '-http://a' 'http://a b' 'http://a/$(id)' 'gopher://a'; do
+  refused "R16 setup address refused: $(printf '%q' "$shape" | head -c 30)" ai-setup "$shape" qwen3 assistant
+done
+refused 'R17 setup model with a leading dash' ai-setup http://127.0.0.2:1 -m assistant
+refused 'R18 setup agent name in capitals' ai-setup http://127.0.0.2:1 qwen3 Assistant
+refused 'R19 scan address with a quote' ai-scan "http://a'b"
+before=$(calls); out=$(pe ai-setup http://127.0.0.2:1 qwen3 assistant)
+check 'R20 setup on a server that already has its AI is refused, nothing tested or saved' '[[ "$(jq -r .error <<<"$out")" == *"already has its AI"* ]] && (( $(calls) == before ))'
+check 'U8 local pair refuses a name with a shell character' '! ( _lc_pair "--name=Ana;id" ) 2>/dev/null'
 
 # ── A. audit ─────────────────────────────────────────────────────────────────
 check 'A20 the audit log exists, 0600' '[[ -f "$AUD" && "$(stat -c %a "$AUD")" == 600 ]]'
@@ -217,8 +264,43 @@ while True:
     subprocess.Popen(["bash", sys.argv[2]], stdin=c.fileno(), stdout=c.fileno())
     c.close()
 SOCKD
-python3 -I "$TMPD/sockd.py" "$PSOCK" "$TMPD/panel-exec.sh" >"$TMPD/sockd.log" 2>&1 & PIDS+=($!)
+# DIVE-7599: a stub model server on a SECOND address (127.0.0.2), the shape
+# Ollama serves: GET /v1/models, POST /v1/messages (a tool call; "texty"
+# answers in text only). Every request is logged.
+cat >"$TMPD/model.py" <<'MODEL'
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+log = open(sys.argv[2], "a")
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def send(self, code, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(code); self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_GET(self):
+        log.write("GET %s\n" % self.path); log.flush()
+        if self.path == "/v1/models": return self.send(200, {"object": "list", "data": [{"id": "qwen3:32b"}, {"id": "texty"}]})
+        self.send(404, {"error": "not found"})
+    def do_POST(self):
+        req = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
+        log.write("POST %s %s\n" % (self.path, req.get("model"))); log.flush()
+        if self.path != "/v1/messages": return self.send(404, {"error": "not found"})
+        c = [{"type": "text", "text": "5"}] if req.get("model") == "texty" else [{"type": "tool_use", "id": "t1", "name": "add", "input": {"a": 2, "b": 3}}]
+        self.send(200, {"type": "message", "role": "assistant", "content": c})
+s = HTTPServer(("127.0.0.2", 0), H)
+open(sys.argv[1], "w").write(str(s.server_address[1]))
+s.serve_forever()
+MODEL
+python3 -I "$TMPD/model.py" "$TMPD/model.port" "$TMPD/model.log" & PIDS+=($!)
+for _ in $(seq 1 50); do [[ -s "$TMPD/model.port" ]] && break; sleep 0.1; done
+MP=$(cat "$TMPD/model.port" 2>/dev/null); MODEL_URL="http://127.0.0.2:$MP"
+# The scan's addresses: the stub, an empty loopback address, a PUBLIC one that
+# must never be dialed, and a name that is not an address at all.
+export FIVE_AI_SCAN_HOSTS="127.0.0.2 127.0.0.3 203.0.113.9 gpu.example.com" FIVE_AI_SCAN_PORTS="$MP"
+python3 -I "$TMPD/sockd.py" "$PSOCK" "$TMPD/panel-exec.sh" >"$TMPD/sockd.log" 2>&1 & SOCKD_PID=$!; PIDS+=($!)
 LAN=$((20000 + RANDOM % 20000)); LOOP=$((LAN + 1))
+# `local pair` reads the office address and the certificate from here.
+printf 'LAN_ADDR=127.0.0.1\nLAN_PORT=%s\n' "$LAN" >"$(_lc_conf)"; cp "$TMPD/cert.pem" "$(_lc_etc)/cert.pem"
 LC_STATE="$STATE" LC_LAN_ADDR=127.0.0.1 LC_LAN_PORT=$LAN LC_LOOP_PORT=$LOOP LC_CERT="$TMPD/cert.pem" LC_KEY="$TMPD/key.pem" \
   LC_TOKEN_FILE="$TMPD/tok.env" LC_AGENTS_FILE="$TMPD/agents.json" LC_PANEL_SOCK="$PSOCK" LC_FILE_MAX=65536 LC_UPDATE_MAX=1048576 \
   "$BUN" "$TMPD/server.ts" serve >"$TMPD/server.log" 2>&1 & PIDS+=($!)
@@ -241,7 +323,7 @@ cw() { curl -sSk -b "$TMPD/chat.jar" -H 'x-local-chat: 1' "$@"; }
 ow() { curl -sSk -b "$TMPD/owner.jar" -H 'x-local-chat: 1' "$@"; }
 before_aud=$(wc -l <"$AUD")
 n403=0; nroutes=0
-for rt in "GET team" "POST team" "GET board" "POST answer" "GET secrets" "POST secrets" "GET settings" "POST test" "POST revoke" "GET update" "POST update" "GET nope"; do
+for rt in "GET team" "POST team" "GET board" "POST answer" "GET secrets" "POST secrets" "GET settings" "POST test" "POST revoke" "GET update" "POST update" "POST invite" "POST ai-scan" "POST ai-setup" "GET nope"; do
   m=${rt% *}; pth=/api/panel/${rt#* }; nroutes=$((nroutes + 1))
   if [[ $m == GET ]]; then c=$(code -b "$TMPD/chat.jar" "$W$pth")
   else c=$(code -b "$TMPD/chat.jar" -H 'x-local-chat: 1' -H 'content-type: application/json' -d '{"action":"restart","name":"alice","ident":"DIVE-3","value":"approve","account":"office-ai","id":"abcdef12"}' "$W$pth"); fi
@@ -286,7 +368,60 @@ check 'B30 a POST with no length (chunked) is refused (411)' '[[ "$(code -b "$TM
 s=$(ow "$W/api/panel/settings")
 check 'B31 settings carry the running version for the Update card' '[[ "$(jq -r ".data | has(\"version\")" <<<"$s")" == true ]]'
 check 'B32 the panel page has the Update card, the hidden tab bar rule and the collapsed check list' 'grep -q "Install update" "$TMPD/panel.html" && grep -qF "nav.tabs[hidden]{display:none}" "$TMPD/panel.html" && grep -q "What was checked" "$TMPD/panel.html"'
-kill "${PIDS[0]}" 2>/dev/null; sleep 0.3; rm -f "$PSOCK"
+# ── I. invite a person (DIVE-7599) ───────────────────────────────────────────
+inv() { ow -H 'content-type: application/json' -d "$1" "$W/api/panel/invite"; }
+devs() { LC_STATE="$STATE" "$BUN" "$TMPD/server.ts" admin devices-ls; }
+i1=$(inv '{"name":"Ana Lee","role":"chat"}'); C1=$(jq -r .data.code <<<"$i1")
+check 'I1 owner: invite Ana Lee (Chat) gives a one-time code and the office address' '[[ "$(jq -r .ok <<<"$i1")" == true && "$C1" =~ ^[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$ && "$(jq -r .data.url <<<"$i1")" == "$W" && "$(jq -r .data.name <<<"$i1")" == "Ana Lee" && "$(jq -r .data.role <<<"$i1")" == chat ]]'
+check 'I2 … the reply carries the certificate fingerprint to check' '[[ "$(jq -r .data.fingerprint <<<"$i1")" == "$(_lc_fingerprint)" && -n "$(_lc_fingerprint)" ]]'
+r=$(curl -sSk -c "$TMPD/ana.jar" -H 'x-local-chat: 1' -H 'content-type: application/json' -d "{\"code\":\"$C1\",\"name\":\"Safari on iPhone\"}" "$W/api/pair")
+check 'I3 the code pairs a new device with the role the owner picked' '[[ "$(jq -r .role <<<"$r")" == chat ]]'
+ANA_ID=$(jq -r .device <<<"$r")
+check 'I4 … under the name the owner typed, not the one the browser guessed' '[[ "$(devs | jq -r --arg i "$ANA_ID" ".[] | select(.id == \$i) | .name")" == "Ana Lee" ]]'
+check 'I5 the same code a second time is refused' '[[ "$(code -H "x-local-chat: 1" -H "content-type: application/json" -d "{\"code\":\"$C1\",\"name\":\"x\"}" "$W/api/pair")" == 403 ]]'
+check 'I6 the invited chat device gets 403 on the invite route' '[[ "$(code -b "$TMPD/ana.jar" -H "x-local-chat: 1" -H "content-type: application/json" -d "{\"name\":\"Eve\",\"role\":\"owner\"}" "$W/api/panel/invite")" == 403 ]]'
+i2=$(inv '{"name":"Bo","role":"owner"}'); C2=$(jq -r .data.code <<<"$i2")
+r=$(curl -sSk -c "$TMPD/bo.jar" -H 'x-local-chat: 1' -H 'content-type: application/json' -d "{\"code\":\"$C2\",\"name\":\"x\"}" "$W/api/pair")
+check 'I7 a Manage invite makes an owner device named Bo, and it can manage' '[[ "$(jq -r .role <<<"$r")" == owner && "$(devs | jq -r ".[] | select(.name == \"Bo\") | .role")" == owner && "$(code -b "$TMPD/bo.jar" "$W/api/panel/team")" == 200 ]]'
+h=$(printf 'LATE2345' | sha256sum | cut -d' ' -f1)
+LC_STATE="$STATE" "$BUN" "$TMPD/server.ts" admin pair-add "$h" $(( $(date +%s) - 1 )) chat "Late Person" >/dev/null
+check 'I8 an expired invite code is refused, no device is made' '[[ "$(code -H "x-local-chat: 1" -H "content-type: application/json" -d "{\"code\":\"LATE2345\",\"name\":\"x\"}" "$W/api/pair")" == 403 ]] && ! grep -q "Late Person" <<<"$(devs)"'
+check 'I9 each invite is audited with the owner device, the name and the role' 'grep -qP "\t${OWNER_ID}\tdevice-invite\tAna Lee chat\tok$" "$AUD" && grep -qP "\t${OWNER_ID}\tdevice-invite\tBo owner\tok$" "$AUD"'
+check 'I10 the codes are in no log (audit, server, socket, CLI argv)' '! grep -qF -e "$C1" -e "${C1/-/}" -e "$C2" -e "${C2/-/}" "$AUD" "$TMPD/server.log" "$TMPD/sockd.log" "$LOG"'
+before_aud=$(wc -l <"$AUD")
+check 'I11 a name with a shell character is refused by the server (400), root never asked' '[[ "$(code -b "$TMPD/owner.jar" -H "x-local-chat: 1" -H "content-type: application/json" -d "{\"name\":\"Ana; rm -rf\",\"role\":\"chat\"}" "$W/api/panel/invite")" == 400 ]] && (( $(wc -l <"$AUD") == before_aud ))'
+s=$(ow "$W/api/panel/settings")
+check 'I12 the device list shows Ana Lee, Chat only, with a last-seen time' 'jq -e ".data.devices[] | select(.name == \"Ana Lee\" and .role == \"chat\" and (.last_seen > 0))" <<<"$s"'
+check 'I13 the panel page has the invite sheet (name, Chat or Manage, the code)' 'grep -q "Invite a person" "$TMPD/panel.html" && grep -q "data-r=\"owner\"" "$TMPD/panel.html" && grep -q "/api/panel/invite" "$TMPD/panel.html"'
+
+# ── F. first-run AI setup (DIVE-7599) ────────────────────────────────────────
+mv "$TMPD/profiles/office-ai" "$TMPD/office-ai.away"
+s=$(ow "$W/api/panel/settings")
+check 'F1 a server with no AI account reads accounts=[] (the page opens on the setup sheet)' '[[ "$(jq -c .data.accounts <<<"$s")" == "[]" ]] && grep -q "Set up your office AI" "$TMPD/panel.html" && grep -q "if (!d.accounts.length) { setup(); return; }" "$TMPD/panel.html"'
+sc=$(ow -H 'content-type: application/json' -d '{}' "$W/api/panel/ai-scan")
+check 'F2 the scan finds the stub model server on the second address, with its models' '[[ "$(jq -c "[.data.servers[] | {url, models}]" <<<"$sc")" == "[{\"url\":\"$MODEL_URL\",\"models\":[\"qwen3:32b\",\"texty\"]}]" ]]'
+check 'F3 … and says how many addresses it looked at (the public one and the name are not among them)' '[[ "$(jq -r .data.scanned <<<"$sc")" == 2 ]]'
+sc=$(ow -H 'content-type: application/json' -d "{\"url\":\"$MODEL_URL\"}" "$W/api/panel/ai-scan")
+check 'F4 a typed address lists that server'"'"'s models' '[[ "$(jq -c ".data.servers[0].models" <<<"$sc")" == "[\"qwen3:32b\",\"texty\"]" ]]'
+c=$(code -b "$TMPD/owner.jar" -H 'x-local-chat: 1' -H 'content-type: application/json' -d '{"url":"https://203.0.113.9"}' "$W/api/panel/ai-scan")
+check 'F5 a typed PUBLIC address is refused, not dialed' '[[ "$c" == 422 ]] && ! grep -q "203.0.113.9" "$TMPD/model.log"'
+before=$(calls)
+r=$(ow -H 'content-type: application/json' -d "{\"url\":\"$MODEL_URL\",\"model\":\"texty\",\"agent\":\"assistant\"}" "$W/api/panel/ai-setup")
+check 'F6 a model that cannot use tools: a plain reason, nothing saved, no agent' '[[ "$(jq -r .error <<<"$r")" == *"cannot use tools"* && ! -d "$TMPD/profiles/office-ai" ]] && ! grep -qE "account add|agent create" <<<"$(tail -n +$((before + 1)) "$LOG")"'
+r=$(ow -H 'content-type: application/json' -d "{\"url\":\"$MODEL_URL\",\"model\":\"qwen3:32b\",\"agent\":\"assistant\"}" "$W/api/panel/ai-setup")
+check 'F7 setup: tested, saved as office-ai on claude, first agent made' '[[ "$(jq -c "{ok, a: .data.account, h: .data.harness, n: .data.agent}" <<<"$r")" == "{\"ok\":true,\"a\":\"office-ai\",\"h\":\"claude\",\"n\":\"assistant\"}" ]]'
+check 'F8 … the account add and agent create the CLI ran' 'grep -qxF -- "--json account add office-ai --provider=custom --base-url=$MODEL_URL --model=qwen3:32b --harness=claude " "$LOG" && grep -qxF -- "--json agent create assistant --type=claude --auth-profile=office-ai --channels=dashboard " "$LOG"'
+check 'F9 … the stub was really asked (a tool-call request for the picked model)' 'grep -qx "POST /v1/messages qwen3:32b" "$TMPD/model.log"'
+check 'F10 … audited with the owner device' 'grep -qP "\t${OWNER_ID}\tai-setup\t$MODEL_URL qwen3:32b assistant\tok$" "$AUD"'
+r=$(ow -H 'content-type: application/json' -d "{\"url\":\"$MODEL_URL\",\"model\":\"qwen3:32b\",\"agent\":\"second\"}" "$W/api/panel/ai-setup")
+check 'F11 a second setup tap is refused: the office AI is not moved from the panel' '[[ "$(jq -r .error <<<"$r")" == *"already has its AI"* ]]'
+PA=10.20; PRIV="$PA.30"   # a made-up office /24, built from parts (the fixture guard refuses private literals)
+scanned=$( (curl() { printf '%s\n' "${@: -1}" >>"$TMPD/dialed"; return 7; }; JSON_MODE=1; FIVE_AI_SCAN_HOSTS="127.0.0.9 203.0.113.9 gpu.example.com"; cmd_account_scan) )
+check 'F12 the scan dials private addresses only (a public one and a name are dropped)' '[[ "$(sort -u "$TMPD/dialed" | tr "\n" " ")" == "http://127.0.0.9:$MP/v1/models " ]]'
+hosts24=$( (unset FIVE_AI_SCAN_HOSTS; _lc_private_addrs() { printf 'eth0 %s\n' "$PRIV.7"; }; _custom_ai_scan_hosts) )
+check 'F13 the scan without a seam looks at this box and the private /24s only' '[[ "$(sort -u <<<"$hosts24" | wc -l)" == 255 ]] && ! grep -vqE "^(127\.0\.0\.1|${PRIV//./\\.}\.[0-9]+)$" <<<"$hosts24"'
+
+kill "$SOCKD_PID" 2>/dev/null; sleep 0.3; rm -f "$PSOCK"
 r=$(ow "$W/api/panel/team")
 check 'B23 helper down: a plain error, the chat page still serves' '[[ "$(jq -r .error <<<"$r")" == *"not running"* ]] && [[ "$(code "$W/")" == 200 ]]'
 
