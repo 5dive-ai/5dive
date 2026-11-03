@@ -1863,6 +1863,13 @@ _memory_consolidate() {
     # 16 seats deaf on Telegram until 02:06Z. Clearing the cache after the fact
     # cannot win against a writer that runs on its own clock; not writing it can.
     distiller="$_cl --print --strict-mcp-config"
+    # DIVE-7579 (D7): on a local-only box, the quiet env the seats run with.
+    local _qv _qp="" _qa=()
+    if declare -F local_only_claude_env >/dev/null 2>&1; then
+      mapfile -t _qa < <(local_only_claude_env)
+      for _qv in "${_qa[@]}"; do _qp+="$(printf '%q' "$_qv") "; done
+    fi
+    [[ -n "$_qp" ]] && distiller="env ${_qp}${distiller}"
     # LEAVE NO TRANSCRIPT. `claude --print` saves its session like any other, so
     # every pass left one ~140 KB file under the caller's cwd (`-root/`, 87-180
     # per seat by 2026-10-05). The prompt-line skip below keeps them out of the
@@ -1872,7 +1879,7 @@ _memory_consolidate() {
     # captured first, then matched: `grep -q` exits on the first hit, so a writer
     # still streaming into it (a pipe or a process substitution) can die of SIGPIPE.
     local _help
-    _help="$("$_cl" --help </dev/null 2>/dev/null)" || true
+    _help="$(env "${_qa[@]}" "$_cl" --help </dev/null 2>/dev/null)" || true
     if grep -qF -- '--no-session-persistence' <<<"$_help"; then
       distiller+=" --no-session-persistence"
     fi

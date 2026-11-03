@@ -249,6 +249,57 @@ _lo_model_target_ok() {
     || local_only_refuse "The model server '${url:0:120}' (it is outside your network)"
 }
 
+# DIVE-7579 (D3): a command that CREATES a seat (agent create, hire, agent
+# import) may instead name --auth-profile=<account> whose saved model address is
+# on the office network: the own-AI account `account add --provider=custom`
+# saves (DIVE-7568), or one a `--base-url` create made. That is exactly what the
+# office panel's Add agent runs and what `account add` prints as the next step;
+# both were refused. An account with no saved address (a cloud sign-in) is
+# refused, and so is one where ANY saved address is outside the office. Only the
+# create verbs: `auth set --auth-profile=<local account>` writes credentials and
+# still needs its own --base-url.
+_lo_create_model_ok() {
+  local a url="" prof="" creds=0
+  for a in "$@"; do
+    case "$a" in
+      --base-url=*) url="${a#--base-url=}" ;;
+      --auth-profile=*) prof="${a#--auth-profile=}" ;;
+      --provider=*|--api-key=*|--own-login) creds=1 ;;   # would write new credentials onto it
+    esac
+  done
+  if [[ -z "$url" && -n "$prof" ]] && (( ! creds )); then
+    _lo_profile_is_local "$prof" && return 0
+    local_only_refuse "The AI account '${prof:0:40}' (it has no model server on your network)"
+  fi
+  _lo_model_target_ok "$@"
+}
+
+# `_lo_profile_model_urls <account>` — the model addresses the account saved,
+# one per line (FIVEDIVE_CUSTOM_BASE_URL, ANTHROPIC_BASE_URL, OPENAI_BASE_URL).
+# Nothing for a name that is not a valid account name.
+_lo_profile_model_urls() {
+  local p="$1" v k
+  [[ "$p" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 0
+  declare -F profile_env_value >/dev/null || return 0
+  for k in FIVEDIVE_CUSTOM_BASE_URL ANTHROPIC_BASE_URL OPENAI_BASE_URL; do
+    v=$(profile_env_value "$p" "$k")
+    [[ -n "$v" ]] && printf '%s\n' "$v"
+  done
+  return 0
+}
+
+# `_lo_profile_is_local <account>` — 0 when the account saved at least one model
+# address and every one of them is on the office network.
+_lo_profile_is_local() {
+  local u n=0
+  while IFS= read -r u; do
+    [[ -n "$u" ]] || continue
+    n=$((n + 1))
+    local_only_url_is_local "$u" || return 1
+  done < <(_lo_profile_model_urls "$1")
+  (( n > 0 ))
+}
+
 # `_lo_source_is_local <spec>` — an install source is local when it names an
 # existing file or directory on this box. Anything else (owner/repo, a URL, a
 # market slug) would be fetched from the internet.
@@ -298,7 +349,7 @@ local_only_gate() {
         case "$a" in --from-market|--market) local_only_refuse "Hiring from the agent market" ;; esac
       done
       _lo_channel_flags_ok "$@"
-      _lo_model_target_ok "$@" ;;
+      _lo_create_model_ok "$@" ;;
     bug)
       for a in "$@"; do
         [[ "$a" == --file ]] && local_only_refuse "Sending a bug report to 5dive"
@@ -371,7 +422,7 @@ local_only_gate() {
           for a in "$@"; do
             case "$a" in --with-skills=?*) local_only_refuse "Installing skills from the internet" ;; esac
           done
-          _lo_model_target_ok "$@" ;;
+          _lo_create_model_ok "$@" ;;
         clone)      _lo_channel_flags_ok "$@" ;;
         import)
           # agent import <slug|./pack.tar.gz> | --from-persona=<file> — a pack
@@ -389,7 +440,7 @@ local_only_gate() {
           done
           _lo_source_is_local "${persona:-$src}" || local_only_refuse "Installing an agent pack from the internet"
           _lo_channel_flags_ok "$@"
-          _lo_model_target_ok "$@" ;;
+          _lo_create_model_ok "$@" ;;
         skill)
           # agent skill <name>|--all add --source=<owner/repo> … — always GitHub
           # unless the source is a directory on this box. list/rm/give are local.

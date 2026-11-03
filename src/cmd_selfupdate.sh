@@ -1297,10 +1297,15 @@ cmd_self_update() {
     local co_home co_name hr="${OFFLINE_UPDATE_HOME_ROOT:-/home}"
     for co_home in "$hr"/claude "$hr"/agent-*; do
       [[ -d "$co_home/.claude/plugins/marketplaces/5dive-plugins" ]] || continue
-      if _ou_refresh_checkout "$stage/plugins" "$co_home/.claude/plugins/marketplaces/5dive-plugins"; then
+      local co_rc=0
+      _ou_refresh_checkout "$stage/plugins" "$co_home/.claude/plugins/marketplaces/5dive-plugins" && co_rc=0 || co_rc=$?
+      if (( co_rc == 0 )); then
         co_name="${co_home##*/}"; co_name="${co_name#agent-}"
         ou_force[$co_name]=1
         step "plugins updated for ${co_home##*/}"
+      elif (( co_rc == 3 )); then
+        # DIVE-7579 (m1): nothing in it moved, so no restart is owed for it.
+        step "plugins for ${co_home##*/} already current"
       else
         warn "could not update the plugins in $co_home — that agent keeps its current ones"
       fi

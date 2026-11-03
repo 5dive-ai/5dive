@@ -3500,7 +3500,18 @@ _hb_agent_native_state() {
   pid=$(_hb_claude_pid "$name"); [[ -n "$pid" ]] || return 1
   bin="/home/agent-${name}/.local/bin/claude"
   [[ -x "$bin" ]] || return 1
-  out=$(sudo -n -u "agent-${name}" "$bin" agents --json 2>/dev/null) || return 1
+  # DIVE-7579 (D7): on a local-only box the probe carries the seat unit's quiet
+  # env. Without it Claude Code looked up api.anthropic.com at every probe (8
+  # lookups, 324 dropped packets in 35 min of the run-5 proof; with it, 0), and
+  # `local-only check` said NOT fully local. The probe runs outside the unit, so
+  # the unit's drop-in never reaches it.
+  local -a qe=()
+  declare -F local_only_claude_env >/dev/null 2>&1 && mapfile -t qe < <(local_only_claude_env)
+  if (( ${#qe[@]} )); then
+    out=$(sudo -n -u "agent-${name}" env "${qe[@]}" "$bin" agents --json 2>/dev/null) || return 1
+  else
+    out=$(sudo -n -u "agent-${name}" "$bin" agents --json 2>/dev/null) || return 1
+  fi
   [[ -n "$out" ]] || return 1
   st=$(jq -r --argjson p "$pid" '.[] | select(.pid==$p) | .status // empty' <<<"$out" 2>/dev/null) || return 1
   [[ -n "$st" ]] || return 1

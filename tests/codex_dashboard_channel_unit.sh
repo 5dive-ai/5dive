@@ -30,7 +30,8 @@ check grep -q 'codex) : ;; # app-server dispatcher' "$START"
 
 # Fresh installs must carry the sibling adapter because dispatcher.ts resolves
 # ../dashboard/server.ts at runtime. Both dependency trees are installed.
-check grep -q "5dive-plugins-main/plugins/dashboard" "$ROOT/install.sh"
+# DIVE-7579: the dashboard plugin is taken with the codex dispatcher through plugin_subtrees.
+check grep -qF 'plugin_subtrees "$CODEX_PLUGIN_TARBALL" "$_cdx_tmp" telegram-codex dashboard' "$ROOT/install.sh"
 check grep -q 'LIB_DIR/dashboard' "$ROOT/install.sh"
 check grep -q 'cd .*LIB_DIR/dashboard.*bun install' "$ROOT/install.sh"
 

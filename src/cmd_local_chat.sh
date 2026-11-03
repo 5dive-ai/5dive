@@ -83,14 +83,76 @@ _lc_token_for_base() {
   else printf '%s' "$def"; fi
 }
 
-# The office address: the first private IPv4 on this box. A public address is
-# never chosen by itself, so the page is not put on the internet by accident.
-_lc_lan_addr() {
-  local a
-  for a in $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1) $(hostname -I 2>/dev/null); do
-    [[ "$a" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]] && { printf '%s' "$a"; return 0; }
+# The office address. A public address is never chosen by itself, so the page
+# is not put on the internet by accident.
+#
+# DIVE-7579 (D1): a box on TWO private networks — the model link (a cable to the
+# office's AI computer) and the office LAN — was given the FIRST private address,
+# which on the run-5 box was the model link: the office could not open the page,
+# and `local-only on` still said ON. Now the network the box uses to reach its
+# model server is skipped: every saved AI account's address is routed
+# (`ip route get`) and that interface is left out. One private address left → it.
+# Still more than one → rc 2, and the caller names the choices and --addr=.
+#
+# `_lc_private_addrs` — "<iface> <IPv4>" per private address, interface order.
+_lc_private_addrs() {
+  local ifc a seen=" "
+  while read -r ifc a; do
+    a="${a%%/*}"
+    [[ "$a" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]] || continue
+    [[ "$seen" == *" $a "* ]] && continue
+    seen+="$a "; printf '%s %s\n' "$ifc" "$a"
+  done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2, $4}')
+  [[ "$seen" != " " ]] && return 0
+  for a in $(hostname -I 2>/dev/null); do
+    [[ "$a" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]] && printf '%s %s\n' "?" "$a"
   done
-  return 1
+  return 0
+}
+
+# `_lc_model_ifaces` — the interface this box reaches each saved model server
+# on, one per line (only servers on a private network: those are the model link).
+_lc_model_ifaces() {
+  local d p u host ip r
+  for d in "${AUTH_PROFILES_DIR:-/var/lib/5dive/auth-profiles}"/*/; do
+    [[ -d "$d" ]] || continue
+    p=$(basename "$d")
+    while IFS= read -r u; do
+      host="${u#*://}"; host="${host%%/*}"; host="${host##*@}"; host="${host%:*}"
+      [[ -n "$host" ]] || continue
+      if [[ "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then ip="$host"
+      else ip=$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR == 1 {print $1}') || ip=""; fi
+      [[ -n "$ip" && "$ip" != 127.* ]] || continue
+      r=$(ip -4 route get "$ip" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1) || r=""
+      [[ -n "$r" ]] && printf '%s\n' "$r"
+    done < <(_lo_profile_model_urls "$p")
+  done | sort -u
+  return 0
+}
+
+# `_lc_lan_addr` — prints the office address (rc 0); rc 1 = no private address;
+# rc 2 = more than one network could be the office's.
+_lc_lan_addr() {
+  local -a all=() keep=() model=()
+  local l
+  mapfile -t all < <(_lc_private_addrs)
+  (( ${#all[@]} )) || return 1
+  (( ${#all[@]} == 1 )) && { printf '%s' "${all[0]#* }"; return 0; }
+  mapfile -t model < <(_lc_model_ifaces)
+  for l in "${all[@]}"; do
+    [[ " ${model[*]} " == *" ${l%% *} "* ]] || keep+=("$l")
+  done
+  (( ${#keep[@]} == 1 )) && { printf '%s' "${keep[0]#* }"; return 0; }
+  return 2
+}
+
+# The refusal when the office network cannot be told: the choices, and the flag.
+_lc_addr_ambiguous() {
+  local l list=""
+  while IFS= read -r l; do
+    [[ -n "$l" ]] && list+="${list:+, }${l#* }$([[ "${l%% *}" != "?" ]] && printf ' (%s)' "${l%% *}")"
+  done < <(_lc_private_addrs)
+  fail "$E_VALIDATION" "local chat: this server is on more than one private network (${list}) and cannot tell which one your office uses, so the chat was NOT started. Name the office one: sudo 5dive local serve --addr=<that address>"
 }
 
 _lc_usage() {
@@ -111,6 +173,8 @@ cmd_local() {
     devices) _lc_devices "$@" ;;
     status)  _lc_status "$@" ;;
     _agents) _lc_agents_write ;;
+    _restage) _lc_restage ;;       # DIVE-7579 (D6): install.sh --upgrade runs it
+    _panel-update-run) _lp_update_run ;;   # DIVE-7579 (D4): the panel's transient update unit
     panel-exec) _lp_exec "$@" ;;   # DIVE-7576: the panel's one root entry (src/cmd_local_panel.sh)
     ""|-h|--help|help) _lc_usage ;;
     *) fail "$E_USAGE" "local: unknown subcommand '$sub' (serve, pair, devices, status)." ;;
@@ -127,6 +191,47 @@ _lc_stage() {
   _local_chat_server_ts >"$tmp"
   if cmp -s -- "$tmp" "$lib/server.ts"; then rm -f -- "$tmp"
   else { chmod 0644 -- "$tmp" && mv -fT -- "$tmp" "$lib/server.ts"; } || fail "$E_GENERIC" "local chat: cannot install $lib/server.ts."; fi
+}
+
+# DIVE-7579 (D6): `local _restage` — bring a running office chat to THIS CLI's
+# server source and units. install.sh --upgrade runs it after every update, from
+# a disk or online: before, only `local serve` wrote server.ts, so a fix to the
+# page or the panel never reached a box by update. Restarts the chat only when
+# something changed; a box with no office chat is left alone.
+_lc_restage() {
+  require_root
+  [[ -f "$(_lc_unit)" ]] || { printf '%s\n' "not set up on this server (nothing to refresh)"; return 0; }
+  local lib changed=0 sock_changed=0 before after
+  lib=$(_lc_lib)
+  before=$(sha256sum "$lib/server.ts" 2>/dev/null | cut -d' ' -f1) || before=""
+  _lc_stage
+  after=$(sha256sum "$lib/server.ts" 2>/dev/null | cut -d' ' -f1) || after=""
+  [[ "$before" == "$after" ]] || changed=1
+  # The unit itself, from the saved settings (a newer CLI may write it differently).
+  local addr port loop tokf bun want
+  addr=$(_lc_conf_get LAN_ADDR); port=$(_lc_conf_get LAN_PORT); loop=$(_lc_conf_get LOOP_PORT); tokf=$(_lc_conf_get TOKEN_FILE)
+  if [[ -n "$addr" && -n "$port" && -n "$loop" && -n "$tokf" ]] && bun=$(_lc_bun 2>/dev/null); then
+    want=$(_lc_unit_text "$bun" "$addr" "$port" "$loop" "$tokf")
+    if [[ "$want" != "$(cat "$(_lc_unit)" 2>/dev/null)" ]]; then
+      printf '%s\n' "$want" >"$(_lc_unit)" && changed=1
+    fi
+  fi
+  # The panel's socket and per-call service.
+  if [[ -f "$(_lp_socket_unit)" || -f "$(_lp_service_unit)" ]]; then
+    [[ "$(_lp_socket_text)" == "$(cat "$(_lp_socket_unit)" 2>/dev/null)" ]] \
+      || { _lp_socket_text >"$(_lp_socket_unit)" && sock_changed=1; }
+    [[ "$(_lp_service_text)" == "$(cat "$(_lp_service_unit)" 2>/dev/null)" ]] \
+      || { _lp_service_text >"$(_lp_service_unit)" && sock_changed=1; }
+  fi
+  (( changed || sock_changed )) && { systemctl daemon-reload >/dev/null 2>&1 || true; }
+  (( sock_changed )) && { systemctl restart 5dive-local-panel.socket >/dev/null 2>&1 || warn "office panel: could not restart 5dive-local-panel.socket"; }
+  if (( changed )); then
+    systemctl try-restart "$(_lc_svc)" >/dev/null 2>&1 \
+      || fail "$E_GENERIC" "local chat: the new server did not start (journalctl -u $(_lc_svc))."
+    printf '%s\n' "refreshed and restarted"
+  else
+    printf '%s\n' "already current$( (( sock_changed )) && printf ' (panel units refreshed)')"
+  fi
 }
 
 # A self-signed cert for the office address; remade when the address changed.
@@ -204,8 +309,12 @@ _lc_serve() {
   require_root
   (( stop )) && { _lc_serve_stop; return 0; }
   [[ -n "$addr" ]] || addr=$(_lc_conf_get LAN_ADDR)
-  [[ -n "$addr" ]] || addr=$(_lc_lan_addr) \
-    || fail "$E_VALIDATION" "local chat: this server has no office (private) address. Name one: sudo 5dive local serve --addr=<IP>"
+  if [[ -z "$addr" ]]; then
+    local arc
+    addr=$(_lc_lan_addr) && arc=0 || arc=$?
+    (( arc == 2 )) && _lc_addr_ambiguous
+    (( arc == 0 )) || fail "$E_VALIDATION" "local chat: this server has no office (private) address. Name one: sudo 5dive local serve --addr=<IP>"
+  fi
   [[ "$addr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || fail "$E_VALIDATION" "local chat: --addr must be an IPv4 address ($addr)."
   [[ -n "$port" ]] || port=$(_lc_conf_get LAN_PORT); port="${port:-8443}"
   [[ "$port" =~ ^[0-9]{2,5}$ ]] && (( port >= 1024 && port <= 65535 )) \

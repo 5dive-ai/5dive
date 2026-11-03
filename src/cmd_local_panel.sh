@@ -27,6 +27,17 @@
 #   5dive local panel-exec <verb> [args]     (root; value on stdin for secret-set)
 #   5dive local panel-exec --socket          (what the socket unit runs)
 #
+# DIVE-7579 (D4) INSTALL AN UPDATE FILE. The owner picks the file on their own
+# laptop or phone and the page uploads it: an office server usually has no
+# screen, and Ubuntu Server mounts no USB stick by itself, so a disk in the box
+# would still need someone at a terminal. The chat server (5dive-chat) streams
+# the upload into its own state folder; `update-install` (no arguments: the
+# path is fixed) copies it into a root-only folder, and a transient root unit
+# runs `self-update --from=<that copy>` — the same signed-file check as the
+# terminal, so a changed or other-key file is refused there. The install runs
+# detached because it restarts the agents and the office chat itself, which
+# would cut the page's request; `update-status` is what the page polls.
+#
 # Test seams: FIVE_LOCAL_CHAT_ROOT prefixes every path; with it set,
 # FIVE_PANEL_CLI names the 5dive binary the verbs call.
 
@@ -34,6 +45,9 @@ _lp_sock()          { printf '%s/run/5dive-local-panel.sock' "$(_lc_root)"; }
 _lp_socket_unit()   { printf '%s/etc/systemd/system/5dive-local-panel.socket' "$(_lc_root)"; }
 _lp_service_unit()  { printf '%s/etc/systemd/system/5dive-local-panel@.service' "$(_lc_root)"; }
 _lp_audit_file()    { printf '%s/var/log/5dive/local-panel.log' "$(_lc_root)"; }
+_lp_update_dir()    { printf '%s/var/lib/5dive/panel-update' "$(_lc_root)"; }
+_lp_update_inbox()  { printf '%s/update/incoming.tar' "$(_lc_state)"; }   # written by the chat server
+_lp_update_unit()   { printf '5dive-panel-update.service'; }
 _lp_cli() {
   if [[ -n "${FIVE_LOCAL_CHAT_ROOT:-}" && -n "${FIVE_PANEL_CLI:-}" ]]; then printf '%s' "$FIVE_PANEL_CLI"
   else printf '/usr/local/bin/5dive'; fi
@@ -52,7 +66,7 @@ readonly LP_VALUE_MAX=8192
 # here is refused; a wrong argument count is refused.
 _lp_spec() {
   case "$1" in
-    team|board|secrets|settings) printf '' ;;
+    team|board|secrets|settings|update-install|update-status) printf '' ;;
     agent-add)     printf 'agent account?' ;;
     agent-restart|agent-remove) printf 'agent' ;;
     gate-answer)   printf 'ident value' ;;
@@ -117,7 +131,7 @@ _lp_reply_fail() { jq -cn --arg e "$1" '{ok:false, error:$e}'; }
 # success (rc 0), the error message on failure (rc 1). stdin passes through.
 _lp_cli_json() {
   local out err rc ef; ef=$(mktemp) || return 1
-  out=$("$(_lp_cli)" --json "$@" 2>"$ef"); rc=$?
+  out=$("$(_lp_cli)" --json "$@" 2>"$ef") && rc=0 || rc=$?
   err=$(tail -n 3 "$ef" 2>/dev/null); rm -f -- "$ef"
   if (( rc == 0 )) && jq -e '.ok == true' <<<"$out" >/dev/null 2>&1; then
     jq -c '.data // null' <<<"$out"; return 0
@@ -162,7 +176,10 @@ _lp_run() {
       [[ -n "$acct" ]] || { printf 'This server has no local AI yet. Add one first: sudo 5dive account add office-ai --provider=custom --base-url=<address> --model=<name> --harness=claude'; return 1; }
       h=$(profile_env_value "$acct" FIVEDIVE_CUSTOM_HARNESS)
       [[ -n "$h" ]] || { printf "account '%s' is not a local AI account" "$acct"; return 1; }
-      _lp_cli_json agent create "$name" --type="$h" --auth-profile="$acct" </dev/null ;;
+      # DIVE-7579: --channels=dashboard, so the new agent is in the office chat.
+      # A never-linked box has no chat-only mark, and with no channel flag the
+      # agent would come up with no chat at all.
+      _lp_cli_json agent create "$name" --type="$h" --auth-profile="$acct" --channels=dashboard </dev/null ;;
     agent-restart) _lp_cli_json agent restart "$1" </dev/null ;;
     agent-remove)  _lp_cli_json agent rm "$1" </dev/null ;;
     board)
@@ -193,8 +210,8 @@ _lp_run() {
       jq -cn --arg n "$1" '{name:$n, saved:true}' ;;
     settings)
       jq -cn --argjson lo "$(_lp_local_only_rows)" --argjson a "$(_lp_accounts)" \
-        --argjson up "$(_lp_update_ready && echo true || echo false)" \
-        '{localOnly:$lo, accounts:$a, updateFromFile:$up}' ;;
+        --argjson up "$(_lp_update_ready && echo true || echo false)" --arg v "${FIVE_VERSION:-}" \
+        '{localOnly:$lo, accounts:$a, updateFromFile:$up, version:$v}' ;;
     account-test)
       local acct="$1" u m h k
       u=$(profile_env_value "$acct" FIVEDIVE_CUSTOM_BASE_URL)
@@ -207,13 +224,90 @@ _lp_run() {
         _lp_cli_json account test --base-url="$u" --model="$m" --harness="$h" </dev/null
       fi ;;
     device-revoke) _lp_cli_json local devices revoke "$1" </dev/null ;;
+    update-install) _lp_update_install ;;
+    update-status)  _lp_update_status ;;
     *) printf 'unknown verb'; return 1 ;;
   esac
 }
 
-# "Install update from file" rides the offline update verb from the sibling row;
-# until a CLI carries it the panel hides the button.
-_lp_update_ready() { local h; h=$("$(_lp_cli)" self-update --help 2>&1); grep -q -- '--from-file' <<<"$h"; }
+# "Install update from file" rides `self-update --from=<file>` (DIVE-7577). It
+# is in this same bundle, so the card shows whenever its verifier is. DIVE-7579
+# (D4): this grepped `self-update --help` for `--from-file`, a flag that never
+# existed (the verb is --from=), so the card never showed.
+_lp_update_ready() { declare -F _ou_verify >/dev/null 2>&1; }
+
+# The status file the page polls: {state: running|done|failed, message, from, to, at}.
+_lp_update_write_status() { # <state> <message> [to]
+  local d f; d=$(_lp_update_dir); f="$d/status.json"
+  install -d -m 0700 -- "$d" 2>/dev/null || return 0
+  jq -cn --arg s "$1" --arg m "${2:0:600}" --arg from "${FIVE_VERSION:-}" --arg to "${3:-}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{state:$s, message:$m, from:$from, to:(if $to == "" then null else $to end), at:$at}' >"$f.tmp" 2>/dev/null \
+    && chmod 0600 "$f.tmp" && mv -f "$f.tmp" "$f"
+  return 0
+}
+
+_lp_update_running() { systemctl is-active --quiet "$(_lp_update_unit)" 2>/dev/null; }
+
+_lp_update_status() {
+  local f; f="$(_lp_update_dir)/status.json"
+  if _lp_update_running; then jq -cn --arg v "${FIVE_VERSION:-}" '{state:"running", from:$v}'; return 0; fi
+  if [[ -s "$f" ]] && jq -e . "$f" >/dev/null 2>&1; then
+    # A run that ended without writing its verdict (killed, box rebooted).
+    jq -c 'if .state == "running" then .state = "failed" | .message = "The update stopped before it finished. Nothing was reported; try it again." else . end' "$f"
+    return 0
+  fi
+  printf '{"state":"none"}'
+}
+
+# update-install — take the file the page uploaded and start the install.
+_lp_update_install() {
+  local src dir copy
+  src=$(_lp_update_inbox); dir=$(_lp_update_dir)
+  if _lp_update_running; then rm -f -- "$src"; printf 'An update is already being installed. Wait for it to finish.'; return 1; fi
+  [[ -f "$src" && ! -L "$src" && -s "$src" ]] || { printf 'No update file arrived. Pick the file again.'; return 1; }
+  install -d -m 0700 -- "$dir" || { printf 'could not prepare a folder for the update'; return 1; }
+  copy="$dir/update.tar"
+  rm -f -- "$copy"
+  # -P: a link put in the chat server's folder is copied as a link, then refused.
+  if ! cp -P -- "$src" "$copy" 2>/dev/null || [[ -L "$copy" || ! -f "$copy" ]]; then
+    rm -f -- "$copy" "$src"; printf 'The uploaded file could not be read. Pick it again.'; return 1
+  fi
+  rm -f -- "$src"
+  chmod 0600 -- "$copy"
+  _lp_update_write_status running "Checking the file and installing it."
+  if ! _lp_spawn_update; then
+    _lp_update_write_status failed "The installer could not be started."
+    rm -f -- "$copy"; printf 'The installer could not be started.'; return 1
+  fi
+  jq -cn --arg v "${FIVE_VERSION:-}" '{state:"running", from:$v}'
+}
+
+# A transient root unit, outside this per-call instance (which the install
+# would outlive) and outside the chat server it restarts.
+_lp_spawn_update() {
+  systemd-run --quiet --collect --unit="$(_lp_update_unit)" --description="5dive update from the office panel" \
+    /usr/local/bin/5dive local _panel-update-run >/dev/null 2>&1
+}
+
+# `local _panel-update-run` (root; the transient unit runs it): install the
+# copy, record the verdict in plain words, remove the copy.
+_lp_update_run() {
+  require_root
+  local copy msg to rc
+  copy="$(_lp_update_dir)/update.tar"
+  [[ -f "$copy" && ! -L "$copy" ]] || { _lp_update_write_status failed "No update file was waiting."; return 0; }
+  msg=$(_lp_cli_json self-update --from="$copy" </dev/null) && rc=0 || rc=$?
+  rm -f -- "$copy"
+  if (( rc == 0 )); then
+    to=$("$(_lp_cli)" --json --version 2>/dev/null | jq -r '.data.version // empty' 2>/dev/null) || to=""
+    _lp_update_write_status "done" "Updated${to:+ to $to}." "$to"
+  else
+    msg="${msg#update refused: }"
+    _lp_update_write_status failed "Not installed: ${msg}"
+  fi
+  _lp_audit "panel" "update-run" "" "$( (( rc == 0 )) && printf 'ok %s' "$to" || printf 'failed: %s' "${msg:0:200}")"
+  return 0
+}
 
 _lp_exec() {
   require_root
@@ -250,8 +344,11 @@ _lp_exec() {
     _lp_audit "$device" "$verb" "$args" "refused: value over $LP_VALUE_MAX bytes"
     _lp_reply_fail "the value is too long"; return 0
   fi
+  # DIVE-7579 (D2): `&& rc=0 || rc=$?`, never `; rc=$?` — under the bundle's
+  # `set -e` a failed action tripped errexit on the bare assignment, so the
+  # helper died before the audit line and the page showed "no answer".
   local out rc
-  out=$(_lp_run "${argv[@]}"); rc=$?
+  out=$(_lp_run "${argv[@]}") && rc=0 || rc=$?
   if (( rc == 0 )) && jq -e . <<<"${out:-null}" >/dev/null 2>&1; then
     _lp_audit "$device" "$verb" "$args" ok
     _lp_reply_ok "${out:-null}"

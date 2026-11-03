@@ -26,7 +26,8 @@ _local_chat_server_ts() {
 //   bun local_chat_server.ts admin devices-revoke <id>
 import { Database } from "bun:sqlite";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { open } from "node:fs/promises";
 import { join } from "node:path";
 
 const env = process.env;
@@ -46,6 +47,10 @@ const AGENT_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const NOTICE_AGENT = "5dive";
 // DIVE-7576: the office control panel's one door to root (src/cmd_local_panel.sh).
 const PANEL_SOCK = env.LC_PANEL_SOCK || "/run/5dive-local-panel.sock";
+// DIVE-7579 (D4): an update file uploaded from the panel (a release file is
+// ~150 MB). Only that one owner route may send a body this size.
+const UPDATE_MAX = Number(env.LC_UPDATE_MAX || 1024 * 1024 * 1024);
+const UPDATE_PATH = "/api/panel/update";
 
 mkdirSync(join(STATE, "files"), { recursive: true, mode: 0o700 });
 const db = new Database(join(STATE, "chat.db"), { create: true });
@@ -344,6 +349,13 @@ async function browserSide(req: Request, url: URL): Promise<Response> {
   // Every write carries a custom header, so a page on another origin cannot
   // post with this device's cookie (it would need a CORS preflight we refuse).
   if (req.method === "POST" && req.headers.get("x-local-chat") !== "1") return json({ error: "forbidden" }, 403);
+  // DIVE-7579: the listener takes a body up to UPDATE_MAX for the update upload,
+  // so every POST names its length and only that route may be that big.
+  if (req.method === "POST") {
+    const len = Number(req.headers.get("content-length") ?? NaN);
+    if (!Number.isFinite(len)) return json({ error: "length required" }, 411);
+    if (len > (p === UPDATE_PATH ? UPDATE_MAX : FILE_MAX + 1024)) return json({ error: "That is too big to send here." }, 413);
+  }
 
   if (p === "/api/pair" && req.method === "POST") {
     const t = Date.now();
@@ -471,6 +483,8 @@ async function panelSide(req: Request, p: string, dev: Device): Promise<Response
   if (dev.role !== "owner")
     return json({ error: "This device can chat but not manage the office server. Pair it as an owner: sudo 5dive local pair --owner", reason: "not_owner" }, 403);
   const get = req.method === "GET", post = req.method === "POST";
+  if (p === UPDATE_PATH && post) return updateUpload(req, dev);
+  if (p === UPDATE_PATH && get) return reply(await panelExec(["update-status"], dev.id));
   let b: Record<string, unknown> = {};
   if (post) { try { b = await req.json(); } catch { return json({ error: "invalid body" }, 400); } }
   if (p === "/api/panel/team" && get) return reply(await panelExec(["team"], dev.id));
@@ -510,6 +524,35 @@ async function panelSide(req: Request, p: string, dev: Device): Promise<Response
   return json({ error: "not found" }, 404);
 }
 
+// DIVE-7579 (D4): stream the update file into this server's own state folder
+// (never into memory), then hand it to root. Root copies it out, checks the
+// signature and every member, and installs it detached; the page polls.
+async function updateUpload(req: Request, dev: Device): Promise<Response> {
+  const dir = join(STATE, "update");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const part = join(dir, "incoming.part"), dest = join(dir, "incoming.tar");
+  let n = 0;
+  const fh = await open(part, "w", 0o600);
+  try {
+    if (!req.body) throw new Error("empty");
+    for await (const chunk of req.body as unknown as AsyncIterable<Uint8Array>) {
+      n += chunk.length;
+      if (n > UPDATE_MAX) throw new Error("too big");
+      await fh.write(chunk);
+    }
+  } catch {
+    await fh.close().catch(() => {});
+    rmSync(part, { force: true });
+    return json({ ok: false, error: "The file did not arrive in full. Try again." }, 413);
+  }
+  await fh.close();
+  if (!n) { rmSync(part, { force: true }); return json({ ok: false, error: "That file is empty." }, 400); }
+  renameSync(part, dest);
+  const r = await panelExec(["update-install"], dev.id, "", 120_000);
+  if (!r.ok) rmSync(dest, { force: true });
+  return reply(r);
+}
+
 // ── listeners ─────────────────────────────────────────────────────────────────
 const errorPage = (e: unknown) => { console.error(e); return json({ error: "server error" }, 500); };
 Bun.serve({
@@ -520,7 +563,7 @@ if (LAN_PORT > 0) {
   const tls = CERT && KEY && existsSync(CERT) ? { cert: Bun.file(CERT), key: Bun.file(KEY) } : undefined;
   if (!tls && env.LC_ALLOW_PLAIN !== "1") { console.error("local chat: no TLS cert; refusing to serve the office network in the clear"); process.exit(1); }
   Bun.serve({
-    hostname: LAN_ADDR, port: LAN_PORT, idleTimeout: 60, maxRequestBodySize: FILE_MAX + 1024, ...(tls ? { tls } : {}),
+    hostname: LAN_ADDR, port: LAN_PORT, idleTimeout: 120, maxRequestBodySize: Math.max(UPDATE_MAX, FILE_MAX) + 1024, ...(tls ? { tls } : {}),
     fetch: (req) => browserSide(req, new URL(req.url)).catch(errorPage),
   });
 }
@@ -560,7 +603,7 @@ form.send textarea{flex:1;resize:none;height:44px;max-height:140px;padding:11px 
 .ghost{display:grid;place-items:center;background:transparent;color:var(--accent);border:1px solid var(--line);padding:0 12px}
 .pair{padding:48px 24px;text-align:center}.pair h2{margin:0 0 8px;font-size:24px}.pair p{color:var(--mute);margin:0 0 24px}
 .pair input{display:block;width:100%;max-width:320px;margin:0 auto 12px;padding:14px;font-size:24px;letter-spacing:4px;text-align:center;text-transform:uppercase;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink)}
-.pair .btn{width:100%;max-width:320px}.err{color:#dc2626;min-height:22px;margin-top:12px}
+.pair input#dn{font-size:16px;letter-spacing:0;text-transform:none}.pair .btn{width:100%;max-width:320px}.err{color:#dc2626;min-height:22px;margin-top:12px}
 .empty{padding:40px 24px;text-align:center;color:var(--mute)}
 </style></head><body>
 <header><button id="back" hidden>&larr; Back</button><h1 id="title">Office chat</h1><a id="manage" href="/panel" hidden style="color:var(--accent);text-decoration:none;font-size:15px">⚙️ Manage</a></header>
@@ -581,15 +624,27 @@ async function api(path, opts = {}) {
 }
 function reset(t, showBack) { ctl?.abort(); ctl = new AbortController(); title.innerHTML = t; back.hidden = !showBack; window.scrollTo(0, 0); }
 
+// DIVE-7579 (m4): every device was named after navigator.platform ("Linux
+// x86_64" three times over), so the owner could not tell which one to remove.
+// The owner may name it; else browser + kind of device, e.g. "Safari on iPhone".
+function guessName() {
+  const u = navigator.userAgent || "", has = (x) => u.includes(x);
+  const os = has("iPhone") ? "iPhone" : has("iPad") ? "iPad" : has("Android") ? "Android" : has("CrOS") ? "Chromebook"
+    : has("Macintosh") ? "Mac" : has("Windows") ? "Windows PC" : has("Linux") ? "Linux" : "device";
+  const br = has("Edg/") ? "Edge" : has("Firefox/") ? "Firefox" : has("Chrome/") ? "Chrome" : has("Safari/") ? "Safari" : "";
+  return br ? br + " on " + os : os;
+}
+function deviceName() { const v = ($("#dn") && $("#dn").value.trim()) || ""; return (v || guessName()).slice(0, 40); }
 function showPair() {
   view = "pair"; reset("Office chat", false);
   app.innerHTML = '<div class="pair"><h2>Connect this device</h2><p>Type the code your office server shows.</p>' +
     '<input id="code" autocomplete="one-time-code" inputmode="text" maxlength="12" placeholder="ABCD-1234" aria-label="Pairing code">' +
+    '<input id="dn" maxlength="40" placeholder="' + esc(guessName()) + '" aria-label="Name this device (optional)">' +
     '<button class="btn" id="go">Connect</button><div class="err" id="err"></div></div>';
   const go = async () => {
     $("#err").textContent = "";
     try {
-      const r = await fetch("/api/pair", { method: "POST", headers: H, body: JSON.stringify({ code: $("#code").value, name: navigator.platform || "device" }) });
+      const r = await fetch("/api/pair", { method: "POST", headers: H, body: JSON.stringify({ code: $("#code").value, name: deviceName() }) });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(j.error || "That code did not work.");
       showList();
@@ -685,7 +740,7 @@ const PANEL_PAGE = /*html*/ `<!doctype html>
 header{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:10px;padding:14px 16px;background:var(--card);border-bottom:1px solid var(--line)}
 header h1{margin:0;font-size:18px;flex:1}header a{color:var(--accent);text-decoration:none;font-size:15px}
 main{max-width:720px;margin:0 auto;padding:12px 16px 96px}
-nav.tabs{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
+nav.tabs[hidden]{display:none}nav.tabs{position:fixed;left:0;right:0;bottom:0;display:flex;background:var(--card);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom)}
 nav.tabs button{flex:1;border:0;background:none;color:var(--mute);font-size:12px;padding:8px 0 10px;cursor:pointer}
 nav.tabs button b{display:block;font-size:22px;font-weight:400}nav.tabs button.on{color:var(--accent)}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:0 0 12px}
@@ -779,16 +834,22 @@ const views = {
   async settings() {
     const d = await api("/api/panel/settings");
     const leaks = d.localOnly.filter((r) => !r.ok);
+    // DIVE-7579 (m5): the headline and only what needs the owner. The full list
+    // of checked items (unit names) stays one tap away, not on the screen.
+    const row = (r) => '<div class="item"><span class="dot ' + (r.ok ? "on" : "bad") + '"></span><div class="grow"><b>' + esc(r.item) + '</b><span>' + esc(r.state) + '</span></div></div>';
+    const seen = (t) => { const x = new Date(t * 1000); return x.toDateString() === new Date().toDateString() ? "today " + x.toTimeString().slice(0, 5) : x.toLocaleDateString(); };
     app.innerHTML = '<div class="card"><h3>Stays in the office?</h3>' +
       (d.localOnly.length ? '<div class="big ' + (leaks.length ? "leak" : "ok") + '">' + (leaks.length ? "⚠️ " + leaks.length + " thing(s) still reach the internet" : "✅ Fully local") + '</div>' +
-        d.localOnly.map((r) => '<div class="item"><span class="dot ' + (r.ok ? "on" : "bad") + '"></span><div class="grow"><b>' + esc(r.item) + '</b><span>' + esc(r.state) + '</span></div></div>').join("")
+        leaks.map(row).join("") +
+        '<details><summary class="mute">What was checked (' + d.localOnly.length + ')</summary>' + d.localOnly.filter((r) => r.ok).map(row).join("") + '</details>'
         : '<p class="mute">Local-only mode is not set up on this server.</p>') + '</div>' +
       '<div class="card"><h3>Your AI</h3>' + (d.accounts.length ? d.accounts.map((a) =>
         '<div class="item"><div class="grow"><b>' + esc(a.model || a.name) + '</b><span>' + esc(a.baseUrl) + '</span></div><button class="btn line" data-test="' + esc(a.name) + '">Test</button></div>').join("")
         : '<p class="mute">No local AI added yet.</p>') + '</div>' +
       '<div class="card"><h3>Connected devices</h3>' + d.devices.map((v) =>
-        '<div class="item"><div class="grow"><b>' + esc(v.name) + (v.id === d.me ? " (this one)" : "") + '</b><span>' + (v.role === "owner" ? "Can manage" : "Chat only") + '</span></div><button class="btn red" data-rv="' + esc(v.id) + '">Remove</button></div>').join("") + '</div>' +
-      (d.updateFromFile ? '<div class="card"><h3>Update</h3><p class="mute">Install an update file from your IT team.</p></div>' : "");
+        '<div class="item"><div class="grow"><b>' + esc(v.name) + (v.id === d.me ? " (this one)" : "") + '</b><span>' + (v.role === "owner" ? "Can manage" : "Chat only") + ' · last seen ' + esc(seen(v.last_seen)) + '</span></div><button class="btn red" data-rv="' + esc(v.id) + '">Remove</button></div>').join("") + '</div>' +
+      (d.updateFromFile ? '<div class="card"><h3>Update</h3><p class="mute">This server runs 5dive ' + esc(d.version || "") + '. Got an update file from your IT team? Pick it and install.</p>' +
+        '<input type="file" id="uf" accept=".tar"><button class="btn" id="ub">Install update</button><p id="us" class="mute"></p></div>' : "");
     app.onclick = async (e) => {
       const t = e.target.closest("button[data-test]"), r = e.target.closest("button[data-rv]");
       if (t) {
@@ -798,9 +859,47 @@ const views = {
         t.disabled = false; t.textContent = "Test";
       }
       if (r && confirm("Remove this device? It will need a new code to come back.")) act(r, "/api/panel/revoke", { id: r.dataset.rv }, "Device removed");
+      if (e.target.id === "ub") installUpdate();
     };
+    if (d.updateFromFile) { try { const u = await api("/api/panel/update"); if (u && u.state === "running") watchUpdate(); } catch (er) {} }
   },
 };
+// DIVE-7579 (D4): upload the file (with progress), then poll until the install
+// ends. The install restarts the agents and this server, so a failed poll is
+// retried, not reported.
+function updateSay(t) { const e = $("#us"); if (e) e.textContent = t; }
+function installUpdate() {
+  const f = $("#uf") && $("#uf").files[0], b = $("#ub");
+  if (!f) { toast("Pick the update file first."); return; }
+  b.disabled = true;
+  const x = new XMLHttpRequest();
+  x.open("POST", "/api/panel/update");
+  x.setRequestHeader("x-local-chat", "1");
+  x.upload.onprogress = (ev) => { if (ev.lengthComputable) updateSay("Sending the file… " + Math.round((ev.loaded / ev.total) * 100) + "%"); };
+  x.onload = () => {
+    let j = {}; try { j = JSON.parse(x.responseText); } catch (er) {}
+    if (x.status === 200 && j.ok !== false) { watchUpdate(); return; }
+    b.disabled = false; updateSay("⚠️ " + (j.error || "The file was not taken."));
+  };
+  x.onerror = () => { b.disabled = false; updateSay("⚠️ The file did not arrive. Try again."); };
+  updateSay("Sending the file…");
+  x.send(f);
+}
+async function watchUpdate() {
+  const b = $("#ub"); if (b) b.disabled = true;
+  updateSay("Installing… this takes about a minute. Agents restart once.");
+  const until = Date.now() + 15 * 60 * 1000;
+  while (Date.now() < until) {
+    await new Promise((r) => setTimeout(r, 3000));
+    let u = null;
+    try { const r = await fetch("/api/panel/update", { credentials: "same-origin" }); const j = await r.json(); if (r.ok) u = j.data; } catch (er) { continue; }
+    if (!u || u.state === "running") continue;
+    if (u.state === "done") { updateSay("✅ " + (u.message || "Updated.")); toast(u.message || "Updated"); return; }
+    if (u.state === "failed") { updateSay("⚠️ " + (u.message || "The update was not installed.")); if (b) b.disabled = false; return; }
+    return;
+  }
+  updateSay("Still not finished after 15 minutes. Reload this page to check.");
+}
 async function show(t) {
   tab = t;
   for (const b of document.querySelectorAll("nav.tabs button")) b.classList.toggle("on", b.dataset.t === t);

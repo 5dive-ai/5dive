@@ -63,6 +63,37 @@ fi
 # marketplace refreshes, Hermes's package fetch) is skipped under it.
 offline_update() { [[ "${FIVEDIVE_OFFLINE_UPDATE:-0}" == 1 ]]; }
 
+# DIVE-7579 (D5): plugin_subtrees <tarball> <dest> <plugin>... — puts each named
+# plugin at <dest>/plugins/<plugin>. Online: the GitHub branch tarball, filtered
+# to those members. A file:// tarball (an update file's plugins.tar.gz) is NOT
+# filtered: bun hard-links packages across plugins, so that tar holds ~14,000
+# hard links whose targets sit in OTHER plugins, a filtered extract of one plugin
+# cannot make them (4,703 "Cannot hard link", tar exit 2) and every update left
+# the root-staged plugins stale. The update's own unpacked copy beside the
+# tarball (<stage>/plugins, unpacked whole by the verifier) is used; with none,
+# the whole file is unpacked once into a temp folder.
+plugin_subtrees() {
+  local tb="$1" dest="$2" p src="" tmp=""
+  shift 2
+  if [[ "$tb" == file://* ]]; then
+    src="$(dirname "$(dirname "${tb#file://}")")/plugins"
+    if [[ ! -d "$src/plugins" ]]; then
+      tmp=$(mktemp -d) || return 1
+      tar -xzf "${tb#file://}" -C "$tmp" --strip-components=1 2>/dev/null || { rm -rf "$tmp"; return 1; }
+      src="$tmp"
+    fi
+    mkdir -p "$dest/plugins" || { [[ -n "$tmp" ]] && rm -rf "$tmp"; return 1; }
+    for p in "$@"; do
+      [[ -d "$src/plugins/$p" ]] && cp -a "$src/plugins/$p" "$dest/plugins/" || { [[ -n "$tmp" ]] && rm -rf "$tmp"; return 1; }
+    done
+    [[ -n "$tmp" ]] && rm -rf "$tmp"
+    return 0
+  fi
+  local -a members=()
+  for p in "$@"; do members+=("5dive-plugins-main/plugins/$p"); done
+  curl -fsSL "$tb" | tar -xz -C "$dest" --strip-components=1 "${members[@]}" 2>/dev/null
+}
+
 # >>> DIVE-1977 pin-resolution block (extracted verbatim by tests/install_pin_sha_unit.sh)
 # DIVE-1977: every path under raw.githubusercontent.com/<org>/5dive/main is an
 # INDEPENDENT CDN object with its own cache generation, so for a window after
@@ -1254,10 +1285,7 @@ TOOLENV
   # The CODEX_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   CODEX_PLUGIN_TARBALL="${CODEX_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _cdx_tmp=$(mktemp -d)
-  if curl -fsSL "$CODEX_PLUGIN_TARBALL" \
-      | tar -xz -C "$_cdx_tmp" --strip-components=1 \
-          '5dive-plugins-main/plugins/telegram-codex' \
-          '5dive-plugins-main/plugins/dashboard' 2>/dev/null \
+  if plugin_subtrees "$CODEX_PLUGIN_TARBALL" "$_cdx_tmp" telegram-codex dashboard \
       && [ -f "$_cdx_tmp/plugins/telegram-codex/dispatcher.ts" ] \
       && [ -f "$_cdx_tmp/plugins/dashboard/server.ts" ]; then
     install -d -m 755 "$LIB_DIR/telegram-codex" "$LIB_DIR/dashboard"
@@ -1295,8 +1323,7 @@ TOOLENV
   # The GROK_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   GROK_PLUGIN_TARBALL="${GROK_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _grk_tmp=$(mktemp -d)
-  if curl -fsSL "$GROK_PLUGIN_TARBALL" \
-      | tar -xz -C "$_grk_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-grok' 2>/dev/null \
+  if plugin_subtrees "$GROK_PLUGIN_TARBALL" "$_grk_tmp" telegram-grok \
       && [ -f "$_grk_tmp/plugins/telegram-grok/server.ts" ]; then
     install -d -m 755 "$LIB_DIR/telegram-grok"
     cp -a "$_grk_tmp/plugins/telegram-grok/." "$LIB_DIR/telegram-grok/"
@@ -1327,8 +1354,7 @@ TOOLENV
   # The AGY_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   AGY_PLUGIN_TARBALL="${AGY_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _agy_tmp="$(mktemp -d)"
-  if curl -fsSL "$AGY_PLUGIN_TARBALL" \
-      | tar -xz -C "$_agy_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-agy' 2>/dev/null \
+  if plugin_subtrees "$AGY_PLUGIN_TARBALL" "$_agy_tmp" telegram-agy \
       && [ -f "$_agy_tmp/plugins/telegram-agy/server.ts" ]; then
     install -d -m 755 "$LIB_DIR/telegram-agy"
     cp -a "$_agy_tmp/plugins/telegram-agy/." "$LIB_DIR/telegram-agy/"
@@ -1363,8 +1389,7 @@ TOOLENV
   # The OPENCODE_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   OPENCODE_PLUGIN_TARBALL="${OPENCODE_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _ocode_tmp="$(mktemp -d)"
-  if curl -fsSL "$OPENCODE_PLUGIN_TARBALL" \
-      | tar -xz -C "$_ocode_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-opencode' 2>/dev/null \
+  if plugin_subtrees "$OPENCODE_PLUGIN_TARBALL" "$_ocode_tmp" telegram-opencode \
       && [ -f "$_ocode_tmp/plugins/telegram-opencode/server.ts" ]; then
     install -d -m 755 "$LIB_DIR/telegram-opencode"
     cp -a "$_ocode_tmp/plugins/telegram-opencode/." "$LIB_DIR/telegram-opencode/"
@@ -1398,8 +1423,7 @@ TOOLENV
   # The PI_PLUGIN_TARBALL override exists to pin it; the DEFAULT is mutable.
   PI_PLUGIN_TARBALL="${PI_PLUGIN_TARBALL:-https://github.com/$GH_ORG/5dive-plugins/archive/refs/heads/main.tar.gz}"
   _pi_tmp="$(mktemp -d)"
-  if curl -fsSL "$PI_PLUGIN_TARBALL" \
-      | tar -xz -C "$_pi_tmp" --strip-components=1 '5dive-plugins-main/plugins/telegram-pi' 2>/dev/null \
+  if plugin_subtrees "$PI_PLUGIN_TARBALL" "$_pi_tmp" telegram-pi \
       && [ -f "$_pi_tmp/plugins/telegram-pi/server.ts" ]; then
     install -d -m 755 "$LIB_DIR/telegram-pi"
     cp -a "$_pi_tmp/plugins/telegram-pi/." "$LIB_DIR/telegram-pi/"
@@ -1979,6 +2003,14 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   # DIVE-7577: pin the release update key this CLI carries (a CLI without one
   # writes nothing). An older CLI refuses the flag and changes nothing.
   "$BIN_DIR/5dive" self-update --write-pubkey >/dev/null 2>&1 || true
+  # DIVE-7579 (D6): the office chat + panel server is staged from the CLI bundle,
+  # and only `local serve` wrote it, so no update (online or from a file) ever
+  # reached it. The new CLI re-stages it and restarts it only when it changed.
+  # A box with no office chat skips this; an older CLI has no such verb.
+  if [[ -f /etc/systemd/system/5dive-local-chat.service ]]; then
+    if _lc_out="$("$BIN_DIR/5dive" local _restage 2>&1)"; then ok "office chat: ${_lc_out##*$'\n'}"
+    else echo "warn: could not refresh the office chat server — it keeps running the one it has (fix: sudo 5dive local serve)" >&2; fi
+  fi
 
   # >>> DIVE-6618 host plugins (extracted verbatim by tests/plugin_host_auto_upgrade_unit.sh)
   # Box-wide plugins (/var/lib/5dive/plugins) were install-once on a self-installed
