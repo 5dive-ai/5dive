@@ -347,8 +347,12 @@ _chat_cmd_devices() {
       if (( JSON_MODE )); then jq -c '{ok:true, data:{devices:.}}' <<<"$rows"; return 0; fi
       [[ "$(jq 'length' <<<"$rows")" != 0 ]] || { echo "No browser or phone has asked yet."; return 0; }
       jq -r '.[] | "\(.code)  \(if .state == "approved" then "approved" else "waiting " end)  \(.device)  \(.createdAt[:10])"' <<<"$rows"
-      jq -e 'any(.[]; .state != "approved")' <<<"$rows" >/dev/null \
-        && echo "Approve one with: sudo 5dive chat devices approve <code>" ;;
+      # DIVE-7595: an `if`, never a trailing `cond && echo`: with every device
+      # approved (the normal state) that list returned 1 and the backstop
+      # reported a bug after a correct listing. `|| true` would hide a jq error.
+      if jq -e 'any(.[]; .state != "approved")' <<<"$rows" >/dev/null; then
+        echo "Approve one with: sudo 5dive chat devices approve <code>"
+      fi ;;
     approve)
       (( $# == 1 )) || fail "$E_USAGE" "usage: sudo 5dive chat devices approve <code>   (the code the new browser or phone shows)"
       local want rows hit

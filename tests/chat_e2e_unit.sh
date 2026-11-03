@@ -349,6 +349,26 @@ run _chat_cmd_devices sync
 check 'sync drops a device the API no longer lists (revoked in the app)' \
   '! _chat_e2e_admin "$LIVE" "{\"op\":\"roster\"}" | jq -e "any(.devices[]; .id == \"dev-phone001\")" >/dev/null'
 
+# ── DIVE-7595: ls with every device approved exits 0, no hint, no backstop ───
+run _chat_cmd_devices ls; rc=$?
+check 'ls, every device approved: exits 0, prints the row, no approve hint' \
+  '[[ $rc == 0 ]] && grep -q "  approved  dev-laptop1  " "$TMP/out" && ! grep -q "Approve one with" "$TMP/out"'
+# The real CLI's EXIT backstop, around the bare verb (it defaults to ls). The
+# flag goes first: an earlier refusal's fail() left it, and it mutes the backstop.
+# shellcheck disable=SC2034  # CURRENT_VERB is read by _report_silent_exit
+bare_devices(){ rm -f "$FIVE_REPORTED_FLAG"; trap '_report_silent_exit $?' EXIT; CURRENT_VERB=chat; cmd_chat devices; }
+run bare_devices; rc=$?
+check 'bare `chat devices`, every device approved: exits 0 and the bug backstop stays silent' \
+  '[[ $rc == 0 && ! -s "$TMP/err" ]]'
+JSON_MODE=1 run _chat_cmd_devices ls; rc=$?
+check 'ls --json, every device approved: unchanged envelope, one approved device' \
+  '[[ $rc == 0 ]] && jq -e ".ok == true and (.data.devices | length) == 1 and .data.devices[0].state == \"approved\"" "$TMP/out" >/dev/null'
+jq -s '.' "$TMP/laptop.json" "$TMP/tablet.json" >"$DEVICES"
+run _chat_cmd_devices ls; rc=$?
+check 'ls, one device waiting: exits 0 and prints the approve hint' \
+  '[[ $rc == 0 ]] && grep -q "  waiting   dev-tablet1  " "$TMP/out" && grep -q "^Approve one with: sudo 5dive chat devices approve <code>$" "$TMP/out"'
+jq -s '.' "$TMP/laptop.json" >"$DEVICES"
+
 # ── DIVE-7440: heal a parent 0.111.0's enable locked to 0700 ─────────────────
 chmod 0700 "$TMP/etc"
 run _chat_cmd_e2e heal; rc=$?
