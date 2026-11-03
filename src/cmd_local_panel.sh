@@ -157,7 +157,11 @@ _lp_reply_fail() { jq -cn --arg e "$1" '{ok:false, error:$e}'; }
 _lp_cli_json() {
   local out err rc ef; ef=$(mktemp) || return 1
   out=$("$(_lp_cli)" --json "$@" 2>"$ef") && rc=0 || rc=$?
-  err=$(tail -n 3 "$ef" 2>/dev/null); rm -f -- "$ef"
+  err=$(tail -n 3 "$ef" 2>/dev/null)
+  # DIVE-7603 (n3): LP_CLI_LOG keeps the whole output (the panel update's
+  # install log); every other call keeps only the last lines, as before.
+  [[ -n "${LP_CLI_LOG:-}" ]] && { cp -f -- "$ef" "$LP_CLI_LOG" && chmod 0600 -- "$LP_CLI_LOG"; } 2>/dev/null
+  rm -f -- "$ef"
   if (( rc == 0 )) && jq -e '.ok == true' <<<"$out" >/dev/null 2>&1; then
     jq -c '.data // null' <<<"$out"; return 0
   fi
@@ -300,12 +304,16 @@ _lp_ai_setup() {
 # existed (the verb is --from=), so the card never showed.
 _lp_update_ready() { declare -F _ou_verify >/dev/null 2>&1; }
 
-# The status file the page polls: {state: running|done|failed, message, from, to, at}.
-_lp_update_write_status() { # <state> <message> [to]
-  local d f; d=$(_lp_update_dir); f="$d/status.json"
+# The status file the page polls: {state: running|done|failed, message, from, to, at, log}.
+# DIVE-7603 (n3): `log` is the last 20 lines the install printed (its stage
+# warnings), so the Update card can show them; the whole output stays beside
+# it in install.log (root, 0600). Before this, all but 3 lines were deleted.
+_lp_update_write_status() { # <state> <message> [to] [log-file]
+  local d f log=""; d=$(_lp_update_dir); f="$d/status.json"
   install -d -m 0700 -- "$d" 2>/dev/null || return 0
-  jq -cn --arg s "$1" --arg m "${2:0:600}" --arg from "${FIVE_VERSION:-}" --arg to "${3:-}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{state:$s, message:$m, from:$from, to:(if $to == "" then null else $to end), at:$at}' >"$f.tmp" 2>/dev/null \
+  [[ -n "${4:-}" && -f "$4" ]] && log=$(tail -n 20 -- "$4" 2>/dev/null | sed -e 's/\x1b\[[0-9;]*m//g' | head -c 3000)
+  jq -cn --arg s "$1" --arg m "${2:0:600}" --arg from "${FIVE_VERSION:-}" --arg to "${3:-}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg log "$log" \
+    '{state:$s, message:$m, from:$from, to:(if $to == "" then null else $to end), at:$at} + (if $log == "" then {} else {log:$log} end)' >"$f.tmp" 2>/dev/null \
     && chmod 0600 "$f.tmp" && mv -f "$f.tmp" "$f"
   return 0
 }
@@ -357,17 +365,18 @@ _lp_spawn_update() {
 # copy, record the verdict in plain words, remove the copy.
 _lp_update_run() {
   require_root
-  local copy msg to rc
-  copy="$(_lp_update_dir)/update.tar"
+  local copy msg to rc log
+  copy="$(_lp_update_dir)/update.tar"; log="$(_lp_update_dir)/install.log"
   [[ -f "$copy" && ! -L "$copy" ]] || { _lp_update_write_status failed "No update file was waiting."; return 0; }
-  msg=$(_lp_cli_json self-update --from="$copy" </dev/null) && rc=0 || rc=$?
+  rm -f -- "$log"
+  msg=$(export FIVEDIVE_PANEL_UPDATE=1 LP_CLI_LOG="$log"; _lp_cli_json self-update --from="$copy" </dev/null) && rc=0 || rc=$?
   rm -f -- "$copy"
   if (( rc == 0 )); then
     to=$("$(_lp_cli)" --json --version 2>/dev/null | jq -r '.data.version // empty' 2>/dev/null) || to=""
-    _lp_update_write_status "done" "Updated${to:+ to $to}." "$to"
+    _lp_update_write_status "done" "Updated${to:+ to $to}." "$to" "$log"
   else
     msg="${msg#update refused: }"
-    _lp_update_write_status failed "Not installed: ${msg}"
+    _lp_update_write_status failed "Not installed: ${msg}" "" "$log"
   fi
   _lp_audit "panel" "update-run" "" "$( (( rc == 0 )) && printf 'ok %s' "$to" || printf 'failed: %s' "${msg:0:200}")"
   return 0

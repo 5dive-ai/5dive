@@ -177,6 +177,9 @@ refused "OTHER KEY: a valid signature by a key this box does not pin" "$OTHER" 1
 # 6. OLDER / EQUAL VERSION.
 refused "OLDER: 2.0.0 onto a box on 3.0.0" "$GOOD" 3.0.0 "already runs 3.0.0"
 refused "EQUAL: 2.0.0 onto a box on 2.0.0" "$GOOD" 2.0.0 "already runs 2.0.0"
+# DIVE-7603 (n5): the office panel shows this line, and its owner has no terminal.
+verify "$GOOD" 2.0.0 0; ! grep -q -- '--allow-downgrade' "$WORK/why" && [[ "$_OU_NOT_NEWER" == 1 ]] \
+  && ok_t "EQUAL: the refusal names no terminal flag and is marked not-newer" || bad_t "EQUAL: refusal names a terminal flag" "$(cat "$WORK/why")"
 verify "$GOOD" 3.0.0 1 && ok_t "OLDER with --allow-downgrade: accepted (the override works)" || bad_t "--allow-downgrade refused" "$(cat "$WORK/why")"
 # 7. EXTRA / MISSING FILE vs THE MANIFEST.
 fx() { echo x > payload/extra; }
@@ -230,7 +233,7 @@ fi
 verb() { # <file> [args…] — runs cmd_self_update in a subshell; output in $WORK/verb.out
   ( set +u
     # shellcheck disable=SC2034  # read by the sourced cmd_self_update / ok()
-    readonly FIVE_VERSION=1.0.0; JSON_MODE=0
+    readonly FIVE_VERSION="${VERB_VER:-1.0.0}"; JSON_MODE=0
     # shellcheck disable=SC1090,SC1091
     . "$ROOT/src/lib/error_codes.sh"; . "$ROOT/src/lib/output.sh"
     . "$LIB"; . "$ROOT/src/cmd_selfupdate.sh"
@@ -265,6 +268,15 @@ if VERB_LOCAL_ONLY=0 verb "$GOOD" && grep -q old "$vco/plugins/dashboard/server.
 else bad_t "VERB: online box seat checkout handling" "$(tail -6 "$WORK/verb.out")"; fi
 if ! verb "$GOOD" --bogus && grep -q "unknown argument '--bogus'" "$WORK/verb.out"; then ok_t "VERB: an unknown flag is a usage error"
 else bad_t "VERB: unknown flag accepted" "$(tail -3 "$WORK/verb.out")"; fi
+# DIVE-7603 (n5): the terminal names --allow-downgrade; the office panel's run does not.
+rm -rf "$WORK/vfake"
+if ! VERB_VER=2.0.0 verb "$GOOD" && grep -q 'nothing newer to install (--allow-downgrade to install it anyway)' "$WORK/verb.out"; then
+  ok_t "VERB: an equal version on a terminal is refused naming --allow-downgrade"
+else bad_t "VERB: terminal equal-version refusal" "$(tail -3 "$WORK/verb.out")"; fi
+if ! FIVEDIVE_PANEL_UPDATE=1 VERB_VER=2.0.0 verb "$GOOD" && grep -q 'nothing newer to install. Nothing was changed' "$WORK/verb.out" \
+   && ! grep -q -- '--allow-downgrade' "$WORK/verb.out"; then
+  ok_t "VERB: the same refusal from the office panel names no terminal flag"
+else bad_t "VERB: panel equal-version refusal names a terminal flag" "$(tail -3 "$WORK/verb.out")"; fi
 
 # ---------------------------------------------------------------- static guards
 I="$ROOT/install.sh"

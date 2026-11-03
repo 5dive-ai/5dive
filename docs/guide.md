@@ -598,13 +598,22 @@ MIT. See [LICENSE](../LICENSE).
 ## Local-only mode: nothing leaves your network
 
 For an office where nothing may leave the building, one command turns off every outside
-connection the box makes on its own, and refuses every command that would make one:
+connection the box makes on its own, and refuses every command that would make one. Save your
+office AI first: the office chat page that `local-only on` starts uses its address to pick the
+office network, which matters on a box with more than one.
 
 ```sh
+# 1. your AI on the office network (any Anthropic-compatible server: Ollama, LM Studio, vLLM)
+sudo 5dive account add office-ai --provider=custom --base-url=http://<lan-ip>:<port> --model=<model> --harness=claude
+# 2. the switch; it also starts the office chat page
 sudo 5dive config local-only on --ntp=192.168.1.1   # --ntp: your office time server (optional)
 sudo systemctl restart '5dive-agent@*'                       # agents pick up the quiet runtime settings
 sudo 5dive config local-only check                   # ok/LEAK per item, then a 60 s connection watch
 ```
+
+Done in the other order on a two-network box, the chat page is not started and says which
+networks it saw; save the account, then start it with `sudo 5dive local serve`, or name the office
+address with `sudo 5dive local serve --addr=<office IP>`.
 
 While it is on, agents must use a model server on your network
 (`--base-url=http://<lan-ip>:<port>`); Telegram, a2a, cloud AI accounts, Google sign-in, hire
