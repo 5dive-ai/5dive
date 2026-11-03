@@ -37,7 +37,9 @@
 # signing key (OFFLINE_UPDATE_SIGNING_KEY on the 5dive repo) and pastes its
 # public half here — `openssl pkey -in key.pem -pubout`. install.sh writes it to
 # $OFFLINE_UPDATE_PUBKEY_FILE at every install/upgrade (`self-update --write-pubkey`).
-OFFLINE_UPDATE_PUBKEY_PEM=''
+OFFLINE_UPDATE_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAf9KHm4dxpSPYZDHIeDI+mA4yHuPavXzwmsw3+POZW10=
+-----END PUBLIC KEY-----'
 
 # >>> DIVE-7577 offline update verifier
 #     (tests/self_update_offline_unit.sh extracts this block VERBATIM between
