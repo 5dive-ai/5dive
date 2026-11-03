@@ -72,8 +72,14 @@ for f in README.md README.zh-CN.md; do
   next="$(awk 'seen && /^```$/ {fence=1; next} fence && NF {print; exit} /^sudo 5dive init$/ {seen=1}' "$f")"
   [[ "$next" == *"docs/readme-demo.png"* ]] && ok "$f: the demo comes right after the install" \
     || bad "$f: the line after the install is not the demo: $next"
-  [[ "$next" != *"https://5dive.ai/self-host"* ]] && ok "$f: the app link is not the headline" \
+  # lodar 2026-11-03 03:10Z: a tap on the demo opens the app page, not a bigger
+  # picture. That link wraps the image and shows no text, so it is not a
+  # headline: strip exactly that wrapper, then the visible line must not link.
+  vis="$(sed -E 's#<a href="https://5dive\.ai/self-host[^"]*">(<img [^>]*>)</a>#\1#' <<<"$next")"
+  [[ "$vis" != *"https://5dive.ai/self-host"* ]] && ok "$f: the app link is not the headline" \
     || bad "$f: the app link is still the line after the install"
+  [[ "$next" == *'<a href="https://5dive.ai/self-host'*'"><img src="docs/readme-demo.png"'* ]] \
+    && ok "$f: a tap on the demo opens 5dive.ai/self-host" || bad "$f: the demo does not link to 5dive.ai/self-host"
   for gone in "5dive cloud" "my.5dive.ai/sign-up"; do
     [[ "$top" != *"$gone"* ]] && ok "$f top has no paid pitch: $gone" || bad "$f top still pitches: $gone"
   done
