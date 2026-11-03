@@ -647,6 +647,11 @@ doctor_check_cli_freshness() {
 doctor_marketplace_reference_sha() {
   local url="${1:-https://github.com/5dive-ai/5dive-plugins.git}"
   local branch="${2:-main}" out
+  # DIVE-7598: a local-only box must not dial github.com (the DNS lookup alone
+  # leaves the office network). UNKNOWN is this function's honest answer there.
+  if [[ "$url" != file://* ]] && declare -F local_only_on >/dev/null 2>&1 && local_only_on; then
+    return 1
+  fi
   out=$(git ls-remote --heads "$url" "$branch" 2>/dev/null) || return 1
   out="${out%%[!0-9a-f]*}"
   [[ "$out" =~ ^[0-9a-f]{40}$ ]] || return 1

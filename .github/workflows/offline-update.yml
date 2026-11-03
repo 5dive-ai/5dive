@@ -237,6 +237,9 @@ jobs:
             > "$RUNNER_TEMP/egress.nft"
           docker cp "$RUNNER_TEMP/egress.nft" usbbox:/root/egress.nft
           box 'nft -f /root/egress.nft && nft list table inet usb7598 | head -3'
+          # The drop log comes from the box's own network namespace: let the
+          # kernel print it, so a dropped packet names its sender (uid) and target.
+          sudo sysctl -qw net.netfilter.nf_log_all_netns=1 || true
           if [[ "$EVENT" == pull_request ]]; then
             # A PR's file is signed with a throwaway key: the box trusts it for
             # this install, and install.sh must then pin 5dive's REAL key over it.
@@ -249,7 +252,8 @@ jobs:
           tail -40 "$RUNNER_TEMP/usb-install.log"
           drops() { box 'nft list counter inet usb7598 dropped_out' | grep -oE 'packets [0-9]+' | awk '{print $2}'; }
           d="$(drops)"; echo "outside packets dropped during the install: $d"
-          [[ "$d" == 0 ]] || { echo "::error::the USB install tried to reach outside its network ($d packets)"; sudo dmesg | grep USB7598-DROP | tail -20 || true; fail=1; }
+          [[ "$d" == 0 ]] || { echo "::error::the USB install tried to reach outside its network ($d packets)"; sudo dmesg | grep USB7598-DROP | tail -20 || true; box 'cat /etc/resolv.conf' || true; fail=1; }
+          (( fail == 0 )) || { echo "--- the whole install log ---"; cat "$RUNNER_TEMP/usb-install.log"; }
           if box 'test -f /etc/5dive/local-only'; then echo "local-only: on"; else echo "::error::local-only is not on"; fail=1; fi
           box '/usr/local/bin/5dive --version' || fail=1
           box 'sudo -u claude -H /home/claude/.local/bin/claude --version' || { echo "::error::Claude Code did not install"; fail=1; }
@@ -263,7 +267,8 @@ jobs:
           box '5dive config local-only off' | tail -3 || true
           sleep 2
           c="$(page)"; echo "office chat page (after off): $c"
-          [[ "$c" =~ ^[234][0-9][0-9]$ ]] || { echo "::error::the office chat stopped answering after local-only off"; fail=1; }
+          [[ "$c" =~ ^[234][0-9][0-9]$ ]] || { echo "::error::the office chat stopped answering after local-only off"; fail=1
+            box 'systemctl status 5dive-local-chat.service --no-pager -l | head -20; journalctl -u 5dive-local-chat.service --no-pager -n 40; ss -ltnp' || true; }
           d="$(drops)"; echo "outside packets dropped, whole run (off included): $d"
           docker rm -f usbbox >/dev/null
           exit $fail
