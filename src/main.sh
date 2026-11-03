@@ -329,6 +329,7 @@ Accounts (a named auth profile — group sign-ins so multiple agents share one l
                                                        # your own AI server (Ollama, vLLM, office GPU box) on
                                                        # claude|codex|hermes|openclaw|pi|opencode; key optional
   5dive account test --base-url=<url> --model=<m> --harness=<h> [--api-key=-] [--json]
+  5dive account scan [--url=<address>] [--json]   # find AI servers on the office network
                                                        # one tool-call request: {ok, format, reason}; saves nothing
   5dive account login <name> --type=<type>             # interactive TTY login into an account
   5dive account set <name> --type=<type> --provider=<id> --api-key=-
@@ -1033,7 +1034,7 @@ _agent_verb_dispatch() {
 }
 
 _account_verb_dispatch() {
-      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|default|usage|poll|add|rename|remove|login|set|set-model|set-active-provider|test"
+      [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive account list|show|default|usage|poll|add|rename|remove|login|set|set-model|set-active-provider|test|scan"
       local acctcmd="$1"; shift
       # `--help` after a subverb is a question about THAT verb, not an unknown
       # flag. Answered before the dispatch, through the same helper `task`
@@ -1071,6 +1072,9 @@ _account_verb_dispatch() {
           with_registry_lock cmd_account_set "$@" ;;
         # DIVE-7568: does this AI server work for an agent? Read-only, no lock.
         test)   cmd_account_test "$@" ;;
+        # DIVE-7599: find AI servers on the office network. Read-only, private
+        # addresses only.
+        scan)   cmd_account_scan "$@" ;;
         set-model)
           # DIVE-5259: an account's model without its key (the included-model
           # switch). Audited, and under the lock `set-account` takes.

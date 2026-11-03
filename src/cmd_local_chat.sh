@@ -159,7 +159,7 @@ _lc_usage() {
   printf '%s\n' \
     "usage: sudo 5dive local serve [--addr=<office IP>] [--port=<port>]   # start the office chat" \
     "       sudo 5dive local serve --stop" \
-    "       sudo 5dive local pair [--owner]             # a one-time code to connect a phone or laptop" \
+    "       sudo 5dive local pair [--owner] [--name=<person>]  # a one-time code to connect a phone or laptop" \
     "                                                   # --owner: it may also manage the server at /panel" \
     "       sudo 5dive local devices ls | revoke <id>" \
     "            5dive local status"
@@ -379,12 +379,19 @@ _lc_pair_code() {
   printf '%s' "$out"
 }
 
+# A person's name for the device a code makes (DIVE-7599: the panel's "Invite a
+# person"). The same characters the server keeps from a browser-typed name, so
+# the name the owner typed is the name the device list shows.
+LC_NAME_RE="^[A-Za-z0-9]([A-Za-z0-9 ._'-]{0,38}[A-Za-z0-9._'-])?$"
+
 _lc_pair() {
-  local role=chat a
+  local role=chat a name=""
   for a in "$@"; do
     case "$a" in
       --owner) role=owner ;;
-      *) fail "$E_USAGE" "local pair takes one flag, --owner (unknown: $a)." ;;
+      --name=*) name="${a#--name=}"
+        [[ "$name" =~ $LC_NAME_RE ]] || fail "$E_VALIDATION" "local pair: a name is 1-40 letters, digits, spaces and . _ ' - (got: ${name:0:40})." ;;
+      *) fail "$E_USAGE" "local pair takes --owner and --name=<name> (unknown: $a)." ;;
     esac
   done
   require_root
@@ -398,10 +405,10 @@ _lc_pair() {
   [[ ${#code} == 8 ]] || fail "$E_GENERIC" "local chat: could not make a code."
   hash=$(printf '%s' "$code" | sha256sum | cut -d' ' -f1)
   exp=$(( $(date +%s) + 900 ))
-  _lc_admin pair-add "$hash" "$exp" "$role" >/dev/null || fail "$E_GENERIC" "local chat: could not save the code."
+  _lc_admin pair-add "$hash" "$exp" "$role" ${name:+"$name"} >/dev/null || fail "$E_GENERIC" "local chat: could not save the code."
   if (( JSON_MODE )); then
-    jq -cn --arg u "https://${addr}:${port}" --arg c "${code:0:4}-${code:4}" --arg f "$(_lc_fingerprint)" --argjson e "$exp" --arg r "$role" \
-      '{ok:true, data:{url:$u, code:$c, fingerprint:$f, expires:$e, role:$r}}'
+    jq -cn --arg u "https://${addr}:${port}" --arg c "${code:0:4}-${code:4}" --arg f "$(_lc_fingerprint)" --argjson e "$exp" --arg r "$role" --arg n "$name" \
+      '{ok:true, data:({url:$u, code:$c, fingerprint:$f, expires:$e, role:$r} + (if $n == "" then {} else {name:$n} end))}'
     return 0
   fi
   printf '%s\n' \

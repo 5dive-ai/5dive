@@ -21,7 +21,7 @@ _local_chat_server_ts() {
 // the LAN hop, so an e2e envelope posted here is refused, never stored.
 //
 //   bun local_chat_server.ts serve
-//   bun local_chat_server.ts admin pair-add <sha256-hex> <expires-epoch-s> [chat|owner]
+//   bun local_chat_server.ts admin pair-add <sha256-hex> <expires-epoch-s> [chat|owner] [<name>]
 //   bun local_chat_server.ts admin devices-ls
 //   bun local_chat_server.ts admin devices-revoke <id>
 import { Database } from "bun:sqlite";
@@ -82,6 +82,11 @@ for (const [t, col] of [["devices", "role"], ["pair_codes", "role"]]) {
   const cols = db.query(`PRAGMA table_info(${t})`).all() as { name: string }[];
   if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE ${t} ADD COLUMN role TEXT NOT NULL DEFAULT 'chat'`);
 }
+// DIVE-7599: an invite names the person; the device that uses the code takes
+// that name, not the one its browser guessed.
+if (!(db.query("PRAGMA table_info(pair_codes)").all() as { name: string }[]).some((c) => c.name === "name"))
+  db.exec("ALTER TABLE pair_codes ADD COLUMN name TEXT NOT NULL DEFAULT ''");
+const cleanName = (v: unknown) => (typeof v === "string" ? v : "").replace(/[^\w .'-]/g, "").trim().slice(0, 40);
 
 const now = () => Math.floor(Date.now() / 1000);
 const sha256 = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
@@ -92,9 +97,11 @@ const json = (body: unknown, status = 200, headers: Record<string, string> = {})
 if (process.argv[2] === "admin") {
   const [op, a, b] = process.argv.slice(3);
   const role = process.argv[6] ?? "chat";
-  if (op === "pair-add" && /^[0-9a-f]{64}$/.test(a || "") && /^\d+$/.test(b || "") && (role === "chat" || role === "owner")) {
+  const who = process.argv[7] ?? "";
+  if (op === "pair-add" && /^[0-9a-f]{64}$/.test(a || "") && /^\d+$/.test(b || "") && (role === "chat" || role === "owner")
+      && cleanName(who) === who) {
     db.query("DELETE FROM pair_codes WHERE expires < ? OR used = 1").run(now());
-    db.query("INSERT OR REPLACE INTO pair_codes (hash, expires, role) VALUES (?, ?, ?)").run(a, Number(b), role);
+    db.query("INSERT OR REPLACE INTO pair_codes (hash, expires, role, name) VALUES (?, ?, ?, ?)").run(a, Number(b), role, who);
     console.log(JSON.stringify({ ok: true }));
   } else if (op === "devices-ls") {
     console.log(JSON.stringify(db.query("SELECT id, name, role, created, last_seen, revoked FROM devices ORDER BY created").all()));
@@ -103,7 +110,7 @@ if (process.argv[2] === "admin") {
     console.log(JSON.stringify({ ok: r.changes > 0 }));
     process.exit(r.changes > 0 ? 0 : 3);
   } else {
-    console.error("usage: admin pair-add <sha256> <expires> [chat|owner] | devices-ls | devices-revoke <id>");
+    console.error("usage: admin pair-add <sha256> <expires> [chat|owner] [<name>] | devices-ls | devices-revoke <id>");
     process.exit(2);
   }
   process.exit(0);
@@ -365,13 +372,13 @@ async function browserSide(req: Request, url: URL): Promise<Response> {
     let b: { code?: unknown; name?: unknown };
     try { b = await req.json(); } catch { return json({ error: "invalid body" }, 400); }
     const code = typeof b.code === "string" ? b.code.replace(/[\s-]/g, "").toUpperCase() : "";
-    const row = db.query("SELECT hash, role FROM pair_codes WHERE hash = ? AND used = 0 AND expires >= ?").get(sha256(code), now()) as
-      | { hash: string; role: string } | null;
+    const row = db.query("SELECT hash, role, name FROM pair_codes WHERE hash = ? AND used = 0 AND expires >= ?").get(sha256(code), now()) as
+      | { hash: string; role: string; name: string } | null;
     if (!code || !row) return json({ error: "That code is wrong or expired." }, 403);
     db.query("UPDATE pair_codes SET used = 1 WHERE hash = ?").run(sha256(code));
     const cookie = randomBytes(32).toString("base64url");
     const id = randomBytes(6).toString("hex");
-    const name = (typeof b.name === "string" ? b.name : "").replace(/[^\w .'-]/g, "").slice(0, 40) || "device";
+    const name = row.name || cleanName(b.name) || "device";
     const role = row.role === "owner" ? "owner" : "chat";
     db.query("INSERT INTO devices (id, name, cookie_hash, created, last_seen, role) VALUES (?, ?, ?, ?, ?, ?)")
       .run(id, name, sha256(cookie), now(), now(), role);
@@ -520,6 +527,26 @@ async function panelSide(req: Request, p: string, dev: Device): Promise<Response
     const id = str(b.id, 32);
     if (!/^[a-f0-9]{8,32}$/.test(id)) return json({ error: "invalid device" }, 400);
     return reply(await panelExec(["device-revoke", id], dev.id));
+  }
+  // DIVE-7599: invite a person by name. Root runs `local pair --name`, so the
+  // code is the same one-use, 15-minute code; it comes back here once and is
+  // never written anywhere but its hash.
+  if (p === "/api/panel/invite" && post) {
+    const name = str(b.name, 40).trim(), role = str(b.role, 5);
+    if (!name || cleanName(name) !== name || !/^[A-Za-z0-9]/.test(name) || (role !== "chat" && role !== "owner"))
+      return json({ error: "Type their name (letters, digits, spaces), and pick Chat or Manage." }, 400);
+    return reply(await panelExec(["device-invite", name, role], dev.id));
+  }
+  // DIVE-7599: first-run setup — find the office's AI server, then save it and
+  // make the first agent. Root does both; this process dials nothing.
+  if (p === "/api/panel/ai-scan" && post) {
+    const url = str(b.url, 300).trim();
+    return reply(await panelExec(url ? ["ai-scan", url] : ["ai-scan"], dev.id, "", 120_000));
+  }
+  if (p === "/api/panel/ai-setup" && post) {
+    const url = str(b.url, 300).trim(), model = str(b.model, 200), agent = str(b.agent, 16);
+    if (!url || !model || !AGENT_RE.test(agent)) return json({ error: "Pick an AI server and a model, and name your first agent." }, 400);
+    return reply(await panelExec(["ai-setup", url, model, agent], dev.id, "", 600_000));
   }
   return json({ error: "not found" }, 404);
 }
@@ -755,6 +782,11 @@ input{width:100%;padding:12px;font:inherit;border:1px solid var(--line);border-r
 .ok{color:var(--live)}.leak{color:var(--bad);font-weight:600}.big{font-size:20px;font-weight:600;margin:4px 0}
 .toast{position:fixed;left:16px;right:16px;bottom:84px;margin:auto;max-width:520px;padding:12px 14px;border-radius:12px;background:var(--ink);color:var(--bg);display:none}
 .empty{padding:32px 8px;text-align:center;color:var(--mute)}
+.seg{display:flex;gap:8px;margin:6px 0 12px}.seg button{flex:1;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);font:inherit;padding:10px 8px;cursor:pointer;text-align:left}
+.seg button b{display:block}.seg button span{color:var(--mute);font-size:13px}.seg button.on{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.code{font:600 34px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:4px;text-align:center;padding:14px;margin:8px 0;border:1px dashed var(--accent);border-radius:12px}
+.pick{display:block;width:100%;text-align:left;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);font:inherit;padding:10px 12px;margin:6px 0;cursor:pointer}
+.pick span{display:block;color:var(--mute);font-size:13px}.pick.on{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
 </style></head><body>
 <header><h1 id="title">Office server</h1><a href="/">💬 Chat</a></header>
 <main id="app"><div class="empty">Loading…</div></main>
@@ -846,7 +878,7 @@ const views = {
       '<div class="card"><h3>Your AI</h3>' + (d.accounts.length ? d.accounts.map((a) =>
         '<div class="item"><div class="grow"><b>' + esc(a.model || a.name) + '</b><span>' + esc(a.baseUrl) + '</span></div><button class="btn line" data-test="' + esc(a.name) + '">Test</button></div>').join("")
         : '<p class="mute">No local AI added yet.</p>') + '</div>' +
-      '<div class="card"><h3>Connected devices</h3>' + d.devices.map((v) =>
+      '<div class="card"><h3>Connected devices</h3><button class="btn" id="inv" style="margin:6px 0 4px">＋ Invite a person</button>' + d.devices.map((v) =>
         '<div class="item"><div class="grow"><b>' + esc(v.name) + (v.id === d.me ? " (this one)" : "") + '</b><span>' + (v.role === "owner" ? "Can manage" : "Chat only") + ' · last seen ' + esc(seen(v.last_seen)) + '</span></div><button class="btn red" data-rv="' + esc(v.id) + '">Remove</button></div>').join("") + '</div>' +
       (d.updateFromFile ? '<div class="card"><h3>Update</h3><p class="mute">This server runs 5dive ' + esc(d.version || "") + '. Got an update file from your IT team? Pick it and install.</p>' +
         '<input type="file" id="uf" accept=".tar"><button class="btn" id="ub">Install update</button><p id="us" class="mute"></p></div>' : "");
@@ -860,10 +892,86 @@ const views = {
       }
       if (r && confirm("Remove this device? It will need a new code to come back.")) act(r, "/api/panel/revoke", { id: r.dataset.rv }, "Device removed");
       if (e.target.id === "ub") installUpdate();
+      if (e.target.id === "inv") invite();
     };
     if (d.updateFromFile) { try { const u = await api("/api/panel/update"); if (u && u.state === "running") watchUpdate(); } catch (er) {} }
   },
 };
+// DIVE-7599: invite a person. Their name, Chat or Manage, then the one-time
+// code and the address to hand over. The code is shown once, here only.
+function invite() {
+  let role = "chat";
+  $("#tabs").hidden = true; window.scrollTo(0, 0);
+  app.onclick = null;
+  app.innerHTML = '<div class="card"><h3>Invite a person</h3><p class="mute">They get a code to connect their phone or laptop.</p>' +
+    '<input id="pn" placeholder="Their name, e.g. Ana" maxlength="40" autocomplete="off">' +
+    '<div class="seg" id="seg"><button data-r="chat" class="on"><b>💬 Chat</b><span>Talk to the agents</span></button>' +
+    '<button data-r="owner"><b>⚙️ Manage</b><span>Chat, and run this server</span></button></div>' +
+    '<button class="btn" id="go">Get a code</button> <button class="btn line" id="cx">Cancel</button></div>';
+  $("#seg").onclick = (e) => { const b = e.target.closest("button[data-r]"); if (!b) return; role = b.dataset.r; for (const x of $("#seg").children) x.classList.toggle("on", x === b); };
+  $("#cx").onclick = () => show("settings");
+  $("#go").onclick = async () => {
+    const name = $("#pn").value.trim(), go = $("#go");
+    if (!name) { toast("Type their name first."); return; }
+    go.disabled = true; go.textContent = "Working…";
+    try {
+      const c = await api("/api/panel/invite", { name, role });
+      const fp = String(c.fingerprint || "").slice(-23);
+      app.innerHTML = '<div class="card"><h3>Code for ' + esc(c.name || name) + '</h3>' +
+        '<p class="mute">On their phone or laptop, open</p><div class="big">' + esc(c.url) + '</div>' +
+        '<p class="mute">and type this code. It works once, for 15 minutes.</p><div class="code" id="cd">' + esc(c.code) + '</div>' +
+        '<p class="mute">' + (c.role === "owner" ? "⚙️ They can chat and manage this server." : "💬 They can chat with the agents.") + '</p>' +
+        (fp ? '<p class="mute">If the browser warns about the certificate, it is safe when it ends with ' + esc(fp) + '.</p>' : '') +
+        '<button class="btn" id="dn">Done</button></div>';
+      $("#dn").onclick = () => show("settings");
+    } catch (er) { toast(er.message); go.disabled = false; go.textContent = "Get a code"; }
+  };
+  $("#pn").focus();
+}
+// DIVE-7599: first run. No AI on this server yet: find the office's AI server,
+// test it, save it and make the first agent, without a terminal.
+async function setup() {
+  let pick = null;
+  $("#tabs").hidden = true; window.scrollTo(0, 0); app.onclick = null;
+  app.innerHTML = '<div class="card"><h3>Set up your office AI</h3><p class="mute" id="sl">Your agents think with an AI server in your office. Looking for one on your network…</p><div id="found"><div class="empty">Searching…</div></div>' +
+    '<details id="typed"><summary class="mute">Type its address instead</summary><input id="au" placeholder="e.g. 192.168.1.20:11434" autocapitalize="off" autocomplete="off"><button class="btn line" id="ac">Check</button></details></div>' +
+    '<div class="card"><h3>Your first agent</h3><input id="an" value="assistant" maxlength="16" autocapitalize="off"><button class="btn" id="sb" disabled>Test and set up</button><p id="ss" class="mute"></p></div>' +
+    '<p class="mute" style="text-align:center"><a href="#team" id="skip" style="color:var(--accent)">Skip for now</a></p>';
+  const list = (servers, empty) => {
+    const rows = [];
+    for (const s of servers) for (const m of (s.models || [])) rows.push({ url: s.url, model: m, kind: s.kind });
+    $("#sl").textContent = rows.length ? "Pick the AI your agents will think with." : "Your agents think with an AI server in your office.";
+    $("#found").innerHTML = rows.length ? rows.map((r, i) => '<button class="pick" data-i="' + i + '"><b>' + esc(r.model) + '</b><span>' + esc(r.kind + " · " + r.url) + '</span></button>').join("") : '<div class="empty">' + esc(empty) + '</div>';
+    $("#found").onclick = (e) => {
+      const b = e.target.closest("button[data-i]"); if (!b) return;
+      pick = rows[+b.dataset.i];
+      for (const x of $("#found").querySelectorAll(".pick")) x.classList.toggle("on", x === b);
+      $("#sb").disabled = false;
+    };
+    if (rows.length === 1) $("#found").querySelector(".pick").click();
+  };
+  $("#skip").onclick = () => { try { sessionStorage.setItem("skipSetup", "1"); } catch (er) {} };
+  $("#ac").onclick = async () => {
+    let url = $("#au").value.trim(); if (!url) return;
+    if (!/^https?:[/][/]/.test(url)) url = "http://" + url;
+    $("#ac").disabled = true;
+    try { const d = await api("/api/panel/ai-scan", { url }); list(d.servers || [], "Nothing answered there. Check the address and that the AI server is on."); }
+    catch (er) { toast(er.message); }
+    $("#ac").disabled = false;
+  };
+  $("#sb").onclick = async () => {
+    const agent = $("#an").value.trim().toLowerCase(), sb = $("#sb");
+    if (!pick || !agent) return;
+    sb.disabled = true; $("#ss").textContent = "Testing " + pick.model + "… this can take a minute.";
+    try {
+      const r = await api("/api/panel/ai-setup", { url: pick.url, model: pick.model, agent });
+      app.innerHTML = '<div class="card"><h3>✅ Your office AI works</h3><p class="mute">' + esc(r.agent) + ' is ready in the chat, thinking with ' + esc(r.model) + '.</p>' +
+        '<div class="row"><a class="btn" href="/" style="text-decoration:none">Open chat</a><a class="btn line" href="#team" style="text-decoration:none">Manage</a></div></div>';
+    } catch (er) { $("#ss").textContent = "⚠️ " + er.message; sb.disabled = false; }
+  };
+  try { const d = await api("/api/panel/ai-scan", {}); list(d.servers || [], "No AI server found on your network. Type its address below."); if (!(d.servers || []).length) $("#typed").open = true; }
+  catch (er) { list([], er.message); $("#typed").open = true; }
+}
 // DIVE-7579 (D4): upload the file (with progress), then poll until the install
 // ends. The install restarts the agents and this server, so a failed poll is
 // retried, not reported.
@@ -912,7 +1020,15 @@ async function show(t) {
 }
 $("#tabs").onclick = (e) => { const b = e.target.closest("button[data-t]"); if (b) { location.hash = b.dataset.t; } };
 window.onhashchange = () => show(views[location.hash.slice(1)] ? location.hash.slice(1) : "team");
-window.onhashchange();
+// DIVE-7599: a server with no AI yet opens on the setup sheet (once per visit
+// after "Skip for now").
+(async () => {
+  let skip = false; try { skip = sessionStorage.getItem("skipSetup") === "1"; } catch (er) {}
+  if (!location.hash && !skip) {
+    try { const d = await api("/api/panel/settings"); if (!d.accounts.length) { setup(); return; } } catch (er) { if (/can chat/.test(er.message)) return; }
+  }
+  window.onhashchange();
+})();
 </script></body></html>`;
 LOCAL_CHAT_TS
 }
