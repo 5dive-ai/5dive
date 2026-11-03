@@ -152,7 +152,7 @@ start() { # <run-file> [args] — a copy of the starter with no root check and o
 # The test copy sits beside the real one, so "next to the file" is the same folder.
 start "$RUN" --ntp=$NTP >"$WORK/s.out" 2>&1; rc=$?
 calls="$(cat "$WORK/dpkg.calls" 2>/dev/null)"
-inst="$(grep '^install ' "$WORK/dpkg.calls" 2>/dev/null)"
+inst="$(grep '^install ' "$WORK/dpkg.calls" 2>/dev/null)" || inst=""
 if (( rc == 0 )) && [[ -e "$WORK/dpkgdb/fivedive-fake-a" && -e "$WORK/dpkgdb/fivedive-fake-dep" \
       && "$inst" == *" fivedive-fake-a"* && "$inst" != *fivedive-fake-have* ]]; then
   ok_t "S1 only the packages this server lacks are installed from the file (one it has is left alone), their dependency through the file's index"
