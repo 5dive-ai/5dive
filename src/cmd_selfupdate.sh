@@ -1856,7 +1856,12 @@ _published_cli_probe() {
   elif [[ -e "$canary_file" ]]; then
     rung="canary opt-in $canary_file (newest released tag, ahead of the fleet pin)"
   else
-    ref=$(curl -fsSL --max-time 5 "$route" 2>/dev/null | tr -d '[:space:]') || ref=""
+    # DIVE-7598: a local-only box never asks api.5dive.com (the DNS lookup alone
+    # leaves the office network); it reads its last-known tag, rung named below.
+    local lo=0
+    declare -F local_only_on >/dev/null 2>&1 && local_only_on && lo=1
+    if (( lo )); then ref=""
+    else ref=$(curl -fsSL --max-time 5 "$route" 2>/dev/null | tr -d '[:space:]') || ref=""; fi
     if [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       rung="fleet stable route $route"
     else
@@ -1866,8 +1871,10 @@ _published_cli_probe() {
       ref=""
       if [[ -r "$known_file" ]]; then ref=$(tr -d '[:space:]' < "$known_file" 2>/dev/null) || ref=""; fi
       rung="last known stable $known_file (the fleet stable route $route did not answer with a tag)"
+      (( lo )) && rung="last known stable $known_file (local-only: the fleet stable route $route is not asked)"
       if [[ ! "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        _pcp_out unavailable "" "the fleet stable route $route did not answer with a tag and $known_file holds no usable last-known tag — the installer could not upgrade this box either"
+        if (( lo )); then _pcp_out unavailable "" "local-only: the fleet stable route $route is not asked, and $known_file holds no usable last-known tag"
+        else _pcp_out unavailable "" "the fleet stable route $route did not answer with a tag and $known_file holds no usable last-known tag — the installer could not upgrade this box either"; fi
         return 0
       fi
     fi

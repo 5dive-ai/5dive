@@ -36,9 +36,15 @@ const LAN_ADDR = env.LC_LAN_ADDR || "0.0.0.0";
 const LAN_PORT = Number(env.LC_LAN_PORT || 8443);
 const LOOP_PORT = Number(env.LC_LOOP_PORT || 8480);
 const CRED = env.CREDENTIALS_DIRECTORY || "";
-const CERT = env.LC_CERT || (CRED ? join(CRED, "cert") : "");
-const KEY = env.LC_KEY || (CRED ? join(CRED, "key") : "");
-const TOKEN_FILE = env.LC_TOKEN_FILE || (CRED ? join(CRED, "token") : "");
+// DIVE-7598: where systemd sets CREDENTIALS_DIRECTORY but the service cannot see
+// it (a systemd in a container: the folder is absent in the service's view), the
+// unit's root pre-start also copies the three files into this service's own
+// 0700 runtime folder. Same reader (this user only), same tmpfs.
+const RUN = env.RUNTIME_DIRECTORY || "";
+const cred = (n: string) => { for (const d of [CRED, RUN]) if (d && existsSync(join(d, n))) return join(d, n); return ""; };
+const CERT = env.LC_CERT || cred("cert");
+const KEY = env.LC_KEY || cred("key");
+const TOKEN_FILE = env.LC_TOKEN_FILE || cred("token");
 const AGENTS_FILE = env.LC_AGENTS_FILE || "/etc/5dive/local-chat/agents.json";
 const UPLOADS = (env.LC_UPLOADS || "/home/claude/chat-uploads").replace(/\/+$/, "");
 const FILE_MAX = Number(env.LC_FILE_MAX || 20 * 1024 * 1024);

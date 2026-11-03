@@ -271,6 +271,20 @@ pr="$(run_update_check 0.86.1 prose)"; uc="$(run_update_check 0.86.1)"
 if [[ "$pr" != *"last resolved"* && "$pr" != *"this box installs"* && "$(jq -r .resolvedStale <<<"$uc")" == null ]]; then
   ok_t "no receipt: no receipt clause, resolvedStale null"
 else bad_t "an absent receipt produced a clause or a resolvedStale verdict" "prose=$pr json=$uc"; fi
+# 6. DIVE-7598: on a local-only box the probe never asks the route (a DNS lookup
+#    off the office network); it names the local-only rung instead. The route
+#    is live here, so a probe that still asked would read it.
+ROUTE=v0.86.1; HOLD=""; rm -f "$TD/etc/canary" "$TD/etc/override"
+lo_out="$(run_probe "local_only_on() { return 0; }
+curl() { echo dialed >> '$TD/state/lo-dialed'; command curl \"\$@\"; }
+$probe_block")"
+if [[ "$lo_out" == *"local-only: the fleet stable route"* && "$lo_out" != *"fleet stable route https://route.invalid/cli-version"$'\n'* && ! -s "$TD/state/lo-dialed" ]]; then
+  ok_t "local-only: the probe does not ask the route and names the local-only rung"
+else bad_t "local-only: the probe asked the route or hid why" "$(cat "$TD/state/lo-dialed" 2>/dev/null) $lo_out"; fi
+on_out="$(run_probe)"
+[[ "$on_out" == *"fleet stable route https://route.invalid/cli-version"* ]] \
+  && ok_t "control: online, the same probe reads the route" || bad_t "control: online probe did not read the route" "$on_out"
+
 # 5e. MUTATION. Drop the canary stale check and arm 5 must go red. Asserted to
 #     APPLY first, like arm 4.
 mut="$(sed 's/if \[\[ "\$rr_json" == '"'"'"canary"'"'"' \]\] \&\& version_lt/if false \&\& version_lt/' <<<"$check_src")"
