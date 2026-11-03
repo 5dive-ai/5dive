@@ -648,9 +648,13 @@ sudo bash /media/usb/5dive-usb-<version>.run --ntp=192.168.1.1   # --ntp: your o
 
 It puts in the system packages 5dive needs from the file, installs 5dive and Claude Code (after
 checking Claude Code against Anthropic's checksum), saves 5dive's update key on the box, and turns
-on local-only mode with the office chat. It never connects to anything. Then add an agent that uses
-your office AI server (`sudo 5dive agent create <name> --type=claude
---base-url=http://<AI server>:<port> --model=<model>`).
+on local-only mode with the office chat. It never connects to anything. Then save your office AI
+server once and add an agent on it, in the office chat:
+
+```sh
+sudo 5dive account add office-ai --provider=custom --base-url=http://<lan-ip>:<port> --model=<model> --harness=claude
+sudo 5dive agent create <name> --type=claude --auth-profile=office-ai --channels=dashboard
+```
 
 What the file holds, and what it leaves out:
 
