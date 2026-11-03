@@ -190,7 +190,7 @@ DUP="$WORK/dup.tar"; cp "$GOOD" "$DUP"
 ( d="$(mktemp -d "$WORK/d.XXXXXX")" && cd "$d" && echo x > manifest.json && tar -rf "$DUP" manifest.json )
 refused "DUPLICATE: a second manifest.json appended after the signed one" "$DUP" 1.0.0 "twice"
 # 9. NO KEY PINNED / A PIN OTHERS CAN WRITE.
-OFFLINE_UPDATE_PUBKEY_FILE="$WORK/none.pem" refused "NO KEY: a box with no update key refuses every file" "$GOOD" 1.0.0 "holds no update key"
+OFFLINE_UPDATE_PUBKEY_FILE="$WORK/none.pem" OFFLINE_UPDATE_PUBKEY_PEM='' refused "NO KEY: a box with no update key refuses every file" "$GOOD" 1.0.0 "holds no update key"
 cp "$WORK/pub.pem" "$WORK/loose.pem"; chmod 666 "$WORK/loose.pem"
 OFFLINE_UPDATE_PUBKEY_FILE="$WORK/loose.pem" refused "LOOSE PIN: a key file others can write is not a pin" "$GOOD" 1.0.0 "cannot be trusted"
 [[ -z "$OFFLINE_UPDATE_PUBKEY_PEM" ]] && ok_t "SHIPPED: the compiled key is empty until the release key exists, so every box refuses every file" \
