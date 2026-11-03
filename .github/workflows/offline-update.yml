@@ -134,6 +134,9 @@ jobs:
             git worktree add -q --detach "$RUNNER_TEMP/tree" HEAD
             (cd "$RUNNER_TEMP/tree" && ./build.sh >/dev/null)
             sed -i 's/^readonly FIVE_VERSION="[^"]*"/readonly FIVE_VERSION="0.0.1"/' "$RUNNER_TEMP/tree/5dive"
+            # The version rewrite changes 5dive's bytes: re-hash it, or install.sh
+            # refuses the bundle on the box ("checksum mismatch", DIVE-7598).
+            sha256sum "$RUNNER_TEMP/tree/5dive" | awk '{print $1}' > "$RUNNER_TEMP/tree/5dive.sha256"
           else
             git worktree add -q --detach "$RUNNER_TEMP/tree" "$TAG"
           fi

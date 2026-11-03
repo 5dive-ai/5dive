@@ -29,6 +29,15 @@ bun="$4"; out="$5"; key="${6:-}"
 [[ -f "$tree/5dive" ]] || die "$tree/5dive is missing — build from a release TAG, which carries the built bundle"
 ver="$(grep -m1 'readonly FIVE_VERSION=' "$tree/5dive" | sed -E 's/.*="([^"]+)".*/\1/')" || ver=""
 [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "the bundle's FIVE_VERSION is '${ver}', not a release version"
+# install.sh checks $REPO/5dive against $REPO/5dive.sha256 and refuses on a
+# mismatch, so a pair that disagrees here is an install that fails on the box
+# (DIVE-7598: CI rewrote the version in 5dive and kept the old hash). Refuse it
+# at build time instead.
+if [[ -f "$tree/5dive.sha256" ]]; then
+  want="$(tr -d '[:space:]' < "$tree/5dive.sha256")"
+  got="$(sha256sum "$tree/5dive" | awk '{print $1}')"
+  [[ "$want" == "$got" ]] || die "$tree/5dive.sha256 does not match $tree/5dive (want ${want:0:16}…, got ${got:0:16}…) — re-hash it after any change to 5dive"
+fi
 [[ -f "$tree/bin/host-scripts.manifest" ]] || die "$tree has no bin/host-scripts.manifest — tags before the DIVE-6849 layout are not packaged"
 grep -q '^offline_update()' "$tree/install.sh" || die "$tree/install.sh predates updates from a file (DIVE-7577) — it would dial out during the update; package a newer tag"
 [[ -f "$plugins/.claude-plugin/marketplace.json" ]] || die "$plugins is not a 5dive-plugins checkout"
