@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); echo "ok   $1"; }
 bad_t() { FAIL=$((FAIL+1)); echo "FAIL $1${2:+ :: $2}"; }
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d); trap 'rc=$?; rm -rf "${TMP:-/nonexistent-7721}"; echo "HARNESS-RC=$rc"' EXIT
 
 block=$(awk '/DIVE-7721: a seat with a channel runs/{on=1} on{print} on&&/^  esac$/{exit}' bin/5dive-agent-start)
 [[ "$block" == *'config patch --stdin'* && "$block" == *'esac' ]] \
