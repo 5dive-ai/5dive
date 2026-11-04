@@ -198,6 +198,12 @@ grep -q 'src/lib/codex_login_sync.sh' build.sh && ok "W3 the lib is in the bundl
 grep -q 'seat_claude_dir_ensure' src/cmd_pack.sh && ok "W4 import makes ~/.claude the seat's first" || no "W4"
 [[ $(grep -c 'dashboard_inbox_prepare "\$user"' src/lib/agent_setup.sh) -ge 3 ]] \
   && ok "W5 every dashboard inbox prepare heals and checks ~/.claude" || no "W5"
+SM=scripts/init-smoke.sh
+_wc() { bash -c 'source <(sed -n "/^cell_type()/p;/^cell_has_webchat()/p" "$1"); cell_has_webchat "$2" && echo yes || echo no' _ "$SM" "$1"; }
+[[ "$(_wc codex)" == yes ]] \
+  && ok "W6 the nightly grades the Codex cell's app chat" || no "W6 init-smoke does not run webchat_arm on codex"
+awk '/^webchat_arm\(\) \{/,/^}/' "$SM" | awk '/stat -c %U/{s=NR} /install -d -o/{i=NR} END{exit !(s && i && s<i)}' \
+  && ok "W7 the nightly grades ~/.claude's owner before it makes the bridge dirs" || no "W7 webchat_arm repairs ~/.claude before grading it"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
