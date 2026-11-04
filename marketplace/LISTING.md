@@ -45,7 +45,11 @@ Own it. Run it from your phone.
 ## Vultr fields
 
 - **One-line description:** the short line above.
-- **Readme:** the description above.
+- **Readme:** the description above, with two Vultr-only edits (marketing
+  review, 2026-11-04): line 2 under the first line is "An open-source
+  alternative to Grok Bot and OpenAI Dots." (README pitch), and "Own it. Run
+  it from your phone." is cut. Then a last line "Source (MIT):
+  https://github.com/5dive-ai/5dive".
 - **Categories:** Developer Tool (id 5), Business (id 16). Vultr's list has no
   AI category (`GET /v2/marketplace/apps/categories`, 2026-11-04).
 - **Minimum plan:** 1 vCPU / 1 GB (`min_cpu_core` 1, `min_mem_mb` 1024), 2 GB
@@ -69,6 +73,8 @@ Own it. Run it from your phone.
 - **Gallery (8:5, 800x500 PNG):** the self-host page (phone with a hired
   team), shot at 1280x800 and scaled. Not the home page: it sells the hosted
   trial, not the server.
+  Second image: the approved cover "Your AI team. On your own server." /
+  "Open source · Free to self-host" (marketing, 2026-11-04).
 
 ## Linode assets still owed
 
