@@ -161,6 +161,14 @@ jobs:
           st2="$(mktemp -d)"
           if _ou_verify "$RUNNER_TEMP/bad.tar" "$st2" 0.0.0 0; then echo "::error::an altered file was accepted"; exit 1; fi
           echo "altered file refused: $_OU_WHY"
+          # DIVE-7665: the file is gzipped whole; one changed byte of the gzip stream is refused too.
+          [[ "$(head -c2 "$OFFLINE_FILE" | od -An -tx1 | tr -d ' ')" == 1f8b ]] || { echo "::error::the update file is not gzipped"; exit 1; }
+          cp "$OFFLINE_FILE" "$RUNNER_TEMP/badgz.tar"
+          python3 -c 'import sys;p=sys.argv[1];b=bytearray(open(p,"rb").read());b[len(b)//2]^=0xff;open(p,"wb").write(b)' "$RUNNER_TEMP/badgz.tar"
+          st3="$(mktemp -d)"
+          if _ou_verify "$RUNNER_TEMP/badgz.tar" "$st3" 0.0.0 0; then echo "::error::a file with its gzip altered was accepted"; exit 1; fi
+          echo "altered gzip refused: $_OU_WHY"
+          echo "update file: $(( $(stat -c %s "$OFFLINE_FILE") / 1048576 )) MiB"
 
       # ---- DIVE-7598: the USB file that installs a NEW server with no internet ----
       # 5dive-usb-<version>.run = packaging/offline/usb-install.sh + the signed
@@ -198,6 +206,7 @@ jobs:
           set -euo pipefail
           f="$(bash packaging/offline/build-usb.sh "$OFFLINE_FILE" "$RUNNER_TEMP/debs" "$PKGS" "$RUNNER_TEMP/usb")"
           ls -la "$f"; cat "$f.sha256"
+          echo "USB file: $(( $(stat -c %s "$f") / 1048576 )) MiB"
           echo "USB_FILE=$f" >> "$GITHUB_ENV"
 
       # The proof (arm 2): a fresh Ubuntu 24.04 system container, booted with

@@ -16,6 +16,15 @@
 #
 # Prints the path of <out-dir>/5dive-offline-<version>.tar. The format is read
 # by src/lib/offline_update.sh (_ou_verify); change the two together.
+#
+# DIVE-7665: the file is that tar, GZIPPED as a whole (the name stays .tar).
+# bun is 102 MB stored raw and the rest is already gzipped, so the outer gzip
+# is bun's: 144 MB -> about 83 MB. The members, the manifest and the signature
+# are exactly format 1, and GNU tar reads a gzipped archive from a file with the
+# same `tar -tvf`/`tar -xf` and no flag, so every reader already installed
+# (0.117.0's _ou_verify, build-usb.sh, the USB starter) opens it unchanged.
+# Source maps (*.map) in the plugins' node_modules are dropped: nothing runs
+# them and they were 46 MB of the plugins, 8 MB packed.
 set -euo pipefail
 
 die() { echo "build-offline: $*" >&2; exit 1; }
@@ -79,6 +88,7 @@ tar "${TARD[@]}" -czf "$stage/payload/cli.tar.gz" -C "$c" .
 # The plugins, WITH node_modules, under the top folder install.sh's tarball
 # filters name (5dive-plugins-main/…). No .git: a box gets files, not history.
 tar -C "$plugins" --exclude=./.git -cf - . | tar -C "$stage/plugins/5dive-plugins-main" -xf -
+find "$stage/plugins/5dive-plugins-main" -path '*/node_modules/*' -type f -name '*.map' -delete
 tar "${TARD[@]}" -czf "$stage/payload/plugins.tar.gz" -C "$stage/plugins" 5dive-plugins-main
 tar -C "$skills" --exclude=./.git -cf - . | tar -C "$stage/skills/skills-main" -xf -
 tar "${TARD[@]}" -czf "$stage/payload/skills.tar.gz" -C "$stage/skills" skills-main
@@ -109,5 +119,6 @@ members+=(payload/bun payload/cli.tar.gz payload/plugins.tar.gz payload/skills.t
 
 install -d "$out"
 f="$out/5dive-offline-$ver.tar"
-tar "${TARD[@]}" --no-recursion -cf "$f" -C "$stage" "${members[@]}"
+tar "${TARD[@]}" --no-recursion -cf - -C "$stage" "${members[@]}" | gzip -9n > "$f.tmp"
+mv -f "$f.tmp" "$f"
 echo "$f"

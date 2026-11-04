@@ -88,6 +88,12 @@ if ! bash "$B" "$UPD" "$WORK/debs" "$PKGS jq" "$WORK/out-m" >/dev/null 2>"$WORK/
   grep -q 'no .deb for jq' "$WORK/e" && ok_t "B4 a named package with no .deb is refused" || bad_t "B4 wrong reason" "$(cat "$WORK/e")"
 else bad_t "B4 built a stick missing a package"; fi
 
+# DIVE-7665: a raw (ungzipped) update file is refused — it is the 60 MB the gzip saves.
+RAWD="$WORK/raw"; mkdir -p "$RAWD"; gzip -dc "$UPD" > "$RAWD/$(basename "$UPD")"
+if ! bash "$B" "$RAWD/$(basename "$UPD")" "$WORK/debs" "$PKGS" "$WORK/out-r" >/dev/null 2>"$WORK/e"; then
+  grep -q 'not gzipped' "$WORK/e" && ok_t "B6 a raw (not gzipped) update file is refused" || bad_t "B6 wrong reason" "$(cat "$WORK/e")"
+else bad_t "B6 built a stick from a raw update file"; fi
+
 # A release whose 5dive has no USB verb: refused.
 t2="$WORK/rel-old"; cp -a "$t" "$t2"; sed -i '/^cmd_usb_install/d' "$t2/5dive"
 OLDUPD="$(bash packaging/offline/build-offline.sh "$t2" "$P" "$S" "$WORK/bun" "$WORK/upd-old" "$WORK/key.pem" 2>/dev/null)" || OLDUPD=""
