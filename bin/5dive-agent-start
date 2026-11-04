@@ -1403,6 +1403,29 @@ elif isinstance(m, str):
         || echo "warn: openclaw model pin ($AGENT_MODEL) failed — the seat runs its account's model" >&2
     fi
   fi
+  # DIVE-7721: a seat with a channel runs `openclaw gateway run`, which needs
+  # gateway.mode set and, in a container, gateway.bind=loopback (its default
+  # there is 0.0.0.0, which it refuses without a token: every web chat message
+  # got "OpenClaw could not answer just now"). `5dive agent channel add` sets
+  # both, but since openclaw 2026.10.10 `config set` refuses while the seat
+  # runs ("The state owner has no Gateway listener"), and the seat IS running
+  # when a channel is added. Here, before the seat process starts, nothing owns
+  # the state, so fill in whichever is missing. A value someone set on purpose
+  # (bind=lan with a token) is left alone.
+  case "$CHANNELS" in none|"") ;; *)
+    if [[ -f "$LOCAL_OPENCLAW_CFG" ]]; then
+      _OC_GW_PATCH="$(jq -c '(.gateway // {}) as $g
+        | {gateway: ({}
+            + (if ($g.mode // "") == "" then {mode: "local"} else {} end)
+            + (if ($g.bind // "") == "" then {bind: "loopback"} else {} end))}
+        | select(.gateway != {})' "$LOCAL_OPENCLAW_CFG" 2>/dev/null || true)"
+      if [[ -n "$_OC_GW_PATCH" ]]; then
+        printf '%s' "$_OC_GW_PATCH" \
+          | /home/claude/.local/bin/openclaw config patch --stdin >/dev/null 2>&1 \
+          || echo "warn: openclaw gateway mode/bind ($_OC_GW_PATCH) failed — the gateway may refuse to start in a container" >&2
+      fi
+    fi ;;
+  esac
 fi
 
 # Same shared/0600 problem as codex: antigravity (`agy`) stores its OAuth

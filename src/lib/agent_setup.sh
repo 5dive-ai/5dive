@@ -1749,8 +1749,11 @@ install_channel_for_openclaw_agent() {
     # DIVE-7355: and bind it to loopback by name. In a container openclaw's
     # default bind is 0.0.0.0, which it refuses without a gateway token, so
     # every web chat message got "OpenClaw could not answer just now".
+    # DIVE-7721: openclaw 2026.10.10+ refuses this while the seat runs; the
+    # restart below applies both keys before the gateway starts
+    # (5dive-agent-start), so a refusal here is not a failure.
     sudo -u "$user" -H bash -c 'export NVM_DIR=/home/claude/.nvm; [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"; export PATH="/home/claude/.local/bin:$PATH"; /home/claude/.local/bin/openclaw config set gateway.mode local 2>&1 | tail -3 && /home/claude/.local/bin/openclaw config set gateway.bind loopback 2>&1 | tail -3' >&2 \
-      || warn "openclaw config set gateway.mode/gateway.bind failed for agent '$name' (rerun: sudo -u $user -H openclaw config set gateway.mode local; sudo -u $user -H openclaw config set gateway.bind loopback)"
+      || warn "openclaw config set gateway.mode/gateway.bind did not apply for agent '$name'; the restart sets them before the gateway starts"
     return 0
   fi
   [[ -n "$token" ]] || fail "$E_VALIDATION" "openclaw $plugin channel requires a bot token"
