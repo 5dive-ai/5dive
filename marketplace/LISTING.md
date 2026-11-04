@@ -9,8 +9,8 @@ from your phone", and the repo description is quoted as approved.
 - **Version:** the newest 5dive CLI release at build time (the server updates
   itself to the newest one on first boot)
 - **Operating system:** Ubuntu 24.04 LTS
-- **Suggested plan:** 2 vCPU, 4 GB RAM (DigitalOcean `s-2vcpu-4gb`, Vultr
-  `vc2-2c-4gb`, Linode Shared 4 GB). One small agent runs on 1 GB.
+- **Suggested plan:** 2 vCPU, 4 GB RAM (DigitalOcean `s-2vcpu-4gb`, Linode
+  Shared 4 GB). One small agent runs on 1 GB.
 - **Support:** https://github.com/5dive-ai/5dive/issues
 - **Website:** https://5dive.ai
 - **Source:** https://github.com/5dive-ai/5dive (MIT)
@@ -46,7 +46,12 @@ Own it. Run it from your phone.
 
 - **One-line description:** the short line above.
 - **Readme:** the description above.
-- **Categories:** Developer Tools, AI.
+- **Categories:** Developer Tool (id 5), Business (id 16). Vultr's list has no
+  AI category (`GET /v2/marketplace/apps/categories`, 2026-11-04).
+- **Minimum plan:** 1 vCPU / 1 GB (`min_cpu_core` 1, `min_mem_mb` 1024), 2 GB
+  recommended: what we told Vultr on 2026-11-03. Cloud Compute only (VPS).
+- **Support:** support URL and repo as in Shared; support email
+  hello@5dive.ai.
 - **App variables:** none.
 - **App instructions:**
 
@@ -57,9 +62,11 @@ Own it. Run it from your phone.
   >
   > Prefer the command line? Run `sudo 5dive init` to set up your first agent.
 
-- **Icon:** the 5dive logo, square PNG.
-- **Gallery (8:5, 800x500 PNG):** the phone app with a hired team, and the
-  self-host page. Made when the listing is submitted.
+- **Icon (light and dark mode):** the app icon, `5dive-frontend`
+  `public/icon-512.png` (dark rounded square, white 5; reads on both themes).
+- **Gallery (8:5, 800x500 PNG):** the self-host page (phone with a hired
+  team), shot at 1280x800 and scaled. Not the home page: it sells the hosted
+  trial, not the server.
 
 ## Linode assets still owed
 

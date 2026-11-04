@@ -61,11 +61,19 @@ Same `image/` steps as DigitalOcean, then Vultr's own `clean_system` from their
 helper script (pinned by commit and sha256), which also adds the `vultr` kernel
 option they require. The build server is deleted by Packer; the snapshot stays.
 
-Then, in the vendor portal (Marketplace, on the hello@5dive.ai account): create
-the app with `LISTING.md`'s Vultr section, no app variables, "Build App Image"
-from the snapshot, "Deploy Image" to test it, mark the build Live, slug
-`5dive`, Make Public. Vultr reviews and emails when it is approved. Vultr takes
-no revenue share from publishers.
+Then the listing, all of it by the API with the same key (docs:
+https://docs.vultr.com/platform/marketplace-vendor; the console path is the
+same steps): `POST /v2/marketplace/vendor` once (the vendor name), `POST
+/v2/marketplace/apps` with `LISTING.md`'s Vultr section, `PATCH` the
+categories, instructions, support contact, deployable plans and slug `5dive`,
+`PUT .../icons` (light and dark), `POST .../images` (gallery), `POST
+.../builds` from the snapshot, `POST .../builds/{id}/publish`, then `PATCH
+.../visibility` `{"public": true}`, which sends it to Vultr's review. Vultr
+emails when it is approved. Vultr takes no revenue share from publishers.
+
+The key's access list must name the build machine's IPv4. If the machine also
+has IPv6, Packer reaches the API over it and gets 401 "Unauthorized IP
+address": pin `api.vultr.com` to its IPv4 for the build (DIVE-7717).
 
 The boot test on the test server: `cloud-init status` is done,
 `/var/log/5dive-firstboot.log` ends in "first boot done", `5dive doctor` is

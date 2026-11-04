@@ -42,6 +42,7 @@ echo 0123456789abcdef > "$root/etc/machine-id"
 echo '{"agents":{}}' > "$root/var/lib/5dive/agents.json"
 echo '# Team wiki' > "$root/var/lib/5dive/wiki/index.md"
 echo 'Host *' > "$root/etc/ssh/ssh_config"
+printf -- '-----BEGIN PUBLIC KEY-----\nMCow\n-----END PUBLIC KEY-----\n' > "$root/etc/5dive/update-pubkey.pem"
 
 if out=$(IMAGE_ROOT="$root" bash $img/cleanup.sh 2>&1); then ok "clean-up exits 0 on a built tree"; else bad "clean-up failed: $out"; fi
 for f in var/lib/5dive/gate-proof.key etc/5dive/vault.key etc/5dive/connectord.env \
@@ -53,9 +54,19 @@ for f in var/lib/5dive/gate-proof.key etc/5dive/vault.key etc/5dive/connectord.e
 done
 [[ -f "$root/etc/machine-id" && ! -s "$root/etc/machine-id" ]] && ok "machine id emptied, file kept" \
   || bad "machine id not emptied (or file gone: systemd needs it present and empty)"
-for f in var/lib/5dive/agents.json var/lib/5dive/wiki/index.md etc/ssh/ssh_config etc/5dive/connectors; do
+for f in var/lib/5dive/agents.json var/lib/5dive/wiki/index.md etc/ssh/ssh_config etc/5dive/connectors \
+         etc/5dive/update-pubkey.pem; do
   [[ -e "$root/$f" ]] && ok "kept: /$f" || bad "clean-up removed install state: /$f"
 done
+
+# 1b. Ubuntu's dbus machine-id LINK to /etc/machine-id is kept (DIVE-7717):
+#     Vultr's clean_system truncates it and fails under -e when it is missing.
+lroot="$tmp/lroot"; mkdir -p "$lroot"/{etc,var/lib/dbus}
+echo 0123456789abcdef > "$lroot/etc/machine-id"
+ln -s /etc/machine-id "$lroot/var/lib/dbus/machine-id"
+IMAGE_ROOT="$lroot" bash $img/cleanup.sh >/dev/null 2>&1 || true
+[[ -L "$lroot/var/lib/dbus/machine-id" && ! -s "$lroot/etc/machine-id" ]] \
+  && ok "dbus machine-id link kept, the id itself emptied" || bad "dbus machine-id link removed (Vultr clean_system fails)"
 
 # 2. A key the explicit list does not know about fails the build.
 echo secret > "$root/var/lib/5dive/new-feature.key"
@@ -65,6 +76,17 @@ else
   ok "clean-up fails the build on a stray key"
 fi
 rm -f "$root/var/lib/5dive/new-feature.key"
+# 2b. The release key's exemption is its exact path only (DIVE-7717): the same
+#     name anywhere else, or another .pem beside it, still fails the build.
+for stray in var/lib/5dive/update-pubkey.pem etc/5dive/update-privkey.pem; do
+  echo secret > "$root/$stray"
+  if IMAGE_ROOT="$root" bash $img/cleanup.sh >/dev/null 2>&1; then
+    bad "clean-up passed with /$stray in the image"
+  else
+    ok "clean-up fails the build on /$stray"
+  fi
+  rm -f "$root/$stray"
+done
 
 # 3. The login line: one line with the link while unlinked, silent once linked,
 #    silent with no CLI.
