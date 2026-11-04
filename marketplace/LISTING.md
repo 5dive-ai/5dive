@@ -50,6 +50,8 @@ Own it. Run it from your phone.
   AI category (`GET /v2/marketplace/apps/categories`, 2026-11-04).
 - **Minimum plan:** 1 vCPU / 1 GB (`min_cpu_core` 1, `min_mem_mb` 1024), 2 GB
   recommended: what we told Vultr on 2026-11-03. Cloud Compute only (VPS).
+- **Website:** https://5dive.ai/self-host (lodar 2026-11-04: every Vultr link
+  field points at the self-host page, not the bare 5dive.ai).
 - **Support:** support URL and repo as in Shared; support email
   hello@5dive.ai.
 - **App variables:** none.
