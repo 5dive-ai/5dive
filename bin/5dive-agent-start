@@ -292,7 +292,13 @@ case "$CH" in
       antigravity) : ;;  # DIVE-7351: MCP server wired into ~/.gemini/config/mcp_config.json below
       hermes|openclaw) : ;;  # DIVE-7349: the dashboard server runs beside the seat, below
       *) echo "channels=dashboard requires type=claude, codex, grok, antigravity, hermes or openclaw (got type=$TYPE)" >&2; exit 2 ;;
-    esac ;;
+    esac
+    # DIVE-7724: every harness's chat server keeps its inbox under ~/.claude.
+    # When the seat cannot make it (a root-owned ~/.claude), say so ONCE, here,
+    # instead of letting the chat server crash-loop with nothing on screen.
+    mkdir -p "$HOME/.claude/channels/dashboard/agent-inbox" 2>/dev/null \
+      || echo "ERROR: the app chat cannot start: $(id -un) cannot write $HOME/.claude (owner: $(stat -c %U "$HOME/.claude" 2>/dev/null || echo unknown)). Fix: sudo 5dive doctor --fix, then restart this agent" >&2
+    ;;
   # DIVE-2895 Buzz (Nostr) channel — claude-only, same shape as dashboard. The
   # plugin polls the relay itself and reads its keypair + watched channel UUIDs
   # from ~/.claude/channels/buzz/config.json, so nothing is passed in argv.

@@ -97,6 +97,7 @@ CORE_FILES=(
   src/lib/quota_wall.sh
   src/lib/seat_refusal.sh
   src/lib/codex_quota.sh
+  src/lib/codex_login_sync.sh
   src/lib/agent_env.sh
   src/lib/verify_policy.sh
   src/lib/devteam.sh

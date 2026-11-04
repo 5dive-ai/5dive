@@ -360,6 +360,9 @@ normalize_profile_seed_perms() {
   # DIVE-7335: no account means the default logins (codex/grok write theirs
   # 0600), so a sign-in on the dashboard or a restart_profile_agents "" heals
   # them too, not just an account's.
+  # DIVE-7724: before any seat boots on this account, the newest copy of its
+  # ChatGPT login wins back into it (a seat's refresh spent the one it held).
+  ! declare -F codex_login_sync >/dev/null || codex_login_sync "${profile:-codex}" >/dev/null 2>&1 || true
   if [[ -z "$profile" ]]; then
     ! declare -F default_creds_secure >/dev/null || default_creds_secure
     return 0
