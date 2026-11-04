@@ -10273,6 +10273,11 @@ cmd_heartbeat_tick() {
   # standard seat from the first rotation on. Costs one stat per key file.
   local _hb_sp; _hb_sp=$(secrets_posture_reconcile --quiet "$reg" 2>&1) || _hb_log "[secrets-posture] pass errored (non-fatal): ${_hb_sp}"
   [[ -z "$_hb_sp" ]] || _hb_log "[secrets-posture] ${_hb_sp}"
+  # DIVE-7724: a Codex seat that refreshed its ChatGPT login spent the token
+  # every other copy holds. Hand the newest copy back to the account and out to
+  # the seats on it, so the next hire and the next refresh both find a live one.
+  local _hb_cls; _hb_cls=$(codex_login_sync 2>&1) || true
+  [[ -z "$_hb_cls" ]] || _hb_log "[codex-login-sync] $(tr '\n' ';' <<<"$_hb_cls")"
   _hb_account_poll_sweep "$now" || _hb_log "[account-poll] pass errored (non-fatal)"
   _hb_quota_snapshot_sweep "$now" || _hb_log "[quota-snapshot] pass errored (non-fatal)"
   (( ${_HB_QSNAP_RAN:-0} || ${_HB_QSNAP_FAILED:-0} )) \

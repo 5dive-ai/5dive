@@ -2253,6 +2253,30 @@ _pack_import_memory_target() {   # _pack_import_memory_target <type> <shape>
   fi
 }
 
+# DIVE-7724: make <cdir>/projects/<slug>/memory with EVERY component owned by
+# <owner>. `install -d -o <owner> <deep path>` owns only the last one: the
+# leading ~/.claude it had to create was root's, and on a Codex seat (no
+# ~/.claude before the import) that broke the app chat for good. Never follows
+# a symlinked component.
+_pack_seat_memdir_make() {   # _pack_seat_memdir_make <owner> <cdir> <mdir>
+  local owner="$1" cdir="$2" mdir="$3" d rel part
+  [[ "$mdir" == "$cdir"/* ]] || return 1
+  d="$cdir"; rel="${mdir#"$cdir"/}"
+  while :; do
+    [[ -L "$d" ]] && return 1
+    if [[ ! -e "$d" ]]; then
+      install -d -m 700 -o "$owner" -g "$owner" "$d" 2>/dev/null || return 1
+    elif [[ "$(stat -c %U "$d" 2>/dev/null)" != "$owner" ]]; then
+      chown "$owner:$owner" "$d" 2>/dev/null || return 1
+    fi
+    [[ -n "$rel" ]] || break
+    part="${rel%%/*}"
+    [[ "$rel" == */* ]] && rel="${rel#*/}" || rel=""
+    d="$d/$part"
+  done
+  return 0
+}
+
 # DIVE-4541: seed a CLAUDE seat's memory dir from a pack's staged memory, routed
 # on the shape of the staged bytes. Extracted from cmd_import so the routing is
 # executable without a seat: it is the branch that decides CONVERT vs verbatim
@@ -3754,6 +3778,9 @@ cmd_import() {
   fi
 
   local cdir="${AGENT_HOME_ROOT:-/home}/agent-${as}/.claude"
+  # DIVE-7724: a non-Claude seat has no ~/.claude yet. Make it the seat's now,
+  # before the persona, avatar and memory below write under it as root.
+  ! declare -F seat_claude_dir_ensure >/dev/null || seat_claude_dir_ensure "agent-${as}" || true
 
   # DIVE-2568: put distilled memory IN EFFECT for a harness that does not
   # auto-load 5dive's store. Must run BEFORE the install below, which routes this
@@ -3981,7 +4008,7 @@ cmd_import() {
       local slug mdir packed landed
       slug=$(printf '%s' "$eff_workdir" | sed 's#/#-#g')
       mdir="$cdir/projects/${slug}/memory"
-      install -d -o "agent-${as}" -g "agent-${as}" "$mdir" 2>/dev/null || true
+      _pack_seat_memdir_make "agent-${as}" "$cdir" "$mdir" || true
       # DIVE-4541: the shape of the staged bytes decides convert-vs-copy, and
       # that routing lives in _pack_seed_claude_memory so it is gradeable
       # without a seat.

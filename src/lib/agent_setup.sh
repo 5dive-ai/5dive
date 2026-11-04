@@ -2051,8 +2051,7 @@ install_channel_for_codex_agent() {
     # shelld/control-plane delivery uses the historical runtime-neutral path.
     # The Codex dashboard adapter drains it directly, including after downtime.
     step "Preparing dashboard inbox for $user"
-    sudo -u "$user" -H bash -c \
-      'mkdir -p "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now"; chmod 700 "$HOME/.claude" "$HOME/.claude/channels" "$HOME/.claude/channels/dashboard" "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now" 2>/dev/null || true'
+    dashboard_inbox_prepare "$user"
   else
   # Write the bot token into ~/.codex/channels/telegram/.env. Strip-then-append
   # the TELEGRAM_BOT_TOKEN line so a rotated token doesn't leave a stale value;
@@ -2178,6 +2177,41 @@ dashboard_plugin_dir() {
   return 1
 }
 
+# DIVE-7724: the seat's ~/.claude must be the seat's. A root step that makes a
+# path under it with `install -d <deep path>` or `mkdir -p` creates the LEADING
+# dirs as root (pack import's memory seed did, then chowned only projects/), and
+# then everything the seat writes there fails: on a Codex seat the app chat
+# adapter's first mkdir threw EACCES and respawned for 14 h with nothing on any
+# screen (chill-gorge marcus, 2026-11-04). Root only. Creates ~/.claude 0700
+# seat-owned when missing; when it exists owned by anyone else, hands the dir
+# itself (never recursively, never through a symlink) back to the seat.
+# rc 1 when it could not.
+seat_claude_dir_ensure() {   # seat_claude_dir_ensure <user> [home]
+  local user="$1" home="${2:-${AGENT_HOME_ROOT:-/home}/$1}" d
+  d="$home/.claude"
+  [[ -d "$home" && ! -L "$home" && ! -L "$d" ]] || return 1
+  if [[ ! -e "$d" ]]; then
+    install -d -m 700 -o "$user" -g "$user" "$d" 2>/dev/null || return 1
+    return 0
+  fi
+  [[ -d "$d" ]] || return 1
+  [[ "$(stat -c %U "$d" 2>/dev/null)" == "$user" ]] && return 0
+  chown "$user:$user" "$d" 2>/dev/null || return 1
+}
+
+# The app chat's inbox for any harness. Fails LOUDLY when the seat still
+# cannot write it: a bare `mkdir -p` here exited 0 through the trailing chmod
+# and the adapter crash-looped unseen.
+dashboard_inbox_prepare() {   # dashboard_inbox_prepare <user>
+  local user="$1"
+  seat_claude_dir_ensure "$user" || true
+  sudo -u "$user" -H bash -c \
+    'mkdir -p "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now"; chmod 700 "$HOME/.claude" "$HOME/.claude/channels" "$HOME/.claude/channels/dashboard" "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now" 2>/dev/null || true'
+  sudo -u "$user" -H bash -c 'test -w "$HOME/.claude/channels/dashboard/agent-inbox"' 2>/dev/null \
+    || warn "app chat will NOT start for $user: it cannot write ~${user}/.claude/channels/dashboard (owner of ~${user}/.claude: $(stat -c %U "${AGENT_HOME_ROOT:-/home}/$user/.claude" 2>/dev/null || echo missing)). Fix: sudo 5dive doctor --fix"
+  return 0
+}
+
 # What every seat whose web chat runs through the dashboard server needs
 # (Grok, DIVE-7347; Hermes and OpenClaw, DIVE-7349): the server's checkout,
 # bun to run it, and the inbox the control plane and shelld drop messages in.
@@ -2193,8 +2227,7 @@ prepare_dashboard_bridge() {
       "bun unavailable for $user (required by the dashboard chat) and automatic install failed. Check network access to bun.sh, or install bun to /usr/local/bin manually, then retry."
   fi
   step "Preparing dashboard inbox for $user"
-  sudo -u "$user" -H bash -c \
-    'mkdir -p "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now"; chmod 700 "$HOME/.claude" "$HOME/.claude/channels" "$HOME/.claude/channels/dashboard" "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now" 2>/dev/null || true'
+  dashboard_inbox_prepare "$user"
 }
 
 # Configure the telegram channel for a grok agent. Structurally identical to
@@ -2363,8 +2396,7 @@ install_channel_for_antigravity_agent() {
         "bun unavailable for $user (required by the dashboard chat) and automatic install failed. Check network access to bun.sh, or install bun to /usr/local/bin manually, then retry."
     fi
     step "Preparing dashboard inbox for $user"
-    sudo -u "$user" -H bash -c \
-      'mkdir -p "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now"; chmod 700 "$HOME/.claude" "$HOME/.claude/channels" "$HOME/.claude/channels/dashboard" "$HOME/.claude/channels/dashboard/agent-inbox" "$HOME/.claude/channels/dashboard/collect-now" 2>/dev/null || true'
+    dashboard_inbox_prepare "$user"
     return 0
   fi
   [[ -n "$token" ]] || fail "$E_VALIDATION" "antigravity telegram channel requires a bot token"
