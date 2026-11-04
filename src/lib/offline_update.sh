@@ -14,6 +14,11 @@
 #   payload/bun            the bun binary the plugins run on
 # Every member is a REGULAR FILE; anything else in the tar is refused before a
 # byte is unpacked, so a link can never point the unpack outside the stage.
+# Since DIVE-7665 the whole tar is gzipped (bun inside it is 102 MB raw). GNU
+# tar reads a gzipped archive from a regular file with the same -tvf/-xf, so
+# the verifier below reads both a gzipped and a plain file, unchanged: a box on
+# 0.117.0 takes the new file, and this reader still takes a 0.117.0 file. A
+# damaged gzip stream fails its CRC, tar exits non-zero, and the file is refused.
 #
 # THE ORDER IS THE SECURITY, and it is the row's order:
 #   1. the signature, against the key PINNED ON THIS BOX — never a key the file

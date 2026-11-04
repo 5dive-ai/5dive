@@ -16,7 +16,8 @@
 # Prints the path of <out-dir>/5dive-usb-<version>.run and writes its .sha256
 # beside it. The .run is packaging/offline/usb-install.sh with its @@…@@ values
 # filled in, a marker line, then an uncompressed tar of the update file and
-# debs/ (both are compressed already).
+# debs/ (both are compressed already: the update file is gzipped as a whole
+# since DIVE-7665, and every .deb is compressed inside).
 #
 # NOT IN IT: Claude Code. Its licence is "All rights reserved" (the npm package's
 # LICENSE.md), so 5dive may not hand it out; the starter takes Anthropic's own
@@ -32,6 +33,9 @@ head_tpl="$here/usb-install.sh"
 [[ -f "$upd" ]] || die "no update file at $upd"
 
 m="$(tar -xOf "$upd" manifest.json 2>/dev/null)" || die "$upd is not an update file (no manifest)"
+# A raw (not gzipped) update file would put ~60 MB of bun on the stick for nothing.
+[[ "$(head -c2 "$upd" | od -An -tx1 | tr -d ' ')" == 1f8b ]] \
+  || die "$upd is not gzipped — build it with a build-offline.sh from DIVE-7665 or later"
 tar -tf "$upd" manifest.sig >/dev/null 2>&1 || die "$upd is UNSIGNED — every box refuses it, so a stick built from it could never install"
 ver="$(jq -r '.version' <<<"$m")"; arch="$(jq -r '.arch' <<<"$m")"
 [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "the update file's version is '$ver'"
