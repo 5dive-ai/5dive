@@ -192,7 +192,8 @@ fi
 
 # ---- the wiring the fix rests on ---------------------------------------------
 grep -q 'codex_login_sync' src/cmd_heartbeat.sh && ok "W1 the heartbeat tick runs the sync" || no "W1 heartbeat does not call codex_login_sync"
-awk '/^normalize_profile_seed_perms\(\) \{/,/^}/' src/cmd_auth.sh | grep -q 'codex_login_sync' \
+_w2_body=$(awk '/^normalize_profile_seed_perms\(\) \{/,/^}/' src/cmd_auth.sh)
+grep -q 'codex_login_sync' <<<"$_w2_body" \
   && ok "W2 the pre-boot normalize runs the sync" || no "W2 normalize_profile_seed_perms does not call codex_login_sync"
 grep -q 'src/lib/codex_login_sync.sh' build.sh && ok "W3 the lib is in the bundle" || no "W3 build.sh misses the lib"
 grep -q 'seat_claude_dir_ensure' src/cmd_pack.sh && ok "W4 import makes ~/.claude the seat's first" || no "W4"
