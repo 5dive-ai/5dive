@@ -1232,6 +1232,51 @@ _compose_spec_root() {
   printf '%s' "$roots"
 }
 
+# -------- DIVE-7780: the lead keeps its context, every other seat starts fresh --
+#
+# lodar, 2026-11-05: "hr must be non fresh for team leads from marketplace" /
+# "why all 6 on non fresh hb?". `agent create` enrols every seat with the box
+# default (fresh off: no /clear between tasks), and nothing on the import path
+# changed it, so a six-seat marketplace team came up with six accumulating
+# windows. The lead needs its context (it carries the owner's thread and the
+# team's plan); a worker or reviewer wants a clean window per task — the
+# trading desk's reviewer is independent only BECAUSE it starts fresh.
+#
+# The lead is the template's org root, derived exactly as the rest of import
+# derives it (_compose_spec_root). No manifest key: templates declare no per-seat
+# fresh and none is invented here. Applied ONLY to seats this import created
+# (the caller passes them): an agent adopted or shared from elsewhere on the box
+# keeps the setting its owner gave it. A seat with no heartbeat (--no-heartbeat,
+# or a failed enrolment) is left unenrolled — this sets a mode, it never enrols.
+# Run under with_registry_lock; never fails the import (the roster is up).
+_compose_team_heartbeat_fresh() {
+  local spec="$1"; shift
+  (( $# > 0 )) || return 0
+  local lead reg n
+  lead=$(_compose_spec_root "$spec" 2>/dev/null) || lead=""
+  if [[ -z "$lead" ]]; then
+    warn "this team has no single lead (no one seat that reports to nobody), so every seat keeps the heartbeat default (keeps its context between tasks). Set it per seat: sudo 5dive heartbeat on <name> --fresh"
+    return 0
+  fi
+  reg=$(registry_read_checked) || { warn "could not read the agent registry — every seat keeps the heartbeat default; set it per seat: sudo 5dive heartbeat on <name> --fresh"; return 0; }
+  local -a fresh_names=() kept_names=()
+  for n in "$@"; do
+    [[ "$(jq -r --arg n "$n" '.agents[$n].heartbeat != null' <<<"$reg" 2>/dev/null)" == "true" ]] || continue
+    if [[ "$n" == "$lead" ]]; then
+      reg=$(jq --arg n "$n" '.agents[$n].heartbeat.fresh = false' <<<"$reg") || return 0
+      kept_names+=("$n")
+    else
+      reg=$(jq --arg n "$n" '.agents[$n].heartbeat.fresh = true' <<<"$reg") || return 0
+      fresh_names+=("$n")
+    fi
+  done
+  (( ${#kept_names[@]} + ${#fresh_names[@]} > 0 )) || return 0
+  printf '%s\n' "$reg" | registry_write
+  (( ${#kept_names[@]} )) && step "heartbeat: ${kept_names[*]} (the lead) keeps its context between tasks"
+  (( ${#fresh_names[@]} )) && step "heartbeat: $(printf '%s\n' "${fresh_names[@]}" | paste -sd' ' -) start(s) each task fresh"
+  return 0
+}
+
 # Rename every declared agent to `<prefix>-<name>` and rewrite the reports_to
 # edges that point INSIDE the roster. An edge naming an agent this spec does not
 # declare is left alone -- `_compose_parse` already refuses those (it validates
@@ -2191,6 +2236,14 @@ HELP
       ((errors++)) || true
     fi
   done
+
+  # DIVE-7780: a team IMPORT (COMPOSE_TEAM_KEY is set by `team import` only)
+  # leaves its lead keeping context and starts every other new seat fresh. A
+  # bare `up` keeps the heartbeat default for every seat, as before. Subshell:
+  # with_registry_lock and warn/step must not end `up` (same reason as create).
+  if [[ -n "${COMPOSE_TEAM_KEY:-}" ]] && (( ${#_brought_up_names[@]} > 0 )); then
+    ( with_registry_lock _compose_team_heartbeat_fresh "$spec" "${_brought_up_names[@]}" ) || true
+  fi
 
   # DIVE-4022 — declared loops, in a SECOND pass over the whole roster.
   #
