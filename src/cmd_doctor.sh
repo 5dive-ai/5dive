@@ -2278,6 +2278,11 @@ cmd_doctor() {
           doctor_add channels "binding-${_dc_name}" ok \
             "${_dc_name}: channels BOUND — ${_dc_detail}${_dc_ev:+ (${_dc_ev})}" ;;
         n/a) : ;;
+        unknown)
+          # DIVE-7749: this caller cannot read the record. Not a fault of the
+          # seat, and a restart would not change it.
+          doctor_add channels "binding-${_dc_name}" warn \
+            "${_dc_name}: channel binding unknown — ${_dc_detail}" false false ;;
         absent)
           # The bridge was expected and wrote nothing. Not an error on its own —
           # a seat that has never been started since the bridge shipped reads
