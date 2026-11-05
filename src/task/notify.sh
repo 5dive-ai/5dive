@@ -401,7 +401,7 @@ _gate_channel_proof_ok() {
 # the fail would only leave the subshell.
 TASK_CP_CHAT=""
 _gate_channel_proof_format_reason() {
-  printf -- "--channel-proof takes the chat id as a number (e.g. 331295046), got '%s'" "${1:0:64}"
+  printf -- "--channel-proof takes the chat id as a number (e.g. 1234567890), got '%s'" "${1:0:64}"
 }
 _gate_channel_proof_parse() { # <raw flag value>
   local raw="$1" v="${1#telegram:}"

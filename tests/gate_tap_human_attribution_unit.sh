@@ -305,7 +305,8 @@ else
   grep -q 'Permission denied' "$TMP/err305" \
     && bad_t "T8b no raw shell error after OK" "stderr: $(cat "$TMP/err305")" \
     || ok_t "T8b no raw 'Permission denied' leaks after OK"
-  grep -F '"gate":"DIVE-305"' "$RELAYED" | grep -qF "\"stamped_as\":\"human:tapper\"" \
+  _rel305=$(grep -F '"gate":"DIVE-305"' "$RELAYED")
+  [[ "$_rel305" == *'"stamped_as":"human:tapper"'* ]] \
     && ok_t "T8c the record is handed to the root relay instead of being dropped" \
     || bad_t "T8c relayed record" "relayed=$(cat "$RELAYED")"
   [[ "$(jq -r '.data.tap_logged' <<<"$out" 2>/dev/null)" == "true" ]] \
@@ -334,7 +335,8 @@ else
   ROOTLOG="$TMP/root-taps.jsonl"; GATE_TAP_LOG="$ROOTLOG"
   _l305=$(grep -F '"gate":"DIVE-305"' "$RELAYED" | tail -1)
   SUDO_USER=agent-relaybot _gate_tap_append_root "$_l305"; _r1=$?
-  [[ $_r1 -eq 0 ]] && grep -F '"gate":"DIVE-305"' "$ROOTLOG" | grep -qF '"appended_by":"agent-relaybot"' \
+  _root305=$(grep -F '"gate":"DIVE-305"' "$ROOTLOG" 2>/dev/null)
+  [[ $_r1 -eq 0 && "$_root305" == *'"appended_by":"agent-relaybot"'* ]] \
     && ok_t "T8i root appends a relayed record of a real answer, stamped with the relaying seat" \
     || bad_t "T8i root append" "rc=$_r1 log=$(cat "$ROOTLOG" 2>/dev/null)"
   _forged=$(jq -c '.stamped_as="human:someone-else"' <<<"$_l305")
