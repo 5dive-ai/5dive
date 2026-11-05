@@ -213,8 +213,8 @@ eq_t "RENDER openclaw: patched through its own CLI on stdin" "config patch --std
 eq_t "RENDER openclaw: provider + primary model" \
   'http://192.168.1.20:11434/v1|openai-completions|sk-local-1|qwen3:32b|fivedive-custom/qwen3:32b|merge' \
   "$(jq -r '[.models.providers["fivedive-custom"] | .baseUrl, .api, .apiKey, .models[0].id] + [.agents.defaults.model.primary, .models.mode] | join("|")' "$OC_LOG.stdin")"
-eq_t "RENDER openclaw: a slow office AI gets 30 min for its first words, not openclaw's 300 s (DIVE-7730)" "1800" \
-  "$(jq -r '.models.providers["fivedive-custom"].timeoutSeconds' "$OC_LOG.stdin")"
+eq_t "RENDER openclaw: a slow office AI gets 30 min for its first words and its run, not openclaw's 300 s / 600 s (DIVE-7730)" "1800|1800" \
+  "$(jq -r '[.models.providers["fivedive-custom"].timeoutSeconds, .agents.defaults.timeoutSeconds] | map(tostring) | join("|")' "$OC_LOG.stdin")"
 # DIVE-7730: local-only turns the hosted catalog and the update hint off; off
 # puts them back only when both are still off.
 eq_t "RENDER openclaw: local-only off, nothing written before → catalog and update hint untouched" "null|null" \
