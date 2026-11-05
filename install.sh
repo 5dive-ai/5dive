@@ -929,9 +929,13 @@ refresh_managed_files() {
   # default id) moves to the bare family alias and follows each Claude release
   # from then on. After the effort heal, so the level it carries is the healed
   # one. Same guard and same fingerprint restart as the heal above.
-  if grep -q 'cmd_agent_float_models' "$BIN_DIR/5dive" 2>/dev/null \
-     && ! "$BIN_DIR/5dive" agent _float_models >/dev/null 2>&1; then
-    echo "warn: some claude seats are still pinned to an old default model; they move at the next update, or now with 'sudo 5dive agent _float_models'" >&2
+  # DIVE-7786: the same pass repairs a seat whose Claude login cannot run its
+  # model; each "repaired: <seat> …" line it prints is kept in the update log.
+  if grep -q 'cmd_agent_float_models' "$BIN_DIR/5dive" 2>/dev/null; then
+    _float_out=$("$BIN_DIR/5dive" agent _float_models 2>&1 >/dev/null) && _float_rc=0 || _float_rc=$?
+    grep '^repaired: ' <<<"$_float_out" >&2 || true
+    (( _float_rc == 0 )) \
+      || echo "warn: some claude seats are still pinned to an old default model; they move at the next update, or now with 'sudo 5dive agent _float_models'" >&2
   fi
   # DIVE-4667: mint stable ids for old seats and install the hook immediately;
   # no agent restart is needed because git reads hooksPath on every commit.

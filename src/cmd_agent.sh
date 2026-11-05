@@ -2026,10 +2026,13 @@ cmd_agent_heal_effort() {
 # level the seat ran at is written under the new keys, or a seat moving off a
 # legacy model would drop to the default effort (DIVE-4863). Idempotent; the
 # self-update fingerprint restarts idle seats onto it.
+# DIVE-7786: the same pass first REPAIRS a seat on a Claude login whose model
+# that login cannot run (a vendor slug), and names each one it touched.
 cmd_agent_float_models() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _float_models takes no arguments"
   require_root
   local reg rows name rec profile home file cur model fam ids out own tmp a moved=0 failed=0
+  local want repaired=()
   reg=$(registry_read)
   a=$(models_json)
   rows=$(jq -r '.agents // {} | to_entries[] | select((.value.type // "claude") == "claude")
@@ -2039,6 +2042,24 @@ cmd_agent_float_models() {
     home="${AGENT_HOME_ROOT:-/home}/agent-${name}"
     file="$home/.claude/settings.json"
     [[ -f "$file" ]] || continue
+    # DIVE-7786: REPAIR a seat already stuck on a model its Claude login cannot
+    # run (a vendor slug kept by a set-account before this fix): Anthropic
+    # refuses every message, so the seat answers nothing. It moves to Sonnet, and
+    # each one is named on stderr ("repaired: …") so the update log says whom it
+    # touched. Booted or not: a dead id is never a choice worth keeping.
+    model=$(jq -r 'if type == "object" and (.model | type) == "string" then .model else "" end' "$file" 2>/dev/null) || model=""
+    if [[ -n "$model" ]] && ! claude_model_ok_on_anthropic "$model" && profile_is_anthropic_login "$profile"; then
+      want=$(resolve_model_for_profile sonnet "$profile")
+      if ( write_runtime_model claude "$name" "$want" ) >/dev/null 2>&1; then
+        registry_read | jq --arg n "$name" --arg m "$want" '.agents[$n].modelFamily = "sonnet"
+          | if (.agents[$n] | has("model")) then .agents[$n].model = $m else . end' | registry_write
+        repaired+=("$name")
+        printf 'repaired: %s %s -> %s (account %s cannot run it)\n' "$name" "$model" "$want" "$profile" >&2
+        rec=sonnet
+      else
+        failed=$((failed + 1)); continue
+      fi
+    fi
     jq -e '(.migrationVersion // null) != null' "$home/.claude.json" >/dev/null 2>&1 || continue
     [[ -z "$profile" || -z "$(profile_env_value "$profile" ANTHROPIC_BASE_URL)" ]] || continue
     cur=$(cat "$file" 2>/dev/null) || { failed=$((failed + 1)); continue; }
@@ -2058,7 +2079,9 @@ cmd_agent_float_models() {
     moved=$((moved + 1))
   done <<<"$rows"
   (( failed == 0 )) || { warn "model float failed for $failed agent(s)"; return 1; }
-  ok "moved $moved agent(s) onto their model family alias"
+  local rep_list="${repaired[*]-}"
+  ok "moved $moved agent(s) onto their model family alias${rep_list:+; repaired ${#repaired[@]} on a model their Claude login cannot run: $rep_list}" \
+    '{moved:($m|tonumber), repaired:($r | if . == "" then [] else split(" ") end)}' --arg m "$moved" --arg r "$rep_list"
 }
 
 # Atomically replace one document-root Codex TOML string key while preserving

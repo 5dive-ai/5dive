@@ -3706,6 +3706,21 @@ cmd_import() {
   # line above did. BYO is left on that line: its profile is written by
   # cmd_create below, so there is no map to read yet, and the id is forwarded
   # to create as --model, which overrides the provider's tier map.
+  # DIVE-7786: a custom pack carries the id its source account resolved (the
+  # seeded OpenRouter slug), not a family. When the bound account maps a family
+  # to exactly that id, the pack asked for that family, and it is recorded below
+  # so `agent set-account` can move the seat later. A slug a Claude login cannot
+  # run lands as Sonnet instead of a seat that refuses every message.
+  if (( ! byo )) && [[ "$type" == claude && -n "$model_req" ]] && ! model_latest "$model_req" >/dev/null; then
+    local _mr_fam
+    _mr_fam=$(model_family_by_map "$model_req" "$profile")
+    if [[ -n "$_mr_fam" ]]; then
+      model_req="$_mr_fam"
+    elif ! claude_model_ok_on_anthropic "$model_req" && profile_is_anthropic_login "$profile"; then
+      step "The pack's model '$model_req' is not a Claude model, and account '$profile' is a Claude login: using Sonnet"
+      model_req=sonnet
+    fi
+  fi
   if (( ! byo )) && [[ -n "$model_req" ]]; then
     model=$(resolve_model_for_profile "$model_req" "$profile")
   fi

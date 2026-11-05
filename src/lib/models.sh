@@ -195,6 +195,54 @@ model_family_of() {
   done <<<"$fams"
 }
 
+# ---------------------------------------------------------------------------
+# A seat moved onto an Anthropic login (DIVE-7786).
+#
+# A seat imported from a custom pack carries the seeded OpenRouter account's id
+# (deepseek/deepseek-v4.1-flash-1017) and no modelFamily, and model_family_of
+# cannot read a family off a vendor slug. `agent set-account` therefore kept the
+# slug when the owner connected their own Claude, and Anthropic refused every
+# message ("There's an issue with the selected model"). Two answers: read the
+# family back through the OLD account's tier map, and never leave a non-Claude
+# id on an Anthropic login.
+# ---------------------------------------------------------------------------
+
+# model_family_by_map <model> <profile> -> the family whose tier map entry on
+# <profile> is <model>, or "". All three OpenRouter tiers map to one slug, so
+# sonnet wins a tie (the family every partner pack asks for), then opus, haiku.
+model_family_by_map() {
+  local m="${1:-}" profile="${2:-}" fam
+  [[ -n "$m" && -n "$profile" ]] || return 0
+  for fam in sonnet opus haiku; do
+    if [[ "$(profile_alias_model "$profile" "$fam")" == "$m" ]]; then
+      printf '%s' "$fam"; return 0
+    fi
+  done
+}
+
+# profile_is_anthropic_login <profile> -> rc 0 when a claude seat on <profile>
+# talks to Anthropic itself: the account exists, has no base url, and is not a
+# Bedrock/Vertex/Foundry account (those take their own model ids). An unnamed or
+# missing account is not known to be one, so nothing is changed for it.
+profile_is_anthropic_login() {
+  local p="${1:-}" v val
+  [[ -n "$p" && -d "${AUTH_PROFILES_DIR}/${p}" ]] || return 1
+  [[ -z "$(profile_env_value "$p" ANTHROPIC_BASE_URL)" ]] || return 1
+  for v in CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY; do
+    val=$(profile_env_value "$p" "$v")
+    [[ -z "$val" || "$val" == 0 || "$val" == false ]] || return 1
+  done
+  return 0
+}
+
+# claude_model_ok_on_anthropic <model> -> rc 0 when Anthropic can serve the
+# value: a claude-* id, or a bare alias Claude Code resolves itself (sonnet,
+# opus[1m], opusplan, default). A vendor slug (deepseek/…, z-ai/…) is not.
+claude_model_ok_on_anthropic() {
+  local m="${1:-}"
+  [[ "$m" =~ ^claude-[a-z0-9.-]+(\[[a-z0-9]+\])?$ || "$m" =~ ^[a-z]+(\[[a-z0-9]+\])?$ ]]
+}
+
 # models_json -> {"opus":"claude-opus-5-5",...}. This is what the telegram plugin
 # reads at boot so its /model picker can't drift from the CLI again.
 models_json() {
