@@ -81,13 +81,19 @@ _share_sanitize_stage() {
   _pack_bundle_manifest "$stage" "$hp"
 }
 
-# The leak scan over the agent's own words (instructions + persona). Hits on
-# stderr as "<file>:<line>: <category>: <match>". rc 1 = refuse.
+# The leak scan over EVERYTHING the page will serve except the manifest we
+# just wrote ourselves: instructions, persona, every skill body and any other
+# file the export staged (DIVE-7782 iteration 2: skill bodies travel in
+# pack.tar.gz, so a scan of CLAUDE.md alone published them unread). Hits on
+# stderr as "<path>:<line>: <category>: <match>", path relative to the stage
+# (skills/research/SKILL.md:3: ...). rc 1 = refuse.
 _share_scan() {
-  local stage="$1" name="$2" d rc=0
+  local stage="$1" name="$2" d
   d=$(mktemp -d) || return 1
-  [[ -f "$stage/CLAUDE.md" ]] && cp "$stage/CLAUDE.md" "$d/"
-  [[ -f "$stage/persona.yaml" ]] && cp "$stage/persona.yaml" "$d/"
+  # Copy the stage minus manifest.json, keeping relative paths so a hit names
+  # the file the reader will find in the pack. Symlinks are not followed.
+  (cd "$stage" && tar -cf - --exclude=./manifest.json .) | (cd "$d" && tar -xf -) \
+    || { rm -rf "$d"; return 1; }
   # The agent's own account name (agent-<name>) is not a leak in its own share:
   # the page is published under that name. Every other hit stands.
   local hits; hits=$(_pack_memory_leakscan "$d" "$name" 2>&1 >/dev/null) || true
@@ -260,7 +266,7 @@ cmd_agent_share() {
   if ! hits=$(_share_scan "$work/stage" "$name" 2>&1); then
     rm -rf "$work"
     [[ -n "$hits" ]] && printf '%s\n' "$hits" >&2
-    fail "$E_VALIDATION" "not shared: '$name's instructions carry private detail a public link must not (each line above: file:line: kind: what). Rewrite those lines without the path, name, id or host, then share again. Nothing was published."
+    fail "$E_VALIDATION" "not shared: '$name's instructions or skills carry private detail a public link must not (each line above: file:line: kind: what). Rewrite those lines without the path, name, id or host, then share again. Nothing was published."
   fi
 
   local dir id

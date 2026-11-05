@@ -47,7 +47,7 @@ _share_boot_unit_install() { :; }
 _agent_avatar_path() { printf '%s/fixture/%s.png' "$TMP" "$1"; }
 
 # A fixture agent as `agent export --audience=publish` stages it.
-fixture() { # <name> <claude-md-extra-line>
+fixture() { # <name> <claude-md-extra-line> [<skill-body-extra-line>]
   local d="$TMP/fixture/$1"; rm -rf "$d"; mkdir -p "$d/skills/research"
   jq -n --arg n "$1" '{packFormat:1, agentName:$n,
     config:{type:"claude", isolation:"admin", channels:"telegram", workdir:"/srv/x", authProfile:"ownerlogin", model:"opus"},
@@ -56,7 +56,7 @@ fixture() { # <name> <claude-md-extra-line>
     hooks:{Stop:[{hooks:[{type:"command", command:"/opt/custom.sh"}]}]}}' > "$d/manifest.json"
   printf '# %s\nYou find leads and write them up.\n%s\n<!-- 5dive:team:begin (managed) -->\n- run sudo 5dive agent list\n<!-- 5dive:team:end -->\n' "$1" "$2" > "$d/CLAUDE.md"
   printf "openagent: '0.1'\nname: %s\nrole: Finds sales leads & writes <b>one-page</b> briefs\n" "${1^}" > "$d/persona.yaml"
-  printf -- '---\nname: research\n---\nbody\n' > "$d/skills/research/SKILL.md"
+  printf -- '---\nname: research\n---\nbody\n%s\n' "${3:-}" > "$d/skills/research/SKILL.md"
 }
 cmd_export() { # <name> --audience=publish -o <out>
   local n="$1" out=""
@@ -124,6 +124,18 @@ eq_t 'leak exits E_VALIDATION' "$E_VALIDATION" "$rc"
 has_t 'refusal names the line and kind' "$out" "CLAUDE.md:3: host-path: /home/someone"
 has_t 'refusal says nothing was published' "$out" "Nothing was published"
 _share_dir_of_agent beta >/dev/null && bad_t 'leaky agent has no share' || ok_t 'leaky agent has no share'
+fixture delta "" "SSH to 62.238.117.176 as root, notes in /home/someone/notes, ping @zed"
+out=$( (cmd_agent_share delta) 2>&1 ); rc=$?
+eq_t 'leaky skill body exits E_VALIDATION' "$E_VALIDATION" "$rc"
+has_t 'skill refusal names the skill file and line' "$out" "skills/research/SKILL.md:5: host-path: /home/someone"
+has_t 'skill refusal names the address too' "$out" "skills/research/SKILL.md:5: hostname: 62.238.117.176"
+has_t 'skill refusal says nothing was published' "$out" "Nothing was published"
+_share_dir_of_agent delta >/dev/null && bad_t 'leaky skill body: nothing published' "$(ls -R "$SHARE_DIR")" || ok_t 'leaky skill body: nothing published'
+fixture epsilon ""
+printf 'see /root/.ssh/ for keys\n' > "$TMP/fixture/epsilon/notes.txt"
+out=$( (cmd_agent_share epsilon) 2>&1 ); rc=$?
+eq_t 'any other staged file is scanned too' "$E_VALIDATION" "$rc"
+has_t 'other-file refusal names it' "$out" "notes.txt:1:"
 fixture gamma "I am agent-gamma on this box."
 (cmd_agent_share gamma) >/dev/null 2>&1 && ok_t "the agent's own account name is not a leak" || bad_t "own account name refused"
 
