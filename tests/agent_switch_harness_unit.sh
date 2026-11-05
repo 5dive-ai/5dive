@@ -93,7 +93,10 @@ audit_log() { :; }
 registry_read() { cat "$TMP/reg"; }
 registry_write() { cat >"$TMP/reg"; }
 with_registry_lock() { "$@"; }
-link_agent_profile() { printf '%s %s\n' "$1" "${2:-}" >>"$TMP/links"; }
+# DIVE-7747: the move reads the link back before it queues the restart, so the
+# shim points it where the real one does (a no-op link is a move that did not land).
+link_agent_profile() { printf '%s %s\n' "$1" "${2:-}" >>"$TMP/links"
+  rm -f "$ENV_DIR/$1-auth.env"; [[ -z "${2:-}" ]] || ln -s "$AUTH_PROFILES_DIR/$2/combined.env" "$ENV_DIR/$1-auth.env"; }
 account_binding_record() { :; }
 plugin_seat_backfill() { :; }
 mod_seat_enabled() { return 1; }
