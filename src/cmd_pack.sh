@@ -3332,7 +3332,7 @@ cmd_import() {
   # "explicitly asked for <type>" apart from "took the pack's baked-in type";
   # the from-persona synth defaults it to claude locally below.
   local from_persona="" p_type="" p_iso="standard" p_iso_set=0 p_model="" p_effort=""
-  local from_url=""
+  local from_url="" from_share=0
   # DIVE-2676: BYO credentials on the import path. Without these an import onto
   # an API-key-only seat provisions an agent that cannot reach a model at all.
   local p_provider="" p_api_key=""
@@ -3385,6 +3385,19 @@ cmd_import() {
       || fail "$E_USAGE" "give ONE of a pack, --from-persona or --from-url"
     [[ "$from_url" =~ ^https://[^[:space:]]+$ ]] \
       || fail "$E_VALIDATION" "--from-url must be an https URL"
+    # DIVE-7782: a share link (https://<box>/a/<id>, as `agent share` prints it)
+    # is a stranger's agent. Its pack sits beside the page; the copy is untrusted,
+    # so it starts at standard (sandboxed is allowed, admin never) and its hooks
+    # stay stripped whatever --allow-hooks says.
+    if [[ "$from_url" =~ ^(https://[^[:space:]?#]+)/a/([A-Za-z0-9_-]{22})(/|/pack\.tar\.gz)?$ ]]; then
+      from_share=1
+      from_url="${BASH_REMATCH[1]}/a/${BASH_REMATCH[2]}/pack.tar.gz"
+      [[ "$p_iso_set" == 1 && "$p_iso" == admin ]] \
+        && fail "$E_VALIDATION" "a shared agent is community-made and starts at standard, never admin (grant it more later, once you trust it: 5dive agent grant <name> admin)"
+      [[ "$p_iso_set" == 1 && "$p_iso" == sandboxed ]] || { p_iso=standard; p_iso_set=1; }
+      allow_hooks=0
+      step "A shared agent is community-made: it starts at standard isolation. Look it over, and connect your own keys."
+    fi
     step "Fetching pack from $(_pack_url_host "$from_url")"
     url_tmp=$(_pack_fetch_url "$from_url") \
       || fail "$E_GENERIC" "could not fetch the pack from $(_pack_url_host "$from_url") (expired or unreachable link)"
@@ -3567,6 +3580,11 @@ cmd_import() {
      && [[ "$(registry_read 2>/dev/null | jq -r '(.agents // {}) | length' 2>/dev/null || echo 1)" == 0 ]]; then
     isolation=admin
     step "First agent on this box: admin, so it can run the team (pass --isolation=standard to keep it least-privilege)"
+  fi
+  # DIVE-7782: a pack a share made says so in its manifest; however it got here
+  # (a link, a downloaded file), it never comes up admin.
+  if [[ "$from_share" == 1 ]] || jq -e '.share.community_made == true' "$stage/manifest.json" >/dev/null 2>&1; then
+    [[ "$isolation" == admin || -z "$isolation" ]] && isolation=standard
   fi
   [[ -n "$p_model" ]]  && model="$p_model"
   [[ -n "$p_effort" ]] && effort="$p_effort"
