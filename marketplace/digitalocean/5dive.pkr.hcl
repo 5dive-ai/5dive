@@ -23,10 +23,12 @@ variable "do_token" {
 }
 
 # nyc3 refused s-1vcpu-1gb for our team on 2026-10-31 ("Size is not available in
-# this region"); fra1 builds. The snapshot can be copied to any region later.
+# this region"), and fra1 on 2026-11-05 (GET /v2/sizes lists it in ams3, nyc1,
+# nyc3, lon1, ... but no longer fra1); ams3 builds. The snapshot can be copied
+# to any region later.
 variable "region" {
   type    = string
-  default = "fra1"
+  default = "ams3"
 }
 
 # DigitalOcean's advice: build on the $6 size, so the 1-Click can be created on
