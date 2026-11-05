@@ -30,6 +30,10 @@
 #   T6  the refusal is not a blanket ban on the word: the same run, same registry,
 #       a NON-roster name still stamps `human:` — so T5 cannot pass by refusing
 #       everything
+#   T8  DIVE-7765: a NON-ROOT relay onto a root-only ledger lands through the
+#       root relay, or says tap_logged:false — never a raw shell error after OK
+#   T9  DIVE-7765: --channel-proof=telegram:<id> is accepted; junk and group ids
+#       are refused with a FORMAT reason, an allowFrom miss with the allowFrom one
 #   T7  the guard is MEASURED, not assumed: `actor_name_is_registered_agent`
 #       separates "is an agent", "measured, is not" and "could not look"
 #
@@ -273,6 +277,115 @@ actor_name_is_registered_agent tapper;   _rc_human=$?
 [[ $_rc_blind -eq 2 ]] \
   && ok_t "T7c an unreadable roster is UNMEASURED (rc 2), not silently 'not an agent'" \
   || bad_t "T7c unmeasurable roster" "rc=$_rc_blind (expected 2)"
+
+# --- T8: DIVE-7765 — a NON-ROOT relay onto a ledger it cannot write. ----------
+# Box bug 729: root created gate-taps.jsonl 0600 root:root, every later agent-run
+# tap printed `OK`, then a raw "Permission denied", and wrote nothing. Modelled
+# without root: the ledger is made unwritable for this (non-root) uid and the
+# answer runs with _gate_is_root pinned false. The privileged relay is the seam
+# `_gate_tap_priv_append`; it is stubbed in two modes — granted (records what
+# root was handed) and refused.
+if [[ $EUID -eq 0 ]]; then
+  printf 'note - T8 skipped: running as root, an unwritable ledger cannot be modelled (root writes through 0400)\n'
+else
+  _real_tap_log="$GATE_TAP_LOG"
+  GATE_TAP_LOG="$TMP/ro/gate-taps.jsonl"; mkdir -p "$TMP/ro"
+  printf '{"seed":1}\n' >"$GATE_TAP_LOG"; chmod 0400 "$GATE_TAP_LOG"; chmod 0500 "$TMP/ro"
+  RELAYED="$TMP/relayed.jsonl"; : >"$RELAYED"
+  PRIV_MODE=grant
+  _gate_tap_priv_append() { [[ "$PRIV_MODE" == grant ]] || return 1; printf '%s\n' "$1" >>"$RELAYED"; }
+  _gate_is_root() { return 1; }
+
+  seed DIVE-305; t2gate DIVE-305
+  out=$(cmd_task_answer DIVE-305 --value=A --human --human-proof="$KNOWN_NONCE" \
+          --tap-uid="$TAP_UID" --tap-msg="$TAP_MSG" --relay-agent=relaybot 2>"$TMP/err305"); rc=$?
+  [[ $rc -eq 0 && "$(answered DIVE-305)" == closed ]] \
+    && ok_t "T8a a non-root relay onto a root-only ledger still answers the gate" \
+    || bad_t "T8a answer lands" "rc=$rc state=$(answered DIVE-305) out=$out"
+  grep -q 'Permission denied' "$TMP/err305" \
+    && bad_t "T8b no raw shell error after OK" "stderr: $(cat "$TMP/err305")" \
+    || ok_t "T8b no raw 'Permission denied' leaks after OK"
+  grep -F '"gate":"DIVE-305"' "$RELAYED" | grep -qF "\"stamped_as\":\"human:tapper\"" \
+    && ok_t "T8c the record is handed to the root relay instead of being dropped" \
+    || bad_t "T8c relayed record" "relayed=$(cat "$RELAYED")"
+  [[ "$(jq -r '.data.tap_logged' <<<"$out" 2>/dev/null)" == "true" ]] \
+    && ok_t "T8d the answer's JSON says tap_logged:true" \
+    || bad_t "T8d tap_logged true" "out=$out"
+
+  PRIV_MODE=refuse; : >"$AUDIT_LOG_FILE"
+  seed DIVE-306; t2gate DIVE-306
+  out=$(cmd_task_answer DIVE-306 --value=A --human --human-proof="$KNOWN_NONCE" \
+          --tap-uid="$TAP_UID" --relay-agent=relaybot 2>"$TMP/err306"); rc=$?
+  [[ $rc -eq 0 && "$(answered DIVE-306)" == closed ]] \
+    && ok_t "T8e with no relay either, the human's answer still lands" \
+    || bad_t "T8e answer lands" "rc=$rc out=$out"
+  [[ "$(jq -r '.data.tap_logged' <<<"$out" 2>/dev/null)" == "false" && -n "$(jq -r '.data.tap_log_reason // empty' <<<"$out" 2>/dev/null)" ]] \
+    && ok_t "T8f …and says so: tap_logged:false with a reason" \
+    || bad_t "T8f tap_logged false + reason" "out=$out"
+  grep -q 'Permission denied' "$TMP/err306" \
+    && bad_t "T8g no raw shell error on the miss" "stderr: $(cat "$TMP/err306")" \
+    || ok_t "T8g no raw 'Permission denied' on the miss either"
+  grep -q 'task answer tap-ledger.*error.*task=DIVE-306' "$AUDIT_LOG_FILE" \
+    && ok_t "T8h the miss is written to the audit log" \
+    || bad_t "T8h miss audited" "audit=$(cat "$AUDIT_LOG_FILE")"
+
+  # THE ROOT HALF. It appends only a line that matches an answer that landed.
+  _gate_is_root() { return 0; }
+  ROOTLOG="$TMP/root-taps.jsonl"; GATE_TAP_LOG="$ROOTLOG"
+  _l305=$(grep -F '"gate":"DIVE-305"' "$RELAYED" | tail -1)
+  SUDO_USER=agent-relaybot _gate_tap_append_root "$_l305"; _r1=$?
+  [[ $_r1 -eq 0 ]] && grep -F '"gate":"DIVE-305"' "$ROOTLOG" | grep -qF '"appended_by":"agent-relaybot"' \
+    && ok_t "T8i root appends a relayed record of a real answer, stamped with the relaying seat" \
+    || bad_t "T8i root append" "rc=$_r1 log=$(cat "$ROOTLOG" 2>/dev/null)"
+  _forged=$(jq -c '.stamped_as="human:someone-else"' <<<"$_l305")
+  _before=$(wc -l <"$ROOTLOG" 2>/dev/null || echo 0)
+  seed DIVE-307
+  _unanswered=$(jq -c '.gate="DIVE-307"' <<<"$_l305")
+  SUDO_USER=agent-relaybot _gate_tap_append_root "$_forged"; _r2=$?
+  SUDO_USER=agent-relaybot _gate_tap_append_root "$_unanswered"; _r3=$?
+  [[ $_r2 -ne 0 && $_r3 -ne 0 && "$(wc -l <"$ROOTLOG")" == "$_before" ]] \
+    && ok_t "T8j root REFUSES a record whose stamp differs, or whose gate was never answered" \
+    || bad_t "T8j root refuses forged lines" "r2=$_r2 r3=$_r3 lines $_before -> $(wc -l <"$ROOTLOG")"
+
+  _gate_is_root() { [[ $EUID -eq 0 ]]; }
+  chmod 0700 "$TMP/ro"; GATE_TAP_LOG="$_real_tap_log"
+fi
+
+# --- T9: DIVE-7765 — `--channel-proof=telegram:<id>`. -----------------------
+# The prefixed form our own surfaces print was refused as "not in allowFrom"
+# while the id WAS in allowFrom. The fixture channel lists TAP_UID only.
+cat >"$TMP/access.json" <<ACC
+{"allowFrom": ["$TAP_UID"], "groups": {}}
+ACC
+_task_owner_channel() { TASK_CH_ACCESS="$TMP/access.json"; TASK_CH_TOKEN=""; return 0; }
+sudo() { return 1; }   # no privileged rails on a fixture: keep every answer in-process
+t1gate() {
+  cmd_task_need "$1" --type=decision --ask="ship it?" --options="A|B" --ask-ok="fixture gate (DIVE-4462)" \
+    --recommend="A" --tier=1 >/dev/null 2>&1
+}
+seed DIVE-310; t1gate DIVE-310
+out=$(cmd_task_answer DIVE-310 --value=A --channel-proof="telegram:$TAP_UID" 2>&1); rc=$?
+# `human_evidence` names the form that cleared it; `channel-chat` is set ONLY when
+# _gate_channel_proof_ok verified the chat (the roster guard may still rename the
+# stamp, which is T5's business, not this arm's).
+_ev310=$(db "SELECT COALESCE(human_evidence,'') FROM tasks WHERE ident='DIVE-310';")
+[[ $rc -eq 0 && "$(answered DIVE-310)" == closed && "$_ev310" == *channel-chat* ]] \
+  && ok_t "T9a telegram:<id> is ACCEPTED as channel proof when <id> is in allowFrom (evidence=channel-chat)" \
+  || bad_t "T9a telegram:<id> accepted" "rc=$rc state=$(answered DIVE-310) evidence=$_ev310 out=$out"
+seed DIVE-311; t1gate DIVE-311
+out=$( (cmd_task_answer DIVE-311 --value=A --channel-proof="telegram:9876543210" --channel-msg=5) 2>&1); rc=$?
+[[ $rc -ne 0 && "$(answered DIVE-311)" == open && "$out" == *"not in access.json allowFrom"* ]] \
+  && ok_t "T9b telegram:<id> NOT in allowFrom is refused with the allowFrom reason" \
+  || bad_t "T9b allowFrom miss reason" "rc=$rc state=$(answered DIVE-311) out=$out"
+for _bad in abc -1001234567890 "telegram:-100123" "telegram:12a"; do
+  out=$( (cmd_task_answer DIVE-310 --value=A --channel-proof="$_bad") 2>&1); rc=$?
+  [[ $rc -ne 0 && "$out" == *"takes the chat id as a number"* && "$out" != *allowFrom* ]] \
+    && ok_t "T9c '$_bad' is refused with the FORMAT reason, not the allowFrom one" \
+    || bad_t "T9c format reason for '$_bad'" "rc=$rc out=$out"
+done
+(_gate_channel_proof_parse "telegram:$TAP_UID"; [[ "$TASK_CP_CHAT" == "$TAP_UID" ]]) \
+  && ok_t "T9d the parser strips exactly the telegram: prefix and keeps the number" \
+  || bad_t "T9d parser" "TASK_CP_CHAT did not come back as $TAP_UID"
 
 echo "-----"
 SUMMARY_PRINTED=1

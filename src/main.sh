@@ -1329,8 +1329,22 @@ main() {
       # caller input (upholds the write_admin_sudoers invariant), never advertised,
       # and is not itself audited (AUDIT_CMD stays unset, so no recursion).
       [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_audit_append is a privileged internal primitive"
-      audit_init 2>/dev/null || true
       local _al
+      # DIVE-7765: ONE named sink besides the audit log -- the gate tap ledger,
+      # root-owned 0600, so an agent seat relaying a button tap can land its record
+      # without the ledger being loosened to group-writable. The line is accepted
+      # only when it matches an answer that really landed (_gate_tap_append_root).
+      # Any other argument is refused: this primitive never grows a free-form path.
+      case "${1:-}" in
+        "") ;;
+        gate-tap)
+          IFS= read -r _al || true
+          [[ -n "$_al" ]] || exit 0
+          _gate_tap_append_root "$_al" || exit 1
+          exit 0 ;;
+        *) fail "$E_USAGE" "_audit_append takes no argument other than gate-tap" ;;
+      esac
+      audit_init 2>/dev/null || true
       IFS= read -r _al || true
       [[ -n "$_al" ]] || exit 0
       printf '%s\n' "$_al" \

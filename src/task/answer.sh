@@ -366,10 +366,42 @@ _gate_tap_human_name() {
 # THE RAW NONCE IS NEVER WRITTEN. `human_nonce_hash` is hash-only at rest for the
 # reason DIVE-916 gives, and a ledger that recorded the presented nonce would undo
 # that at a second address. We record only WHETHER one was presented.
+# DIVE-7765: THE LEDGER IS ROOT-OWNED, AND MOST TAPS ARRIVE AS AN AGENT. Before
+# this, the append was `printf >>"$log" 2>/dev/null || return 0`: the redirection
+# fails before `2>/dev/null` applies, so a non-root relay printed a raw
+# "Permission denied" after `OK`, wrote nothing, and returned 0. Once root had
+# created the file (0600 root:root), the ledger recorded ONLY root-run answers --
+# on a box where agents relay taps, none of them (box bug 729). Now:
+#   1. a writer that CAN append (root, or the file/dir is its own) appends, with
+#      the redirection's own error captured, not leaked;
+#   2. anyone else hands the line to root over the `_audit_append gate-tap` sink
+#      -- the same NOPASSWD primitive every seat already holds for the audit log --
+#      and root appends it with ownership intact (_gate_tap_append_root);
+#   3. if neither lands, it SAYS SO: TASK_TAP_LOGGED=0 + TASK_TAP_LOG_WHY reach the
+#      OK line and its JSON, and the miss is written to the audit log.
+# NOT 0660 root:claude: every seat is in group claude, so that would let any agent
+# rewrite the ledger it exists to make trustworthy.
+TASK_TAP_LOGGED="" TASK_TAP_LOG_WHY=""
+_gate_tap_direct_append() { # <log> <line> -- 0 when the line landed
+  local log="$1" line="$2" dir="${1%/*}"
+  [[ -d "$dir" ]] || mkdir -p "$dir" 2>/dev/null || return 1
+  if ! _gate_is_root; then
+    if [[ -e "$log" ]]; then [[ -w "$log" ]] || return 1
+    else [[ -w "$dir" ]] || return 1
+    fi
+  fi
+  { printf '%s\n' "$line" >>"$log"; } 2>/dev/null || return 1
+  chmod 0600 "$log" 2>/dev/null || true
+  if _gate_is_root; then chown root:root "$log" 2>/dev/null || true; fi
+  return 0
+}
+# The seam a unit harness replaces: the one call that crosses to root.
+_gate_tap_priv_append() { # <line>
+  printf '%s\n' "$1" | sudo -n /usr/local/bin/5dive _audit_append gate-tap >/dev/null 2>&1
+}
 _gate_tap_log() {
+  TASK_TAP_LOGGED=0 TASK_TAP_LOG_WHY=""
   local log="${GATE_TAP_LOG:-${STATE_DIR}/gate-taps.jsonl}"
-  local dir="${log%/*}"
-  [[ -d "$dir" ]] || mkdir -p "$dir" 2>/dev/null || return 0
   local line
   line=$(jq -cn \
     --arg ts        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
@@ -388,11 +420,40 @@ _gate_tap_log() {
     '{ts:$ts, gate:$ident, tier:$tier, type:$type, tap_uid:$tap_uid,
       tap_username:$tap_user, tap_message_id:$tap_msg, relay_agent:$relay,
       resolved_human:$resolved, resolved_via:$via, stamped_as:$stamp,
-      human_proof:$nonce, verdict:$verdict}' 2>/dev/null) || return 0
-  printf '%s\n' "$line" >>"$log" 2>/dev/null || return 0
-  chmod 0600 "$log" 2>/dev/null || true
-  [[ $EUID -eq 0 ]] && chown root:root "$log" 2>/dev/null || true
+      human_proof:$nonce, verdict:$verdict}' 2>/dev/null) \
+    || { TASK_TAP_LOG_WHY="the tap record could not be built"; line=""; }
+  if [[ -n "$line" ]]; then
+    if _gate_tap_direct_append "$log" "$line"; then TASK_TAP_LOGGED=1; return 0; fi
+    if ! _gate_is_root && _gate_tap_priv_append "$line"; then TASK_TAP_LOGGED=1; return 0; fi
+    if _gate_is_root; then TASK_TAP_LOG_WHY="the tap ledger ${log} could not be appended"
+    else TASK_TAP_LOG_WHY="the tap ledger ${log} is not writable by $(id -un 2>/dev/null || echo this seat) and the root relay (_audit_append gate-tap) refused or is not granted"
+    fi
+  fi
+  _task_store_audit_log "task answer tap-ledger" error 0 -- \
+    "task=${1:-}" "tap_uid=${4:-}" "relay_agent=${7:-}" "reason=tap not recorded" \
+    "detail=${TASK_TAP_LOG_WHY}" 2>/dev/null || true
   return 0
+}
+
+# DIVE-7765: the ROOT half of the relay, reached only as `sudo 5dive _audit_append
+# gate-tap` with one JSON line on stdin. It accepts a line ONLY when it describes
+# an answer that really landed: the named gate is answered, within the last 10
+# minutes, and the row's persisted `need_answered_by` is exactly the line's
+# `stamped_as`. So a seat can relay the record of an answer that happened, never
+# invent a tap for a gate nobody answered. `appended_by` is stamped from SUDO_USER
+# here, overwriting anything the caller sent, so the ledger says which seat
+# relayed it.
+_gate_tap_append_root() { # <line>
+  local line="$1" ident stamp persisted
+  _gate_is_root || return 1
+  ident=$(jq -r 'if type=="object" then (.gate // "") else "" end' <<<"$line" 2>/dev/null) || return 1
+  [[ "$ident" =~ ^[A-Za-z][A-Za-z0-9]*-[0-9]+$ ]] || return 1
+  stamp=$(jq -r '.stamped_as // ""' <<<"$line" 2>/dev/null) || return 1
+  tasks_db_init >/dev/null 2>&1 || return 1
+  persisted=$(db "SELECT COALESCE(need_answered_by,'') FROM tasks WHERE ident=$(sqlq "$ident") AND need_answered_at IS NOT NULL AND need_answered_at >= datetime('now','-10 minutes') LIMIT 1;" 2>/dev/null) || return 1
+  [[ -n "$persisted" && "$persisted" == "$stamp" ]] || return 1
+  line=$(jq -c --arg u "${SUDO_USER:-unknown}" '.appended_by=$u' <<<"$line" 2>/dev/null) || return 1
+  _gate_tap_direct_append "${GATE_TAP_LOG:-${STATE_DIR}/gate-taps.jsonl}" "$line"
 }
 
 # ── DIVE-3160: `_task_answer` — the delegated, SIGNED gate clear ─────────────
@@ -542,7 +603,7 @@ cmd_task_channel_delegated() {
 
   for a in "${args[@]}"; do
     case "$a" in
-      --channel-proof=*) channel_proof="${a#*=}" ;;
+      --channel-proof=*) _gate_channel_proof_parse "${a#*=}"; channel_proof="$TASK_CP_CHAT" ;;
     esac
     case "$op:$a" in
       answer:--value=*|answer:--human|answer:--human-proof=*|answer:--channel-proof=*|answer:--channel-msg=*|answer:--tap-uid=*|answer:--tap-username=*|answer:--tap-msg=*|answer:--relay-agent=*|answer:--from=telegram) ;;
@@ -554,7 +615,7 @@ cmd_task_channel_delegated() {
   done
   [[ -n "$channel_proof" ]] || fail "$E_AUTH_REQUIRED" "_task_channel requires paired-human channel proof."
   _gate_channel_proof_ok "$channel_proof" \
-    || fail "$E_AUTH_REQUIRED" "_task_channel channel proof did not verify for agent ${actor}."
+    || fail "$E_AUTH_REQUIRED" "_task_channel channel proof did not verify for agent ${actor}: ${TASK_CP_REASON:-unverified}."
 
   TASK_CHANNEL_DELEGATED=1
   case "$op" in
@@ -708,7 +769,7 @@ cmd_task_answer() {
       # hard gate (money/destructive/secret) NEVER accepts it and keeps its
       # per-gate button tap. This is the "go with recs from your own channel"
       # clear (lodar's chosen scope, DIVE-1305 decision 2026-07-16).
-      --channel-proof=*) channel_proof="${1#*=}" ;;
+      --channel-proof=*) _gate_channel_proof_parse "${1#*=}"; channel_proof="$TASK_CP_CHAT" ;;
       # DIVE-2412: the message_id of the human's OWN message in that verified DM.
       # This is the citation the tier-2 form is built on: the chat id above says
       # WHICH conversation, and only this says the human actually spoke in it —
@@ -1936,6 +1997,13 @@ cmd_task_answer() {
       "$relay_agent" "${_tap_name:-}" "$_tap_persisted" \
       "$_tap_nonce" "$_tap_verdict" "$_tap_src" || true
   fi
+  # DIVE-7765: what the ledger write did reaches the caller, never a raw shell
+  # error. Empty when no tap was relayed (the JSON then carries null).
+  local _tap_logged="" _tap_note=""
+  if [[ -n "$tap_uid" || -n "$relay_agent" || -n "$tap_msg" ]]; then
+    _tap_logged="${TASK_TAP_LOGGED:-0}"
+    [[ "$_tap_logged" == "1" ]] || _tap_note=" — tap NOT recorded in the tap ledger: ${TASK_TAP_LOG_WHY:-unknown reason}"
+  fi
 
   # DIVE-2099: the authoritative record of a STANDING-authority clear. Emitted
   # AFTER the write and reading `need_answered_by` BACK OUT of the row, so it
@@ -2238,10 +2306,11 @@ cmd_task_answer() {
     [[ -n "$_frame_answerer" ]] || _frame_answerer="unknown"
     _frame_note=" — account frame: filer=${_frame_filer}, answerer=${_frame_answerer}; second-person terms in the selected filer-authored option refer to ${_frame_answerer}"
   fi
-  ok "$ident answered ($nt) — now ${newstatus}${note}${_frame_note}" \
-     '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1"), owner_busy_on:(($bo|select(length>0)) // null), option_account_frame:(if $af=="1" then {filer:$gf, answerer:$ga, second_person_refers_to:$ga} else null end)}' \
+  ok "$ident answered ($nt) — now ${newstatus}${note}${_frame_note}${_tap_note}" \
+     '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1"), owner_busy_on:(($bo|select(length>0)) // null), option_account_frame:(if $af=="1" then {filer:$gf, answerer:$ga, second_person_refers_to:$ga} else null end), tap_logged:(if $tl=="" then null else ($tl=="1") end), tap_log_reason:(if $tl=="0" then $tw else null end)}' \
      --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged" --arg bo "$_busy_on" \
-     --arg af "$_account_frame" --arg gf "$_frame_filer" --arg ga "$_frame_answerer"
+     --arg af "$_account_frame" --arg gf "$_frame_filer" --arg ga "$_frame_answerer" \
+     --arg tl "$_tap_logged" --arg tw "${TASK_TAP_LOG_WHY:-}"
 }
 
 # _task_answer_ping_detached <cmd_send args...> — DIVE-6205. The gate-answer ping,
