@@ -85,7 +85,12 @@ t "candidate filter returns empty when no target is measured eligible" \
 require_root()   { :; }
 ensure_state()   { :; }
 registry_write() { cat >/dev/null; }
-cmd_config()     { :; }
+CONFIG_CALLS=$(mktemp); trap 'rc=$?; rm -f "$CONFIG_CALLS"; echo "HARNESS-RC=$rc"' EXIT
+cmd_config()     { printf '%s\n' "$*" >>"$CONFIG_CALLS"; }
+# DIVE-7747: rotate reads back the env file and auth link before it says
+# rotated:true. This harness does not own those files: they land on the account
+# cmd_config was last asked for.
+agent_profile_on_disk() { local p; p=$(sed -n 's/.*auth-profile=//p' "$CONFIG_CALLS" | tail -n1); printf '%s\t%s\n' "$p" "$p"; }
 REG_FIXTURE=''
 registry_read()  { printf '%s' "$REG_FIXTURE"; }
 

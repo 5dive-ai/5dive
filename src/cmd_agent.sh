@@ -2466,8 +2466,18 @@ cmd_info() {
   _op_state=$(_agent_operational_state "${active:-unknown}" "$_ha_state" "$_hs_state" "$sup" "$_iq_state")
   _auth_line=$(_agent_auth_display "$_ha_state" "$_ha_exp" "$_ha_refresh")
 
+  # DIVE-7747: the account the registry names vs the one the seat's files boot
+  # on. A rotation that moved the registry alone left three seats walled until
+  # their weekly reset while every surface printed the registry's account.
+  local _pd="" _pd_state="unmeasured"
+  if declare -F agent_profile_drift >/dev/null 2>&1; then
+    _pd=$(agent_profile_drift "$name" "$_info_prof"); case $? in
+      0) _pd_state="agrees" ;; 1) _pd_state="drift" ;; *) _pd_state="unmeasured" ;;
+    esac
+  fi
   local obj
   obj=$(jq -c \
+    --arg pdState "$_pd_state" --arg pdDetail "$_pd" \
     --argjson sup "$sup" \
     --arg qState "$_iq_state" --arg qWin "$_iq_win" --arg qPct "$_iq_pct" \
     --arg qReset "$_iq_reset" --arg qNote "$_iq_note" \
@@ -2519,6 +2529,8 @@ cmd_info() {
       },
       workdir: ($a.workdir // $default_wd),
       authProfile: ($a.authProfile // null),
+      # DIVE-7747: agrees | drift | unmeasured (files unreadable to this caller).
+      authProfileOnDisk: {state: $pdState, detail: (if $pdDetail == "" then null else $pdDetail end)},
       botUsername: ($a.botUsername // null),
       isolation: ($a.isolation // "admin"),
       # DIVE-2079: `isolation` above is the stored LABEL (and `// "admin"` means
@@ -2605,7 +2617,7 @@ cmd_info() {
                           elif .channelsBinding.state == "absent" then "unknown — \(.channelsBinding.detail)"
                           else "unknown — \(.channelsBinding.detail // "not probeable from here")" end)\(if .channelsBinding.evidence then "\n             ↳ \(.channelsBinding.evidence)" else "" end)"
        end),
-      "profile:     \(.authProfile // "-")",
+      "profile:     \(.authProfile // "-")\(if .authProfileOnDisk.state == "drift" then " — DRIFT: \(.authProfileOnDisk.detail)" else "" end)",
       "auth:        \($authLine)",
       "startup:     \(.health.startup.state)\(if .health.startup.reason then " — \(.health.startup.reason)" else "" end)",
       "workdir:     \(.workdir)",
@@ -2624,6 +2636,9 @@ cmd_info() {
        else empty end),
       (if .health.quota.state == "exhausted" then
          "\nWARNING: this seat CANNOT EXECUTE A SINGLE TOKEN. Its auth account \(.authProfile // "?") is at \(.health.quota.pct)% of its \(.health.quota.window) rate limit\(if .health.quota.resetsAt then " and does not reset until \(.health.quota.resetsAt)" else "" end). The process is \(.active), the credential parses, and neither fact matters until the window turns over — this is the one measurement that decides whether the seat can work, and before DIVE-4342 none of `agent list`, `liveness` or `supervisor` consulted it. Move the seat to an account with headroom (`sudo 5dive account usage` to find one, then `5dive agent config set auth-profile=<name> --agent=\(.name)`) or reassign what is queued behind it: 5dive task ls --assignee=\(.name)"
+       else empty end),
+      (if .authProfileOnDisk.state == "drift" then
+         "\nWARNING: this seat is NOT on the account the registry names (\(.authProfileOnDisk.detail)). Its next start boots on the env file and link, and usage, cooldowns and rotation reason about the registry one. Re-set the account to make all three agree and restart it: 5dive agent set-account \(.name) \(.authProfile // "default") (DIVE-7747)."
        else empty end),
       (if .health.auth.state == "refused" then
          "\nWARNING: this seat CANNOT ANSWER: its own last turn was refused by its AI account (\(.health.auth.refusal // "refused")). The credential file is present, so every file check reads ok, and a headless probe can still pass on an account that refuses the interactive client the seat runs. Fix the account (add credit, or set a new key with `5dive agent auth set`), which restarts the seat and clears this line (DIVE-7118)."

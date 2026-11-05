@@ -412,6 +412,24 @@ cmd_config() {
       fi
     fi
   fi
+  # DIVE-7747: AN ACCOUNT MOVE IS ALL OR NOTHING. From the registry write below
+  # to the queued restart, the seat's account lives in four places (registry,
+  # binding event, agents.d env, -auth.env link) and the restart is what makes
+  # the live process read the last two. On teal-fox 2026-11-04 three rotation
+  # seats had a registry that moved while the env/link/restart did not, and sat
+  # walled until the weekly reset. The rotate is fired by the seat's own
+  # StopFailure hook under an 8s timeout: the timeout kills the non-root caller,
+  # the root half keeps going with a stderr nobody reads, and the first `step`
+  # line after the registry write took a SIGPIPE. So inside this window a closed
+  # pipe and a terminate/hangup/interrupt cannot stop the move halfway, the
+  # env/link writers run where a `fail` cannot exit past the rollback, and the
+  # move is checked on disk before the restart is queued. A step that does not
+  # land puts the registry and binding back and refuses, naming that step.
+  local _mv_step="" _mv_traps=""
+  if (( profile_dirty )); then
+    _mv_traps=$(trap -p PIPE HUP TERM INT)
+    trap '' PIPE HUP TERM INT
+  fi
   echo "$reg" | registry_write
   # DIVE-4589: the binding event is written after the registry write has SUCCEEDED
   # (a failed write must not leave a rebind recorded that never happened) and
@@ -432,15 +450,31 @@ cmd_config() {
     new_channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$reg")
     new_workdir=$(jq -r --arg n "$name" '.agents[$n].workdir // empty' <<<"$reg")
     new_profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg")
-    write_agent_env "$name" "$type" "$new_channels" "$new_workdir" "$new_profile"
     if (( profile_dirty )); then
+      ( write_agent_env "$name" "$type" "$new_channels" "$new_workdir" "$new_profile" ) \
+        || _mv_step="env file"
+    else
+      write_agent_env "$name" "$type" "$new_channels" "$new_workdir" "$new_profile"
+    fi
+    if (( profile_dirty )) && [[ -z "$_mv_step" ]]; then
       step "Re-pointing ${ENV_DIR}/${name}-auth.env"
-      link_agent_profile "$name" "$new_profile"
+      ( link_agent_profile "$name" "$new_profile" ) || _mv_step="auth link"
       # DIVE-7101: the restart below boots the seat as itself, and it cannot
       # read the new account's openclaw key store; push the key in as root.
-      if [[ "$type" == openclaw ]] && declare -F seed_openclaw_state_into_seat >/dev/null 2>&1; then
+      if [[ -z "$_mv_step" && "$type" == openclaw ]] && declare -F seed_openclaw_state_into_seat >/dev/null 2>&1; then
         seed_openclaw_state_into_seat "$name" "$new_profile" || true
       fi
+    fi
+    # DIVE-7747: read back what the next start will boot on, not what we meant.
+    if (( profile_dirty )) && [[ -z "$_mv_step" ]]; then
+      local _on_env _on_link
+      IFS=$'\t' read -r _on_env _on_link < <(agent_profile_on_disk "$name")
+      if [[ "$_on_env" != "$new_profile" ]]; then _mv_step="env file"
+      elif [[ "$_on_link" != "$new_profile" ]]; then _mv_step="auth link"
+      fi
+    fi
+    if [[ -n "$_mv_step" ]]; then
+      _config_move_abort "$name" "$type" "$prev_profile" "$new_profile" "$_mv_step" "$_mv_traps"
     fi
   fi
   # DIVE-345: removing the channel must strip the stale telegram wiring left on
@@ -689,13 +723,51 @@ cmd_config() {
   # default timer slack): a pin then a message, as init-smoke and a person do,
   # had the restart land mid-reply 15s later and kill the session answering it.
   step "Restarting agent to apply (deferred ~1s)"
-  systemd-run --on-active=1 --timer-property=AccuracySec=100ms --collect \
-    /bin/systemctl restart "5dive-agent@${name}.service" >&2
+  if (( profile_dirty )); then
+    # DIVE-7747: an account move is done when the restart is QUEUED; a seat whose
+    # files moved and whose process was never told to re-read them is the drift.
+    systemd-run --on-active=1 --timer-property=AccuracySec=100ms --collect \
+      /bin/systemctl restart "5dive-agent@${name}.service" >&2 \
+      || _config_move_abort "$name" "$type" "$prev_profile" \
+           "$(jq -r --arg n "$name" '.agents[$n].authProfile // empty' <<<"$reg")" "restart" "$_mv_traps"
+    trap - PIPE HUP TERM INT
+    eval "$_mv_traps"
+  else
+    systemd-run --on-active=1 --timer-property=AccuracySec=100ms --collect \
+      /bin/systemctl restart "5dive-agent@${name}.service" >&2
+  fi
   local applied_json
   applied_json=$(printf '%s\n' "${applied_keys[@]+"${applied_keys[@]}"}" | jq -R . | jq -cs '. | map(select(length > 0))')
   ok "config applied." \
      '{name:$n, applied:$a}' \
      --arg n "$name" --argjson a "$applied_json"
+}
+
+# DIVE-7747: an account move that did not land. Put the registry, the binding
+# history and both files back on <prev>, restore the caller's signal traps and
+# refuse, naming the step. Nothing is restarted: the seat is still on <prev>.
+# A caller that wants the step as data (the rotate's rotated:false envelope)
+# names a file in _5D_MOVE_STEP_FILE.
+_config_move_abort() { # <name> <type> <prev> <target> <step> <saved-traps>
+  local name="$1" type="$2" prev="$3" target="$4" mstep="$5" traps="$6" rb_reg rb_ch rb_wd
+  rb_reg=$(registry_read)
+  if [[ -n "$prev" ]]; then
+    rb_reg=$(jq --arg n "$name" --arg v "$prev" '.agents[$n].authProfile = $v' <<<"$rb_reg")
+  else
+    rb_reg=$(jq --arg n "$name" 'del(.agents[$n].authProfile)' <<<"$rb_reg")
+  fi
+  printf '%s\n' "$rb_reg" | registry_write
+  if declare -F account_binding_record >/dev/null 2>&1; then
+    account_binding_record "$name" "$prev" "${_5D_BINDING_REASON:-config-set}-rollback" || true
+  fi
+  rb_ch=$(jq -r --arg n "$name" '.agents[$n].channels // "none"' <<<"$rb_reg")
+  rb_wd=$(jq -r --arg n "$name" '.agents[$n].workdir // empty' <<<"$rb_reg")
+  ( write_agent_env "$name" "$type" "$rb_ch" "$rb_wd" "$prev" ) || true
+  ( link_agent_profile "$name" "$prev" ) || true
+  [[ -z "${_5D_MOVE_STEP_FILE:-}" ]] || printf '%s\n' "$mstep" >"$_5D_MOVE_STEP_FILE" 2>/dev/null || true
+  trap - PIPE HUP TERM INT
+  eval "$traps"
+  fail "$E_GENERIC" "moving '$name' to account '${target:-default}' did not finish: the ${mstep} step did not land. Put back on '${prev:-default}' (registry, env file and auth link); no restart was queued, the seat keeps running '${prev:-default}'."
 }
 
 # DIVE-6005: put the declared channel list back to its pre-call value, registry

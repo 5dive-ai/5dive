@@ -2360,6 +2360,36 @@ rotation_eligible_accounts() {
   printf '%s' "$out"
 }
 
+# DIVE-7747: the account a seat's NEXT start boots on, read from the two files
+# 5dive-agent-start reads: the agents.d env's AGENT_AUTH_PROFILE and the profile
+# dir the -auth.env link points into. Prints "<env>\t<link>", "" for none. The
+# registry is what we MEANT; this is what will run.
+agent_profile_on_disk() { # <name>
+  # A caller that cannot read the directory gets "?" for both, never "" (which
+  # would read as "no account" and flag drift that is not there).
+  local name="$1" env_file="${ENV_DIR}/${1}.env" link="${ENV_DIR}/${1}-auth.env" e="" l=""
+  if [[ ! -r "$ENV_DIR" || ! -x "$ENV_DIR" ]] || [[ -e "$env_file" && ! -r "$env_file" ]]; then
+    printf '?\t?\n'; return 0
+  fi
+  [[ -r "$env_file" ]] && e=$(sed -n 's/^AGENT_AUTH_PROFILE=//p' "$env_file" | head -n1)
+  if [[ -L "$link" ]]; then
+    l=$(readlink "$link")
+    l=$(basename "$(dirname "$l")")
+  fi
+  printf '%s\t%s\n' "$e" "$l"
+}
+
+# DIVE-7747: rc 0 and nothing when registry, env and link agree; rc 1 and one
+# line naming all three when they do not; rc 2 when the files are unreadable.
+agent_profile_drift() { # <name> <registry-profile>
+  local e l
+  IFS=$'\t' read -r e l < <(agent_profile_on_disk "$1")
+  [[ "$e" == "?" ]] && return 2
+  [[ "$e" == "${2:-}" && "$l" == "${2:-}" ]] && return 0
+  printf 'registry=%s env=%s link=%s\n' "${2:--}" "${e:--}" "${l:--}"
+  return 1
+}
+
 cmd_agent_rotation_rotate() {
   local name="${1:-}"; shift || true
   [[ -n "$name" ]] \
@@ -2556,13 +2586,59 @@ cmd_agent_rotation_rotate() {
   # still-cooling-but-sooner account; the resume waits on its reset).
   # DIVE-4589: name the PATH that moved the binding. The event itself is emitted
   # inside cmd_config (one emitter); only the reason is per-caller.
-  _5D_BINDING_REASON=rotation cmd_config "$name" set "auth-profile=${target}" >/dev/null
+  #
+  # DIVE-7747: the move runs in a subshell so a step that does not land comes
+  # back here as rotated:false naming it (cmd_config has already put the
+  # registry back) instead of exiting past this envelope; and from here to the
+  # stamp a closed pipe or a terminate cannot cut it in half — the hook that
+  # fires this gives up after 8s and stops reading our stderr.
+  local _rot_traps _rot_stepf _rot_rc=0 _rot_failed="" _rot_e _rot_l
+  _rot_traps=$(trap -p PIPE HUP TERM INT)
+  trap '' PIPE HUP TERM INT
+  _rot_stepf=$(mktemp "${TMPDIR:-/tmp}/5dive-rotate-step.XXXXXX" 2>/dev/null) || _rot_stepf=""
+  ( _5D_BINDING_REASON=rotation _5D_MOVE_STEP_FILE="$_rot_stepf" \
+      cmd_config "$name" set "auth-profile=${target}" ) >/dev/null || _rot_rc=$?
+  if (( _rot_rc )); then
+    [[ -n "$_rot_stepf" ]] && _rot_failed=$(head -n1 "$_rot_stepf" 2>/dev/null)
+    [[ -n "$_rot_failed" ]] || _rot_failed="account set"
+  else
+    # Criterion: rotated:true only once the files the restart reads say <target>.
+    IFS=$'\t' read -r _rot_e _rot_l < <(agent_profile_on_disk "$name")
+    if [[ "$_rot_e" != "$target" ]]; then _rot_failed="env file"
+    elif [[ "$_rot_l" != "$target" ]]; then _rot_failed="auth link"
+    fi
+    if [[ -n "$_rot_failed" ]]; then
+      # cmd_config said done and the disk disagrees: the registry must not stay
+      # moved alone. Put it on what the files say, which is what will run.
+      registry_read | jq --arg n "$name" --arg v "$_rot_e" \
+        'if $v == "" then del(.agents[$n].authProfile) else .agents[$n].authProfile = $v end' \
+        | registry_write
+      declare -F account_binding_record >/dev/null 2>&1 \
+        && { account_binding_record "$name" "$_rot_e" rotation-rollback || true; }
+    fi
+  fi
+  [[ -z "$_rot_stepf" ]] || rm -f "$_rot_stepf"
+  if [[ -n "$_rot_failed" ]]; then
+    trap - PIPE HUP TERM INT; eval "$_rot_traps"
+    local _rot_now
+    _rot_now=$(registry_read | jq -r --arg n "$name" '.agents[$n].authProfile // ""')
+    if (( JSON_MODE )); then
+      ok "" '{rotated:false, from:$f, to:null, attempted:$t, failedStep:$s, wall:$w, currentNearWall:$nw,
+              reason:("the move to " + $t + " did not finish (" + $s + " step); the seat stays on " + (if $now == "" then "default" else $now end))}' \
+         --arg f "$current" --arg t "$target" --arg s "$_rot_failed" --arg now "$_rot_now" \
+         --argjson w "$( ((wall)) && echo true || echo false )" --argjson nw "$current_near_wall"
+    else
+      echo "NOT ROTATED — the move of '$name' to '$target' did not finish (${_rot_failed} step); it stays on '${_rot_now:-default}'"
+    fi
+    return 0
+  fi
   # DIVE-6121: stamp the wall move AFTER cmd_config wrote the new binding (it
   # rewrote the registry), so the chain guard above sees it on the next wall.
   if (( wall )); then
     registry_read | jq --arg n "$name" --argjson t "$(date +%s)" \
       '.agents[$n].rotation.lastWallRotateAt = $t' | registry_write
   fi
+  trap - PIPE HUP TERM INT; eval "$_rot_traps"
 
   # DIVE-3856: STOP OVER-CLAIMING. What this verb knows is that it re-pointed
   # the profile and that `cmd_config` SCHEDULED a bounce — `systemd-run

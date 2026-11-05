@@ -128,6 +128,9 @@ ensure_state() { :; }
 audit_log() { :; }
 write_agent_env() { :; }
 link_agent_profile() { :; }
+# DIVE-7747: the env and link writers above are no-ops, so the move's read-back
+# is told they landed on the registry's account (this harness grades the model).
+agent_profile_on_disk() { local p; p=$(registry_read | jq -r --arg n "$1" '.agents[$n].authProfile // empty'); printf '%s\t%s\n' "$p" "$p"; }
 account_binding_record() { :; }
 install_channel_for_agent() { :; }
 systemd-run() { printf 'restart\n' >>"$TMP/restarts"; }
