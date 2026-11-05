@@ -14,14 +14,12 @@ claim_py="$PWD/marketplace/image/files/usr/local/lib/5dive-claim/claim.py"
 tmp="$(mktemp -d)"
 pids=()
 cleanup() {
-  local rc=$? p
+  local p
   for p in "${pids[@]:-}"; do [[ -n "$p" ]] && kill "$p" 2>/dev/null || true; done
   wait 2>/dev/null || true
   rm -rf "$tmp" 2>/dev/null || true
-  echo "HARNESS-RC=$rc"
-  exit "$rc"
 }
-trap cleanup EXIT
+trap 'rc=$?; cleanup; echo "HARNESS-RC=$rc"; exit "$rc"' EXIT
 
 pass=0; fail=0
 ok()  { pass=$((pass+1)); echo "ok - $1"; }
