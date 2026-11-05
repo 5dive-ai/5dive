@@ -171,7 +171,14 @@ mkdir -p "$WORK/bin2"
 cat > "$WORK/bin2/systemctl" <<'STUB'
 #!/usr/bin/env bash
 case "$1" in
-  show) p="${3#--property=}"; cat "$SYSTEMCTL_FAKE/$p" 2>/dev/null; exit 0 ;;
+  show) p="${3#--property=}"
+        # <prop>.then: every read AFTER the first answers it — "the unit changed
+        # between the two samples" without racing a background sleep (DIVE-7789).
+        if [[ -f "$SYSTEMCTL_FAKE/$p.then" ]]; then
+          [[ -f "$SYSTEMCTL_FAKE/$p.seen" ]] && { cat "$SYSTEMCTL_FAKE/$p.then"; exit 0; }
+          : > "$SYSTEMCTL_FAKE/$p.seen"
+        fi
+        cat "$SYSTEMCTL_FAKE/$p" 2>/dev/null; exit 0 ;;
   restart) [[ -f "$SYSTEMCTL_FAKE/refuse" ]] && exit 1
            [[ -f "$SYSTEMCTL_FAKE/on_restart" ]] && . "$SYSTEMCTL_FAKE/on_restart"
            exit 0 ;;
@@ -190,7 +197,14 @@ export HEALTH_GATE_WINDOW_SECS=0 HEALTH_GATE_POLL_SECS=1
 set_unit(){ printf '%s\n' "$1" > "$SYSTEMCTL_FAKE/ActiveState"
             printf '%s\n' "$2" > "$SYSTEMCTL_FAKE/SubState"
             printf '%s\n' "$3" > "$SYSTEMCTL_FAKE/NRestarts"
-            printf '5dive-agent@t.service\n' > "$SYSTEMCTL_FAKE/Id"; }
+            printf '5dive-agent@t.service\n' > "$SYSTEMCTL_FAKE/Id"
+            flip_clear; }
+# The unit changes between the canary's two samples: the first read of <prop>
+# answers the current value, every later read answers <value>. Deterministic —
+# a background `sleep 1` against HEALTH_GATE_PRECHECK_SECS=1 is a coin toss on a
+# loaded runner (DIVE-7789: full-sweep red at 8ae5e429 on exactly that race).
+flip_after_first_read(){ rm -f "$SYSTEMCTL_FAKE/$1.seen"; printf '%s\n' "$2" > "$SYSTEMCTL_FAKE/$1.then"; }
+flip_clear(){ rm -f "$SYSTEMCTL_FAKE"/*.then "$SYSTEMCTL_FAKE"/*.seen; }
 
 set_unit active running 0; rm -f "$SYSTEMCTL_FAKE/on_restart" "$SYSTEMCTL_FAKE/refuse"
 eq_t "probe on a healthy unit -> healthy" "$(_hg_probe 5dive-agent@t.service)" healthy
@@ -267,13 +281,13 @@ _hg_canary_ok 5dive-agent@t.service \
 # THE ARM. The unit reads active/running at both samples, but systemd re-started
 # it between them: it was ALREADY looping before the update touched anything.
 set_unit active running 5
-( sleep 1; printf 6 > "$SYSTEMCTL_FAKE/NRestarts" ) &
+flip_after_first_read NRestarts 6
 if _hg_canary_ok 5dive-agent@t.service; then
   bad_t "an ALREADY crash-looping unit was accepted as a canary" "the gate would blame the release and roll back a good one"
 else
   ok_t "an already crash-looping unit is rejected as a canary (a false rollback is the worst outcome this row has)"
 fi
-wait 2>/dev/null
+flip_clear
 
 # NEGATIVE CONTROL: being stricter on an unreadable counter would disqualify every
 # canary on a systemd too old to report NRestarts.
@@ -287,9 +301,10 @@ _hg_canary_ok 5dive-agent@t.service \
 set_unit active running 5
 printf 'printf RESTARTED > "$SYSTEMCTL_FAKE/didrestart"\n' > "$SYSTEMCTL_FAKE/on_restart"
 rm -f "$SYSTEMCTL_FAKE/didrestart"
-( sleep 1; printf 6 > "$SYSTEMCTL_FAKE/NRestarts" ) &
-v="$(_hg_probe 5dive-agent@t.service)"; wait 2>/dev/null
+flip_after_first_read NRestarts 6
+v="$(_hg_probe 5dive-agent@t.service)"
 eq_t "probe on an already-looping unit -> not-a-canary" "$v" not-a-canary
+flip_clear
 [[ -e "$SYSTEMCTL_FAKE/didrestart" ]] \
   && bad_t "the probe restarted a unit it had already rejected" "the caller does the ordinary restart; the probe must not double-bounce it" \
   || ok_t "the probe does NOT restart a unit it rejected — the caller's ordinary restart is the only bounce"
@@ -411,13 +426,13 @@ grep -q daemon-reload "$SYSTEMCTL_FAKE/cmd.log" 2>/dev/null \
 # cannot answer a question about the release either.
 export HEALTH_GATE_PRECHECK_SECS=1
 set_unit active running 5
-( sleep 1; printf 'failed\n' > "$SYSTEMCTL_FAKE/ActiveState" ) &
+flip_after_first_read ActiveState failed
 if _hg_canary_ok 5dive-agent@t.service; then
   bad_t "a unit that left active/running between the two samples was accepted as a canary" "the counter never moved, so only the second sample can reject it"
 else
   ok_t "a unit that leaves active/running between the two samples is rejected as a canary"
 fi
-wait 2>/dev/null
+flip_clear
 unset HEALTH_GATE_PRECHECK_SECS
 set_unit active running 0
 
@@ -890,9 +905,9 @@ mut "dropping the second sample's active/running check accepts a unit that stopp
     'export SYSTEMCTL_FAKE PATH HEALTH_GATE_PRECHECK_SECS=1
      printf active > "$SYSTEMCTL_FAKE/ActiveState"; printf running > "$SYSTEMCTL_FAKE/SubState"
      printf "5dive-agent@t.service" > "$SYSTEMCTL_FAKE/Id"; printf 5 > "$SYSTEMCTL_FAKE/NRestarts"
-     ( sleep 1; printf failed > "$SYSTEMCTL_FAKE/ActiveState" ) &
+     rm -f "$SYSTEMCTL_FAKE/ActiveState.seen"; printf failed > "$SYSTEMCTL_FAKE/ActiveState.then"
      _hg_canary_ok 5dive-agent@t.service && echo MUTANT-CAUGHT
-     wait 2>/dev/null'
+     rm -f "$SYSTEMCTL_FAKE"/*.then "$SYSTEMCTL_FAKE"/*.seen'
 # M9: the reload dropped from the restore — the box keeps the ExecStart it reverted.
 mut "a restore with no daemon-reload leaves systemd on the ExecStart it just reverted" \
     '/systemctl daemon-reload/d' \
