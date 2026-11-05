@@ -999,9 +999,26 @@ custom_ai_render_hermes() {   # <hermes-bin> <hermes-home>
   [[ -x "$bin" ]] || return 1
   install -d -m 700 "$home"
   touch "$envf"; chmod 600 "$envf"
+  local lo="${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" mdev host
   tmp="$(mktemp -p "$home" .env.XXXXXX)"
-  grep -v '^FIVEDIVE_CUSTOM_API_KEY=' "$envf" > "$tmp" || true
+  # Our proxy lines (below) are dropped and written again; NO_PROXY goes with
+  # them only when the proxy was ours, so an owner's own NO_PROXY is kept.
+  awk -v p="$LOCAL_ONLY_DEAD_PROXY" '
+    /^FIVEDIVE_CUSTOM_API_KEY=/ { next }
+    $0 == "HTTPS_PROXY=" p || $0 == "HTTP_PROXY=" p { ours = 1; next }
+    { keep[++n] = $0 }
+    END { for (i = 1; i <= n; i++) if (!(ours && keep[i] ~ /^NO_PROXY=/)) print keep[i] }' "$envf" > "$tmp" || true
   [[ -n "${FIVEDIVE_CUSTOM_API_KEY:-}" ]] && printf 'FIVEDIVE_CUSTOM_API_KEY=%s\n' "$FIVEDIVE_CUSTOM_API_KEY" >> "$tmp"
+  # DIVE-7730: in local-only mode every web call hermes makes goes to a closed
+  # local port, except to the office AI and this box. Hermes also fetches
+  # OpenRouter's model list (for context sizes) with no switch to stop it; with
+  # this it fails at once, with no outside lookup.
+  if [[ -e "$lo" ]]; then
+    host="${FIVEDIVE_CUSTOM_BASE_URL#*://}"; host="${host%%/*}"; host="${host%:*}"; host="${host#[}"; host="${host%]}"
+    grep -v '^NO_PROXY=' "$tmp" > "$tmp.n" || true; mv -f "$tmp.n" "$tmp"
+    printf 'HTTPS_PROXY=%s\nHTTP_PROXY=%s\nNO_PROXY=%s,localhost,127.0.0.1,::1\n' \
+      "$LOCAL_ONLY_DEAD_PROXY" "$LOCAL_ONLY_DEAD_PROXY" "$host" >> "$tmp"
+  fi
   chmod 600 "$tmp"; mv -f "$tmp" "$envf"
   "$bin" config set model.provider custom >/dev/null 2>&1 || return 1
   "$bin" config set model.base_url "$(custom_ai_openai_url "$FIVEDIVE_CUSTOM_BASE_URL")" >/dev/null 2>&1 || return 1
@@ -1011,18 +1028,64 @@ custom_ai_render_hermes() {   # <hermes-bin> <hermes-home>
   else
     "$bin" config set model.api_key "" >/dev/null 2>&1 || true
   fi
+  # DIVE-7730: in local-only mode hermes still looked up GitHub (its update
+  # check, at every gateway start), models.dev and its own model catalog
+  # (hermes-agent.nousresearch.com, raw.githubusercontent.com): measured on a
+  # firewalled box. Its own switches turn them off; the models.dev address is a
+  # closed local port, so a lookup fails at once. Mode off: all three go back,
+  # only when models.dev still carries our address (an owner's mirror is kept).
+  if [[ -e "$lo" ]]; then
+    "$bin" config set updates.check false >/dev/null 2>&1 || true
+    "$bin" config set models_dev.url "$HERMES_LOCAL_ONLY_MODELS_DEV" >/dev/null 2>&1 || true
+    "$bin" config set model_catalog.enabled false >/dev/null 2>&1 || true
+  else
+    mdev=$(sed -n '/^models_dev:/,/^[^[:space:]]/s/^[[:space:]]*url:[[:space:]]*//p' "$home/config.yaml" 2>/dev/null | tr -d "\"' " | head -1)
+    if [[ "$mdev" == "$HERMES_LOCAL_ONLY_MODELS_DEV" ]]; then
+      "$bin" config set models_dev.url "" >/dev/null 2>&1 || true
+      "$bin" config set updates.check true >/dev/null 2>&1 || true
+      "$bin" config set model_catalog.enabled true >/dev/null 2>&1 || true
+    fi
+  fi
 }
+HERMES_LOCAL_ONLY_MODELS_DEV="http://127.0.0.1:9/"
+LOCAL_ONLY_DEAD_PROXY="http://127.0.0.1:9"
 # openclaw: a models.providers entry in its openai-completions API, and the
-# agent default pointed at it. Patched through openclaw's own CLI on stdin (the
+# agent default pointed at it. DIVE-7730: timeoutSeconds is how long openclaw
+# waits for the first words of an answer (its default for a server on the
+# network is 300 s). An office AI on a CPU took ~30 min to read openclaw's
+# 12,800-token opening prompt, and openclaw gave up twice at 300 s. The run
+# limit (agents.defaults.timeoutSeconds, ~600 s) caps it too, so both move. Patched through openclaw's own CLI on stdin (the
 # key never on argv), merged, so the rest of openclaw.json is kept.
-custom_ai_render_openclaw() {   # <openclaw-bin>
-  local bin="$1"
+custom_ai_render_openclaw() {   # <openclaw-bin> [<openclaw.json>]
+  local bin="$1" cfg="${2:-$HOME/.openclaw/openclaw.json}" quiet=null
   [[ -x "$bin" ]] || return 1
+  # The office chat runs each openclaw turn with this limit (dashboard 0.5.31;
+  # its own default is 600 s). Exported in the start's shell, so the chat
+  # server this start launches inherits it.
+  export DASHBOARD_OPENCLAW_TURN_TIMEOUT_S=1800
+  # DIVE-7730: in local-only mode the gateway still fetched its hosted model
+  # catalog (catalog.openclaw.ai) at every start: measured on a firewalled box.
+  # Its two documented opt-outs turn that and the start-time update check off.
+  # Mode off: both back on, only when both are still off (the pair we wrote).
+  if [[ -e "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" ]]; then
+    quiet=false
+    # ClawHub's plugin feed (clawhub.ai/v1/feeds/plugins) is fetched with a
+    # fixed address and no switch yet: every web call the gateway makes goes
+    # to a closed local port instead, except to the office AI and this box.
+    # Node 24 reads these only with NODE_USE_ENV_PROXY. Exported here, in the
+    # start's own shell, so the gateway this start launches inherits them.
+    local host="${FIVEDIVE_CUSTOM_BASE_URL#*://}"; host="${host%%/*}"; host="${host%:*}"; host="${host#[}"; host="${host%]}"
+    export HTTPS_PROXY="$LOCAL_ONLY_DEAD_PROXY" HTTP_PROXY="$LOCAL_ONLY_DEAD_PROXY" \
+      NO_PROXY="$host,localhost,127.0.0.1,::1" NODE_USE_ENV_PROXY=1
+  elif [[ "$(jq -r '[.models.catalogRefresh.enabled, .update.checkOnStart] | map(tostring) | join(",")' "$cfg" 2>/dev/null)" == "false,false" ]]; then
+    quiet=true
+  fi
   jq -cn --arg id "$CUSTOM_AI_ID" --arg u "$(custom_ai_openai_url "$FIVEDIVE_CUSTOM_BASE_URL")" \
-         --arg m "$FIVEDIVE_CUSTOM_MODEL" --arg k "${FIVEDIVE_CUSTOM_API_KEY:-no-key-required}" \
-    '{models: {mode: "merge", providers: {($id): {baseUrl: $u, apiKey: $k, api: "openai-completions",
+         --arg m "$FIVEDIVE_CUSTOM_MODEL" --arg k "${FIVEDIVE_CUSTOM_API_KEY:-no-key-required}" --argjson q "$quiet" \
+    '{models: {mode: "merge", providers: {($id): {baseUrl: $u, apiKey: $k, api: "openai-completions", timeoutSeconds: 1800,
         models: [{id: $m, name: $m, reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 8192}]}}},
-      agents: {defaults: {model: {primary: ($id + "/" + $m)}}}}' \
+      agents: {defaults: {model: {primary: ($id + "/" + $m)}, timeoutSeconds: 1800}}}
+     | if $q == null then . else .models.catalogRefresh = {enabled: $q} | .update = {checkOnStart: $q} end' \
     | "$bin" config patch --stdin >/dev/null 2>&1
 }
 # pi: a provider in ~/.pi/agent/models.json (pi's custom-provider file) and the

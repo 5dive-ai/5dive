@@ -34,6 +34,28 @@ _lo_dropin(){ printf '%s/etc/systemd/system/5dive-agent@.service.d/5dive-local-o
 _lo_codex() { printf '%s/etc/codex/managed_config.toml' "$(_lo_root)"; }
 _lo_ntpconf(){ printf '%s/etc/systemd/timesyncd.conf.d/5dive-local-only.conf' "$(_lo_root)"; }
 _lo_motd()  { printf '%s/etc/default/motd-news' "$(_lo_root)"; }
+_lo_hosts() { printf '%s/etc/hosts' "$(_lo_root)"; }
+
+# DIVE-7730: names an agent runtime looks up with no switch to stop it, so the
+# box answers them itself (0.0.0.0 / ::) and the lookup never leaves. Measured
+# on a firewalled box: openclaw 2026.10.10 resolves clawhub.ai (its plugin feed)
+# at every gateway start, before and regardless of any proxy setting.
+LO_HOSTS_NAMES=(clawhub.ai)
+LO_HOSTS_BEGIN="# >>> 5dive local-only (DIVE-7730): names answered on this box. Removed by: 5dive config local-only off"
+LO_HOSTS_END="# <<< 5dive local-only"
+_lo_hosts_block() {
+  local n; printf '%s\n' "$LO_HOSTS_BEGIN"
+  for n in "${LO_HOSTS_NAMES[@]}"; do printf '0.0.0.0 %s\n:: %s\n' "$n" "$n"; done
+  printf '%s\n' "$LO_HOSTS_END"
+}
+# Drop our block from the hosts file, in place (owner, mode and every other
+# line kept). Prints nothing; never fails the caller.
+_lo_hosts_strip() {
+  local h; h=$(_lo_hosts); [[ -f "$h" ]] || return 0
+  grep -qxF -- "$LO_HOSTS_BEGIN" "$h" || return 0
+  local body; body=$(awk -v b="$LO_HOSTS_BEGIN" -v e="$LO_HOSTS_END" '$0 == b { skip = 1; next } skip && $0 == e { skip = 0; next } !skip' "$h") || return 0
+  printf '%s\n' "$body" > "$h"
+}
 
 # Units that dial out on a stock Ubuntu server. Only an ENABLED one is touched.
 LO_OS_UNITS=(
@@ -66,8 +88,24 @@ _lo_dropin_body() {
     "# feature-flag calls from the agent runtime; tool search off for local models" \
     "# (DIVE-7573). Removed by: 5dive config local-only off" \
     "[Service]"
-  for e in "${LOCAL_ONLY_CLAUDE_ENV[@]}" "${LOCAL_MODEL_SEAT_ENV[@]}"; do printf 'Environment=%s\n' "$e"; done
+  for e in "${LOCAL_ONLY_CLAUDE_ENV[@]}" "${LOCAL_ONLY_HARNESS_ENV[@]}" "${LOCAL_MODEL_SEAT_ENV[@]}"; do printf 'Environment=%s\n' "$e"; done
 }
+
+# DIVE-7730: codex's managed config (the layer that wins over each seat's own
+# config.toml). The first three keys were DIVE-7557. Measured in a no-network
+# sandbox on codex 0.153.3: with only those, every `codex exec` still looked up
+# github.com + api.github.com (a `git ls-remote` of OpenAI's plugin catalog) and
+# chatgpt.com (apps and remote plugins); with the [features] table below it
+# looked up nothing outside the box. 5dive's codex seats use none of these.
+_LO_CODEX_MARK="# 5dive local-only (DIVE-7557). Removed by: 5dive config local-only off"
+_lo_codex_body() {
+  printf '%s\n' "$_LO_CODEX_MARK" \
+    "check_for_update_on_startup = false" "" "[analytics]" "enabled = false" "" \
+    "[feedback]" "enabled = false" "" \
+    "[features]" "plugins = false" "remote_plugin = false" "apps = false" \
+    "in_app_updates = false" "plugin_sharing = false"
+}
+_lo_codex_is_ours() { [[ "$(head -n1 "$(_lo_codex)" 2>/dev/null)" == "$_LO_CODEX_MARK" ]]; }
 
 # Every Claude Code seat home on the box: the agents and the claude user.
 _lo_seat_homes() {
@@ -156,12 +194,14 @@ _lo_on() {
   done < <(_lo_seat_homes)
   _lo_record "seat-marketplaces"
   # 2b. codex. An existing managed config is the owner's: never overwritten.
+  # One we wrote (it starts with our marker) is brought up to date, so a box
+  # that turned the mode on before DIVE-7730 loses its plugin-catalog lookups.
   local cx; cx=$(_lo_codex)
   if [[ ! -e "$cx" ]]; then
     mkdir -p "$(dirname "$cx")"
-    printf '%s\n' "# 5dive local-only (DIVE-7557). Removed by: 5dive config local-only off" \
-      "check_for_update_on_startup = false" "" "[analytics]" "enabled = false" "" \
-      "[feedback]" "enabled = false" > "$cx" && _lo_record "file $cx"
+    _lo_codex_body > "$cx" && _lo_record "file $cx"
+  elif _lo_codex_is_ours && [[ "$(cat "$cx" 2>/dev/null)" != "$(_lo_codex_body)" ]]; then
+    _lo_codex_body > "$cx"
   fi
 
   # 3. 5dive nightly self-update.
@@ -199,6 +239,10 @@ _lo_on() {
       fi
     fi
   fi
+  # 3c. DIVE-7730: names with no switch (LO_HOSTS_NAMES) answered on the box.
+  local hf; hf=$(_lo_hosts)
+  mkdir -p "$(dirname "$hf")"; [[ -e "$hf" ]] || : > "$hf"
+  _lo_hosts_strip; _lo_hosts_block >> "$hf" && _lo_record "hosts"
   local mf; mf=$(_lo_motd)
   if [[ -f "$mf" ]] && grep -q '^ENABLED=1' "$mf"; then
     sed -i 's/^ENABLED=1/ENABLED=0/' "$mf" && _lo_record "motd-news"
@@ -258,6 +302,7 @@ _lo_off() {
         snapd-mask) { systemctl unmask "${LO_SNAPD_UNITS[@]}" && systemctl start snapd.socket; } >/dev/null 2>&1 \
                       || warn "could not turn snapd back on" ;;
         motd-news) [[ -f "$(_lo_motd)" ]] && sed -i 's/^ENABLED=0/ENABLED=1/' "$(_lo_motd)" ;;
+        hosts)     _lo_hosts_strip ;;
         nightly)   declare -F _su_nightly_on >/dev/null && { _su_nightly_on >/dev/null 2>&1 || warn "could not turn nightly self-update back on"; } ;;
         file)      rm -f -- "$rest" ;;
         # DIVE-7598 (5): the office chat stays ON. It listens on the office
@@ -306,9 +351,13 @@ _lo_check() {
     if [[ -n "$rm" ]]; then _lo_line LEAK "plugin catalog refresh ($(basename "$h"))" "$rm"; bad=1
     else _lo_line ok "plugin catalog refresh ($(basename "$h"))" "local copy"; fi
   done < <(_lo_seat_homes)
-  if [[ -f "$(_lo_codex)" ]] && grep -q 'check_for_update_on_startup *= *false' "$(_lo_codex)"; then
-    _lo_line ok "codex update check + analytics" off
-  else _lo_line LEAK "codex update check + analytics" on; bad=1; fi
+  if [[ -f "$(_lo_codex)" ]] && grep -q 'check_for_update_on_startup *= *false' "$(_lo_codex)" \
+     && grep -q '^plugins *= *false' "$(_lo_codex)"; then
+    _lo_line ok "codex update check, analytics, plugin catalog" off
+  else _lo_line LEAK "codex update check, analytics, plugin catalog" on; bad=1; fi
+  if [[ -f "$(_lo_hosts)" ]] && grep -qxF -- "$LO_HOSTS_BEGIN" "$(_lo_hosts)"; then
+    _lo_line ok "openclaw plugin feed (clawhub.ai)" "answered on this box"
+  else _lo_line LEAK "openclaw plugin feed (clawhub.ai)" "looked up outside"; bad=1; fi
   if declare -F _su_nightly_is_on >/dev/null && _su_nightly_is_on; then
     _lo_line LEAK "5dive nightly self-update" on; bad=1
   else _lo_line ok "5dive nightly self-update" off; fi
