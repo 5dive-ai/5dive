@@ -1329,29 +1329,14 @@ main() {
       # caller input (upholds the write_admin_sudoers invariant), never advertised,
       # and is not itself audited (AUDIT_CMD stays unset, so no recursion).
       [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_audit_append is a privileged internal primitive"
-      local _al
-      # DIVE-7765: ONE named sink besides the audit log -- the gate tap ledger,
-      # root-owned 0600, so an agent seat relaying a button tap can land its record
-      # without the ledger being loosened to group-writable. The line is accepted
-      # only when it matches an answer that really landed (_gate_tap_append_root).
-      # Any other argument is refused: this primitive never grows a free-form path.
-      case "${1:-}" in
-        "") ;;
-        gate-tap)
-          IFS= read -r _al || true
-          [[ -n "$_al" ]] || exit 0
-          _gate_tap_append_root "$_al" || exit 1
-          exit 0 ;;
-        *) fail "$E_USAGE" "_audit_append takes no argument other than gate-tap" ;;
-      esac
-      audit_init 2>/dev/null || true
-      IFS= read -r _al || true
-      [[ -n "$_al" ]] || exit 0
-      printf '%s\n' "$_al" \
-        | jq -c --arg u "${SUDO_USER:-unknown}" \
-            'if type=="object" then .user=$u else empty end' \
-        >> "$AUDIT_LOG" 2>/dev/null || true
-      exit 0
+      # DIVE-7765: the primitive takes NO argument. A standard seat's grant is
+      # the exact no-argument command, and sudoers matches arguments exactly, so
+      # a sink named in argv is refused before it gets here (quinn, iteration 1).
+      # The one other sink -- the gate tap ledger -- is named on STDIN instead:
+      # see _audit_append_stdin (src/lib/audit.sh).
+      [[ $# -eq 0 ]] || fail "$E_USAGE" "_audit_append takes no arguments (one NDJSON line on stdin)"
+      _audit_append_stdin
+      exit $?
       ;;
     plugin|plugins)
       # DIVE-4020: the plugin lifecycle verb. Until this existed there was no

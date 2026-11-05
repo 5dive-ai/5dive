@@ -84,6 +84,41 @@ _audit_sourced_caller_fence() {
   return 0
 }
 
+# _audit_append_stdin — the ROOT body of `5dive _audit_append` (DIVE-1268).
+#
+# Reads ONE NDJSON line from stdin, re-stamps `user` from SUDO_USER so the payload
+# cannot spoof the actor, and appends it to the audit log. Nothing else.
+#
+# DIVE-7765: ONE other sink, the gate tap ledger (root-owned 0600), so a seat
+# relaying a button tap can land its record without the ledger being loosened to
+# group-writable. THE SINK IS NAMED ON STDIN, NEVER IN ARGV: a standard seat's
+# grant is exactly `NOPASSWD: /usr/local/bin/5dive _audit_append`, and sudoers
+# matches a command's arguments exactly, so `_audit_append gate-tap` is refused
+# on every standard seat (measured by quinn, iteration 1). A first line equal to
+# $AUDIT_SINK_GATE_TAP selects the ledger, and the SECOND line is the record,
+# accepted only by _gate_tap_append_root (an answer that really landed). The
+# header cannot collide with an audit row: it is not JSON, so the audit path
+# below would have dropped it anyway. Returns non-zero only for a refused tap.
+AUDIT_SINK_GATE_TAP='#5dive-sink gate-tap'
+_audit_append_stdin() {
+  local _al
+  IFS= read -r _al || true
+  [[ -n "$_al" ]] || return 0
+  if [[ "$_al" == "$AUDIT_SINK_GATE_TAP" ]]; then
+    _al=""
+    IFS= read -r _al || true
+    [[ -n "$_al" ]] || return 1
+    _gate_tap_append_root "$_al"
+    return
+  fi
+  audit_init 2>/dev/null || true
+  printf '%s\n' "$_al" \
+    | jq -c --arg u "${SUDO_USER:-unknown}" \
+        'if type=="object" then .user=$u else empty end' \
+    >> "$AUDIT_LOG" 2>/dev/null || true
+  return 0
+}
+
 # _emit_audit_line <ndjson-line> — append one line to the tamper-evident log
 # WITHOUT ever failing the caller or leaking to stderr.
 #

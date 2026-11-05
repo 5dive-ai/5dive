@@ -374,9 +374,11 @@ _gate_tap_human_name() {
 # on a box where agents relay taps, none of them (box bug 729). Now:
 #   1. a writer that CAN append (root, or the file/dir is its own) appends, with
 #      the redirection's own error captured, not leaked;
-#   2. anyone else hands the line to root over the `_audit_append gate-tap` sink
-#      -- the same NOPASSWD primitive every seat already holds for the audit log --
-#      and root appends it with ownership intact (_gate_tap_append_root);
+#   2. anyone else hands the line to root over `_audit_append`, the same
+#      no-argument NOPASSWD primitive every seat already holds for the audit log,
+#      with the gate-tap sink named on STDIN (sudoers matches argv exactly, so a
+#      sink in argv would be refused on every standard seat), and root appends it
+#      with ownership intact (_audit_append_stdin -> _gate_tap_append_root);
 #   3. if neither lands, it SAYS SO: TASK_TAP_LOGGED=0 + TASK_TAP_LOG_WHY reach the
 #      OK line and its JSON, and the miss is written to the audit log.
 # NOT 0660 root:claude: every seat is in group claude, so that would let any agent
@@ -395,9 +397,10 @@ _gate_tap_direct_append() { # <log> <line> -- 0 when the line landed
   if _gate_is_root; then chown root:root "$log" 2>/dev/null || true; fi
   return 0
 }
-# The seam a unit harness replaces: the one call that crosses to root.
+# The one call that crosses to root. The argv is EXACTLY the standard seat's
+# grant (no argument); the sink header and the record travel on stdin.
 _gate_tap_priv_append() { # <line>
-  printf '%s\n' "$1" | sudo -n /usr/local/bin/5dive _audit_append gate-tap >/dev/null 2>&1
+  printf '%s\n%s\n' "$AUDIT_SINK_GATE_TAP" "$1" | sudo -n /usr/local/bin/5dive _audit_append >/dev/null 2>&1
 }
 _gate_tap_log() {
   TASK_TAP_LOGGED=0 TASK_TAP_LOG_WHY=""
@@ -426,7 +429,7 @@ _gate_tap_log() {
     if _gate_tap_direct_append "$log" "$line"; then TASK_TAP_LOGGED=1; return 0; fi
     if ! _gate_is_root && _gate_tap_priv_append "$line"; then TASK_TAP_LOGGED=1; return 0; fi
     if _gate_is_root; then TASK_TAP_LOG_WHY="the tap ledger ${log} could not be appended"
-    else TASK_TAP_LOG_WHY="the tap ledger ${log} is not writable by $(id -un 2>/dev/null || echo this seat) and the root relay (_audit_append gate-tap) refused or is not granted"
+    else TASK_TAP_LOG_WHY="the tap ledger ${log} is not writable by $(id -un 2>/dev/null || echo this seat) and the root relay (sudo 5dive _audit_append) refused it or is not granted"
     fi
   fi
   _task_store_audit_log "task answer tap-ledger" error 0 -- \
@@ -435,11 +438,11 @@ _gate_tap_log() {
   return 0
 }
 
-# DIVE-7765: the ROOT half of the relay, reached only as `sudo 5dive _audit_append
-# gate-tap` with one JSON line on stdin. It accepts a line ONLY when it describes
-# an answer that really landed: the named gate is answered, within the last 10
-# minutes, and the row's persisted `need_answered_by` is exactly the line's
-# `stamped_as`. So a seat can relay the record of an answer that happened, never
+# DIVE-7765: the ROOT half of the relay, reached only as `sudo 5dive _audit_append`
+# with the gate-tap sink header and one JSON line on stdin (_audit_append_stdin).
+# It accepts a line ONLY when it describes an answer that really landed: the
+# named gate is answered, within the last 10 minutes, and the row's persisted
+# `need_answered_by` is exactly the line's `stamped_as`. So a seat can relay the record of an answer that happened, never
 # invent a tap for a gate nobody answered. `appended_by` is stamped from SUDO_USER
 # here, overwriting anything the caller sent, so the ledger says which seat
 # relayed it.

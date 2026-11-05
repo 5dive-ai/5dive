@@ -31,7 +31,9 @@
 #       a NON-roster name still stamps `human:` — so T5 cannot pass by refusing
 #       everything
 #   T8  DIVE-7765: a NON-ROOT relay onto a root-only ledger lands through the
-#       root relay, or says tap_logged:false — never a raw shell error after OK
+#       root relay, or says tap_logged:false — never a raw shell error after OK;
+#       T8k-n hold the relay's REAL sudo argv to the rendered standard-seat grant
+#       (sudoers matches argv exactly) and drive root's stdin sink end to end
 #   T9  DIVE-7765: --channel-proof=telegram:<id> is accepted; junk and group ids
 #       are refused with a FORMAT reason, an allowFrom miss with the allowFrom one
 #   T7  the guard is MEASURED, not assumed: `actor_name_is_registered_agent`
@@ -348,6 +350,42 @@ else
   [[ $_r2 -ne 0 && $_r3 -ne 0 && "$(wc -l <"$ROOTLOG")" == "$_before" ]] \
     && ok_t "T8j root REFUSES a record whose stamp differs, or whose gate was never answered" \
     || bad_t "T8j root refuses forged lines" "r2=$_r2 r3=$_r3 lines $_before -> $(wc -l <"$ROOTLOG")"
+
+  # THE CROSSING ITSELF (quinn, iteration 1). T8c-d stub the relay, so they could
+  # not see that `sudo -n 5dive _audit_append gate-tap` never matches a standard
+  # seat's grant: sudoers matches argv EXACTLY, and the grant has no argument.
+  # These arms run the REAL relay against a sudo that records what it was asked,
+  # and hold that argv to the line render_standard_sudoers actually writes.
+  _real_priv_append_src=$(source "$SRC/task/answer.sh" >/dev/null 2>&1; declare -f _gate_tap_priv_append)
+  eval "${_real_priv_append_src/_gate_tap_priv_append/_real_priv_append}"
+  sudo() { printf '%s\n' "$*" >"$TMP/sudo-argv"; cat >"$TMP/sudo-stdin"; }
+  _real_priv_append "$_l305"; _rk=$?
+  _argv=$(cat "$TMP/sudo-argv" 2>/dev/null)
+  [[ $_rk -eq 0 && "$_argv" == "-n /usr/local/bin/5dive _audit_append" ]] \
+    && ok_t "T8k the relay asks sudo for EXACTLY '5dive _audit_append' (no argument), the sink rides stdin" \
+    || bad_t "T8k relay argv" "rc=$_rk argv='$_argv'"
+  _std=$( (source "$SRC/cmd_agent_create.sh" >/dev/null 2>&1; render_standard_sudoers agent-relaybot 0 0) 2>/dev/null)
+  _cmd="${_argv#-n }"
+  grep -qxF "agent-relaybot ALL=(root) NOPASSWD: ${_cmd}" <<<"$_std" \
+    && ok_t "T8l a standard seat's rendered sudoers grants that exact command, so sudo will match it" \
+    || bad_t "T8l rendered grant matches the relay" "cmd='$_cmd' grant lines: $(grep -F _audit_append <<<"$_std")"
+
+  _gate_is_root() { return 0; }
+  _before=$(wc -l <"$ROOTLOG")
+  SUDO_USER=agent-relaybot _audit_append_stdin <"$TMP/sudo-stdin"; _rm=$?
+  [[ $_rm -eq 0 && "$(wc -l <"$ROOTLOG")" == $((_before + 1)) && "$(tail -1 "$ROOTLOG")" == *'"gate":"DIVE-305"'*'"appended_by":"agent-relaybot"'* ]] \
+    && ok_t "T8m root reads what the relay sent over stdin and lands it in the tap ledger" \
+    || bad_t "T8m stdin sink end to end" "rc=$_rm lines $_before -> $(wc -l <"$ROOTLOG") tail=$(tail -1 "$ROOTLOG")"
+  _real_audit_log="${AUDIT_LOG:-}"; AUDIT_LOG="$TMP/audit-root.log"; : >"$AUDIT_LOG"
+  _orig_audit_init=$(declare -f audit_init); audit_init() { :; }
+  _before=$(wc -l <"$ROOTLOG")
+  printf '{"cmd":"task done","user":"spoofed"}\n' | SUDO_USER=agent-relaybot _audit_append_stdin; _rn1=$?
+  printf '%s\n%s\n' "$AUDIT_SINK_GATE_TAP" "$_forged" | SUDO_USER=agent-relaybot _audit_append_stdin; _rn2=$?
+  [[ $_rn1 -eq 0 && "$(jq -r .user "$AUDIT_LOG" 2>/dev/null)" == agent-relaybot && $_rn2 -ne 0 \
+     && "$(wc -l <"$ROOTLOG")" == "$_before" ]] \
+    && ok_t "T8n a headerless line still goes to the audit log (re-stamped); a forged tap over stdin is refused" \
+    || bad_t "T8n audit path unchanged, forged tap refused" "rn1=$_rn1 rn2=$_rn2 audit=$(cat "$AUDIT_LOG") ledger $_before -> $(wc -l <"$ROOTLOG")"
+  AUDIT_LOG="$_real_audit_log"; eval "$_orig_audit_init"; unset -f sudo
 
   _gate_is_root() { [[ $EUID -eq 0 ]]; }
   chmod 0700 "$TMP/ro"; GATE_TAP_LOG="$_real_tap_log"
