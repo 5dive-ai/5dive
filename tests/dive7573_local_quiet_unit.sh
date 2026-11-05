@@ -232,8 +232,8 @@ grep -q 'ANTHROPIC_BASE_URL' "$cap" && ! grep -q ENABLE_TOOL_SEARCH "$cap" \
 : >"$cap"; PROFILE_ENV_SEED=true; ( _apply_byo_claude custom k office-llm qwen3:8b "$CUSTOM_URL" ) >/dev/null 2>&1
 grep -q 'ANTHROPIC_BASE_URL' "$cap" && ! grep -q ENABLE_TOOL_SEARCH "$cap" \
   && ok_ "T4 an operator's own ENABLE_TOOL_SEARCH is never overwritten" || bad_ 'T4 operator value' "$(cat "$cap")"
-[[ "$(_lo_dropin_body | grep -c '^Environment=')" == 13 ]] \
-  && ok_ 'T5 the drop-in body is the three env lists (Claude 4 + other runtimes 8 + tool search 1, DIVE-7730), one Environment= line each' || bad_ 'T5 body' "$(_lo_dropin_body)"
+[[ "$(_lo_dropin_body | grep -c '^Environment=')" == 15 ]] \
+  && ok_ 'T5 the drop-in body is the three env lists (Claude 4 + other runtimes 10 + tool search 1, DIVE-7730), one Environment= line each' || bad_ 'T5 body' "$(_lo_dropin_body)"
 
 
 # ── DIVE-7624: no usage stats or error reports from a custom-endpoint seat, ──

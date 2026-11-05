@@ -174,6 +174,33 @@ eq_t "RENDER hermes: custom provider, /v1 base, model, key by reference" \
   "$(paste -sd'|' "$HERMES_LOG")"
 eq_t "RENDER hermes: the key is in the seat's .env, replaced, others kept" "OTHER=1|FIVEDIVE_CUSTOM_API_KEY=sk-local-1" "$(paste -sd'|' "$H/.hermes/.env")"
 ! grep -q sk-local-1 "$HERMES_LOG" && ok_t "RENDER hermes: the key is never on argv" || bad_t "RENDER hermes: key on argv"
+# DIVE-7730: local-only turns hermes' update check and models.dev catalog off;
+# off again puts them back only when the catalog still carries our address.
+grep -q 'models_dev' "$HERMES_LOG" && bad_t "RENDER hermes: catalog touched with local-only off" || ok_t "RENDER hermes: local-only off and no mark → catalog and update check untouched"
+LOF="$TMP/local-only-flag"; : > "$LOF"; : > "$HERMES_LOG"
+HOME="$H" BIN="$TMP/hermes-bin" FIVE_LOCAL_ONLY_FILE="$LOF" FIVEDIVE_CUSTOM_HARNESS=hermes custom_ai_apply hermes
+grep -qx 'config set updates.check false' "$HERMES_LOG" && grep -qx 'config set models_dev.url http://127.0.0.1:9/' "$HERMES_LOG" \
+  && grep -qx 'config set model_catalog.enabled false' "$HERMES_LOG" \
+  && ok_t "RENDER hermes: local-only on → update check, model catalog off, models.dev pointed at a closed local port" || bad_t "RENDER hermes: local-only on: $(paste -sd'|' "$HERMES_LOG")"
+eq_t "RENDER hermes: local-only on → web calls go to a closed local port except the office AI and this box" \
+  "OTHER=1|FIVEDIVE_CUSTOM_API_KEY=sk-local-1|HTTPS_PROXY=http://127.0.0.1:9|HTTP_PROXY=http://127.0.0.1:9|NO_PROXY=192.168.1.20,localhost,127.0.0.1,::1" \
+  "$(paste -sd'|' "$H/.hermes/.env")"
+HOME="$H" BIN="$TMP/hermes-bin" FIVE_LOCAL_ONLY_FILE="$LOF" FIVEDIVE_CUSTOM_HARNESS=hermes custom_ai_apply hermes
+eq_t "RENDER hermes: a second local-only start writes the proxy lines once" "1|1" \
+  "$(grep -c '^HTTPS_PROXY=' "$H/.hermes/.env")|$(grep -c '^NO_PROXY=' "$H/.hermes/.env")"
+rm -f "$LOF"; printf 'models_dev:\n  url: http://127.0.0.1:9/\nupdates:\n  check: false\n' > "$H/.hermes/config.yaml"; : > "$HERMES_LOG"
+HOME="$H" BIN="$TMP/hermes-bin" FIVE_LOCAL_ONLY_FILE="$LOF" FIVEDIVE_CUSTOM_HARNESS=hermes custom_ai_apply hermes
+grep -qx 'config set models_dev.url ' "$HERMES_LOG" && grep -qx 'config set updates.check true' "$HERMES_LOG" \
+  && grep -qx 'config set model_catalog.enabled true' "$HERMES_LOG" \
+  && ok_t "RENDER hermes: local-only off → our catalog address removed, update check and model catalog back on" || bad_t "RENDER hermes: off with mark: $(paste -sd'|' "$HERMES_LOG")"
+eq_t "RENDER hermes: local-only off → our proxy lines and their NO_PROXY gone, the rest kept" "OTHER=1|FIVEDIVE_CUSTOM_API_KEY=sk-local-1" "$(paste -sd'|' "$H/.hermes/.env")"
+printf 'OTHER=1\nNO_PROXY=corp.lan\n' > "$H/.hermes/.env"
+HOME="$H" BIN="$TMP/hermes-bin" FIVE_LOCAL_ONLY_FILE="$LOF" FIVEDIVE_CUSTOM_HARNESS=hermes custom_ai_apply hermes
+grep -qx 'NO_PROXY=corp.lan' "$H/.hermes/.env" && ok_t "RENDER hermes: an owner's own NO_PROXY is kept when the mode is off" || bad_t "RENDER hermes: owner NO_PROXY lost"
+printf 'models_dev:\n  url: https://mirror.corp/api.json\n' > "$H/.hermes/config.yaml"; : > "$HERMES_LOG"
+HOME="$H" BIN="$TMP/hermes-bin" FIVE_LOCAL_ONLY_FILE="$LOF" FIVEDIVE_CUSTOM_HARNESS=hermes custom_ai_apply hermes
+! grep -q 'models_dev\|updates' "$HERMES_LOG" && ok_t "RENDER hermes: local-only off keeps an owner's own catalog mirror" || bad_t "RENDER hermes: mirror touched"
+rm -f "$H/.hermes/config.yaml"
 
 # openclaw
 cat > "$TMP/openclaw-bin" <<'EOF'
@@ -186,6 +213,25 @@ eq_t "RENDER openclaw: patched through its own CLI on stdin" "config patch --std
 eq_t "RENDER openclaw: provider + primary model" \
   'http://192.168.1.20:11434/v1|openai-completions|sk-local-1|qwen3:32b|fivedive-custom/qwen3:32b|merge' \
   "$(jq -r '[.models.providers["fivedive-custom"] | .baseUrl, .api, .apiKey, .models[0].id] + [.agents.defaults.model.primary, .models.mode] | join("|")' "$OC_LOG.stdin")"
+# DIVE-7730: local-only turns the hosted catalog and the update hint off; off
+# puts them back only when both are still off.
+eq_t "RENDER openclaw: local-only off, nothing written before → catalog and update hint untouched" "null|null" \
+  "$(jq -r '[.models.catalogRefresh, .update] | map(tostring) | join("|")' "$OC_LOG.stdin")"
+LOF="$TMP/local-only-flag"; : > "$LOF"
+HOME="$TMP" FIVE_LOCAL_ONLY_FILE="$LOF" CUSTOM_AI_OPENCLAW_BIN="$TMP/openclaw-bin" FIVEDIVE_CUSTOM_HARNESS=openclaw custom_ai_apply openclaw
+eq_t "RENDER openclaw: local-only on → hosted catalog refresh and start-time update check off" "false|false|fivedive-custom/qwen3:32b" \
+  "$(jq -r '[.models.catalogRefresh.enabled, .update.checkOnStart, .agents.defaults.model.primary] | map(tostring) | join("|")' "$OC_LOG.stdin")"
+eq_t "RENDER openclaw: local-only on → the gateway's web calls go to a closed local port except the office AI and this box" \
+  "http://127.0.0.1:9|http://127.0.0.1:9|192.168.1.20,localhost,127.0.0.1,::1|1" "${HTTPS_PROXY:-}|${HTTP_PROXY:-}|${NO_PROXY:-}|${NODE_USE_ENV_PROXY:-}"
+unset HTTPS_PROXY HTTP_PROXY NO_PROXY NODE_USE_ENV_PROXY
+rm -f "$LOF"; mkdir -p "$TMP/.openclaw"; printf '{"models":{"catalogRefresh":{"enabled":false}},"update":{"checkOnStart":false}}' > "$TMP/.openclaw/openclaw.json"
+HOME="$TMP" FIVE_LOCAL_ONLY_FILE="$LOF" CUSTOM_AI_OPENCLAW_BIN="$TMP/openclaw-bin" FIVEDIVE_CUSTOM_HARNESS=openclaw custom_ai_apply openclaw
+eq_t "RENDER openclaw: local-only off → both back on" "true|true" "$(jq -r '[.models.catalogRefresh.enabled, .update.checkOnStart] | map(tostring) | join("|")' "$OC_LOG.stdin")"
+eq_t "RENDER openclaw: local-only off → no proxy exported" "|" "${HTTPS_PROXY:-}|${NODE_USE_ENV_PROXY:-}"
+printf '{"update":{"checkOnStart":false}}' > "$TMP/.openclaw/openclaw.json"
+HOME="$TMP" FIVE_LOCAL_ONLY_FILE="$LOF" CUSTOM_AI_OPENCLAW_BIN="$TMP/openclaw-bin" FIVEDIVE_CUSTOM_HARNESS=openclaw custom_ai_apply openclaw
+eq_t "RENDER openclaw: local-only off keeps an owner's own update-check choice" "null" "$(jq -c '.update' "$OC_LOG.stdin")"
+rm -rf "$TMP/.openclaw"
 
 # pi
 H="$TMP/pi"; mkdir -p "$H/.pi/agent"; printf '{"theme":"dark","defaultModel":"x"}' > "$H/.pi/agent/settings.json"

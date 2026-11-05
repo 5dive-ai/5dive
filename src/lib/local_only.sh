@@ -42,13 +42,17 @@ LOCAL_ONLY_CLAUDE_ENV=(CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUP
 #             ping to pi.dev; PI_SKIP_VERSION_CHECK the pi.dev latest-version call.
 #   opencode  auto-update, the models.dev catalog, language-server downloads and
 #             the default plugins it fetches from npm at start.
-#   openclaw  the gateway's auto-update (its start-time update hint is the seat's
-#             openclaw.json update.checkOnStart, written by the seat render).
+#   openclaw  the gateway's auto-update, its install telemetry, and ClawHub
+#             (skills and plugins), which the gateway still looked up ~75 s
+#             after start with every config opt-out set: pointed at a closed
+#             local port it fails at once. Its hosted model catalog and start-
+#             time update hint are openclaw.json switches, written by the seat's
+#             start (bin/5dive-agent-start, custom_ai_render_openclaw).
 # Harmless to a runtime that does not read them, so every seat gets all of them.
 LOCAL_ONLY_HARNESS_ENV=(PI_OFFLINE=1 PI_TELEMETRY=0 PI_SKIP_VERSION_CHECK=1
   OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1
   OPENCODE_DISABLE_LSP_DOWNLOAD=1 OPENCODE_DISABLE_DEFAULT_PLUGINS=1
-  OPENCLAW_NO_AUTO_UPDATE=1)
+  OPENCLAW_NO_AUTO_UPDATE=1 OPENCLAW_TELEMETRY=0 OPENCLAW_CLAWHUB_URL=http://127.0.0.1:9)
 # DIVE-7573 (D4): a seat on a local/custom model. Claude Code defers the chat's
 # reply tool behind tool search, and a small model never calls the search: 0 of
 # 4 replies from qwen3:8b in the DIVE-7560 run, every one with this set.

@@ -51,7 +51,8 @@ export STUB_UNITS="$TMPD/units" STUB_SS="$TMPD/ss.txt" PATH="$TMPD/bin:$PATH"
 body=$(_lo_dropin_body); n=0
 for kv in PI_OFFLINE=1 PI_TELEMETRY=0 PI_SKIP_VERSION_CHECK=1 OPENCODE_DISABLE_AUTOUPDATE=1 \
           OPENCODE_DISABLE_MODELS_FETCH=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 \
-          OPENCODE_DISABLE_DEFAULT_PLUGINS=1 OPENCLAW_NO_AUTO_UPDATE=1; do
+          OPENCODE_DISABLE_DEFAULT_PLUGINS=1 OPENCLAW_NO_AUTO_UPDATE=1 \
+          OPENCLAW_TELEMETRY=0 OPENCLAW_CLAWHUB_URL=http://127.0.0.1:9; do
   grep -qxF "Environment=$kv" <<<"$body" || { n=$((n+1)); echo "  missing: $kv"; }
 done
 (( n == 0 )) && ok_ "H1 the drop-in carries every runtime's off-switch (pi, opencode, openclaw)" || bad_ H1 "$n missing"
@@ -80,6 +81,20 @@ mkdir -p "$(dirname "$cx")"; printf 'model = "mine"\n' > "$cx"
 ( _lo_on; _lo_off ) >/dev/null 2>&1
 [[ $(cat "$cx") == 'model = "mine"' ]] && ok_ "C3 an owner's own codex managed config is never touched" || bad_ C3 "$(cat "$cx")"
 rm -f "$cx"
+
+# ── K1-K4 (hosts) ─────────────────────────────────────────────────────────────
+hf=$(_lo_hosts); printf '127.0.0.1 localhost\n10.0.0.5 nas.office\n' > "$hf"; chmod 0644 "$hf"
+( _lo_on ) >/dev/null 2>&1
+grep -qx '0.0.0.0 clawhub.ai' "$hf" && grep -qx ':: clawhub.ai' "$hf" && grep -qx '10.0.0.5 nas.office' "$hf" \
+  && ok_ "K1 on answers clawhub.ai on the box (openclaw's plugin feed has no switch) and keeps the owner's lines" || bad_ K1 "$(cat "$hf")"
+grep -qE '^ok .*clawhub' <<<"$( ( _lo_check --watch=0 --status ) 2>/dev/null)" && ok_ "K2 check: the hosts entry is ok" || bad_ K2 "$( ( _lo_check --watch=0 --status ) 2>&1 | grep clawhub)"
+( _lo_on ) >/dev/null 2>&1
+[[ $(grep -c '^0.0.0.0 clawhub.ai$' "$hf") == 1 ]] && ok_ "K3 a second on writes the block once" || bad_ K3 "$(cat "$hf")"
+( _lo_off ) >/dev/null 2>&1
+[[ "$(cat "$hf")" == $'127.0.0.1 localhost\n10.0.0.5 nas.office' && "$(stat -c %a "$hf")" == 644 ]] \
+  && ok_ "K4 off puts the hosts file back exactly (lines and mode)" || bad_ K4 "$(cat "$hf"; stat -c %a "$hf")"
+printf '%s\n' "$(cat "$hf")" > "$hf"
+grep -qE 'LEAK .*clawhub' <<<"$( ( _lo_check --watch=0 --status ) 2>/dev/null)" && ok_ "K5 check: no hosts entry is a LEAK" || bad_ K5 "not flagged"
 
 # ── M1 ────────────────────────────────────────────────────────────────────────
 ( _lo_on ) >/dev/null 2>&1; printf '%s\n' "$old" > "$cx"
