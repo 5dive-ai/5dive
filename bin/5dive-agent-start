@@ -1050,7 +1050,10 @@ custom_ai_render_hermes() {   # <hermes-bin> <hermes-home>
 HERMES_LOCAL_ONLY_MODELS_DEV="http://127.0.0.1:9/"
 LOCAL_ONLY_DEAD_PROXY="http://127.0.0.1:9"
 # openclaw: a models.providers entry in its openai-completions API, and the
-# agent default pointed at it. Patched through openclaw's own CLI on stdin (the
+# agent default pointed at it. DIVE-7730: timeoutSeconds is how long openclaw
+# waits for the first words of an answer (its default for a server on the
+# network is 300 s). An office AI on a CPU took ~30 min to read openclaw's
+# 12,800-token opening prompt, and openclaw gave up twice at 300 s. Patched through openclaw's own CLI on stdin (the
 # key never on argv), merged, so the rest of openclaw.json is kept.
 custom_ai_render_openclaw() {   # <openclaw-bin> [<openclaw.json>]
   local bin="$1" cfg="${2:-$HOME/.openclaw/openclaw.json}" quiet=null
@@ -1074,7 +1077,7 @@ custom_ai_render_openclaw() {   # <openclaw-bin> [<openclaw.json>]
   fi
   jq -cn --arg id "$CUSTOM_AI_ID" --arg u "$(custom_ai_openai_url "$FIVEDIVE_CUSTOM_BASE_URL")" \
          --arg m "$FIVEDIVE_CUSTOM_MODEL" --arg k "${FIVEDIVE_CUSTOM_API_KEY:-no-key-required}" --argjson q "$quiet" \
-    '{models: {mode: "merge", providers: {($id): {baseUrl: $u, apiKey: $k, api: "openai-completions",
+    '{models: {mode: "merge", providers: {($id): {baseUrl: $u, apiKey: $k, api: "openai-completions", timeoutSeconds: 1800,
         models: [{id: $m, name: $m, reasoning: false, input: ["text"], contextWindow: 32768, maxTokens: 8192}]}}},
       agents: {defaults: {model: {primary: ($id + "/" + $m)}}}}
      | if $q == null then . else .models.catalogRefresh = {enabled: $q} | .update = {checkOnStart: $q} end' \
