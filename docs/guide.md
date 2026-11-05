@@ -624,7 +624,7 @@ network, DNS included. Only what we saw work is listed.
 | OpenCode 1.19, pi 1.5 | qwen3:8b | no office chat yet | none in 30 min, nor after a restart |
 
 Model server: Ollama 0.40 on a 4-core cloud server with 8 GB and no graphics card, so every
-reply took minutes. OpenClaw's opening instructions (about 13,800 tokens) took longer than its
+reply took minutes. OpenClaw's opening instructions (about 12,800 tokens) took longer than its
 30-minute limit to read there. Use a graphics card or a Mac Studio for real work.
 
 - **Give Ollama a bigger window.** Its default (4096 tokens) cuts off an agent's instructions.
