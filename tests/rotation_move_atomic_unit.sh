@@ -17,12 +17,15 @@
 #   L  the link step fails: rotated:false naming "auth link"; registry, env and
 #      link back on the old account; a rollback binding event; no restart
 #   R  the restart cannot be queued: rotated:false naming "restart", rolled back
+#   S  the same pipe/terminate cuts on `config set auth-profile=` (the call
+#      set-account makes), under errexit like production: registry == env == link
 #   D  drift is visible (agent_profile_drift) and re-setting the registry's
 #      account heals it (env + link follow, restart queued)
 #
-# NEGATIVE CONTROL: PREFIX_TREE=<ref> (e.g. origin/main) sources cmd_config and
-# the rotate from that ref instead of the worktree. Arms P, T and L must go red
-# there: the registry drifts from the env. The driver reads the files itself,
+# NEGATIVE CONTROL: PREFIX_TREE=<ref> (e.g. origin/main) sources output.sh,
+# cmd_config and the rotate from that ref instead of the worktree. Arms P, T and L must go red
+# there: the registry drifts from the env. So must S/pipe: on the base tree a
+# `step` write to the closed stderr exits the verb after the registry write. The driver reads the files itself,
 # so the control does not depend on any helper this fix adds.
 #
 # Run: bash tests/rotation_move_atomic_unit.sh  (no root, no network)
@@ -53,13 +56,18 @@ for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/actor.
   source "src/$f"
 done
 if [[ -n "${PREFIX_TREE:-}" ]]; then
+  source <(git show "${PREFIX_TREE}:src/lib/output.sh")   # step/warn as they were
   source <(git show "${PREFIX_TREE}:src/cmd_agent_config.sh")
   source <(git show "${PREFIX_TREE}:src/cmd_account.sh")
 else
   source src/cmd_agent_config.sh
   source src/cmd_account.sh
 fi
-set +e
+# PRODUCTION'S SHELL OPTIONS. src/header.sh runs every verb under
+# `set -euo pipefail`; iteration 1 of this driver did `set +e` here, which hid
+# the cut that kills `config set`/`set-account` (a `step` write to a closed
+# stderr returned 1 and errexit exited after the registry write). Never relax it.
+set -euo pipefail
 ENV_DIR="$T/agents.d"; AUTH_PROFILES_DIR="$T/profiles"; STATE_DIR="$T/state"
 REG="$T/agents.json"
 require_root()   { :; }
@@ -72,6 +80,7 @@ resolve_agent_model() { :; }
 account_has_live_headroom() { [[ "$1" == roomy ]]; }
 account_near_wall_state() { printf unmeasured; }
 usage_agent_home() { printf '%s/home/agent-%s\n' "$T" "$1"; }
+model_family_of() { :; }
 account_binding_record() { printf '%s %s\n' "$2" "$3" >>"$T/bindings"; }
 systemd-run() {
   [[ "${CUT:-}" == restart ]] && return 1
@@ -99,6 +108,10 @@ if [[ "${CUT:-}" == link ]]; then
 fi
 if [[ "${VERB:-rotate}" == heal ]]; then
   JSON_MODE=1 cmd_config seat set "auth-profile=$(jq -r '.agents.seat.authProfile' "$REG")"
+elif [[ "${VERB:-rotate}" == set ]]; then
+  # `5dive agent config <n> set auth-profile=` / `set-account`: cmd_config in the
+  # verb's own shell, no subshell around it (unlike the rotate), so errexit is live.
+  JSON_MODE=1 cmd_config seat set auth-profile=roomy
 else
   JSON_MODE=1 cmd_agent_rotation_rotate seat "--wall=$(( $(date +%s) + 6000 ))"
 fi
@@ -169,6 +182,20 @@ D="$TMP/r"; seed "$D"; OUT=$(run "$D" CUT=restart)
 t "R an unqueued restart: registry == env == link afterwards" "agree" "$(agree "$D")"
 t "R ...on the account it left" "walled" "$(reg_of "$D")"
 t "R rotated:false naming the restart" "false:restart" "$(J "$OUT" '.data.rotated'):$(J "$OUT" '.data.failedStep')"
+
+# ── S: the same cuts on `config set auth-profile=` (and set-account, which is
+#    this call), under production's errexit with no subshell to absorb an exit
+D="$TMP/sp"; seed "$D"; OUT=$(run "$D" VERB=set CUT=pipe)
+t "S/pipe the cut fired" "yes" "$([[ -e "$D/cut-fired" ]] && echo yes || echo no)"
+t "S/pipe config set, closed stderr: registry == env == link afterwards" "agree" "$(agree "$D")"
+t "S/pipe ...and the restart that makes the process read them is queued" \
+  "$([[ "$(reg_of "$D")" == roomy ]] && echo 1 || echo 0)" \
+  "$(grep -c '^restart' "$D/restarts" 2>/dev/null || echo 0)"
+D="$TMP/st"; seed "$D"; OUT=$(run "$D" VERB=set CUT=term)
+t "S/term config set, terminate: registry == env == link afterwards" "agree" "$(agree "$D")"
+D="$TMP/sc"; seed "$D"; OUT=$(run "$D" VERB=set)
+t "S/clean config set moves all three onto the target" "agree:roomy" "$(agree "$D"):$(env_of "$D")"
+t "S/clean ...and queues the restart" "1" "$(grep -c '^restart' "$D/restarts" 2>/dev/null || echo 0)"
 
 # ── D: drift is visible and re-setting the same account heals it ────────────
 if [[ -z "${PREFIX_TREE:-}" ]]; then

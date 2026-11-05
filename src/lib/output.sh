@@ -216,7 +216,12 @@ fail() {
 }
 
 die()  { fail "$E_GENERIC" "$@"; }
-warn() { echo "warn: $*" >&2; }
+# DIVE-7747: `|| true` on warn and step. Both are chatter to stderr, and under
+# `set -e` a write to a closed stderr (EPIPE once SIGPIPE is ignored) returned 1
+# and killed the caller between two writes that belong together: an account
+# move left the registry on the new account and the env file on the old one.
+# A progress line that could not be shown is never a reason to stop.
+warn() { echo "warn: $*" >&2 || true; }
 
 # defer_write_note <message> / _five_flush_write_notes — a warn that is composed at
 # the point where its evidence exists and printed at the point where its claim is
@@ -259,7 +264,7 @@ _five_flush_write_notes() {
 # Progress chatter (what the old script printed as `echo "==> ..."`). Always
 # goes to stderr so JSON stdout stays parseable. In text mode the user still
 # sees it interleaved at the terminal.
-step() { echo "==> $*" >&2; }
+step() { echo "==> $*" >&2 || true; }
 
 # ok <prose-line> [jq-expr] [jq-args...]
 # Prose mode: `echo "OK — <prose-line>"` to stdout. Skipped if <prose-line> is
