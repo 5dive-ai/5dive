@@ -215,6 +215,7 @@ eq_t "RENDER openclaw: provider + primary model" \
   "$(jq -r '[.models.providers["fivedive-custom"] | .baseUrl, .api, .apiKey, .models[0].id] + [.agents.defaults.model.primary, .models.mode] | join("|")' "$OC_LOG.stdin")"
 eq_t "RENDER openclaw: a slow office AI gets 30 min for its first words and its run, not openclaw's 300 s / 600 s (DIVE-7730)" "1800|1800" \
   "$(jq -r '[.models.providers["fivedive-custom"].timeoutSeconds, .agents.defaults.timeoutSeconds] | map(tostring) | join("|")' "$OC_LOG.stdin")"
+eq_t "RENDER openclaw: the office chat's openclaw turn gets 30 min too" "1800" "${DASHBOARD_OPENCLAW_TURN_TIMEOUT_S:-}"
 # DIVE-7730: local-only turns the hosted catalog and the update hint off; off
 # puts them back only when both are still off.
 eq_t "RENDER openclaw: local-only off, nothing written before → catalog and update hint untouched" "null|null" \

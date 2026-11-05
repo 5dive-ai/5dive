@@ -1059,6 +1059,10 @@ LOCAL_ONLY_DEAD_PROXY="http://127.0.0.1:9"
 custom_ai_render_openclaw() {   # <openclaw-bin> [<openclaw.json>]
   local bin="$1" cfg="${2:-$HOME/.openclaw/openclaw.json}" quiet=null
   [[ -x "$bin" ]] || return 1
+  # The office chat runs each openclaw turn with this limit (dashboard 0.5.31;
+  # its own default is 600 s). Exported in the start's shell, so the chat
+  # server this start launches inherits it.
+  export DASHBOARD_OPENCLAW_TURN_TIMEOUT_S=1800
   # DIVE-7730: in local-only mode the gateway still fetched its hosted model
   # catalog (catalog.openclaw.ai) at every start: measured on a firewalled box.
   # Its two documented opt-outs turn that and the start-time update check off.
