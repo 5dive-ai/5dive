@@ -395,11 +395,17 @@ cmd_config() {
   # the new account's map to it on its own. An explicit model= in this call wins.
   # Re-setting the SAME account is therefore the one-off heal for a seat that
   # was imported before this fix.
+  # DIVE-7786: a seat with no recorded family whose model is a vendor slug (a
+  # custom pack imported on the seeded OpenRouter account) reads its family back
+  # through the OLD account's tier map. And a model Anthropic cannot serve is
+  # never left on an Anthropic login: it becomes Sonnet, with the step printed.
   if (( profile_dirty )) && [[ "$type" == "claude" && -z "$new_model" ]]; then
-    local _mf _mcur _mwant _new_prof
+    local _mf _mf_rec _mcur _mwant _new_prof
     _mcur=$(resolve_agent_model claude "$name") || _mcur=""
-    _mf=$(jq -r --arg n "$name" '.agents[$n].modelFamily // ""' <<<"$reg")
+    _mf_rec=$(jq -r --arg n "$name" '.agents[$n].modelFamily // ""' <<<"$reg")
+    _mf="$_mf_rec"
     [[ -n "$_mf" ]] || _mf=$(model_family_of "$_mcur")
+    [[ -n "$_mf" || -z "$_mcur" ]] || _mf=$(model_family_by_map "$_mcur" "$prev_profile")
     _new_prof=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
     if [[ -n "$_mf" && -n "$_mcur" && "$_mcur" != "$_mf" ]] \
         && { [[ "$_mcur" == "$(resolve_model_for_profile "$_mf" "$prev_profile")" ]] \
@@ -409,8 +415,24 @@ cmd_config() {
         step "Re-deriving model for account '${_new_prof:-default}': $_mf -> $_mwant (was $_mcur)"
         new_model="$_mwant"
         applied_keys+=("model")
+        [[ -n "$_mf_rec" ]] \
+          || reg=$(jq --arg n "$name" --arg f "$_mf" '.agents[$n].modelFamily = $f' <<<"$reg")
       fi
     fi
+    if [[ -z "$new_model" && -n "$_mcur" ]] && ! claude_model_ok_on_anthropic "$_mcur" \
+        && profile_is_anthropic_login "$_new_prof"; then
+      _mwant=$(resolve_model_for_profile sonnet "$_new_prof")
+      step "'$_mcur' is not a Claude model and account '$_new_prof' is a Claude login, which cannot run it: model -> $_mwant (Sonnet)"
+      new_model="$_mwant"
+      applied_keys+=("model")
+      reg=$(jq --arg n "$name" '.agents[$n].modelFamily = "sonnet"' <<<"$reg")
+    fi
+  fi
+  # DIVE-7786: a registry `model` field (stamped by a writer outside this verb)
+  # follows the model written below, so nothing re-rendering from the registry
+  # can bring back the id this call replaced.
+  if [[ -n "$new_model" ]] && jq -e --arg n "$name" '.agents[$n] | has("model")' <<<"$reg" >/dev/null 2>&1; then
+    reg=$(jq --arg n "$name" --arg m "$new_model" '.agents[$n].model = $m' <<<"$reg")
   fi
   # DIVE-7747: AN ACCOUNT MOVE IS ALL OR NOTHING. From the registry write below
   # to the queued restart, the seat's account lives in four places (registry,
