@@ -1329,15 +1329,14 @@ main() {
       # caller input (upholds the write_admin_sudoers invariant), never advertised,
       # and is not itself audited (AUDIT_CMD stays unset, so no recursion).
       [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_audit_append is a privileged internal primitive"
-      audit_init 2>/dev/null || true
-      local _al
-      IFS= read -r _al || true
-      [[ -n "$_al" ]] || exit 0
-      printf '%s\n' "$_al" \
-        | jq -c --arg u "${SUDO_USER:-unknown}" \
-            'if type=="object" then .user=$u else empty end' \
-        >> "$AUDIT_LOG" 2>/dev/null || true
-      exit 0
+      # DIVE-7765: the primitive takes NO argument. A standard seat's grant is
+      # the exact no-argument command, and sudoers matches arguments exactly, so
+      # a sink named in argv is refused before it gets here (quinn, iteration 1).
+      # The one other sink -- the gate tap ledger -- is named on STDIN instead:
+      # see _audit_append_stdin (src/lib/audit.sh).
+      [[ $# -eq 0 ]] || fail "$E_USAGE" "_audit_append takes no arguments (one NDJSON line on stdin)"
+      _audit_append_stdin
+      exit $?
       ;;
     plugin|plugins)
       # DIVE-4020: the plugin lifecycle verb. Until this existed there was no
