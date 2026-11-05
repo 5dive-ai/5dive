@@ -96,7 +96,10 @@ if grep -q 'cli plugin add voice --yes' <<<"$(calls)" && grep -q "systemd-run --
 else bad_t "YES" "$out | calls=$(calls) state=$(st)"; fi
 
 box 20000; rm -rf "$WORK/b/sd"
-out="$(run 'cmd_plugin_auto_voice --on; sleep 0.2')"
+# The setup child is detached, so it can land late on a loaded runner: poll for
+# its call (up to 10 s) instead of a fixed 0.2 s sleep (DIVE-7760: main went red
+# at 62392552 with the add logged and the setup not yet run).
+out="$(run 'cmd_plugin_auto_voice --on; for _ in $(seq 100); do grep -q "plugin setup voice" "$WORK/b/calls" && break; sleep 0.1; done')"
 if [[ -s "$WORK/b/state/voice-auto.pid" ]] && grep -q 'cli plugin setup voice --yes' <<<"$(calls)"; then
   ok_t "YES, no systemd: setup runs as a detached child whose pid --wait can watch"
 else bad_t "YES no systemd" "$out | calls=$(calls)"; fi
