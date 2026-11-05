@@ -2141,10 +2141,27 @@ PY
 CODEX_HEALTH_SCHEMA=1
 CODEX_HEALTH_REL=".codex/channels/dispatcher/health.json"
 
+# _channel_health_readable <path> -> exit 0 when this caller can PROVE whether
+# the record exists: the deepest ancestor it can see is one it may search, so a
+# missing child really is missing. Exit 1 when the walk stops at a directory it
+# cannot enter (a non-root seat reading another seat's 0700 `.codex`), or when
+# the file is plainly there and still came back empty: then "absent" would be a
+# guess (DIVE-7749).
+_channel_health_readable() { # <path>
+  local path="$1" d=""
+  if [[ -e "$path" ]]; then [[ -r "$path" ]]; return; fi
+  d="${path%/*}"
+  while [[ -n "$d" && ! -e "$d" ]]; do d="${d%/*}"; done
+  [[ -n "$d" ]] || d="/"
+  [[ -d "$d" && -x "$d" ]]
+}
+
 # _channel_health_read <name> -> the raw record on stdout, empty when there is
 # none. Three reads because the caller may be the agent itself, root, or a seat
-# that can only reach the file through the agent's own uid; every failure is one
-# answer (empty = absent), which the classifier then renders.
+# that can only reach the file through the agent's own uid. An empty answer is
+# ABSENT only when the caller could have seen the file (exit 0); when it could
+# not, the exit is 2 — "cannot read" and "absent" have different remedies, and
+# only one of them is a restart (DIVE-7749).
 _channel_health_read() { # <name>
   local name="$1"
   # Two `local`s on purpose (SC2318): the words of a single `local` are expanded
@@ -2156,6 +2173,8 @@ _channel_health_read() { # <name>
   [[ -n "$raw" ]] || raw=$(sudo -n -u "agent-${name}" cat "$path" 2>/dev/null) || raw=""
   [[ -n "$raw" ]] || raw=$(sudo -n cat "$path" 2>/dev/null) || raw=""
   printf '%s' "$raw"
+  [[ -n "$raw" ]] || _channel_health_readable "$path" || return 2
+  return 0
 }
 
 # _channel_health_classify <raw-json|""> <declared-csv> <yes|no service-active>
@@ -2243,12 +2262,19 @@ _channel_health_classify() {
 # evidence outranks a label.
 agent_channel_handshake() {
   local name="$1" declared="${2:-}" type="${3:-}" active="${4:-yes}"
-  local attempts="${5:-0}" max="${6:-2}" raw=""
+  local attempts="${5:-0}" max="${6:-2}" raw="" rc=0
   case "$declared" in
     ""|none|null) return 0 ;;
   esac
-  raw=$(_channel_health_read "$name")
+  raw=$(_channel_health_read "$name") || rc=$?
   if [[ -z "$raw" && "$type" != "codex" ]]; then return 0; fi
+  # DIVE-7749: the record may exist where this caller cannot look. Say so, the
+  # same way the tmux probe below does, and offer no repair: restarting a seat
+  # because its file is private fixes nothing.
+  if [[ -z "$raw" && "$rc" == 2 ]]; then
+    printf 'unknown|the Codex bridge handshake is not readable from this seat; run this as root on the box|none|\n'
+    return 0
+  fi
   _channel_health_classify "$raw" "$declared" "$active" "$attempts" "$max"
 }
 

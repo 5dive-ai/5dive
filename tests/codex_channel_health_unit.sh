@@ -34,7 +34,7 @@ set -uo pipefail
 # that is supposed to guarantee it stayed green throughout (it matched this line and
 # never looked further down the file). ${_h4b:-} because the trap is armed ~165
 # lines before the variable exists, and an early exit must still print the marker.
-trap 'rc=$?; [[ -n "${_h4b:-}" ]] && rm -rf "$_h4b"; echo "HARNESS-RC=$rc"' EXIT
+trap 'rc=$?; [[ -n "${_h4b:-}" ]] && rm -rf "$_h4b"; [[ -n "${_h4c:-}" ]] && { chmod -R u+rwx "$_h4c" 2>/dev/null; rm -rf "$_h4c"; }; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 SRC=src
 
@@ -56,7 +56,7 @@ tnc() { # <desc> <needle> <haystack> — does NOT contain
 }
 
 # Extracted by name rather than pasted: a copy would grade the copy.
-for _fn in _channel_health_classify _channel_health_read agent_channel_handshake agent_channels_binding; do
+for _fn in _channel_health_classify _channel_health_readable _channel_health_read agent_channel_handshake agent_channels_binding; do
   fnsrc=$(sed -n "/^${_fn}() {/,/^}/p" "$SRC/cmd_agent.sh")
   [[ -n "$fnsrc" ]] || { echo "FAIL: could not extract ${_fn} from $SRC/cmd_agent.sh"; exit 1; }
   eval "$fnsrc"
@@ -213,6 +213,60 @@ t "4b.2 a different seat does not read it"                 ""               "$(_
 name=zed
 t "4b.3 and a caller's unrelated \$name cannot supply it" ""               "$(_h4b_probe other)"
 unset name
+
+# ---- §4c "cannot read" is not "absent" (DIVE-7749) -------------------------
+# A non-root seat asking about a Codex teammate cannot enter that seat's 0700
+# `.codex`, so every read comes back empty although the bridge is running. The
+# old reader called that absent: "the bridge did not start", and a restart. These
+# arms run the REAL reader against real permissions, with only the `/home` root
+# moved into a tempdir (the one edit to the extracted source; nothing else is
+# stubbed, and sudo is made to refuse the way it does for a narrowed seat).
+_h4c=$(mktemp -d)
+_h4c_fns=$(for _fn in _channel_health_readable _channel_health_read agent_channel_handshake; do
+  sed -n "/^${_fn}() {/,/^}/p" "$SRC/cmd_agent.sh"; done | sed "s|/home/agent-|${_h4c}/agent-|g")
+_h4c_run() ( # <name> <type> — in a subshell so the moved reader never leaks into §5
+  sudo() { return 1; }
+  eval "$_h4c_fns"
+  agent_channel_handshake "$1" telegram,dashboard "$2" yes
+)
+# marcus: the bridge is up and wrote its record, but this caller cannot enter
+# .codex. The harness owns the tempdir, so 0700 would still let it in; 000 is
+# what another seat's 0700 dir looks like from here.
+mkdir -p "$_h4c/agent-marcus/$(dirname "$CODEX_HEALTH_REL")"
+rec > "$_h4c/agent-marcus/$CODEX_HEALTH_REL"
+chmod 000 "$_h4c/agent-marcus/.codex"
+# nova: the parent is open to this caller and the record is genuinely missing.
+mkdir -p "$_h4c/agent-nova/$(dirname "$CODEX_HEALTH_REL")"
+if [[ $EUID -ne 0 ]]; then
+  v=$(_h4c_run marcus codex)
+  t   "4c.1 an unreadable record on a codex seat is unknown"  "unknown" "$(st "$v")"
+  t   "4c.2 with the reason and who can read it" \
+      "the Codex bridge handshake is not readable from this seat; run this as root on the box" "$(de "$v")"
+  t   "4c.3 and offers no restart"                            "none"    "$(rp "$v")"
+  tnc "4c.4 it never names a cause it did not see"            "did not start" "$v"
+  t   "4c.5 a claude seat still falls through to the banner"  ""        "$(_h4c_run marcus claude)"
+  # The supervisor acts on `repair` alone (§8): `none` is never a restart.
+else
+  echo "4c.1-4c.5: running as root, which can read a 0700 dir — the unreadable arms do not apply"
+fi
+v=$(_h4c_run nova codex)
+t  "4c.6 a genuinely missing record is still absent"        "absent"  "$(st "$v")"
+tc "4c.7 with the unchanged did-not-start text"             "the bridge did not start" "$(de "$v")"
+t  "4c.8 and the unchanged restart"                         "restart" "$(rp "$v")"
+v=$(_h4c_run ghost codex)
+t  "4c.9 a seat with no home at all, under a readable root, is absent" "absent" "$(st "$v")"
+chmod 755 "$_h4c/agent-marcus/.codex"
+v=$(_h4c_run marcus codex)
+t  "4c.10 once readable, the same record is believed"       "bound"   "$(st "$v")"
+chmod 000 "$_h4c/agent-marcus/.codex"
+# The walk itself, both ways round.
+_channel_health_readable "$_h4c/agent-nova/$CODEX_HEALTH_REL"; t "4c.11 open parent proves absence" "0" "$?"
+if [[ $EUID -ne 0 ]]; then
+  _channel_health_readable "$_h4c/agent-marcus/$CODEX_HEALTH_REL"; t "4c.12 a closed ancestor proves nothing" "1" "$?"
+  printf 'x' > "$_h4c/agent-nova/$CODEX_HEALTH_REL"; chmod 000 "$_h4c/agent-nova/$CODEX_HEALTH_REL"
+  _channel_health_readable "$_h4c/agent-nova/$CODEX_HEALTH_REL"; t "4c.13 a file that is there but unreadable proves nothing" "1" "$?"
+fi
+chmod -R u+rwx "$_h4c" 2>/dev/null
 
 # ---- §5 the reader: absence is evidence only when it was expected --------
 # A claude seat runs no Codex bridge. Reporting `absent` there would invent a
