@@ -1,0 +1,19 @@
+# DIVE-7731: the one-time "connect this server" page of a server made from the
+# 5dive marketplace image (/usr/local/lib/5dive-claim/claim.py). firstboot.sh
+# starts it; it disables itself once the server is linked, after too many wrong
+# passwords, or a day after first boot. Loopback only: Caddy's https front is
+# the way in.
+[Unit]
+Description=5dive one-time connect page (marketplace image)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/5dive-claim/closed
+
+[Service]
+ExecStart=/usr/bin/python3 -I /usr/local/lib/5dive-claim/claim.py serve
+Restart=on-failure
+RestartSec=5
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

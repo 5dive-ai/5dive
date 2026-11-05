@@ -11,6 +11,15 @@ log="${FIVEDIVE_FIRSTBOOT_LOG:-/var/log/5dive-firstboot.log}"
 exec >>"$log" 2>&1
 echo "5dive first boot $(date -u +%FT%TZ)"
 
+# DIVE-7731: first, the one-time connect page, so the hoster's "open
+# http://<ip>/" link works within a minute or two of boot. It gets the server
+# its own https name (an IP certificate) first; without one it stays closed and
+# the login line's terminal path is the way.
+claim="${FIVEDIVE_CLAIM:-/usr/local/lib/5dive-claim/claim.py}"
+if [[ -f "$claim" ]]; then
+  timeout 900 python3 -I "$claim" open </dev/null || echo "connect page did not open"
+fi
+
 # An image can be weeks older than the newest release: start on the newest.
 if ! timeout 900 "$cli" self-update </dev/null; then
   echo "self-update failed; keeping the image's CLI"

@@ -25,9 +25,20 @@ Ubuntu 24.04 LTS plus our `install.sh`, split in two:
 - **First boot** (`firstboot.sh`, cloud-init per instance): updates the CLI to the
   newest release and redoes the per-server install steps. Best-effort; it never
   blocks the login.
+- **Connect page** (`files/usr/local/lib/5dive-claim/claim.py`, DIVE-7731): the
+  no-terminal way. On first boot the server gets its own https name (`5dive
+  secret https`: an IP certificate, else sslip.io) and serves one page at
+  `http://<ip>/` (Caddy sends it to https). The owner types the root password
+  the hoster shows (checked against `/etc/shadow`, never sent anywhere), signs in
+  on my.5dive.ai/self-host, taps Connect, and the server runs the self-host link
+  line itself. The page closes for good once linked, after 10 wrong passwords,
+  or 24 hours after boot; with no https name it never opens. A DigitalOcean
+  Droplet made with an SSH key has no root password: the page says to use
+  Access › Reset root password (emailed). Unit test:
+  `tests/marketplace_claim_unit.sh`.
 - **First login** (`files/etc/update-motd.d/99-5dive`): one line, *Link this server
   to your 5dive account: https://5dive.ai/self-host*. It goes away once the server
-  is linked.
+  is linked. The terminal way, for after the connect page has closed.
 
 ## DigitalOcean
 
@@ -75,7 +86,8 @@ The key's access list must name the build machine's IPv4. If the machine also
 has IPv6, Packer reaches the API over it and gets 401 "Unauthorized IP
 address": pin `api.vultr.com` to its IPv4 for the build (DIVE-7717).
 
-The boot test on the test server: `cloud-init status` is done,
+The boot test on the test server: `http://<ip>/` shows the connect page over
+https (`5dive-claim` active), `cloud-init status` is done,
 `/var/log/5dive-firstboot.log` ends in "first boot done", `5dive doctor` is
 healthy, the login line shows, `ufw status` is SSH/80/443, and all of it again
 after a reboot. Delete the test server after.
