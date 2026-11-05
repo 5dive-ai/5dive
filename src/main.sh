@@ -424,6 +424,9 @@ Hire, publish, install (any agent, no sudo — DIVE-5396):
   5dive hire-link <slug> [--json]                    # the one-tap hire link a standard-tier agent sends its human (admin: agent import)
   5dive hire-link --create --name=<N> --description=<need>  # make a custom agent for a need no catalogue agent fits; prints its draft + card
   5dive hire-link custom-<id> --hire                 # admin-tier, on the owner's yes: hire that made agent onto this box
+  5dive agent share <name> | --list                  # root: a public link to <name> anyone can add to their own 5dive (DIVE-7782)
+  5dive agent unshare <name|link>                    # root: that link stops working
+  5dive config public-address=<https://name>|clear   # root, self-hosted: the address share links use (checked on set)
   5dive route add <name>|/<name> --port=<port>       # publish an app you run on 127.0.0.1:<port>; route rm|ls
   5dive pkg install <package>...                     # a system package from the box's apt repositories (install only)
 
@@ -810,6 +813,13 @@ _agent_verb_dispatch() {
         clone)
           AUDIT_CMD="agent clone"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_clone "$@" ;;
+        share)
+          # DIVE-7782: a public link to this agent's recipe, served by this box.
+          [[ "${1:-}" == --list ]] || { AUDIT_CMD="agent share"; AUDIT_ARGS=("$@"); }
+          cmd_agent_share "$@" ;;
+        unshare)
+          AUDIT_CMD="agent unshare"; AUDIT_ARGS=("$@")
+          cmd_agent_unshare "$@" ;;
         export)
           # DIVE-39: write a portable pack (read-only on the source agent).
           AUDIT_CMD="agent export"; AUDIT_ARGS=("$@")
@@ -1401,6 +1411,9 @@ main() {
       if [[ "${1:-}" == local-only ]]; then
         # DIVE-7557: `5dive config local-only on|off|status|check`.
         shift; cmd_local_only "$@"
+      elif [[ "${1:-}" == public-address=* && $# -eq 1 ]]; then
+        # DIVE-7782: a self-hosted box's public address, for share links.
+        cmd_public_address "${1#public-address=}"
       else
         cmd_box_config "$@"
       fi ;;
