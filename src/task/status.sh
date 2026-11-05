@@ -1043,7 +1043,50 @@ _task_status_cmd() {
     # Empty = unknown, and unknown is a real answer here: it is what stops a bare
     # `#N` from being resolved against a default slug further down.
     _task_slug=$(_gate_task_repo_slug "$_dref" "$_body")
-    if [[ -z "$_dref" ]]; then
+    # DIVE-7779: A PRIMARY THAT WAS CLOSED UNMERGED ON PURPOSE HAS AN EXIT.
+    #
+    # Measured on DIVE-7754 (2026-11-05): its PR was closed unmerged because the
+    # work missed its bar, ops recorded `task merge-declined`, the close was
+    # approved — and no seat could close the row. `unbind-pr` refuses a primary,
+    # this gate never read the decline, re-pointing only moved the refusal to
+    # done-before-pr-merged (state=CLOSED), `--force-merge-gate` does not reach
+    # that branch, and clearing delivery_ref fell back to the body's `Branch:`
+    # line. So the row sat open, re-dispatched every 15 minutes.
+    #
+    # THE EXIT NEEDS THREE THINGS, and each one is a separate fact:
+    #   1. a decline RECORDED against the CURRENT binding (_TASKS_MERGE_DECLINED_SQL:
+    #      a decline of a ref the row no longer carries is about another PR);
+    #   2. `--no-pr` — the closer's own claim that this close delivers no code;
+    #   3. the PR MEASURED CLOSED. An OPEN one can still merge, so it keeps the
+    #      normal gate; a MERGED one passes the normal gate anyway; an unanswered
+    #      read is not CLOSED and falls through to the normal refusal.
+    # Then the binding, its iteration and the body's `Branch:` line are not
+    # checked, and the declined PR's head branch is not held against the close by
+    # the result-text branch scan below. Everything else the no-binding path
+    # checks still runs: bound companions, an OPEN PR naming this row, an OPEN PR
+    # the result cites.
+    local _md_ref="" _md_head="" _md_skip=""
+    if [[ -n "$_dref" && $no_pr -eq 1 ]]; then
+      local _md_rec=""
+      _md_rec=$(db "SELECT CASE WHEN (${_TASKS_MERGE_DECLINED_SQL}) THEN COALESCE(merge_declined_by,'?')||' at '||COALESCE(merge_declined_at,'?') ELSE '' END FROM tasks WHERE id=${id};" 2>/dev/null) || _md_rec=""
+      if [[ -n "$_md_rec" ]]; then
+        local _md_tok="" _md_state=""
+        _md_tok=$(_gate_gh_token 2>/dev/null) || _md_tok=""
+        _md_state=$(_gate_gh "$_md_tok" 0 pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null) || _md_state=""
+        if [[ "$_md_state" == "CLOSED" ]]; then
+          _md_head=$(_gate_gh "$_md_tok" 0 pr view "$_dref" --json headRefName -q '.headRefName' 2>/dev/null) || _md_head=""
+          [[ "$_md_head" == "null" ]] && _md_head=""
+          _md_ref="$_dref"
+          # The body's `Branch:` line declared the same delivery: not checked either.
+          local _md_bb=""; _md_bb=$(_push_branch_from_body "$_body" 2>/dev/null) || _md_bb=""
+          _md_skip=$(printf '%s\n%s\n' "$_md_head" "$_md_bb" | grep -v '^$') || _md_skip=""
+          warn "$ident: closing with --no-pr — $_dref is CLOSED unmerged and its merge was DECLINED (recorded by $_md_rec), so this close delivers no code and the binding is not checked (DIVE-7779, audited)."
+          _task_store_audit_log "task.done-merge-declined" ok 0 -- "$ident" "ref=$_dref" "declined=$_md_rec" "state=CLOSED" "head=${_md_head:-unread}"
+          _dref=""
+        fi
+      fi
+    fi
+    if [[ -z "$_dref" && -z "$_md_ref" ]]; then
       _branch=$(_push_branch_from_body "$_body")
     fi
     # -----------------------------------------------------------------------
@@ -1136,7 +1179,8 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
     # BEFORE the primary's gate on purpose: that gate can MERGE the primary at
     # close (DIVE-4137), and landing the primary while a companion is open is the
     # half-shipped state this exists to prevent.
-    if [[ -n "$_dref" ]] && declare -F _task_companions_unlanded >/dev/null 2>&1; then
+    # DIVE-7779: a declined primary still owes its companions (`unbind-pr` drops one).
+    if [[ -n "$_dref" || -n "$_md_ref" ]] && declare -F _task_companions_unlanded >/dev/null 2>&1; then
       local _comp_open; _comp_open=$(_task_companions_unlanded "$id")
       if [[ -n "$_comp_open" ]]; then
         local _comp_list; _comp_list=$(paste -sd';' - <<<"$_comp_open"); _comp_list="${_comp_list//;/; }"
@@ -1579,7 +1623,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
             [[ "$_cu_anc" == "1" ]] \
               && _cu_why="$_cu_why Its head ${_cu_head:0:12} IS on main, which on its own is what an EMPTY branch looks like — ancestry alone would accept a row that delivered nothing (DIVE-2101), so it cannot close this."
             [[ "$_state" == "CLOSED" ]] \
-              && _cu_fix="it is CLOSED, so it cannot be merged — if the work landed another way, land or cite a commit on main whose SUBJECT names $ident and re-run; if it landed in a different PR, re-point the binding (\`task deliver $ident --pr=<url>\`); if it never landed, this row is not done"
+              && _cu_fix="it is CLOSED, so it cannot be merged — if the work landed another way, land or cite a commit on main whose SUBJECT names $ident and re-run; if it landed in a different PR, re-point the binding (\`task deliver $ident --pr=<url>\`); if it was closed ON PURPOSE and nothing of it will land, record that (\`5dive task merge-declined $ident --reason=<why>\`) and close with \`5dive task done $ident --no-pr\` (DIVE-7779, audited); otherwise this row is not done"
             policy_refuse "$E_CONFLICT" done-before-pr-merged DIVE-1830 "$ident" "$ident cannot close: $_dref is not merged to main (state=$_state, measured).$_cu_why$_cu_q — $_cu_fix"
           fi
         fi
@@ -2295,6 +2339,12 @@ $_body"
       # `[[ -z ]]` test below actually reads. Same defect and same fix as DIVE-2566
       # one file over — an unguarded substitution around a probe allowed to fail.
       local _br_cands; _br_cands=$(_gate_branch_refs_from_text "$_mg_txt" "$ident") || _br_cands=""
+      # DIVE-7779: the head of a primary closed unmerged with a recorded decline
+      # (the exit above), and the body's `Branch:` line, are the branch this close
+      # says did NOT land. Drop only those; any other branch named is still checked.
+      if [[ -n "${_md_skip:-}" && -n "$_br_cands" ]]; then
+        _br_cands=$(grep -ivxF -f <(printf '%s\n' "$_md_skip") <<<"$_br_cands") || _br_cands=""
+      fi
       if [[ -n "$_br_cands" ]]; then
         _mg_had_subject=1
         local _cand _slug3 _attr3 _bm3 _bl_hit="" _bl_hit_slug="" _bl_hit_how="" _bl_searched2="" _bl_any_unreach=0
