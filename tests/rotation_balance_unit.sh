@@ -149,6 +149,9 @@ cmd_config() {
   printf '%s\n' "$*" >>"$CONFIG_CALLS"
   registry_read | jq -c --arg a "$1" --arg p "${3#auth-profile=}" '.agents[$a].authProfile = $p' | registry_write
 }
+# DIVE-7747: rotate reads back the env file and auth link before it says
+# rotated:true. This harness does not own those files: they follow the registry.
+agent_profile_on_disk() { local p; p=$(registry_read | jq -r --arg n "$1" '.agents[$n].authProfile // ""'); printf '%s\t%s\n' "$p" "$p"; }
 account_near_wall_state() { [[ "$1" == full ]] && printf near || printf clear; }
 account_has_live_headroom() { [[ "$1" != full ]]; }
 db() { printf ''; }
