@@ -1,6 +1,151 @@
 # Changelog
 
-## Unreleased — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
+## v0.120.0 — fix(agent): moving a seat onto the owner's Claude login no longer keeps an OpenRouter-only model (DIVE-7786)
+
+A seat imported from a custom pack on the seeded OpenRouter account carried that account's
+model id (`deepseek/deepseek-v4.1-flash-1017`) and no recorded family. When the owner
+connected their own Claude, `agent set-account` could not tell which family the id stood for,
+kept it, and Claude Code answered every message with "There's an issue with the selected
+model". Two partner clients hit it (alert-vale's mira, tiny-alder's sysadmin seat).
+
+- `agent set-account` reads the family back through the OLD account's tier map when none is
+  recorded (sonnet wins a tie), then re-derives as before and records the family.
+- A model a Claude login cannot run (anything but a `claude-*` id or a bare alias) is never
+  left on one: the move sets Sonnet and prints the step. Bedrock/Vertex/Foundry accounts and
+  accounts that do not exist are left alone. Deliberate Claude pins (`claude-opus-5-5`, an
+  older `claude-*` id, `opus[1m]`) stay.
+- `agent import` records the family when a custom pack's id is the bound account's mapped id,
+  and lands a vendor id as Sonnet on a Claude login.
+- Any model write through `agent config` (the speed buttons, set-account) also updates the
+  registry's `model` field when the seat has one, so it can never disagree with settings.json.
+- REPAIR: `agent _float_models`, which every self-update runs, moves a seat already stuck on
+  a non-Claude model under a Claude login to Sonnet and prints `repaired: <seat> <old> -> <new>`
+  for each one; the installer keeps those lines in the update log. Run
+  `sudo 5dive agent _float_models` to do it now and see whom it touched.
+
+Tests: `tests/model_alias_mapping_account_unit.sh` (53 arms) and `tests/model_float_unit.sh`
+(44 arms) green; 17 of them red on the pre-fix tree.
+
+## v0.120.0 — feat(agent): share links — any agent becomes a public link (DIVE-7782)
+
+`5dive agent share <name>` publishes the agent's recipe (its instructions, skills and
+first-party tools, never logins, files, keys or private memory) as a public link this box
+serves: `https://<public address>/a/<id>`. The page shows what the agent does and one button
+to add it on my.5dive.ai. A share whose recipe carries private detail is refused with the
+`file:line` of each hit, never trimmed. `5dive agent unshare <name|link>` stops the link.
+`agent import --from-url=<share link>` adds a copy at standard isolation, never admin.
+
+## v0.120.0 — fix(team): an imported team's lead keeps its context, every other new seat starts fresh (DIVE-7780)
+
+`5dive team import` enrolled every seat it created with the heartbeat default, which keeps
+context between wakes. A six-seat marketplace team therefore came up with six accumulating
+windows (measured on the trading desk: FRESH=no on six of six), and a reviewer seat whose
+independence depends on a fresh read every task did not get one.
+
+After the roster is up, team import now leaves the team's lead (the template's org root, the
+same derivation import already uses) keeping context, and sets every other seat it created to
+start each task fresh. A mid-lead (a seat that reports to someone and manages others) is not
+the org root and starts fresh. An agent already on the box keeps its owner's setting, an
+unenrolled seat stays unenrolled, and a bare `up` is unchanged. No manifest field was added.
+
+Teams imported before this release are not healed by the update: run
+`5dive heartbeat on <seat> --fresh` for each non-lead seat.
+
+`tests/team_import_heartbeat_fresh_unit.sh` runs the real `cmd_compose_up` over a two-seat
+spec and reads it back with the real `heartbeat ls`: 7 arms green; F2 and F4 red on the
+pre-fix tree.
+
+## v0.120.0 — fix(task): a pull request closed unmerged on purpose no longer leaves its row unclosable (DIVE-7779)
+
+When a row's pull request was closed without merging on purpose (the work missed its bar)
+and `task merge-declined` was recorded, `task done` still refused it, and no other verb could
+close it either. Now `task done <id> --no-pr` closes such a row, but only when the decline
+was recorded against the pull request the row is bound to and GitHub reports it CLOSED. The
+close is audited as `task.done-merge-declined`. An OPEN, unreadable or undeclined pull
+request is refused exactly as before, and so is any other unlanded branch the result names.
+The CLOSED refusal now names this exit.
+
+## v0.120.0 — fix(task): `telegram:<id>` channel proof is accepted, and every relayed button tap lands in the tap ledger (DIVE-7765)
+
+`task answer --channel-proof=telegram:<id>` was refused as "not in access.json allowFrom" even
+when the id was in allowFrom: only a bare number passed, and any refusal was reported as an
+allowFrom miss. Every `--channel-proof` flag (`task answer`, `clear-recs`, `inbox --send`) now
+accepts the `telegram:` prefix our own surfaces print. A value that is not a positive number
+(junk, a negative group id) is refused with its own reason, and the allowFrom sentence is said
+only for a real allowFrom miss.
+
+The gate tap ledger (`gate-taps.jsonl`, 0600 root) silently recorded only root-run answers:
+an agent seat relaying a tap printed `OK`, then a raw `Permission denied`, and wrote nothing.
+A seat that cannot write the ledger now hands the record to root over the existing
+`_audit_append` primitive, with the tap-ledger sink named on stdin so the call matches the
+no-argument grant every standard seat already holds (no sudoers change, no re-grant). Root appends it only when it matches an answer that
+really landed in the last 10 minutes, and stamps `appended_by` with the relaying seat. If no
+path lands, the answer says `tap_logged:false` with the reason and the miss is audited.
+
+`tests/gate_tap_human_attribution_unit.sh` T8/T9 cover both; T8k-n hold the relay's real
+sudo command to the rendered standard-seat grant and drive root's stdin sink end to end.
+
+## v0.120.0 — fix(marketplace): the browser connect page for Vultr and DigitalOcean servers is withdrawn (DIVE-7756)
+
+- **The browser connect page added in v0.119.0 is withdrawn.** It asked for the server's own login password in a web page, which is not safe enough. Marketplace servers connect the way they did before v0.119.0 until a one-tap flow that never asks for that password ships.
+
+## v0.120.0 — feat(marketplace): a Vultr server connects with one link and a Google sign-in, no server password (DIVE-7756)
+
+- **A server made from the 5dive Vultr app connects itself.** Vultr makes a random one-time code for each new server and puts it in the link on the server's page. Open the link, sign in with Google, tap Connect: the server picks up its link over HTTPS and shows up in your 5dive app. Nothing listens on the server and its password is never asked for. The link works for 24 hours; after that, the command on the self-host page still works.
+
+## v0.120.0 — fix(agent): agent info no longer says a Codex bridge "did not start" when it only cannot read the handshake (DIVE-7749)
+
+A seat without root asking `5dive agent info` about a Codex teammate could not enter that
+teammate's private `.codex` folder, so every read of the bridge's handshake came back empty.
+The reader treated "could not read" as "not there": the line said `the bridge did not start`
+and the supervisor offered a restart, while the bridge was running fine.
+
+The reader now answers "absent" only when this caller could have seen the file. When it could
+not, `agent info` prints `bound: unknown — the Codex bridge handshake is not readable from this
+seat; run this as root on the box`, no restart is offered, and `doctor` shows it as a warning
+instead of an error with a restart fix. Root, and a genuinely missing file under a folder the
+caller can open, read exactly as before. The file's permissions are not changed: it sits next
+to the seat's login.
+
+`tests/codex_channel_health_unit.sh` §4c runs the real reader against real folder permissions
+in a tempdir; its unreadable arms go red on the pre-fix tree with "did not start" and a restart.
+
+## v0.120.0 — fix(agent): an account rotation either moves the seat or says it did not; the registry no longer moves alone (DIVE-7747)
+
+A seat's own usage-wall hook runs `agent rotation rotate` with an 8-second timeout. When the
+timeout fired, the root half of the move kept going with nobody reading its error output, and
+the first progress line after the registry write killed it. The registry then named the new
+account while the seat's env file, its login link and the running process stayed on the walled
+one, and `rotate` had already been counted as a success. On one box three seats sat walled
+until the weekly reset this way.
+
+An account move (rotation, `set-account`, `config set auth-profile=`) is now all or nothing. A
+closed output pipe or a terminate signal no longer stops it halfway (a progress or warning line
+that cannot be written is skipped, never fatal); the env file and the link
+are read back before the restart is queued; and a step that does not land puts the registry
+and the binding history back and refuses, naming the step. `rotate` answers `rotated:true` only
+after it has read the target back from both files, and otherwise `rotated:false` with
+`failedStep`. `agent info` flags a seat whose registry, env file and link disagree
+(`authProfileOnDisk.state: drift`) and names the fix: re-setting the registry's account,
+which rewrites both files and restarts the seat onto it.
+
+`tests/rotation_move_atomic_unit.sh` cuts the real move between the registry write and the env
+rewrite (closed stderr, SIGTERM, a failed link, an unqueued restart) on both `rotate` and `config set`,
+under the same `set -euo pipefail` the CLI runs with; run with
+`PREFIX_TREE=origin/main` it goes red with the drift seen on the box.
+
+## v0.120.0 — fix(local-only): Codex, Hermes and OpenClaw stay inside the office network too, and the guide gets a tested-offline table (DIVE-7730)
+
+Measured on a server whose firewall dropped and logged every outside connection, DNS included, with each agent on a model server on the office network:
+
+- **Codex** still looked up GitHub (OpenAI's plugin catalog) and chatgpt.com on every run. Its managed config now also turns off plugins, remote plugins, apps, in-app updates and plugin sharing, and a config `local-only on` wrote before is brought up to date. `check` flags the old file.
+- **Hermes** looked up GitHub (its update check), models.dev, its own model catalog and OpenRouter's model list. Under local-only a Hermes seat's start turns off the update check and the catalog, points models.dev at a closed local port, and sends every other web call to a closed local port except the office AI and the box itself. `local-only off` puts them back.
+- **OpenClaw** fetched its hosted model catalog (catalog.openclaw.ai) and ClawHub's plugin feed (clawhub.ai) at every start. The seat's start turns off the catalog refresh and the start-time update check, points ClawHub and every other web call at a closed local port except the office AI and the box, and turns its install telemetry off. The plugin feed looks its name up before any proxy applies, so `local-only on` also answers `clawhub.ai` in `/etc/hosts` (`off` removes exactly those lines; `check` names it).
+- **OpenClaw on your own AI waits 30 minutes for an answer**, not 5 (first words) and 10 (whole run): an office AI on a CPU needed ~30 min to read OpenClaw's 12,800-token opening prompt.
+- **pi and OpenCode** get their own off-switches for version checks, model catalogs and downloads.
+- **The guide** starts the local-only section with a six-line quick start and a table of what was proven offline, model and hardware included.
+
+## v0.120.0 — feat(self-update): the update path checks the box it just updated still runs an agent (DIVE-4068)
 
 0.26.1 shipped a launcher that could not start any agent (DIVE-4067). The nightly installs the
 release and then restarts every agent, so every box that took it **emptied itself, unattended**,
@@ -38,7 +183,7 @@ first agent it restarts:
 
 `self-update`'s JSON gains a `health_gate` object; every existing field keeps its meaning.
 
-## Unreleased — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
+## v0.120.0 — feat(team): `loops:` — a company import brings recurring work, not just a roster (DIVE-4022)
 
 `5dive team import <slug>` provisioned a **roster**, not a working company. Agents, roles and
 reporting lines came up with nothing recurring on the board, so an imported team sat idle
@@ -95,7 +240,7 @@ functional against a real sqlite task store with a stub CLI, not source greps; e
 (kill the reconcile, drop the title arm, fold loop errors into `errors`, move the pass above
 the creates, strip the template's loops, …) were each run alone and each went red.
 
-## Unreleased — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
+## v0.120.0 — feat(team): `--type=<harness>` — a company import is no longer Claude-Code-only (DIVE-3998)
 
 All four bundled team templates hard-set `defaults.type: claude`, so `5dive team import
 content-studio` could only ever produce Claude Code seats — even though `agent create` has
@@ -134,7 +279,7 @@ long accepted every harness in `TYPE_BIN` and per-agent `type:` was already read
 and `cmd_team` themselves, each with a no-flag negative control. The wiring arms are not decoration: a
 mutation that parses `--type` and never applies it survived every transform-level arm.
 
-## Unreleased — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
+## v0.120.0 — fix(memory): the exit code cannot tell a broken checker from a false fact (DIVE-3909)
 
 DIVE-3885 shipped the right rule — *a checker that could not RUN is `unknown`, never `stale`,
 because a broken instrument must not accuse a true fact* — and encoded it as a list of EXIT CODES
@@ -165,7 +310,7 @@ cases that must be classified oppositely share an exit code. **Parseability is t
 - 3 new harness sections (74/74 green), including the **negative control that decides the design**:
   an rc=2 check that PARSES must stay `stale`.
 
-## Unreleased — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
+## v0.120.0 — feat(memory): `check:` — a checkable fact says how to re-check itself, and `add` will not let it skip (DIVE-3885)
 
 Item 3 of the memory-janitor plan is a `check:` whose exit code re-derives a fact, plus a pass that
 flips it stale. It looked buildable on the existing `--evidence=<kind>:<ref>`: `cmd:` *is* a check,
@@ -203,7 +348,7 @@ arm through the built binary — that arm is what caught the stale exit code bei
 "this is a bug in the CLI" by the `lib/output.sh` backstop, which would have buried the digest a
 nightly pass exists to produce.
 
-## Unreleased — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
+## v0.120.0 — fix(supervisor): a lapsed refusal is scrollback, not a wall — `agent info` reads the expiry it was already quoting (DIVE-3880)
 
 `agent info` printed **⚠ NOT TRANSACTING (quota-exhausted)** about a seat that was executing the very
 command that read the flag. Measured 2026-09-01 14:17Z on `ops`: the pane refusal it quoted said
@@ -232,7 +377,7 @@ Undated pane lines resolve to the NEAREST of yesterday/today/tomorrow at that ti
 at 23:55 is tomorrow and `11pm` read at 00:05 is yesterday. Residual, stated rather than hidden: a refusal
 still on screen more than ~12h later reads as the same time-of-day today.
 
-## Unreleased — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
+## v0.120.0 — fix(task): a merged row that NO seat could close — the merge gate now reads the proof it already asks for (DIVE-3823)
 
 Two rails, each correct, that intersect on a seat which can satisfy neither:
 
@@ -266,7 +411,7 @@ STATUS proves the merge". Nothing read it.
 
 Not touched: only-the-verifier-closes stays exactly as it is.
 
-## Unreleased — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
+## v0.120.0 — feat(task): gate state on the surfaces people READ — `ls` column, `show` header, `--gated` (DIVE-3785)
 
 `task show` printed a row's gate at the TAIL of the record, below the body; `task ls` printed nothing at
 all. So the board could not answer the one question a fleet with a paired human is most often asked —
@@ -304,7 +449,7 @@ all. So the board could not answer the one question a fleet with a paired human 
   fleet-wide by DEFAULT since DIVE-3224, so the flag OSS-36 specified was never built and anyone reaching
   for it got `unknown flag: --fleet` — a hard error where the view they wanted was already on screen.
 
-## Unreleased — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
+## v0.120.0 — feat(task): `5dive task doctor` — every open row nothing will dispatch, and why (DIVE-3784)
 
 On 2026-08-28 05:00Z the board read **31 open rows** and `5dive-ai/5dive` main had not moved in **~42h**
 (`5816e7a` / `v0.23.0`, since 2026-08-26 10:23Z). Of the 31: 30 `blocked`, exactly **1 `todo`**. A reader
@@ -345,7 +490,7 @@ Complements the heartbeat's `_hb_blocked_sweep` (DIVE-1355) rather than replacin
 a2a at most once per 24h and covers two of these four classes. A throttled push to one seat's inbox is a
 different job from an operator looking at a stalled board now.
 
-## Unreleased — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
+## v0.120.0 — feat(liveness): `5dive liveness` — a seat is alive only against an artifact it WROTE (DIVE-3778)
 
 The **v0.23 headline capability**. The theme was ratified 2026-08-26 as "Liveness you cannot fake"
 (DIVE-3738); v0.23.0 shipped its substrate — courier-routed alarms (DIVE-3727) and the rung-4
@@ -390,7 +535,7 @@ both directions — the third state folded UP into `alive`, folded DOWN into `no
 freshness window removed — each asserted to have applied and to turn a *named* arm red while leaving
 the others green, so no arm's green is the fixture's doing.
 
-## Unreleased — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
+## v0.120.0 — feat(supervisor): rung 4 — a poller-dead seat is restarted, once per 6h (DIVE-3753)
 
 On 2026-08-26 the supervisor printed `ESCALATE <seat> (poller-dead: rung-4-needed)` for `marketing`,
 `main`, `dev` and `olivia`. The detection was correct, it fired on time — and **nothing served rung 4**,
@@ -446,7 +591,7 @@ out of sqlite), `poller_liveness_unit` (41), `supervisor_classify_unit` (37),
 case, the tick dispatch entry, the counter exclusion, the limiter and the retired remedy text each red
 exactly the arms that claim them.
 
-## Unreleased — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
+## v0.120.0 — feat(durable): an irreversible action fires ONCE, even when the agent crashes mid-flight (INST-8)
 
 INST-4 made the *record* of an action idempotent (`lifecycle_events` has a UNIQUE index on
 `idem_key`). INST-5 bounded *who* may act and *what* they may act on. Neither could answer the
@@ -493,7 +638,7 @@ next (email / pay / publish) would have been double-send, double-pay, double-pub
   the double-claim refusal must go red), the inversion arm with its live control, and a realistic
   pre-INST-8 store fixture for the migration.
 
-## Unreleased — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
+## v0.120.0 — fix(memory): consolidate reports what it PRODUCED, and the sweep can now authenticate (DIVE-3711)
 
 `5dive memory consolidate` had produced atoms **once across the entire fleet** while
 `/var/log/5dive-heartbeat.log` reported `13 seat(s) distilled, 4 failed, 0 not due` every six hours
@@ -533,7 +678,7 @@ it is a liveness check wearing a productivity label; and **hand-written artifact
 are not evidence the pipeline ran** — a populated output directory reads exactly like a working
 extractor, and only the ledger tells them apart.
 
-## Unreleased — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
+## v0.120.0 — feat(memory): `5dive memory consolidate` — async transcript → memory atoms (DIVE-3628, DIVE-726 phase 1)
 
 A session window dies and everything it learned dies with it, because "compile before you close" is
 a HABIT and a habit is not a mechanism. The motivating case is on the record: the very
@@ -601,7 +746,7 @@ Tests: `tests/memory_consolidate_unit.sh`, 53 assertions, offline by constructio
 an injected seam). Four mutants — the live-session skip, the dry-run ledger guard, the ledger skip,
 and the errexit fix — each red exactly the arm meant to catch it.
 
-## Unreleased — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
+## v0.120.0 — fix(self-update): skip an agent holding an in_progress row and bounce it at its next task boundary (DIVE-3173)
 
 DIVE-3172 made the nightly restart conditional on the agent payload actually moving, which takes a
 CLI-only night to zero restarts. This is the belt for the nights the payload genuinely moves: those
@@ -640,7 +785,7 @@ concern - our nightly updates kills some active agents mid tasks"*).
   three sweeps of one marker — parked mid-task is NOT restarted and keeps its marker; the row closes
   and the SAME marker fires the bounce; the next sweep does not bounce it again.
 
-## Unreleased — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
+## v0.120.0 — feat(task): `merge-unverified` reads back the closes the merge gate could not check (DIVE-3526)
 
 Since DIVE-1935 the mandatory auto-detect merge gate has said so when its repo scan cannot
 complete: it warns, writes a `task.merge-gate-unverified` row to the audit log, and lets the close
@@ -672,7 +817,7 @@ never read is a receipt, not a control.
 - **Exit status is the consumable signal** (1 when any stamped close still has an open PR), because
   a stamp with no consumer is the whole defect.
 
-## Unreleased — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
+## v0.120.0 — fix(branch-hygiene): the weekly digest classifies branches by EVIDENCE, not age (DIVE-2394)
 
 `--apply` was already safe: it deletes only on a closed PR whose head SHA equals the branch's
 current SHA, and age never entered that path. **The digest above it was the problem.** Its
@@ -736,7 +881,7 @@ from the merged-and-tidy ones. A reader handed "dead branch, 40d" reaches for de
   the invariant `branch-hygiene-report.sh` greps for when it runs this same script against
   `lodar/5dive-api` and `lodar/5dive-frontend`.
 
-## Unreleased — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
+## v0.120.0 — fix(council): `authority.gate_clear_leads` can actually be set (DIVE-3493)
 
 The constitution validator and the authority reader accepted **disjoint** subsets of YAML, so the
 key was unsettable through any path: `council amend` threw `use inline arrays in constitution v0`
@@ -762,7 +907,7 @@ worked example — so the template failed the validator shipping beside it.
   *"no motion could have succeeded"*, not *"nobody convened one"* — an instrument that measured its
   own writer.
 
-## Unreleased — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
+## v0.120.0 — feat(task): an inert push-for-review clears at filing, pinging nobody (DIVE-3481)
 
 lodar, 2026-08-16, on a routine branch-push approval waking the org lead: *"why dev2 cannot do
 delegated push himself and burns your token for approval?"* An approval gate whose ask is an
@@ -796,7 +941,7 @@ permanent gate record and digest line intact, and **no ping to anyone**.
 - **`5dive task pfr-autoclear [on|off|status]`**, default **on**, restores the lead ping with no
   release.
 
-## Unreleased — fix(usage): the middle wildcard is a read too (DIVE-3419)
+## v0.120.0 — fix(usage): the middle wildcard is a read too (DIVE-3419)
 
 Both transcript readers in `cmd_usage.sh` used `projects/*/*.jsonl`. `usage_collect` was guarded at the
 **top** (`probe_readable` on `projects/`) and the **bottom** (per-file `except OSError`) of a *three*-level
@@ -826,7 +971,7 @@ true** — and every "⚠ N NOT checked — burn is unknown (not 0)" banner buil
   ANY-UID arm (`ELOOP`, which root cannot resolve either) so a uid-0 CI run cannot be a vacuous green, and
   over-fire controls. **9/14 pre-fix, 23/0 after.**
 
-## Unreleased — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
+## v0.120.0 — fix(task): `assignee` / `verifier` / `created_by` must name a real agent (DIVE-3344)
 
 Nothing validated these columns. The work-picker dispatches on `assignee`, so a row on a name that is
 not a registered agent was **structurally undispatchable** — not blocked, not parked, not flagged, and
@@ -850,7 +995,7 @@ never once a dispatch target) and corroborated here (5 open rows).
 - **`wip-cap-install`** read the same unvalidated column (it had minted `wip_cap:cli`, a lane ceiling
   for an agent that does not exist). It now skips unregistered lanes and **names the skip**.
 
-## Unreleased — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
+## v0.120.0 — fix(agent config): buzz had a staging GATE and no install DISPATCH (DIVE-3333)
 
 `5dive agent config <name> set channels=<current>,buzz` could not succeed on any seat that was not
 **created** with buzz. `cmd_config` dispatches `install_channel_for_agent` for telegram, discord and
@@ -883,7 +1028,7 @@ arms grade the satisfier next to the gate, and drive `cmd_config` for real — w
 that the same call reaches the restart once the cache is staged, so the rollback arms cannot pass
 against a `cmd_config` that simply refuses everything.
 
-## Unreleased — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
+## v0.120.0 — test(task): the open-row announcement's STREAM is graded, not documented (DIVE-2748)
 
 DIVE-2483's gate answer said the preservation notice lands on **stdout**. It lands on **stderr**,
 via the fleet's `warn()`. Six arms were written for that condition and all six were green, because
@@ -917,7 +1062,7 @@ Still open and scoped out on purpose: `task reject` remains an unguarded writer 
 column (`src/cmd_task.sh:4235`). That is a design question about accumulating verifier feedback, not
 this gap.
 
-## Unreleased — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
+## v0.120.0 — fix(agent): `agent info` reports whether a seat is TRANSACTING, not only whether it is up (DIVE-3274)
 
 DIVE-3272 taught the supervisor BOARD to see a seat that is alive and closing nothing. The
 drill-down people actually type kept printing only liveness: `state: active / enabled` was
@@ -959,7 +1104,7 @@ supervisor:  quota-exhausted / quota-exhausted — pane shows a model-capacity r
 - `agent list` is unchanged — it is the survey surface, and this is a per-agent drill-down
   (three sqlite reads), deliberately not an N-way fan-out.
 
-## Unreleased — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
+## v0.120.0 — fix(gate): route a ship gate on the ROW'S BRANCH BINDING, not on the ask's prose, and say out loud when a gate did not route at all (DIVE-3266)
 
 A gate reaches the filer's lead only if `_GATE_ENG_SHIP_RX` matches the ask or the row
 title. `gate_builder_routing` is OFF by default, so for an ordinary builder ship gate that
@@ -1023,7 +1168,7 @@ prose for identifiers.
   `gate_access_lead_clear`, `gate_internal_ops_floor`, `task_needs_human_parity`,
   `task_inbox_json_tier`, `push_unit`, `broker_surface`, + 15 more).
 
-## Unreleased — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
+## v0.120.0 — fix(task): the merge-gate asserts its OWN instrument, and names the seat where it is inert (DIVE-1935)
 
 DIVE-1935's first iteration was rejected, and for the right reason. It added a
 `sudo -n -u claude gh auth token` arm to `_gate_gh_token` justified by *"agents hold
