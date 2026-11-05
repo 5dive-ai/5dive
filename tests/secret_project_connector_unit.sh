@@ -131,7 +131,7 @@ else
     chmod "$m" "$L"
     out=$(put AIzaNEW GOOGLE_MAPS_API --connector=project-locked$m); rc=$?
     mode="$(stat -c %a "$L")"; chmod 600 "$L"; after="$(sha256sum < "$L")"
-    [[ $rc -ne 0 && "$out" == *"nothing was saved"* && "$out" != *OK* && "$before" == "$after" && $((8#$mode)) -eq $((8#$m)) ]] \
+    [[ $rc -ne 0 && "$out" == *"nothing was saved"* && "$out" != *"OK — "* && "$before" == "$after" && $((8#$mode)) -eq $((8#$m)) ]] \
       && ok_t "J9 mode $m .env.local is refused; its bytes and mode are unchanged" || bad_t "J9 mode $m" "rc=$rc mode=$mode out=$out file=$(cat "$L")"
     [[ "$(ls -A "$TMP/projects/locked$m")" == ".env.local" ]] \
       && ok_t "J9 mode $m no temp file left behind" || bad_t "J9 mode $m temp left" "$(ls -A "$TMP/projects/locked$m")"
