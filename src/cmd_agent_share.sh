@@ -63,7 +63,9 @@ _share_strip_managed() {
   tmp=$(mktemp "${f}.XXXXXX") || return 1
   awk '/<!-- 5dive:[a-z0-9_-]+:begin/ { skip = 1; next }
        skip && /5dive:[a-z0-9_-]+:end/ { skip = 0; next }
-       !skip { print }' "$f" > "$tmp" && mv -f "$tmp" "$f"
+       !skip { print }' "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$f" || return 1
+  return 0
 }
 
 # Turn an exported stage into the recipe: drop what does not travel, pin the
