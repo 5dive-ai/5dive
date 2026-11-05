@@ -37,20 +37,7 @@ Own it. Run it from your phone.
 
 ## Getting started (DigitalOcean "Getting started" field, Linode docs)
 
-DigitalOcean (DIVE-7731, no terminal):
-
-1. Open your Droplet's IP address in your browser: http://your-droplet-ip/
-2. Type the Droplet's root password, then sign in to 5dive. Your server
-   connects itself.
-3. Made the Droplet with an SSH key? It has no root password yet: open the
-   Droplet, then Access › Reset root password. The new one comes by email.
-4. The page works for 24 hours after the Droplet starts. After that, log in
-   over SSH as root and follow the line on the screen.
-5. Prefer the command line? Run `sudo 5dive init` to set up your first agent.
-
-Linode (its own flow, unchanged):
-
-1. Log in to the server over SSH as the sudo user you chose.
+1. Log in to the server over SSH as root (Linode: as the sudo user you chose).
 2. The login screen shows one line: open https://5dive.ai/self-host to link
    this server to your 5dive account and hire your team from your phone.
 3. Prefer the command line? Run `sudo 5dive init` to set up your first agent.
@@ -72,13 +59,12 @@ Linode (its own flow, unchanged):
 - **Support:** support URL and repo as in Shared; support email
   hello@5dive.ai.
 - **App variables:** none.
-- **App instructions (DIVE-7731, no terminal):**
+- **App instructions:**
 
-  > Open http://{{ip}}/ in your browser. Type the root password
-  > (`{{root_password}}`), then sign in to 5dive. Your server connects itself.
+  > Log in to your server: `ssh root@{{ip}}` (password `{{root_password}}`).
   >
-  > The page works for 24 hours after the server starts. After that, log in
-  > with `ssh root@{{ip}}` and follow the line on the screen.
+  > The login screen shows one line: open https://5dive.ai/self-host to link
+  > this server to your 5dive account and hire your team from your phone.
   >
   > Prefer the command line? Run `sudo 5dive init` to set up your first agent.
 

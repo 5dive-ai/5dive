@@ -17,11 +17,6 @@ r="${IMAGE_ROOT:-}"
 rm -f  "$r/var/lib/5dive/gate-proof.key" "$r/etc/5dive/vault.key"
 rm -f  "$r/etc/5dive/connectord.env" "$r/etc/5dive/provisioning.env"
 rm -rf "$r/var/lib/5dive/tasks" "$r/var/lib/5dive/secret-drop"
-# DIVE-7731: the connect page's state (claims, tries, closed) is one server's;
-# the https front's name and certificate are the build server's address.
-rm -rf "$r/var/lib/5dive-claim" "$r/var/lib/5dive-secret-https"
-rm -f  "$r/etc/5dive/secret-https.Caddyfile" "$r/etc/5dive/secret-drop.env" \
-       "$r/var/log/5dive-claim-link.log"
 if [[ -d "$r/etc/5dive/connectors" ]]; then
   find "$r/etc/5dive/connectors" -mindepth 1 -delete
 fi
