@@ -35,6 +35,20 @@ local_only_on()   { [[ -e "$(local_only_file)" ]]; }
 # still passed; a missing package then fails in milliseconds instead of hanging.
 LOCAL_ONLY_CLAUDE_ENV=(CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1
   CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1 NPM_CONFIG_REGISTRY=http://127.0.0.1:9/)
+# DIVE-7730: the same for the other agent runtimes, each by its own documented
+# switch (read from each one's source, then measured on a firewalled box):
+#   pi        PI_OFFLINE turns off every startup network call (version check,
+#             model catalog refresh, package checks); PI_TELEMETRY=0 the install
+#             ping to pi.dev; PI_SKIP_VERSION_CHECK the pi.dev latest-version call.
+#   opencode  auto-update, the models.dev catalog, language-server downloads and
+#             the default plugins it fetches from npm at start.
+#   openclaw  the gateway's auto-update (its start-time update hint is the seat's
+#             openclaw.json update.checkOnStart, written by the seat render).
+# Harmless to a runtime that does not read them, so every seat gets all of them.
+LOCAL_ONLY_HARNESS_ENV=(PI_OFFLINE=1 PI_TELEMETRY=0 PI_SKIP_VERSION_CHECK=1
+  OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1
+  OPENCODE_DISABLE_LSP_DOWNLOAD=1 OPENCODE_DISABLE_DEFAULT_PLUGINS=1
+  OPENCLAW_NO_AUTO_UPDATE=1)
 # DIVE-7573 (D4): a seat on a local/custom model. Claude Code defers the chat's
 # reply tool behind tool search, and a small model never calls the search: 0 of
 # 4 replies from qwen3:8b in the DIVE-7560 run, every one with this set.

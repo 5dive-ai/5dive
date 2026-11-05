@@ -66,8 +66,24 @@ _lo_dropin_body() {
     "# feature-flag calls from the agent runtime; tool search off for local models" \
     "# (DIVE-7573). Removed by: 5dive config local-only off" \
     "[Service]"
-  for e in "${LOCAL_ONLY_CLAUDE_ENV[@]}" "${LOCAL_MODEL_SEAT_ENV[@]}"; do printf 'Environment=%s\n' "$e"; done
+  for e in "${LOCAL_ONLY_CLAUDE_ENV[@]}" "${LOCAL_ONLY_HARNESS_ENV[@]}" "${LOCAL_MODEL_SEAT_ENV[@]}"; do printf 'Environment=%s\n' "$e"; done
 }
+
+# DIVE-7730: codex's managed config (the layer that wins over each seat's own
+# config.toml). The first three keys were DIVE-7557. Measured in a no-network
+# sandbox on codex 0.153.3: with only those, every `codex exec` still looked up
+# github.com + api.github.com (a `git ls-remote` of OpenAI's plugin catalog) and
+# chatgpt.com (apps and remote plugins); with the [features] table below it
+# looked up nothing outside the box. 5dive's codex seats use none of these.
+_LO_CODEX_MARK="# 5dive local-only (DIVE-7557). Removed by: 5dive config local-only off"
+_lo_codex_body() {
+  printf '%s\n' "$_LO_CODEX_MARK" \
+    "check_for_update_on_startup = false" "" "[analytics]" "enabled = false" "" \
+    "[feedback]" "enabled = false" "" \
+    "[features]" "plugins = false" "remote_plugin = false" "apps = false" \
+    "in_app_updates = false" "plugin_sharing = false"
+}
+_lo_codex_is_ours() { [[ "$(head -n1 "$(_lo_codex)" 2>/dev/null)" == "$_LO_CODEX_MARK" ]]; }
 
 # Every Claude Code seat home on the box: the agents and the claude user.
 _lo_seat_homes() {
@@ -156,12 +172,14 @@ _lo_on() {
   done < <(_lo_seat_homes)
   _lo_record "seat-marketplaces"
   # 2b. codex. An existing managed config is the owner's: never overwritten.
+  # One we wrote (it starts with our marker) is brought up to date, so a box
+  # that turned the mode on before DIVE-7730 loses its plugin-catalog lookups.
   local cx; cx=$(_lo_codex)
   if [[ ! -e "$cx" ]]; then
     mkdir -p "$(dirname "$cx")"
-    printf '%s\n' "# 5dive local-only (DIVE-7557). Removed by: 5dive config local-only off" \
-      "check_for_update_on_startup = false" "" "[analytics]" "enabled = false" "" \
-      "[feedback]" "enabled = false" > "$cx" && _lo_record "file $cx"
+    _lo_codex_body > "$cx" && _lo_record "file $cx"
+  elif _lo_codex_is_ours && [[ "$(cat "$cx" 2>/dev/null)" != "$(_lo_codex_body)" ]]; then
+    _lo_codex_body > "$cx"
   fi
 
   # 3. 5dive nightly self-update.
@@ -306,9 +324,10 @@ _lo_check() {
     if [[ -n "$rm" ]]; then _lo_line LEAK "plugin catalog refresh ($(basename "$h"))" "$rm"; bad=1
     else _lo_line ok "plugin catalog refresh ($(basename "$h"))" "local copy"; fi
   done < <(_lo_seat_homes)
-  if [[ -f "$(_lo_codex)" ]] && grep -q 'check_for_update_on_startup *= *false' "$(_lo_codex)"; then
-    _lo_line ok "codex update check + analytics" off
-  else _lo_line LEAK "codex update check + analytics" on; bad=1; fi
+  if [[ -f "$(_lo_codex)" ]] && grep -q 'check_for_update_on_startup *= *false' "$(_lo_codex)" \
+     && grep -q '^plugins *= *false' "$(_lo_codex)"; then
+    _lo_line ok "codex update check, analytics, plugin catalog" off
+  else _lo_line LEAK "codex update check, analytics, plugin catalog" on; bad=1; fi
   if declare -F _su_nightly_is_on >/dev/null && _su_nightly_is_on; then
     _lo_line LEAK "5dive nightly self-update" on; bad=1
   else _lo_line ok "5dive nightly self-update" off; fi
