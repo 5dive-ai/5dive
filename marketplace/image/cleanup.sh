@@ -17,6 +17,10 @@ r="${IMAGE_ROOT:-}"
 rm -f  "$r/var/lib/5dive/gate-proof.key" "$r/etc/5dive/vault.key"
 rm -f  "$r/etc/5dive/connectord.env" "$r/etc/5dive/provisioning.env"
 rm -rf "$r/var/lib/5dive/tasks" "$r/var/lib/5dive/secret-drop"
+# DIVE-7756: the one-time connect's state is one server's (its start time, its
+# closed mark, first boot's done mark); a new server starts it fresh.
+rm -rf "$r/var/lib/5dive-claim"
+rm -f  "$r/var/log/5dive-claim.log" "$r/etc/systemd/system/multi-user.target.wants/5dive-claim.service"
 if [[ -d "$r/etc/5dive/connectors" ]]; then
   find "$r/etc/5dive/connectors" -mindepth 1 -delete
 fi
