@@ -134,8 +134,16 @@ c=0; env CLAIM_STATE_DIR="$BOXD/state" CLAIM_PORT="$(free_port)" CLAIM_NO_SYSTEM
 start "$(box b)" CLAIM_MAX_FAILS=3
 pw_post a >/dev/null; pw_post b >/dev/null; c=$(pw_post c)
 [[ "$c" == 403 ]] && grep -q 'Too many wrong passwords' "$tmp/body" && ok "lockout: the 3rd wrong password locks it" || bad "lockout: $c"
+# The route leaves only AFTER that answer: on a real box dropping it restarts
+# Caddy, which cut this very request (seen live on a DO droplet: the 10th try got
+# a dropped connection instead of the locked page).
+grep -q '5dive-claim' "$BOXD/etc5/Caddyfile" && ok "lockout: the route is still in the front when the locked page is answered" \
+  || bad "lockout: the route left the front before the answer, so Caddy's restart would cut it"
 c=$(pw_post "$PW")
 [[ "$c" == 410 && "$(status_of)" == closed:locked ]] && ok "lockout: the right password after it is refused (410, closed:locked)" || bad "after lockout: $c $(status_of)"
+for _ in $(seq 40); do ! grep -q '5dive-claim' "$BOXD/etc5/Caddyfile" && break; sleep 0.1; done
+! grep -q '5dive-claim' "$BOXD/etc5/Caddyfile" && grep -q 'https://203.0.113.7 {' "$BOXD/etc5/Caddyfile" \
+  && ok "lockout: then the route leaves the front, the front stays" || bad "lockout: the route never left the front"
 
 # 9. It expires: a page past its hours takes nothing.
 start "$(box c)" CLAIM_OPEN_HOURS=0

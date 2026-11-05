@@ -249,7 +249,18 @@ def drop_route():
 
 # ---- open / close ------------------------------------------------------------
 
-def close(reason):
+DROP_DELAY_S = 1.5
+
+def _drop_and_disable():
+    drop_route()
+    systemctl("disable", UNIT)
+
+def close(reason, answering=False):
+    """Closed for good. answering=True when a request through the front is
+    still waiting for its answer: dropping the route restarts Caddy, which cuts
+    that very request, so the owner would see a broken page instead of why it
+    closed. The marker is written now (every later request gets 410); the route
+    leaves a moment after. A non-daemon timer, so the process waits for it."""
     with lock:
         if closed_reason():
             return
@@ -260,8 +271,12 @@ def close(reason):
             os.unlink(STATE)
         except OSError:
             pass
-        drop_route()
-        systemctl("disable", UNIT)
+        if answering:
+            t = threading.Timer(DROP_DELAY_S, _drop_and_disable)
+            t.daemon = False   # a request thread is a daemon; a Timer inherits that
+            t.start()
+        else:
+            _drop_and_disable()
     log("closed: %s" % reason)
 
 def log(msg):
@@ -452,14 +467,14 @@ class Handler(BaseHTTPRequestHandler):
             if closed_reason() or st is None:
                 return self.send(410, closed_page())
             if now() >= st["expires"]:
-                close("expired")
+                close("expired", answering=True)
                 return self.send(410, closed_page())
             if not password_ok(word):
                 word = None
                 st["fails"] = st.get("fails", 0) + 1
                 save(st)
                 if st["fails"] >= MAX_FAILS:
-                    close("locked")
+                    close("locked", answering=True)
                     return self.send(403, page("Locked", "<h1>Too many wrong passwords</h1><p>This page is "
                         "closed for good. To connect this server, log in to it (<code>ssh root@…</code>) "
                         "and follow the line it shows.</p>"))
