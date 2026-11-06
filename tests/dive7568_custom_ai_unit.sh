@@ -95,14 +95,17 @@ out=$( (cmd_account_add_custom o3 --provider=custom --base-url=http://10.0.0.5 -
 # ── HINT (DIVE-7659): the "New agent" line is the office panel's own call ────
 # agent create defaults to channels=none; the hint must add --channels=dashboard
 # (cmd_local_panel.sh agent-add) for a harness with a web chat, and never for one
-# without (pi, opencode take no chat channel).
+# without. pi and opencode have one since DIVE-7348, so their hint carries it too.
 JSON_MODE=0
 out=$( (cmd_account_add_custom office-ai --provider=custom --base-url=http://192.168.1.20:11434 --model=m --harness=claude </dev/null) 2>&1)
 [[ "$out" == *"New agent: sudo 5dive agent create <name> --type=claude --auth-profile=office-ai --channels=dashboard"* ]] \
   && ok_t "HINT: a claude account's hint is the office panel's call (--auth-profile + --channels=dashboard)" || bad_t "HINT: claude hint wrong: $out"
 out=$( (cmd_account_add_custom office-pi --provider=custom --base-url=http://192.168.1.20:11434 --model=m --harness=pi </dev/null) 2>&1)
-[[ "$out" == *"--type=pi --auth-profile=office-pi"* && "$out" != *"--channels="* ]] \
-  && ok_t "HINT: a pi account's hint has no chat channel" || bad_t "HINT: pi hint wrong: $out"
+[[ "$out" == *"New agent: sudo 5dive agent create <name> --type=pi --auth-profile=office-pi --channels=dashboard"* ]] \
+  && ok_t "HINT: a pi account's hint adds the web chat like claude (DIVE-7348)" || bad_t "HINT: pi hint wrong: $out"
+out=$( (cmd_account_add_custom office-oc --provider=custom --base-url=http://192.168.1.20:11434 --model=m --harness=opencode </dev/null) 2>&1)
+[[ "$out" == *"New agent: sudo 5dive agent create <name> --type=opencode --auth-profile=office-oc --channels=dashboard"* ]] \
+  && ok_t "HINT: an opencode account's hint adds the web chat (DIVE-7348)" || bad_t "HINT: opencode hint wrong: $out"
 panel_call=$(grep -o 'agent create "\$name" --type="\$h" --auth-profile="\$acct" --channels=dashboard' src/cmd_local_panel.sh)
 [[ -n "$panel_call" ]] && ok_t "HINT: the office panel still makes that call (cmd_local_panel.sh agent-add)" || bad_t "HINT: the panel's agent-add call moved; re-check the hint"
 usb=$(sed -n '/^### No internet at all: install from a USB stick/,/^### /p' docs/guide.md)
