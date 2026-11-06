@@ -1232,12 +1232,36 @@ cmd_self_update() {
     inst_env+=(FIVE_ALLOW_DOWNGRADE="$allow_down")
   else
     installer=$(mktemp) || fail "$E_GENERIC" "failed to create temp file"
+    # >>> DIVE-7816 signed online update
+    # Check the release against 5dive's root key BEFORE anything runs: the
+    # installer and the bundle come from the signed commit and must match the
+    # signed hashes (src/lib/signed_update.sh). `local -x` hands the verified
+    # commit and bundle to the installer for this function's life only.
+    local sigw=""
+    sigw=$(mktemp -d) || { rm -f "$installer"; fail "$E_GENERIC" "failed to create temp folder"; }
     # shellcheck disable=SC2064
-    trap "rm -f '$installer'" RETURN
-
-    step "Fetching installer"
-    curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
-      || fail "$E_GENERIC" "failed to fetch installer"
+    trap "rm -f '$installer'; rm -rf '$sigw'" RETURN
+    local sig_tag=""
+    step "Checking the update is signed by 5dive"
+    sig_tag="$(_su_sig_target)"
+    if _su_sig_verify "$sig_tag" "$sigw"; then
+      cp "$SU_SIG_INSTALLER" "$installer" || fail "$E_GENERIC" "failed to stage the signed installer"
+      local -x GH_SHA="$SU_SIG_COMMIT"
+      local -x FIVE_VERIFIED_BUNDLE="$SU_SIG_BUNDLE"
+      local -x FIVE_VERIFIED_BUNDLE_SHA256="$SU_SIG_BUNDLE_SHA256"
+      _su_sig_record verified "$sig_tag" "signing key ${SU_SIG_KEY_ID:0:16}"
+      step "Signed by 5dive — installing $sig_tag"
+    elif [[ "$SIGNED_UPDATE_ENFORCE" == 1 ]]; then
+      _su_sig_record refused "$sig_tag" "$_SU_SIG_WHY"
+      fail "$E_VALIDATION" "update refused: $_SU_SIG_WHY. Nothing was changed; this box stays on ${old_ver:-the version it has}."
+    else
+      _su_sig_record unsigned-warned "$sig_tag" "$_SU_SIG_WHY"
+      warn "this update is not signature-checked ($_SU_SIG_WHY). Installing it anyway this release; from the next one an unsigned update is refused."
+      step "Fetching installer"
+      curl -fsSL "https://raw.githubusercontent.com/$(gh_org)/5dive/main/install.sh" -o "$installer" \
+        || fail "$E_GENERIC" "failed to fetch installer"
+    fi
+    # <<< DIVE-7816 signed online update
   fi
 
   # DIVE-3173: pay off any restart still owed from a PREVIOUS run before taking

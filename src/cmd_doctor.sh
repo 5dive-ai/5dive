@@ -2526,6 +2526,8 @@ cmd_doctor() {
     # the board distinguishes merged from installed, and a category that is
     # dispatched nowhere is a check that never runs.
     doctor_check_cli_freshness
+    # DIVE-7816: was the last online update signed by 5dive?
+    doctor_check_update_signing
 
     # --- disk headroom (DIVE-1966/1967) ---
     #

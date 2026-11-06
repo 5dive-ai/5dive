@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# 5dive-release-sign — make the signed files every box checks before an online
+# update (DIVE-7816). The box side is src/lib/signed_update.sh; the formats are
+# documented there and in docs/signed-updates.md.
+#
+# WHERE EACH COMMAND RUNS
+#   keygen, certify, revocations   the OFFLINE root machine (root.pem never
+#                                  leaves it; it signs only these two kinds)
+#   keygen, sign-tag, publish      the SIGNING machine (signing.pem lives there
+#                                  and nowhere else — never GitHub Actions, never
+#                                  the API host, never an agent seat)
+#
+# Every command is plain openssl + jq + git, so it runs on any Linux box.
+#
+#   keygen <out.pem>                          new ed25519 private key (mode 600) + prints
+#                                             its public key and key_id
+#   certify --root=<root.pem> --pub=<signing.pub.pem> --days=<n> --out=<dir>
+#                                             root certifies a signing key
+#                                             -> <dir>/signing-key.json + .sig
+#   revocations --root=<root.pem> --serial=<n> [--revoke=<key_id>]... --out=<dir>
+#                                             root signs the revocation list
+#                                             -> <dir>/revoked.json + .sig  (serial must only go UP)
+#   sign-tag --key=<signing.pem> --certs=<dir> --repo=<clone> --tag=<vX.Y.Z> --out=<dir> [--yes]
+#                                             sign a release from a LOCAL clone: the tag's
+#                                             commit, its `5dive` bundle and its install.sh
+#                                             -> <dir>/release.json + .sig, plus the cert and
+#                                             revocation files copied beside them
+#   sign-files --key=<signing.pem> --certs=<dir> --tag=<vX.Y.Z> --commit=<40hex>
+#              --bundle=<file> --installer=<file> --out=<dir>
+#                                             the same, from explicit files (tests, rebuilds)
+#   publish --dir=<dir> --tag=<vX.Y.Z> [--repo-slug=5dive-ai/5dive]
+#                                             upload the six files to the tag's GitHub release
+#   key-id <pub.pem>                          print a public key's key_id
+set -euo pipefail
+
+die() { printf '5dive-release-sign: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
+need openssl; need jq; need sha256sum
+
+key_id() { openssl pkey -pubin -in "$1" -outform DER 2>/dev/null | sha256sum | awk '{print $1}'; }
+sign()   { openssl pkeyutl -sign -inkey "$1" -rawin -in "$2" -out "$3"; }
+verify() { openssl pkeyutl -verify -pubin -inkey "$1" -rawin -in "$2" -sigfile "$3" >/dev/null 2>&1; }
+pubof()  { openssl pkey -in "$1" -pubout; }
+sha()    { sha256sum "$1" | awk '{print $1}'; }
+
+declare -A A=(); declare -a REVOKE=()
+cmd="${1:-}"; [[ -n "$cmd" ]] || { sed -n '2,40p' "$0"; exit 2; }
+shift
+POS=()
+for a in "$@"; do
+  case "$a" in
+    --revoke=*) REVOKE+=("${a#--revoke=}") ;;
+    --yes) A[yes]=1 ;;
+    --*=*) k="${a%%=*}"; A[${k#--}]="${a#*=}" ;;
+    *) POS+=("$a") ;;
+  esac
+done
+arg() { [[ -n "${A[$1]:-}" ]] || die "$cmd needs --$1="; printf '%s' "${A[$1]}"; }
+
+case "$cmd" in
+  keygen)
+    out="${POS[0]:-}"; [[ -n "$out" ]] || die "keygen <out.pem>"
+    [[ ! -e "$out" ]] || die "$out exists — refusing to overwrite a key"
+    ( umask 077; openssl genpkey -algorithm ed25519 -out "$out" )
+    pubof "$out" > "$out.pub"
+    printf 'private key: %s (keep it here)\npublic key:  %s.pub\nkey_id:      %s\n' "$out" "$out" "$(key_id "$out.pub")"
+    ;;
+  key-id)
+    [[ -f "${POS[0]:-}" ]] || die "key-id <pub.pem>"; key_id "${POS[0]}" ;;
+  certify)
+    root="$(arg root)" pub="$(arg pub)" days="$(arg days)" out="$(arg out)"
+    [[ "$days" =~ ^[0-9]+$ && "$days" -ge 1 && "$days" -le 1100 ]] || die "--days must be 1..1100"
+    mkdir -p "$out"
+    kid="$(key_id "$pub")"; [[ "$kid" =~ ^[0-9a-f]{64}$ ]] || die "$pub is not an ed25519 public key"
+    jq -n --arg k "$kid" --rawfile p "$pub" --argjson na "$(( $(date +%s) + days * 86400 ))" \
+      '{format:1, kind:"5dive-signing-key", key_id:$k, pubkey:$p, not_after:$na}' > "$out/signing-key.json"
+    sign "$root" "$out/signing-key.json" "$out/signing-key.sig"
+    printf 'certified %s until %s\n' "$kid" "$(date -u -d "@$(jq -r .not_after "$out/signing-key.json")" +%F)"
+    ;;
+  revocations)
+    root="$(arg root)" serial="$(arg serial)" out="$(arg out)"
+    [[ "$serial" =~ ^[0-9]+$ ]] || die "--serial must be a number, and higher than the last list's"
+    for k in "${REVOKE[@]}"; do [[ "$k" =~ ^[0-9a-f]{64}$ ]] || die "--revoke takes a 64-hex key_id ($k)"; done
+    mkdir -p "$out"
+    printf '%s\n' "${REVOKE[@]}" | jq -R . | jq -s --argjson s "$serial" \
+      '{format:1, kind:"5dive-revocations", serial:$s, revoked:(map(select(length>0)))}' > "$out/revoked.json"
+    sign "$root" "$out/revoked.json" "$out/revoked.sig"
+    printf 'revocation list serial %s: %s key(s) revoked\n' "$serial" "${#REVOKE[@]}"
+    ;;
+  sign-files|sign-tag)
+    key="$(arg key)" certs="$(arg certs)" tag="$(arg tag)" out="$(arg out)"
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--tag must be vX.Y.Z"
+    for f in signing-key.json signing-key.sig revoked.json revoked.sig; do
+      [[ -s "$certs/$f" ]] || die "$certs/$f is missing (certify and revocations make them)"
+    done
+    tmpd="$(mktemp -d)"; trap 'rm -rf "$tmpd"' EXIT
+    pubof "$key" > "$tmpd/pub.pem"
+    kid="$(key_id "$tmpd/pub.pem")"
+    [[ "$kid" == "$(jq -r .key_id "$certs/signing-key.json")" ]] \
+      || die "this signing key is not the one $certs/signing-key.json certifies"
+    (( $(date +%s) < $(jq -r '.not_after|floor' "$certs/signing-key.json") )) || die "the signing key's certificate has expired — have the root certify a new key"
+    if jq -e --arg k "$kid" '.revoked|index($k) != null' "$certs/revoked.json" >/dev/null; then
+      die "this signing key is on the revocation list"
+    fi
+    if [[ "$cmd" == sign-tag ]]; then
+      repo="$(arg repo)"; need git
+      commit="$(git -C "$repo" rev-parse --verify "refs/tags/$tag^{commit}")" || die "tag $tag is not in $repo (git fetch --tags first)"
+      git -C "$repo" show "$commit:5dive" > "$tmpd/5dive" || die "$tag carries no 5dive bundle"
+      git -C "$repo" show "$commit:install.sh" > "$tmpd/install.sh" || die "$tag carries no install.sh"
+      bundle="$tmpd/5dive" installer="$tmpd/install.sh"
+      ver="$(grep -m1 -oP '(?<=^readonly FIVE_VERSION=")[^"]+' "$bundle" || true)"
+      [[ "v$ver" == "$tag" ]] || die "the bundle in $tag says version '${ver:-none}' — refusing to sign a mismatch"
+      printf 'About to sign %s\n  commit    %s\n  5dive     %s\n  install.sh %s\n' "$tag" "$commit" "$(sha "$bundle")" "$(sha "$installer")"
+      printf '  subject   %s\n' "$(git -C "$repo" log -1 --format=%s "$commit")"
+      if [[ -z "${A[yes]:-}" ]]; then
+        read -r -p "Type the tag to sign it: " typed
+        [[ "$typed" == "$tag" ]] || die "not signed"
+      fi
+    else
+      commit="$(arg commit)" bundle="$(arg bundle)" installer="$(arg installer)"
+      [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || die "--commit must be 40 hex"
+    fi
+    mkdir -p "$out"
+    jq -n --arg t "$tag" --arg c "$commit" --arg b "$(sha "$bundle")" --arg i "$(sha "$installer")" --arg k "$kid" \
+      '{format:1, kind:"5dive-release", tag:$t, commit:$c, bundle_sha256:$b, installer_sha256:$i, key_id:$k}' > "$out/release.json"
+    sign "$key" "$out/release.json" "$out/release.sig"
+    verify "$tmpd/pub.pem" "$out/release.json" "$out/release.sig" || die "self-check of the new signature failed"
+    if [[ "$(cd "$certs" && pwd)" != "$(cd "$out" && pwd)" ]]; then
+      cp "$certs"/{signing-key.json,signing-key.sig,revoked.json,revoked.sig} "$out/"
+    fi
+    printf 'signed %s -> %s\n' "$tag" "$out"
+    ;;
+  publish)
+    dir="$(arg dir)" tag="$(arg tag)" slug="${A[repo-slug]:-5dive-ai/5dive}"; need gh
+    files=(); for f in signing-key.json signing-key.sig revoked.json revoked.sig release.json release.sig; do
+      [[ -s "$dir/$f" ]] || die "$dir/$f is missing"; files+=("$dir/$f"); done
+    [[ "$(jq -r .tag "$dir/release.json")" == "$tag" ]] || die "$dir/release.json is not for $tag"
+    gh release view "$tag" -R "$slug" >/dev/null 2>&1 \
+      || gh release create "$tag" -R "$slug" --verify-tag --title "$tag" --notes "Signed release $tag" >/dev/null
+    gh release upload "$tag" -R "$slug" --clobber "${files[@]}"
+    printf 'published the signature files of %s\n' "$tag"
+    ;;
+  *) die "unknown command '$cmd' (run with no arguments for help)" ;;
+esac

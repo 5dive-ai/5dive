@@ -646,6 +646,14 @@ jobs:
           set -o pipefail
           sudo -E env OU_REQUIRE_NETNS_ARM=1 bash tests/self_update_offline_unit.sh | tee root-arms-ou.txt
           grep -q '^ok   - NO NETWORK' root-arms-ou.txt
+      - name: signed_update_unit as root, the real self-update arms required (DIVE-7816)
+        run: |
+          set -o pipefail
+          sudo -E env SU_REQUIRE_ROOT_ARM=1 bash tests/signed_update_unit.sh | tee root-arms-su.txt
+          if grep -q 'REHEARSAL' root-arms-su.txt; then echo "the end-to-end arms ran as a rehearsal, not as root"; exit 1; fi
+          for a in '(a) \[as root, unpatched\]' '(b) \[as root, unpatched\]' '(c) \[as root, unpatched\]'; do
+            grep -q "^ok   - $a" root-arms-su.txt || { echo "missing root arm: $a"; exit 1; }
+          done
 
   rails-pristine:
     runs-on: ubuntu-latest

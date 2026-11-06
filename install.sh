@@ -822,8 +822,20 @@ refresh_managed_files() {
   # that needs an out-of-band key.) Temp lives in BIN_DIR so the final mv is a
   # same-fs atomic swap.
   local _bundle_tmp; _bundle_tmp="$(mktemp "${BIN_DIR}/.5dive.XXXXXX")"
-  curl -fsSL "$REPO/5dive" -o "$_bundle_tmp" || { rm -f "$_bundle_tmp"; die "failed to download 5dive bundle from $REPO/5dive"; }
   local _want _got
+  # >>> DIVE-7816 verified bundle
+  # `5dive self-update` already checked this bundle against 5dive's signed
+  # release manifest and hands it over with its signed hash: install exactly
+  # those bytes, re-hashed here, and fetch nothing.
+  if [[ -n "${FIVE_VERIFIED_BUNDLE:-}" ]]; then
+    cp "$FIVE_VERIFIED_BUNDLE" "$_bundle_tmp" || { rm -f "$_bundle_tmp"; die "could not read the verified 5dive bundle at $FIVE_VERIFIED_BUNDLE"; }
+    _want="${FIVE_VERIFIED_BUNDLE_SHA256:-}"
+    _got="$(sha256sum "$_bundle_tmp" | awk '{print $1}')"
+    [[ "$_want" =~ ^[0-9a-f]{64}$ && "$_got" == "$_want" ]] \
+      || { rm -f "$_bundle_tmp"; die "the verified 5dive bundle does not match its signed hash — refusing to install"; }
+  else
+  # <<< DIVE-7816 verified bundle
+  curl -fsSL "$REPO/5dive" -o "$_bundle_tmp" || { rm -f "$_bundle_tmp"; die "failed to download 5dive bundle from $REPO/5dive"; }
   # `|| _want=""` is load-bearing: under `set -euo pipefail` (line 6) a plain
   # assignment whose command-substitution pipeline fails aborts the whole script
   # BEFORE the policy below can classify an absent checksum. The
@@ -855,6 +867,7 @@ refresh_managed_files() {
     die "failed to fetch required 5dive.sha256 from $REPO/5dive.sha256 — refusing to install an unverified bundle"
   fi
   # <<< DIVE-2248 checksum policy
+  fi  # DIVE-7816 verified bundle
   # DIVE-2243: direction is a separate assertion from the action. Checked HERE —
   # after integrity, before the swap — so a refusal leaves the installed binary
   # untouched and the box keeps running the version it already has.
