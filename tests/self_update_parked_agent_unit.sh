@@ -297,7 +297,13 @@ self_update_with() { # <registry-json-or-MISSING> <payload-moves:yes|no>
     agent_type(){ printf 'claude\n'; }
     db(){ echo 0; }; sqlq(){ printf '%s' "$1"; }
     _hb_agent_idle(){ return 0; }
+    # DIVE-7816: the shipped bundle concatenates src/lib/signed_update.sh after
+    # this file (build.sh CORE list), and cmd_self_update now calls its verifier
+    # before the installer runs. Sourcing cmd_selfupdate.sh alone is no longer the
+    # shipped shape. This build has no root key, so the check warns and the old
+    # path runs exactly as before; its record goes to the sandbox, not /var/lib.
     . src/cmd_selfupdate.sh
+    . src/lib/signed_update.sh; SIGNED_UPDATE_STATE_DIR="$WORK/sig"
     # Move the payload for every agent, or for none, on demand. Declared AFTER
     # the source so it overrides the shipped one.
     # The counter lives in a FILE, not a variable: every call site reads this

@@ -571,6 +571,12 @@ _agent_busy_state(){ _hg_in_list "${1:-}" "${HG_BUSY:-}" && printf 'busy\n' || p
 _team_bot_install_listener(){ return 0; }
 PRELUDE
     printf '%s\n' "$block"
+    # DIVE-7816: the shipped bundle carries src/lib/signed_update.sh next to
+    # cmd_self_update (build.sh), which now calls its verifier before the
+    # installer runs. This build has no root key, so it warns and the old path
+    # runs as before; the probe it would ask for a tag is stubbed here.
+    printf '_published_cli_probe(){ return 0; }\n'
+    cat src/lib/signed_update.sh
     printf '%s\n' "$mutated"
     printf 'cmd_self_update\n'
   } > "$d/driver.sh"
@@ -580,6 +586,7 @@ PRELUDE
     export SYSTEMCTL_FAKE="$d/fake" HG_BIN="$d/bin" HG_HOMES="$d/homes" HG_NEW_LAUNCHER="$newl"
     export HG_RESTART_NEEDED_RC="$rcneed" HG_BUSY="$busylist" HG_PARKED="$parkedlist"
     export HEALTH_GATE_BIN_DIR="$d/bin" HEALTH_GATE_SYSTEMD_DIR="$d/sysd" HEALTH_GATE_ROLLBACK_DIR="${rbdir:-$d/rb}"
+    export SIGNED_UPDATE_STATE_DIR="$d/sig"
     export HEALTH_GATE_WINDOW_SECS=0 HEALTH_GATE_POLL_SECS=1 HEALTH_GATE_PRECHECK_SECS=0
     bash "$d/driver.sh" > "$d/out" 2>&1
     printf '%s\n' "$?" > "$d/rc"

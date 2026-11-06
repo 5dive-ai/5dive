@@ -91,7 +91,13 @@ nightly() {
     sqlq(){ printf '%s' "$1"; }
     db(){ [[ "$1" == *nova* ]] && echo 1 || echo 0; }
     _hb_agent_idle(){ return 0; }
+    # DIVE-7816: the shipped bundle concatenates src/lib/signed_update.sh after
+    # this file (build.sh CORE list), and cmd_self_update now calls its verifier
+    # before the installer runs. Sourcing cmd_selfupdate.sh alone is no longer the
+    # shipped shape. This build has no root key, so the check warns and the old
+    # path runs exactly as before; its record goes to the sandbox, not /var/lib.
     . src/cmd_selfupdate.sh
+    . src/lib/signed_update.sh; SIGNED_UPDATE_STATE_DIR="$WORK/sig"
     _hg_capture(){ return 0; }; _hg_probe(){ systemctl restart "$1"; printf 'healthy\n'; }
     _agent_payload_fingerprint(){
       local c; c=$(cat "$WORK/fpc" 2>/dev/null || echo 0); c=$((c+1))

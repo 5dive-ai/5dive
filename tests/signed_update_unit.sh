@@ -277,4 +277,5 @@ if (( E_RC == 0 )) && [[ "$(kv "$E_BOX/mark" kind)" == legacy ]] \
   ok_t "warn-only build (this release): the tampered release is logged + recorded for doctor, and the old path runs"
 else bad_t "warn-only build behaviour" "rc=$E_RC mark=$(cat "$E_BOX/mark" 2>/dev/null) out=$(tail -5 <<<"$E_OUT")"; fi
 
-done_t
+echo "$PASS passed, $FAIL failed"
+exit $(( FAIL > 0 ))
