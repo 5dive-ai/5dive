@@ -62,6 +62,10 @@
 # internal verdict: not a publish. Nothing here renders to a web surface.
 
 _LIV_WINDOW_MIN_DEFAULT=60
+# DIVE-7825: a Telegram poller whose last completed getUpdates is older than this
+# is stuck. A healthy poll comes back at least every 45 s (30 s window + the
+# plugin's 15 s cutoff), so 120 s is two missed polls plus a retry.
+_LIV_POLL_STALE_SEC=120
 _LIV_AUDIT_TAIL=4000
 
 _liv_usage() {
@@ -77,12 +81,15 @@ Verdicts — four, and none of them collapses into another:
   alive             a timestamped artifact this seat wrote, inside the window. Named in the output.
   quota-exhausted   the seat's auth account is at 100% of a rate-limit window: it cannot execute a
                     single token until the reset, whatever it wrote before the wall. Outranks alive.
+  poll-stalled      the seat's Telegram poller is running but its last completed poll (bot.lastpoll,
+                    written by the poller) is over ${_LIV_POLL_STALE_SEC}s old: the owner's messages are not
+                    arriving. Outranks alive. No bot.lastpoll (older plugin) = not measured.
   no-effect         every probe RAN and found nothing this seat wrote inside the window.
   not-reached       at least one probe could not run and nothing positive was found. UNKNOWN,
                     not healthy: this is the state a process-presence check silently calls green.
 
-Exit: 0 every seat alive - 4 some seat has no effect or is quota-exhausted - 3 some seat
-not-reached - 2 usage.
+Exit: 0 every seat alive - 4 some seat has no effect, is quota-exhausted or poll-stalled - 3
+some seat not-reached - 2 usage.
 
 Read-only. No process table, no tmux, no pane scrape — a present process that wrote
 nothing for three days is the incident this command exists to catch, not evidence.
@@ -134,9 +141,16 @@ _liv_is_fresh() {
 # Then positive evidence (a real artifact outranks a broken probe); then the
 # third state; only a COMPLETE, SUCCESSFUL, EMPTY read is allowed to say a seat
 # produced nothing.
+#
+# DIVE-7825: a stalled Telegram poll comes second, for the same reason: it is the
+# poller's own artifact (the mtime of the last poll that came back), and a seat
+# that wrote a row ten minutes ago while its owner's messages queue unread is the
+# box report 748 false green. Only `stalled` gates; `unmeasured` (no file, an
+# older plugin, a home this uid cannot read) changes nothing.
 _liv_verdict() {
-  local fresh="${1:-0}" unreadable="${2:-0}" quota="${3:-unmeasured}"
+  local fresh="${1:-0}" unreadable="${2:-0}" quota="${3:-unmeasured}" poll="${4:-unmeasured}"
   if [[ "$quota" == "exhausted" ]]; then printf 'quota-exhausted\n'; return 0; fi
+  if [[ "$poll" == "stalled" ]];     then printf 'poll-stalled\n';    return 0; fi
   if (( fresh > 0 ));      then printf 'alive\n';       return 0; fi
   if (( unreadable > 0 )); then printf 'not-reached\n'; return 0; fi
   printf 'no-effect\n'
@@ -205,6 +219,41 @@ _liv_probe_audit() {
   _liv_probe_out read "$e" "${cmd} @ ${stamp}"
 }
 
+# DIVE-7825: the seat's Telegram poll — <state>\037<age-sec>\037<file>, one line.
+# state: `stalled` (bot.lastpoll older than _LIV_POLL_STALE_SEC while its poller
+# runs), `polling` (fresh), or `unmeasured` (no lastpoll file in any runtime's
+# state dir, no live poller, or not readable by this uid).
+#
+# The poller's pid is read only to SUPPRESS a verdict, never to grant one: a
+# poller that exited (or was SIGKILLed before it could remove its file) is not a
+# stalled poll, and a present process is still not evidence of life here. /proc
+# is used rather than `kill -0`, which fails with EPERM on another seat's
+# process and would read every live poller as gone.
+_liv_seat_home() {
+  local unix="$1" h=""
+  if [[ -n "${AGENT_HOME_ROOT:-}" ]]; then printf '%s/%s' "$AGENT_HOME_ROOT" "$unix"; return 0; fi
+  h=$(getent passwd "$unix" 2>/dev/null | cut -d: -f6) || h=""
+  printf '%s' "${h:-/home/$unix}"
+}
+_liv_probe_poll() {
+  local unix="$1" now="$2" home d dir pid m age out=""
+  home=$(_liv_seat_home "$unix")
+  for d in claude codex grok opencode pi gemini; do
+    dir="$home/.$d/channels/telegram"
+    [[ -r "$dir/bot.lastpoll" && -r "$dir/bot.pid" ]] || continue
+    pid=$(tr -dc '0-9' <"$dir/bot.pid" 2>/dev/null)
+    [[ -n "$pid" && -d "${_LIV_PROC_ROOT:-/proc}/$pid" ]] || continue
+    m=$(stat -c %Y "$dir/bot.lastpoll" 2>/dev/null) || continue
+    [[ "$m" =~ ^[0-9]+$ ]] || continue
+    age=$(( now - m )); (( age < 0 )) && age=0
+    if (( age > _LIV_POLL_STALE_SEC )); then
+      printf 'stalled\037%s\037%s\n' "$age" "$dir/bot.lastpoll"; return 0
+    fi
+    [[ -n "$out" ]] || out=$(printf 'polling\037%s\037%s' "$age" "$dir/bot.lastpoll")
+  done
+  if [[ -n "$out" ]]; then printf '%s\n' "$out"; else printf 'unmeasured\037\037\n'; fi
+}
+
 # _liv_seat_record <seat> <unix-user> <now> <window-sec> -> one JSON record
 _liv_seat_record() {
   local seat="$1" unix="$2" now="$3" w="$4"
@@ -244,7 +293,11 @@ _liv_seat_record() {
   IFS=$'\037' read -r qstate qwin qpct qreset qage qnote <<<"$(quota_wall_seat "$seat")"
   [[ -n "$qstate" ]] || qstate="unmeasured"
 
-  local verdict; verdict=$(_liv_verdict "$fresh" "$unreadable" "$qstate")
+  local pstate page pfile
+  IFS=$'\037' read -r pstate page pfile <<<"$(_liv_probe_poll "$unix" "$now")"
+  [[ -n "$pstate" ]] || pstate="unmeasured"
+
+  local verdict; verdict=$(_liv_verdict "$fresh" "$unreadable" "$qstate" "$pstate")
   local reason=""
   case "$verdict" in
     alive)       reason="wrote ${best_src}: ${best_art}" ;;
@@ -257,12 +310,17 @@ _liv_seat_record() {
       # place that difference survives.
       [[ -n "$best_art" ]] && reason="${reason} (last wrote ${best_src}: ${best_art})"
       ;;
+    poll-stalled)
+      reason="telegram poll stalled — the last poll came back ${page}s ago (${pfile}); the owner's messages are not arriving"
+      [[ -n "$best_art" ]] && reason="${reason} (last wrote ${best_src}: ${best_art})"
+      ;;
   esac
 
   jq -cn --arg seat "$seat" --arg unix "$unix" --arg v "$verdict" --arg r "$reason" \
          --arg es "$best_src" --arg ea "$best_art" --arg dg "$degraded" \
          --arg qs "$qstate" --arg qw "$qwin" --arg qp "$qpct" --arg qr "$qreset" \
          --arg qa "$qage" --arg qn "$qnote" \
+         --arg ps "$pstate" --arg pa "$page" --arg pf "$pfile" \
          --argjson probes "$probes" --argjson fresh "$fresh" --argjson unread "$unreadable" \
          --argjson w "$w" --argjson age "$best_age" \
     '{seat:$seat, unixUser:$unix, windowSec:$w, verdict:$v, reason:$r,
@@ -273,6 +331,9 @@ _liv_seat_record() {
              resetsAt:(if $qr == "" then null else $qr end),
              snapshotAgeSec:(if $qa == "" then null else ($qa|tonumber? // null) end),
              note:$qn},
+      telegramPoll:{state:$ps,
+                    lastPollAgeSec:(if $pa == "" then null else ($pa|tonumber? // null) end),
+                    file:(if $pf == "" then null else $pf end)},
       probes:$probes, freshSources:$fresh, unreadableSources:$unread,
       degraded:(if $dg == "" then [] else ($dg|split("; ")) end)}'
 }
@@ -338,43 +399,47 @@ cmd_liveness() {
     records=$(jq -c --argjson r "$rec" '. + [$r]' <<<"$records")
   done
 
-  local n_alive n_none n_nr n_quota
+  local n_alive n_none n_nr n_quota n_poll
   n_alive=$(jq '[.[]|select(.verdict=="alive")]|length'       <<<"$records")
   n_none=$(jq  '[.[]|select(.verdict=="no-effect")]|length'   <<<"$records")
   n_nr=$(jq    '[.[]|select(.verdict=="not-reached")]|length' <<<"$records")
   n_quota=$(jq '[.[]|select(.verdict=="quota-exhausted")]|length' <<<"$records")
+  n_poll=$(jq  '[.[]|select(.verdict=="poll-stalled")]|length'    <<<"$records")
 
   # A roster we could not read is counted as a not-reached in its own right, so
   # it can never be the difference between rc 0 and a silent all-green.
   local rc=0
-  if   (( n_none > 0 || n_quota > 0 ));           then rc=4
+  if   (( n_none > 0 || n_quota > 0 || n_poll > 0 )); then rc=4
   elif (( n_nr > 0 )) || [[ -n "$roster_note" ]]; then rc=3
   fi
 
   if (( JSON_MODE )); then
     jq -cn --argjson seats "$records" --argjson w "$w" --argjson na "$n_alive" \
-           --argjson nn "$n_none" --argjson nr "$n_nr" --argjson nq "$n_quota" \
+           --argjson nn "$n_none" --argjson nr "$n_nr" --argjson nq "$n_quota" --argjson np "$n_poll" \
            --arg roster "$roster_note" \
       '{ok:true, data:{windowSec:$w, seats:$seats,
-        summary:{alive:$na, noEffect:$nn, notReached:$nr, quotaExhausted:$nq},
+        summary:{alive:$na, noEffect:$nn, notReached:$nr, quotaExhausted:$nq, pollStalled:$np},
         roster:(if $roster == "" then "read" else "not-reached" end),
         rosterNote:(if $roster == "" then null else $roster end)}}'
   else
     printf 'effect-derived liveness — window %dm, evidence is an artifact the seat WROTE\n\n' "$window_min"
     printf '%-14s %-16s %s\n' SEAT VERDICT EVIDENCE
     jq -r '.[] | [.seat, .verdict,
-                  (if .evidence then "\(.evidence.source): \(.evidence.artifact) (\(.evidence.ageSec)s ago)" else .reason end)]
+                  (if .verdict == "poll-stalled" then .reason elif .evidence then "\(.evidence.source): \(.evidence.artifact) (\(.evidence.ageSec)s ago)" else .reason end)]
                  | @tsv' <<<"$records" \
       | while IFS=$'\t' read -r s v e; do printf '%-14s %-16s %s\n' "$s" "$v" "$e"; done
     jq -r '.[] | select((.degraded|length) > 0) | "  degraded probes on \(.seat): \(.degraded|join("; "))"' <<<"$records"
     [[ -n "$roster_note" ]] && printf '\nroster: NOT-REACHED — %s\n' "$roster_note"
-    printf '\n%d alive, %d quota-exhausted, %d no-effect, %d NOT-REACHED (of %d seat(s))\n' \
-      "$n_alive" "$n_quota" "$n_none" "$n_nr" "${#seats[@]}"
+    printf '\n%d alive, %d quota-exhausted, %d poll-stalled, %d no-effect, %d NOT-REACHED (of %d seat(s))\n' \
+      "$n_alive" "$n_quota" "$n_poll" "$n_none" "$n_nr" "${#seats[@]}"
     if (( n_nr > 0 )) || [[ -n "$roster_note" ]]; then
       printf 'NOT-REACHED is not a pass: those seats were not measured.\n'
     fi
     if (( n_quota > 0 )); then
       printf 'quota-exhausted is not a pass either: those seats cannot execute a token until the reset.\n'
+    fi
+    if (( n_poll > 0 )); then
+      printf 'poll-stalled is not a pass either: those seats are not receiving their Telegram messages.\n'
     fi
   fi
   # DIVE-2598: a deliberate non-zero exit must claim its reason, or the EXIT-trap
