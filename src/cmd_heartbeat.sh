@@ -546,7 +546,9 @@ _hb_a2a_queue_sweep() {
     rounds=$((rounds + 1))
     remaining=()
     for name in "${seats[@]}"; do
-      if a2a_queue_flush_one "$name"; then
+      local _frc=0
+      a2a_queue_flush_one "$name" || _frc=$?
+      if (( _frc == 0 )); then
         _HB_A2A_FLUSHED=$((_HB_A2A_FLUSHED + 1))
         depth=$(_a2a_queue_depth "$name")
         # Depth AFTER the drain, every time: the backlog is the number the next
@@ -556,6 +558,10 @@ _hb_a2a_queue_sweep() {
         depth=$(_a2a_queue_depth "$name")
       fi
       [[ "$depth" =~ ^[0-9]+$ ]] && _a2a_spool_mark "$name" "$depth"
+      # DIVE-7807: a HELD seat (rc 2, its account refusing turns) leaves this
+      # pass. Unlike a busy seat it will not clear within the drain budget (only
+      # the owner's fix does), so polling it would spend the whole budget.
+      (( _frc == 2 )) && continue
       [[ "$depth" =~ ^[0-9]+$ ]] && (( depth > 0 )) && remaining+=("$name")
     done
     seats=( ${remaining[@]+"${remaining[@]}"} )
@@ -8246,6 +8252,21 @@ _hb_stall_sweep() {
       db "INSERT INTO task_prefs (key,value) VALUES ('stall_first_seen_at', datetime('now'))
           ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now');"
       first_seen=$(date -u '+%Y-%m-%d %H:%M:%S')
+    fi
+    # DIVE-7807 (chill-gorge): a row started AND closed between two ticks is
+    # never seen by `total_stranded == 0` or by the alert-time activity probe, so
+    # the clock kept running across real work ("idle 75m" over a window in which
+    # the seat closed five rows). The clock starts at the LAST ROW MOVEMENT, read
+    # from the board: done_at counts on its own, so a row closed with no
+    # started_at still moves it. datetime() puts both sides in the format the
+    # clock is written in, so the string compare is a time compare.
+    local _last_move
+    _last_move=$(db "SELECT MAX(MAX(COALESCE(datetime(started_at),''), COALESCE(datetime(done_at),'')))
+                     FROM tasks WHERE kind='standard';" 2>/dev/null) || _last_move=""
+    if [[ -n "$_last_move" && "$_last_move" > "$first_seen" ]]; then
+      db "UPDATE task_prefs SET value=$(sqlq "$_last_move"), updated_at=datetime('now')
+          WHERE key='stall_first_seen_at';"
+      first_seen="$_last_move"
     fi
     local since_secs; since_secs=$(( $(date -u +%s) - $(date -u -d "$first_seen" +%s 2>/dev/null || date -u +%s) ))
     if (( since_secs >= _HB_STALL_MIN_MINUTES * 60 )); then
