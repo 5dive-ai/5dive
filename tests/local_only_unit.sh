@@ -24,6 +24,10 @@
 #   CHECK.    a public connection in the ss watch → LEAK + exit 1; only
 #             LAN/loopback peers → "Fully local" + exit 0.
 #   REFRESH.  the skills/plugins refresh scripts skip (exit 0) when the flag exists.
+#   TEAMS.    DIVE-7658: `allow teams` (refused while off, and for any other
+#             name) opens Teams alone: --channels=teams and connect pass, Telegram
+#             and internet installs stay refused, check counts the teams plugin's
+#             connections as ok and any other process as LEAK; deny and off shut it.
 #   MUTANTS.  a gate that ignores the flag reds REFUSE; an undo record naming an
 #             owner-off unit reds ONOFF's owner-off arm.
 #
@@ -317,6 +321,52 @@ k=$(grep -cE '^(ok|LEAK) ' "$TMPD/chk.out")
 ( _lo_off ) >/dev/null 2>&1
 ( _lo_check --watch=0 ) >"$TMPD/chk.out" 2>&1; rc=$?
 [[ $rc == 1 ]] && grep -q '^LEAK  local-only switch' "$TMPD/chk.out" && ok_ "CHECK: switch off → LEAK on the switch line, exit 1" || bad_ "CHECK off" "rc=$rc"
+
+# ── TEAMS (DIVE-7658): the one service the firm's IT may open ───────────────
+AF="$TMPD/root/etc/5dive/local-only.allow"
+( _lo_allow on teams ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc != 0 && ! -e "$AF" ]] && ok_ "TEAMS: allow with local-only OFF is refused, nothing written" || bad_ "TEAMS allow-off" "rc=$rc"
+( _lo_on ) >/dev/null 2>&1
+( _lo_allow on telegram ) >/dev/null 2>&1; rc=$?
+[[ $rc != 0 && ! -e "$AF" ]] && ok_ "TEAMS: allow telegram is refused (only teams can be opened)" || bad_ "TEAMS other" "rc=$rc"
+( _lo_check --watch=0 --status ) >"$TMPD/t.out" 2>&1
+grep -qE '^ok +Microsoft Teams +shut' "$TMPD/t.out" && ok_ "TEAMS: status says shut by default" || bad_ "TEAMS default" "$(grep Teams "$TMPD/t.out")"
+( _lo_allow on teams && _lo_allow on teams ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 0 && $(grep -cx teams "$AF") == 1 ]] && local_only_allows teams && grep -q 'OPEN' "$TMPD/t.out" \
+  && ok_ "TEAMS: allow teams opens it (once, idempotent)" || bad_ "TEAMS allow" "rc=$rc"
+( _lo_check --watch=0 --status ) >"$TMPD/t.out" 2>&1
+grep -qE '^ok +Microsoft Teams +open' "$TMPD/t.out" && ok_ "TEAMS: status says open" || bad_ "TEAMS status open" "$(grep Teams "$TMPD/t.out")"
+# The other refusals hold with Teams open.
+( local_only_gate agent create x --type=claude --base-url=http://127.0.0.1:1 --channels=teams ) >/dev/null 2>&1 \
+  && ok_ "TEAMS: --channels=teams passes once IT opened it" || bad_ "TEAMS create" "refused"
+( local_only_gate agent create x --type=claude --base-url=http://127.0.0.1:1 --channels=teams,telegram ) >/dev/null 2>&1 \
+  && bad_ "TEAMS telegram" "telegram passed with Teams open" || ok_ "TEAMS: Telegram is still refused with Teams open"
+( local_only_gate plugin install foo ) >/dev/null 2>&1 \
+  && bad_ "TEAMS plugin" "internet install passed" || ok_ "TEAMS: an internet plugin install is still refused with Teams open"
+# The watch: the teams plugin's connections are allowed, anything else still a LEAK.
+mkdir -p "$TMPD/plug/teams/.claude-plugin" "$TMPD/plug/other" "$TMPD/root/proc/77" "$TMPD/root/proc/9"
+: > "$TMPD/plug/teams/server.ts"; printf '{ "name": "teams" }\n' > "$TMPD/plug/teams/.claude-plugin/plugin.json"
+ln -sfn "$TMPD/plug/teams" "$TMPD/root/proc/77/cwd"; ln -sfn "$TMPD/plug/other" "$TMPD/root/proc/9/cwd"
+printf '%s\n' 'tcp ESTAB 0 0 10.0.0.2:40200 198.51.100.20:443 users:(("bun",pid=77,fd=9))' > "$STUB_SS"
+( _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 0 ]] && grep -q '^ok    Microsoft Teams (your IT allowed it): 1' "$TMPD/t.out" && ! grep -q '^LEAK' "$TMPD/t.out" \
+  && ok_ "TEAMS: check counts the teams plugin's connection as allowed, exit 0" || bad_ "TEAMS watch ok" "rc=$rc $(cat "$TMPD/t.out")"
+printf '%s\n' 'tcp SYN-SENT 0 0 10.0.0.2:40300 203.0.113.9:443 users:(("node",pid=9,fd=3))' >> "$STUB_SS"
+( _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 1 ]] && grep -q '203.0.113.9:443' "$TMPD/t.out" && grep -q '^LEAK  outside connections seen: 1' "$TMPD/t.out" \
+  && ok_ "TEAMS: any other process going out is still a LEAK with Teams open" || bad_ "TEAMS watch leak" "rc=$rc $(cat "$TMPD/t.out")"
+( _lo_proc_is_teams() { return 0; }; _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 0 ]] && ok_ "MUTANT: a teams test that waves every process through hides the LEAK (the arm above would red)" || bad_ "MUTANT teams proc" "rc=$rc"
+( _lo_allow off teams ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 0 && ! -e "$AF" ]] && ! local_only_allows teams && ok_ "TEAMS: deny teams shuts it (file gone)" || bad_ "TEAMS deny" "rc=$rc"
+printf '%s\n' 'tcp ESTAB 0 0 10.0.0.2:40200 198.51.100.20:443 users:(("bun",pid=77,fd=9))' > "$STUB_SS"
+( _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 1 ]] && grep -q '^LEAK  outside connections seen: 1' "$TMPD/t.out" \
+  && ok_ "TEAMS: shut → the teams plugin going out is a LEAK again" || bad_ "TEAMS shut watch" "rc=$rc"
+( local_only_gate agent teams connect x ) >/dev/null 2>&1 && bad_ "TEAMS shut connect" "passed" || ok_ "TEAMS: shut → agent teams connect refused again"
+( _lo_allow on teams; _lo_off ) >/dev/null 2>&1
+[[ ! -e "$AF" ]] && ok_ "TEAMS: local-only off forgets the opening, so the next on starts fully offline" || bad_ "TEAMS off" "allow file left"
+: > "$STUB_SS"
 
 # ── REFRESH ──────────────────────────────────────────────────────────────────
 flag_on

@@ -130,13 +130,17 @@ _lo_usage() {
   printf '%s\n' \
     "usage: sudo 5dive config local-only on [--ntp=<office time server>] [--no-chat]" \
     "       sudo 5dive config local-only off" \
+    "       sudo 5dive config local-only allow|deny teams   # your IT opens Microsoft Teams alone" \
     "            5dive config local-only status" \
     "            5dive config local-only check [--watch=<seconds>]   # default 60; 0 = no watch" \
     "" \
     "Local-only mode: nothing on this box connects outside your network. It refuses" \
     "Telegram, a2a, cloud AI models, updates and installs from the internet, and turns" \
     "off the system's own background calls (updates, crash reports, time sync)." \
-    "AI models must run on your network: agent create --base-url=http://<lan-ip>:<port>/…"
+    "AI models must run on your network: agent create --base-url=http://<lan-ip>:<port>/…" \
+    "" \
+    "allow teams: the one outside service your IT may open. Only Teams messages go out," \
+    "to Microsoft; everything above stays refused. deny teams shuts it again."
 }
 
 cmd_local_only() {
@@ -146,8 +150,10 @@ cmd_local_only() {
     off)    _lo_off "$@" ;;
     status) _lo_check --watch=0 --status "$@" ;;
     check)  _lo_check "$@" ;;
+    allow)  _lo_allow on "$@" ;;    # DIVE-7658
+    deny)   _lo_allow off "$@" ;;
     -h|--help|help) _lo_usage ;;
-    *) fail "$E_USAGE" "unknown local-only verb '$verb' (on, off, status or check)" ;;
+    *) fail "$E_USAGE" "unknown local-only verb '$verb' (on, off, status, check, allow or deny)" ;;
   esac
 }
 
@@ -286,6 +292,36 @@ _lo_on() {
 # harness run it under FIVE_LOCAL_ONLY_ROOT with _lc_serve stubbed.
 _lo_chat_enabled() { [[ -z "$(_lo_root)" || "${FIVE_LOCAL_ONLY_CHAT:-}" == 1 ]]; }
 
+# ── DIVE-7658: `allow|deny teams` — the firm's IT opens Microsoft Teams alone ──
+# The box stays local-only: every other refusal holds. The teams plugin reads
+# the same file at connect and on every message, so `deny` shuts it at once
+# (the next message is refused, no reply goes out) without a restart.
+_lo_allow() {   # on|off <name>
+  local want="$1"; shift
+  local name="${1:-}"
+  [[ -n "$name" && $# -eq 1 ]] || fail "$E_USAGE" "usage: sudo 5dive config local-only allow|deny teams"
+  [[ " ${LO_ALLOWABLE[*]} " == *" $name "* ]] \
+    || fail "$E_VALIDATION" "only Microsoft Teams can be opened on a local-only box (got '${name:0:40}'): sudo 5dive config local-only allow teams"
+  require_root
+  local f; f=$(local_only_allow_file)
+  if [[ "$want" == on ]]; then
+    local_only_on || fail "$E_CONFLICT" "local-only mode is off, so Teams is not blocked here. Nothing changed."
+    mkdir -p "$(dirname "$f")" || fail "$E_GENERIC" "could not create $(dirname "$f")"
+    grep -qxF -- "$name" "$f" 2>/dev/null || printf '%s\n' "$name" >> "$f" || fail "$E_GENERIC" "could not write $f"
+    chmod 0644 "$f" 2>/dev/null || true
+    printf '%s\n' "Microsoft Teams is OPEN on this local-only box. Only Teams messages go out, to Microsoft; everything else stays offline." \
+      "Connect an agent: sudo 5dive agent teams connect <agent> --app-id=<id> --tenant-id=<id> --endpoint=https://<address your IT publishes>" \
+      "Shut it again: sudo 5dive config local-only deny teams"
+  else
+    if [[ -f "$f" ]]; then
+      local rest; rest=$(grep -vxF -- "$name" "$f" || true)
+      if [[ -n "$rest" ]]; then printf '%s\n' "$rest" > "$f"; else rm -f -- "$f"; fi
+    fi
+    printf '%s\n' "Microsoft Teams is SHUT. Agents refuse Teams messages from now on and send none."
+  fi
+  return 0
+}
+
 _lo_off() {
   (( $# == 0 )) || fail "$E_USAGE" "local-only off takes no flags"
   require_root
@@ -319,6 +355,7 @@ _lo_off() {
   _lo_have systemctl && systemctl daemon-reload >/dev/null 2>&1 || true
   _lo_have systemctl && [[ -z "$(_lo_root)" ]] && systemctl try-restart systemd-timesyncd >/dev/null 2>&1 || true
   rm -f -- "$flag"
+  rm -f -- "$(local_only_allow_file)"   # DIVE-7658: the next `on` starts fully offline
   printf '%s\n' "Local-only mode is OFF. Everything it turned off is back as it was." \
     "Restart your agents once so they pick it up: sudo systemctl restart '5dive-agent@*'"
   (( chat_kept )) && printf '%s\n' "The office chat is still on, reachable from your network only. Stop it: sudo 5dive local serve --stop"
@@ -326,6 +363,22 @@ _lo_off() {
 }
 
 # One line per item: "ok    <item>  <state>" or "LEAK  <item>  <state>".
+# DIVE-7658: `_lo_proc_is_teams <ss process field>` — 0 when every pid in it is
+# a teams plugin server (its working directory is the plugin, named teams).
+# /proc is read under FIVE_LOCAL_ONLY_ROOT (the harness's seam); the link's
+# target is taken as it is.
+_lo_proc_is_teams() {
+  local field="$1" pid cwd n=0
+  [[ "$field" == *pid=* ]] || return 1
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    cwd=$(readlink "$(_lo_root)/proc/$pid/cwd" 2>/dev/null) || return 1
+    [[ -f "$cwd/server.ts" ]] && grep -qE '"name"[[:space:]]*:[[:space:]]*"teams"' "$cwd/.claude-plugin/plugin.json" 2>/dev/null || return 1
+    n=$((n + 1))
+  done < <(grep -oE 'pid=[0-9]+' <<<"$field" | cut -d= -f2)
+  (( n > 0 ))
+}
+
 _lo_line() { printf '%-5s %-34s  %s\n' "$1" "$2" "$3"; }   # DIVE-7579 (m2): two spaces always (the panel splits on them)
 
 _lo_check() {
@@ -341,6 +394,9 @@ _lo_check() {
   local bad=0 u st
   if local_only_on; then _lo_line ok "local-only switch" on
   else _lo_line LEAK "local-only switch" off; bad=1; fi
+  # DIVE-7658: the one service the firm's IT may open. Not a LEAK: it was asked for.
+  if local_only_allows teams; then _lo_line ok "Microsoft Teams" "open (your IT allowed it)"
+  else _lo_line ok "Microsoft Teams" shut; fi
   if [[ -f "$(_lo_dropin)" ]]; then _lo_line ok "agent runtime background calls" off
   else _lo_line LEAK "agent runtime background calls" on; bad=1; fi
   # DIVE-7573 (D3): a seat that still names a GitHub marketplace looks it up at
@@ -389,7 +445,8 @@ _lo_check() {
   if (( watch > 0 )); then
     _lo_have ss || fail "$E_NOT_INSTALLED" "check needs 'ss' (iproute2) to watch connections"
     printf '\nWatching connections for %ss (anything that is not this box or your network counts)...\n' "$watch"
-    local -A seen=()
+    local -A seen=() teams_seen=()
+    local teams_open=0; local_only_allows teams && teams_open=1
     local i line peer host proc tick="${FIVE_LOCAL_ONLY_TICK:-1}"
     for (( i = 0; i < watch; i++ )); do
       while IFS= read -r line; do
@@ -399,10 +456,16 @@ _lo_check() {
         host="${peer%:*}"; host="${host#[}"; host="${host%]}"; host="${host%%%*}"
         [[ -n "$host" && "$host" != "*" ]] || continue
         _lo_host_is_local "$host" && continue
+        # DIVE-7658: with Teams open, the teams plugin's own connections are
+        # the allowed ones (it sends only to Microsoft's hosts, plugin hosts.ts).
+        if (( teams_open )) && _lo_proc_is_teams "${proc:-}"; then
+          teams_seen["$peer"]=1; continue
+        fi
         seen["$peer ${proc:-}"]=1
       done < <(ss -tunpH 2>/dev/null)
       (( tick > 0 )) && sleep "$tick"
     done
+    (( ${#teams_seen[@]} )) && printf 'ok    Microsoft Teams (your IT allowed it): %s connection(s)\n' "${#teams_seen[@]}"
     if (( ${#seen[@]} )); then
       printf 'LEAK  outside connections seen: %s\n' "${#seen[@]}"
       printf '      %s\n' "${!seen[@]}" | sort

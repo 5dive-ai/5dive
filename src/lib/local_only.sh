@@ -18,6 +18,16 @@
 local_only_file() { printf '%s' "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}"; }
 local_only_on()   { [[ -e "$(local_only_file)" ]]; }
 
+# DIVE-7658: the firm's IT may open ONE outside service on a local-only box,
+# Microsoft Teams (lodar 2026-11-04: "fully offline, but possible to add ms
+# teams if they want"). /etc/5dive/local-only.allow lists what is open, one name
+# a line; `teams` is the only name it knows. Absent = fully offline. Written by
+# `sudo 5dive config local-only allow|deny teams`; read here, by the teams
+# plugin's connect and by its server at start.
+LO_ALLOWABLE=(teams)
+local_only_allow_file() { printf '%s' "${FIVE_LOCAL_ONLY_ALLOW_FILE:-$(dirname "$(local_only_file)")/local-only.allow}"; }
+local_only_allows() { [[ -f "$(local_only_allow_file)" ]] && grep -qxF -- "$1" "$(local_only_allow_file)"; }
+
 # DIVE-7573 (D2): the env that keeps Claude Code from dialing out on its own
 # (telemetry, error reports, feature flags, auto-update). The local-only drop-in
 # gives it to every seat's systemd unit; every OTHER Claude Code run 5dive makes
@@ -333,7 +343,10 @@ _lo_channels_outside() {   # <csv> → 0 when it names a channel that dials out
   local c
   IFS=',' read -r -a _lo_cs <<<"$1"
   for c in "${_lo_cs[@]}"; do
-    case "$c" in telegram|discord|buzz) return 0 ;; esac
+    case "$c" in
+      telegram|discord|buzz) return 0 ;;
+      teams) local_only_allows teams || return 0 ;;   # DIVE-7658: unless IT opened it
+    esac
   done
   return 1
 }
@@ -345,7 +358,7 @@ _lo_channel_flags_ok() {
   for a in "$@"; do
     case "$a" in
       --telegram-*|--discord-token=*) local_only_refuse "Telegram and Discord" ;;
-      --channels=*) _lo_channels_outside "${a#--channels=}" && local_only_refuse "Telegram, Discord and Buzz" ;;
+      --channels=*) _lo_channels_outside "${a#--channels=}" && local_only_refuse "Telegram, Discord, Buzz and Microsoft Teams" ;;
     esac
   done
   return 0
@@ -437,6 +450,10 @@ local_only_gate() {
         _tg_connect_greet|_telegram_open|telegram-*|team-bot|team-group|pair|topic|cos)
                     local_only_refuse "Telegram" ;;
         buzz)       [[ "${1:-}" == enable || "${2:-}" == enable ]] && local_only_refuse "Buzz" ;;
+        # DIVE-7658: Teams messages go through Microsoft's cloud, so it stays
+        # shut until the firm's IT opens it: config local-only allow teams.
+        teams)      [[ "${1:-}" == connect || "${2:-}" == connect ]] && ! local_only_allows teams \
+                      && local_only_refuse "Microsoft Teams (it goes through Microsoft's cloud; your IT can open it alone: sudo 5dive config local-only allow teams)" ;;
         install)    local_only_refuse "Installing an agent program from the internet" ;;
         pack-sync)  local_only_refuse "Updating agent packs from the internet" ;;
         switch)     local_only_refuse "Switching an agent to another AI service" ;;
@@ -479,7 +496,7 @@ local_only_gate() {
           for a in "${@:3}"; do
             case "$a" in
               telegram.*|discord.*) local_only_refuse "Telegram and Discord" ;;
-              channels=*) _lo_channels_outside "${a#channels=}" && local_only_refuse "Telegram, Discord and Buzz" ;;
+              channels=*) _lo_channels_outside "${a#channels=}" && local_only_refuse "Telegram, Discord, Buzz and Microsoft Teams" ;;
             esac
           done ;;
         auth)
