@@ -214,7 +214,7 @@ grep -qE '^ *"\$BIN" gateway run </dev/null' "$AS" && ! grep -qE '"\$BIN" gatewa
 
 _wc() { bash -c "source <(sed -n '/^cell_type()/p;/^cell_has_webchat()/p' $SM); cell_has_webchat $1 && echo yes || echo no"; }
 eq_t "smoke: openclaw still grades its web chat" "yes" "$(_wc openclaw)"
-eq_t "smoke: hermes web chat is not graded while the app has it off" "no no" "$(_wc hermes-standard) $(_wc hermes-sandboxed)"
-grep -q 'webchat: not graded on hermes' "$SM" && ok_t "smoke: a hermes cell says its web chat was not graded" || bad_t "smoke: a hermes cell drops the web chat silently"
+eq_t "smoke: hermes grades its web chat (DIVE-7833)" "yes yes" "$(_wc hermes-standard) $(_wc hermes-sandboxed)"
+grep -q 'hermes_webchat_why "$home"' "$SM" && ok_t "smoke: a hermes web chat red shows the gateway wiring" || bad_t "smoke: a hermes web chat red hides why"
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))
