@@ -368,15 +368,22 @@ _pack_stage_skill_bodies() {   # _pack_stage_skill_bodies <skills-dir> <stage>
 # runs LAST, after everything is staged. No persona, no `persona` key: openagent
 # then refuses the file by name rather than guessing an identity.
 _pack_bundle_manifest() {   # _pack_bundle_manifest <stage> <has-persona:true|false>
-  local stage="$1" has_persona="$2" files f
-  files=$(cd "$stage" && find . -type f ! -path ./manifest.json -print0 | sort -z \
+  local stage="$1" has_persona="$2" f fm
+  # DIVE-7806: the checksum map goes to jq as a FILE, never an argument. A
+  # memory pack of a long-lived seat lists thousands of facts, and one argv
+  # string over 128 KB is "Argument list too long" (measured: a 2.8k-fact seat).
+  # Outside the stage, or the map would checksum itself.
+  fm=$(mktemp) || return 1
+  (cd "$stage" && find . -type f ! -path ./manifest.json -print0 | sort -z \
     | while IFS= read -r -d '' f; do printf '%s\t%s\n' "${f#./}" "$(sha256sum <"$f" | cut -d' ' -f1)"; done \
-    | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}') || return 1
+    | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}') > "$fm" \
+    || { rm -f "$fm"; return 1; }
   jq --argjson bv "$OPENAGENT_BUNDLE_VERSION" --arg oa "$OPENAGENT_BUNDLE_SPEC" \
-     --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson hp "$has_persona" --argjson files "$files" \
+     --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson hp "$has_persona" --slurpfile files "$fm" \
      '. + {bundle_version: $bv, openagent: $oa, source_harness: "5dive", created_at: $at}
-        + (if $hp then {persona: "persona.yaml"} else {} end) + {files: $files}' \
-     "$stage/manifest.json" > "$stage/manifest.json.$$" || { rm -f "$stage/manifest.json.$$"; return 1; }
+        + (if $hp then {persona: "persona.yaml"} else {} end) + {files: $files[0]}' \
+     "$stage/manifest.json" > "$stage/manifest.json.$$" || { rm -f "$stage/manifest.json.$$" "$fm"; return 1; }
+  rm -f "$fm"
   mv "$stage/manifest.json.$$" "$stage/manifest.json"
 }
 

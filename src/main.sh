@@ -424,7 +424,7 @@ Hire, publish, install (any agent, no sudo — DIVE-5396):
   5dive hire-link <slug> [--json]                    # the one-tap hire link a standard-tier agent sends its human (admin: agent import)
   5dive hire-link --create --name=<N> --description=<need>  # make a custom agent for a need no catalogue agent fits; prints its draft + card
   5dive hire-link custom-<id> --hire                 # admin-tier, on the owner's yes: hire that made agent onto this box
-  5dive agent share <name> | --list                  # root: a public link to <name> anyone can add to their own 5dive (DIVE-7782)
+  5dive agent share <name> [--with-memory] | --list  # root: a public link to <name> anyone can add to their own 5dive (DIVE-7782); --with-memory brings what it learned (DIVE-7806)
   5dive agent unshare <name|link>                    # root: that link stops working
   5dive config public-address=<https://name>|clear   # root, self-hosted: the address share links use (checked on set)
   5dive route add <name>|/<name> --port=<port>       # publish an app you run on 127.0.0.1:<port>; route rm|ls

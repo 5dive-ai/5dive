@@ -1,13 +1,24 @@
 # ── DIVE-7782: share links — any agent becomes a public link ────────────────
 #
 #   5dive agent share <name>              root: print the agent's public link
+#   5dive agent share <name> --with-memory   ...and it brings what it learned
 #   5dive agent share --list              every live share on this box
 #   5dive agent unshare <name|link|id>    root: the link stops working
 #   5dive config public-address=<https://name>|clear   root: a self-hosted box's address
 #
 # A share is a RECIPE, not a clone: the agent's name, portrait, instructions,
 # skills and first-party plugins, exported for the PUBLISH audience. Never its
-# logins, files, keys, memory, hooks (custom scripts) or channels.
+# logins, files, keys, hooks (custom scripts) or channels, and its memory only
+# when the owner opts in.
+#
+# MEMORY IS OPT-IN (DIVE-7806, lodar 2026-11-06: "opt-in memory with the privacy
+# scan"). Memory holds customers, names and addresses, so a default share
+# carries none. `--with-memory` carries the same distilled set a published
+# `agent export` does: only 'reference' and 'project' facts (what the agent
+# learned), never 'user' or 'feedback' (notes about its people), never a fact
+# marked private. Those facts then go through the SAME scan as everything else
+# below (_share_scan, over the whole stage, memory/ included): one hit refuses
+# the whole share and names memory/<file>:<line>. Nothing is trimmed.
 #
 # WHERE IT IS SERVED (lodar 2026-11-05: "it goes to the user own url"): from the
 # sharing box itself, on the https front the box already has for secret links
@@ -84,8 +95,9 @@ _share_sanitize_stage() {
 }
 
 # The leak scan over EVERYTHING the page will serve except the manifest we
-# just wrote ourselves: instructions, persona, every skill body and any other
-# file the export staged (DIVE-7782 iteration 2: skill bodies travel in
+# just wrote ourselves: instructions, persona, every skill body, the memory
+# facts of a --with-memory share (memory/*.md) and any other file the export
+# staged (DIVE-7782 iteration 2: skill bodies travel in
 # pack.tar.gz, so a scan of CLAUDE.md alone published them unread). Hits on
 # stderr as "<path>:<line>: <category>: <match>", path relative to the stage
 # (skills/research/SKILL.md:3: ...). rc 1 = refuse.
@@ -106,11 +118,37 @@ _share_scan() {
   return 1
 }
 
+# The facts a share carries: memory/*.md minus the index. <stage>
+_share_memory_count() {
+  [[ -d "$1/memory" ]] || { echo 0; return 0; }
+  find "$1/memory" -maxdepth 1 -type f -name '*.md' ! -name MEMORY.md 2>/dev/null | wc -l
+}
+
+# The seat's shareable facts, distilled into <out>: the publish set of `agent
+# export` ('reference'/'project' only, private ones out; a codex store is
+# converted to atoms first). Echoes "<kept> <left out>"; rc 1 = no store.
+_share_memory_distill() {   # <name> <out>
+  local name="$1" out="$2" memdir src tmp="" counts
+  memdir=$(_pack_memory_dir "$name" 2>/dev/null) || memdir=""
+  [[ -n "$memdir" && -d "$memdir" ]] || return 1
+  src="$memdir"
+  if [[ "$(_pack_memory_kind "$name" 2>/dev/null)" == "codex" ]]; then
+    tmp=$(mktemp -d) || return 1
+    _pack_codex_to_atoms "$memdir" "$tmp" knowledge >/dev/null || { rm -rf "$tmp"; return 1; }
+    src="$tmp"
+  fi
+  counts=$(_pack_scope_memory "$src" "$out") || { [[ -n "$tmp" ]] && rm -rf "$tmp"; return 1; }
+  [[ -n "$tmp" ]] && rm -rf "$tmp"
+  printf '%s\n' "$counts"
+}
+
 # Write index.html for a share from its stage. <stage> <out> <page url> <has avatar 0|1>
 _share_render_page() {
-  SHARE_STAGE="$1" SHARE_OUT="$2" SHARE_URL="$3" SHARE_AVATAR="$4" SHARE_ADD="$SHARE_APP_ADD_URL" python3 - <<'PY'
+  SHARE_STAGE="$1" SHARE_OUT="$2" SHARE_URL="$3" SHARE_AVATAR="$4" SHARE_ADD="$SHARE_APP_ADD_URL" \
+    SHARE_MEM="$(_share_memory_count "$1")" python3 - <<'PY'
 import html, json, os, re, urllib.parse
 stage, out, url, has_av = os.environ["SHARE_STAGE"], os.environ["SHARE_OUT"], os.environ["SHARE_URL"], os.environ["SHARE_AVATAR"] == "1"
+mem = int(os.environ.get("SHARE_MEM") or 0)
 m = json.load(open(os.path.join(stage, "manifest.json")))
 persona = {}
 try:
@@ -139,6 +177,14 @@ av = ("<img class=av src='avatar.png' alt='' width=96 height=96>" if has_av
 brings = ""
 if skills: brings += "<h2>Skills</h2><ul class=chips>%s</ul>" % chips(skills)
 if plugins: brings += "<h2>Tools</h2><ul class=chips>%s</ul>" % chips(plugins)
+# DIVE-7806: say plainly whether it comes with what it learned.
+if mem:
+    brings += ("<h2>Memory</h2><p class=stay>Comes with what it learned: %d %s.</p>"
+               % (mem, "note" if mem == 1 else "notes"))
+    stays = "Logins, files, keys and its private notes about people. You connect your own."
+else:
+    brings += "<h2>Memory</h2><p class=stay>Starts fresh: it comes without its memory.</p>"
+    stays = "Logins, files, keys and private memory. You connect your own."
 CSS = ("*{box-sizing:border-box}body{font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#f6f6f4;color:#1b1b1a}"
        "main{max-width:30rem;margin:0 auto;padding:2rem 1rem 3rem}"
        ".top{text-align:center}.av{width:96px;height:96px;border-radius:50%;object-fit:cover;display:block;margin:0 auto .75rem}"
@@ -155,10 +201,10 @@ CSS = ("*{box-sizing:border-box}body{font:16px/1.5 system-ui,-apple-system,Segoe
        ".badge{background:#3a3220;color:#f3d98b}small,h2{color:#aaa}}")
 body = ("<div class=top>%s<h1>%s</h1>%s<span class=badge>Community-made</span></div>"
         "<a class=add href='%s'>Add %s to my 5dive</a>%s"
-        "<h2>Stays behind</h2><p class=stay>Logins, files, keys and private memory. You connect your own.</p>"
+        "<h2>Stays behind</h2><p class=stay>%s</p>"
         "<small>Shared from someone's own 5dive server. Look it over before you add it. "
         "Already on 5dive? Tell your lead agent: add the agent at %s</small>"
-        % (av, E(name), ("<p class=job>%s</p>" % E(job)) if job else "", E(add), E(name), brings, E(url)))
+        % (av, E(name), ("<p class=job>%s</p>" % E(job)) if job else "", E(add), E(name), brings, E(stays), E(url)))
 title = "%s — a 5dive agent" % name
 desc = job or "An AI agent you can add to your own 5dive."
 doc = ("<!doctype html><html lang=en><head><meta charset=utf-8>"
@@ -225,20 +271,24 @@ _share_list() {
 }
 
 cmd_agent_share() {
-  local name="" a
+  local name="" a with_memory=0
   for a in "$@"; do
     case "$a" in
       --json) JSON_MODE=1 ;;
+      --with-memory) with_memory=1 ;;
       --list) _share_list; return 0 ;;
       _serve) require_root agent share; _share_serve; return $? ;;
       -h|--help) printf '%s\n' \
         "usage: 5dive agent share <name>     # print <name>'s public link" \
+        "       5dive agent share <name> --with-memory   # it brings what it learned" \
         "       5dive agent share --list     # every live share on this box" \
         "       5dive agent unshare <name|link>" \
         "" \
         "  The link opens a page on this box: name, portrait, job, skills, and an" \
-        "  Add button. A share is a recipe: never logins, files, keys, memory or" \
-        "  custom scripts. A copy someone adds starts at standard isolation." \
+        "  Add button. A share is a recipe: never logins, files, keys or custom" \
+        "  scripts. Memory only with --with-memory: what it learned, never its notes" \
+        "  about people, and refused whole if one line names a path, host or person." \
+        "  A copy someone adds starts at standard isolation." \
         "  Sharing again refreshes the page and keeps the same link." \
         "  A self-hosted box needs its public address first:" \
         "    sudo 5dive config public-address=https://<your name>"
@@ -254,10 +304,28 @@ cmd_agent_share() {
   local base; base=$(_share_base_url) || fail "$E_CONFLICT" "$(_share_no_address_msg)"
 
   local work; work=$(mktemp -d) || fail "$E_GENERIC" "no temp dir"
+  # DIVE-7806: --with-memory distils the seat's facts and seals them into the
+  # export (its seal re-applies the same type filter and the secret tripwire).
+  # The export is told audience=self ONLY to move its operational-detail check
+  # here: _share_scan below runs that same check over the whole stage, memory/
+  # included, and names memory/<file>:<line> the way the page will serve it.
+  # A refusal from it is a refusal of the share, as for every other file.
+  local exp_args=(--audience=publish) mem_kept=0 mem_left=0
+  if (( with_memory )); then
+    local counts
+    if counts=$(_share_memory_distill "$name" "$work/memory"); then
+      mem_kept="${counts%% *}"; mem_left="${counts##* }"
+    fi
+    if (( mem_kept > 0 )); then
+      exp_args=(--audience=self "--approve-memory=$work/memory")
+    else
+      warn "share: '$name' has nothing it learned to share yet (0 knowledge notes; $mem_left private ones stay here). Sharing it without memory."
+    fi
+  fi
   # The export runs in a subshell: its refusals `fail` (exit) and must come back
   # here as a reason, not end this command without one.
   local err=""
-  if ! err=$( (JSON_MODE=0; cmd_export "$name" --audience=publish -o "$work/pack.tar.gz") 2>&1 >/dev/null ); then
+  if ! err=$( (JSON_MODE=0; cmd_export "$name" "${exp_args[@]}" -o "$work/pack.tar.gz") 2>&1 >/dev/null ); then
     rm -rf "$work"
     fail "$E_GENERIC" "could not share '$name': the export refused it: $(printf '%s' "$err" | grep -v '^==>' | tail -3 | tr '\n' ' ')"
   fi
@@ -268,8 +336,9 @@ cmd_agent_share() {
   if ! hits=$(_share_scan "$work/stage" "$name" 2>&1); then
     rm -rf "$work"
     [[ -n "$hits" ]] && printf '%s\n' "$hits" >&2
-    fail "$E_VALIDATION" "not shared: '$name's instructions or skills carry private detail a public link must not (each line above: file:line: kind: what). Rewrite those lines without the path, name, id or host, then share again. Nothing was published."
+    fail "$E_VALIDATION" "not shared: '$name's instructions, skills or memory carry private detail a public link must not (each line above: file:line: kind: what). Rewrite those lines without the path, name, id or host, then share again. Nothing was published."
   fi
+  local mem_n; mem_n=$(_share_memory_count "$work/stage")
 
   local dir id
   if dir=$(_share_dir_of_agent "$name"); then id="${dir##*/}"
@@ -286,8 +355,8 @@ cmd_agent_share() {
   fi
   _share_render_page "$work/stage" "$new/index.html" "$url" "$has_av" \
     || { rm -rf "$work" "$new"; fail "$E_GENERIC" "could not render the share page"; }
-  jq -n --arg id "$id" --arg a "$name" --arg u "$url" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    '{id:$id, agent:$a, url:$u, shared_at:$at}' > "$new/share.json"
+  jq -n --arg id "$id" --arg a "$name" --arg u "$url" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson m "$mem_n" \
+    '{id:$id, agent:$a, url:$u, shared_at:$at, memory:$m}' > "$new/share.json"
   rm -rf "$work"
   mkdir -p "$SHARE_DIR"; chmod 755 "$new"; chmod 644 "$new"/*
   rm -rf "${dir:?}.old"; [[ -d "$dir" ]] && mv "$dir" "$dir.old"
@@ -298,10 +367,12 @@ cmd_agent_share() {
   local served=false
   [[ "$serving" == true ]] && curl -fsS --max-time 3 -o /dev/null "http://127.0.0.1:${SECRET_DROP_PORT}/a/${id}" 2>/dev/null && served=true
   [[ "$served" == true ]] || warn "share: the page is not answering on this box yet; the link opens once it does ($SHARE_BOOT_UNIT starts it at boot)"
+  local stays="logins, files, keys and memory stay here"
+  (( mem_n > 0 )) && stays="it brings $mem_n note(s) of what it learned; logins, files, keys and its notes about people stay here"
   ok "share link for '$name': $url
-   Anyone who opens it can add a copy of '$name' to their own 5dive (logins, files, keys and memory stay here).
+   Anyone who opens it can add a copy of '$name' to their own 5dive ($stays).
    Stop it any time: sudo 5dive agent unshare $name" \
-    '{agent:$a, url:$u, id:$id, serving:$s}' --arg a "$name" --arg u "$url" --arg id "$id" --argjson s "$served"
+    '{agent:$a, url:$u, id:$id, serving:$s, memory:$m}' --arg a "$name" --arg u "$url" --arg id "$id" --argjson s "$served" --argjson m "$mem_n"
 }
 
 cmd_agent_unshare() {
