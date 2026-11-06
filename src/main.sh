@@ -227,6 +227,8 @@ Agents:
                                                      # handle instead of numeric id.
   5dive agent <name> tui                             # attach to an interactive agent tmux session (dispatcher-only seats explain the alternative)
   5dive agent logs <name> [--follow] [--lines=N] [--tmux]
+  5dive agent logs <name> --screen                   # one frame of the agent's own window, with colours (root).
+                                                     # A capture, never an attach: the agent's size never changes.
   5dive agent peek <name> [--lines=N]                # a TEAMMATE's live pane (default 80 lines, max 500); works
                                                      # from a standard seat: a team you share, or one manages the other.
   5dive agent send <name> --message-file=<path>|--message-file=-|--message=<text>|<text...>
@@ -312,7 +314,7 @@ Agents:
                                                      # move an agent between Claude Code, Codex and Grok IN PLACE: same name,
                                                      # unix user, bot, tasks and grants; memory + instructions converted,
                                                      # the old side's files kept so switching back is instant (DIVE-5501).
-                                                     # To Grok needs Grok turned on (5dive grok enable) (DIVE-7414)
+                                                     # To Grok is refused after 5dive grok disable (DIVE-7414)
 
 Default workdir: ${DEFAULT_WORKDIR}
 
@@ -423,6 +425,9 @@ Hire, publish, install (any agent, no sudo — DIVE-5396):
   5dive hire-link <slug> [--json]                    # the one-tap hire link a standard-tier agent sends its human (admin: agent import)
   5dive hire-link --create --name=<N> --description=<need>  # make a custom agent for a need no catalogue agent fits; prints its draft + card
   5dive hire-link custom-<id> --hire                 # admin-tier, on the owner's yes: hire that made agent onto this box
+  5dive agent share <name> [--with-memory] | --list  # root: a public link to <name> anyone can add to their own 5dive (DIVE-7782); --with-memory brings what it learned (DIVE-7806)
+  5dive agent unshare <name|link>                    # root: that link stops working
+  5dive config public-address=<https://name>|clear   # root, self-hosted: the address share links use (checked on set)
   5dive route add <name>|/<name> --port=<port>       # publish an app you run on 127.0.0.1:<port>; route rm|ls
   5dive pkg install <package>...                     # a system package from the box's apt repositories (install only)
 
@@ -596,9 +601,8 @@ Health:
     --note tells Claude Code seats when to use it (DIVE-6143).
 
   5dive grok enable | disable | status
-    Let this server make Grok agents (DIVE-7066). enable shows one warning
-    and asks the owner to confirm at a terminal; disable stops new Grok
-    agents (existing ones keep running).
+    Grok agents are on by default (DIVE-7802). disable stops new Grok
+    agents here (existing ones keep running); enable undoes it.
 
   5dive doctor [--fix] [--dry-run] [--caps] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|mod|policy|plugins|caps|models]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
@@ -809,6 +813,13 @@ _agent_verb_dispatch() {
         clone)
           AUDIT_CMD="agent clone"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_clone "$@" ;;
+        share)
+          # DIVE-7782: a public link to this agent's recipe, served by this box.
+          [[ "${1:-}" == --list ]] || { AUDIT_CMD="agent share"; AUDIT_ARGS=("$@"); }
+          cmd_agent_share "$@" ;;
+        unshare)
+          AUDIT_CMD="agent unshare"; AUDIT_ARGS=("$@")
+          cmd_agent_unshare "$@" ;;
         export)
           # DIVE-39: write a portable pack (read-only on the source agent).
           AUDIT_CMD="agent export"; AUDIT_ARGS=("$@")
@@ -1336,15 +1347,14 @@ main() {
       # caller input (upholds the write_admin_sudoers invariant), never advertised,
       # and is not itself audited (AUDIT_CMD stays unset, so no recursion).
       [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "_audit_append is a privileged internal primitive"
-      audit_init 2>/dev/null || true
-      local _al
-      IFS= read -r _al || true
-      [[ -n "$_al" ]] || exit 0
-      printf '%s\n' "$_al" \
-        | jq -c --arg u "${SUDO_USER:-unknown}" \
-            'if type=="object" then .user=$u else empty end' \
-        >> "$AUDIT_LOG" 2>/dev/null || true
-      exit 0
+      # DIVE-7765: the primitive takes NO argument. A standard seat's grant is
+      # the exact no-argument command, and sudoers matches arguments exactly, so
+      # a sink named in argv is refused before it gets here (quinn, iteration 1).
+      # The one other sink -- the gate tap ledger -- is named on STDIN instead:
+      # see _audit_append_stdin (src/lib/audit.sh).
+      [[ $# -eq 0 ]] || fail "$E_USAGE" "_audit_append takes no arguments (one NDJSON line on stdin)"
+      _audit_append_stdin
+      exit $?
       ;;
     plugin|plugins)
       # DIVE-4020: the plugin lifecycle verb. Until this existed there was no
@@ -1409,6 +1419,9 @@ main() {
       if [[ "${1:-}" == local-only ]]; then
         # DIVE-7557: `5dive config local-only on|off|status|check`.
         shift; cmd_local_only "$@"
+      elif [[ "${1:-}" == public-address=* && $# -eq 1 ]]; then
+        # DIVE-7782: a self-hosted box's public address, for share links.
+        cmd_public_address "${1#public-address=}"
       else
         cmd_box_config "$@"
       fi ;;
@@ -1449,9 +1462,9 @@ main() {
       AUDIT_CMD="machine"; AUDIT_ARGS=("$@")
       cmd_machine "$@" ;;
     grok)
-      # DIVE-7066: the server owner's own Grok opt-in (src/cmd_grok.sh). enable/
-      # disable write or remove the root-owned arm marker, so cmd_grok checks
-      # root itself; status is a read. Audited: who turned Grok on or off.
+      # DIVE-7066/7802: the server owner's own Grok off switch (src/cmd_grok.sh).
+      # disable/enable write or remove the root-owned off marker, so cmd_grok
+      # checks root itself; status is a read. Audited: who turned Grok on or off.
       case "${1:-}" in enable|disable) AUDIT_CMD="grok"; AUDIT_ARGS=("$@") ;; esac
       cmd_grok "$@" ;;
     doctor)

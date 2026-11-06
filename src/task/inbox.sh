@@ -499,7 +499,7 @@ cmd_task_inbox() {
       --login)           login=1 ;;
       # DIVE-7164: the owner's messages from their agents (the last 20).
       --messages)        _owner_inbox_print all; return 0 ;;
-      --channel-proof=*) channel_proof="${1#*=}" ;;
+      --channel-proof=*) _gate_channel_proof_parse "${1#*=}"; channel_proof="$TASK_CP_CHAT" ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  fail "$E_USAGE" "unexpected arg: $1 (inbox takes no positional args)" ;;
     esac
@@ -734,7 +734,7 @@ _task_inbox_send() {
   # proof = an operator/root invocation on the box.
   if [[ -n "$channel_proof" ]]; then
     _gate_channel_proof_ok "$channel_proof" \
-      || fail "$E_AUTH_REQUIRED" "channel-proof did not verify — the chat id is not in this bot's access.json allowFrom (paired-human DMs)"
+      || fail "$E_AUTH_REQUIRED" "channel-proof did not verify — ${TASK_CP_REASON:-unverified}"
   fi
   _task_owner_channel || fail "$E_AUTH_REQUIRED" "no paired owner channel (connector token / access.json missing)"
 
@@ -1126,7 +1126,7 @@ cmd_task_clear_recs() {
   local channel_proof="" only="" from=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --channel-proof=*) channel_proof="${1#*=}" ;;
+      --channel-proof=*) _gate_channel_proof_parse "${1#*=}"; channel_proof="$TASK_CP_CHAT" ;;
       --only=*)          only="${1#*=}" ;;
       --from=*)          from="${1#*=}" ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
@@ -1138,7 +1138,7 @@ cmd_task_clear_recs() {
   # Verify the channel up front so a bad/forged chat id fails once, loudly, before
   # we touch any gate. Same allowFrom check cmd_task_answer re-runs per gate.
   _gate_channel_proof_ok "$channel_proof" \
-    || fail "$E_AUTH_REQUIRED" "channel-proof did not verify — that chat id is not in this bot's access.json allowFrom"
+    || fail "$E_AUTH_REQUIRED" "channel-proof did not verify — ${TASK_CP_REASON:-unverified}"
 
   # Eligible pending gates: unanswered, blocked, tier<2, has a recommend, not
   # lead-routed. --only narrows to one row (still subject to every filter, so a

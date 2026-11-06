@@ -1037,6 +1037,31 @@ doctor_registry_seat_names() {
   jq -r '.agents | keys[]' <<<"$reg" 2>/dev/null | tr '\n' ' '
 }
 
+# DIVE-7724 — a seat whose ~/.claude is not its own. Every harness keeps the
+# app chat's inbox there (~/.claude/channels/dashboard), so a root-owned one
+# makes the chat adapter crash on its first mkdir and respawn forever; on
+# chill-gorge a Codex seat answered nothing for 14 h and no surface said why.
+# --fix hands the dir itself back to the seat (seat_claude_dir_ensure).
+doctor_check_seat_claude_dir() {   # doctor_check_seat_claude_dir <registry json>
+  local reg="$1" name user d owner bad=() fixed=() left=()
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    user="agent-${name}"; d="${AGENT_HOME_ROOT:-/home}/${user}/.claude"
+    [[ -d "$d" && ! -L "$d" ]] || continue
+    owner=$(stat -c %U "$d" 2>/dev/null) || continue
+    [[ "$owner" == "$user" ]] && continue
+    bad+=("${name}(${owner})")
+    if (( DOCTOR_REPAIR )) && seat_claude_dir_ensure "$user"; then fixed+=("$name"); else left+=("$name"); fi
+  done < <(jq -r '.agents // {} | keys[]' <<<"$reg" 2>/dev/null)
+  if (( ${#bad[@]} == 0 )); then
+    doctor_add registry seat-claude-dir ok "every seat owns its ~/.claude"
+  elif (( DOCTOR_REPAIR )) && (( ${#left[@]} == 0 )); then
+    doctor_add registry seat-claude-dir ok "gave ${#fixed[@]} seat(s) back their ~/.claude: ${fixed[*]}; restart them so the app chat starts" true true
+  else
+    doctor_add registry seat-claude-dir error "${#bad[@]} seat(s) do not own their ~/.claude, so their app chat cannot start: ${bad[*]}. Fix: sudo 5dive doctor --fix" true false
+  fi
+}
+
 # DIVE-6382 — a seat the registry says is parked (desiredState=stopped) while
 # its unit is active. The pending-restart sweep HOLDS every owed restart for
 # such a seat (DIVE-4033) and says so only in the heartbeat log, and with the
@@ -2164,6 +2189,7 @@ cmd_doctor() {
       # have a registry entry?", which is the direction the orphans were in.
       doctor_check_orphan_seats "$want_fix"
       doctor_check_parked_running "$reg"
+      doctor_check_seat_claude_dir "$reg"
     fi
   fi
 
@@ -2252,6 +2278,11 @@ cmd_doctor() {
           doctor_add channels "binding-${_dc_name}" ok \
             "${_dc_name}: channels BOUND — ${_dc_detail}${_dc_ev:+ (${_dc_ev})}" ;;
         n/a) : ;;
+        unknown)
+          # DIVE-7749: this caller cannot read the record. Not a fault of the
+          # seat, and a restart would not change it.
+          doctor_add channels "binding-${_dc_name}" warn \
+            "${_dc_name}: channel binding unknown — ${_dc_detail}" false false ;;
         absent)
           # The bridge was expected and wrote nothing. Not an error on its own —
           # a seat that has never been started since the bridge shipped reads

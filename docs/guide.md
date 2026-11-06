@@ -597,6 +597,42 @@ MIT. See [LICENSE](../LICENSE).
 
 ## Local-only mode: nothing leaves your network
 
+**Quick start** (your AI server already running on the office network):
+
+```sh
+sudo 5dive account add office-ai --provider=custom --base-url=http://<lan-ip>:11434 --model=<model> --harness=claude
+sudo 5dive account test --base-url=http://<lan-ip>:11434 --model=<model> --harness=claude
+sudo 5dive config local-only on
+sudo 5dive agent create ava --type=claude --auth-profile=office-ai --channels=dashboard
+sudo 5dive local pair                   # a code for your phone or laptop
+sudo 5dive config local-only check      # says "Fully local", or names what leaked
+```
+
+For Codex, Hermes or OpenClaw, use the same name in `--harness=` and `--type=`.
+
+### Tested offline
+
+Each row ran on a server whose firewall dropped and logged everything outside the office
+network, DNS included. Only what we saw work is listed.
+
+| Agent | Model | Chat reply | Outside connections |
+|---|---|---|---|
+| Claude Code | qwen3:8b | yes | none in 51 min, nor after a reboot |
+| Codex 0.166 | qwen3:8b | yes | none in 30 min, nor after a restart |
+| Hermes 0.21.5 | qwen3:4b-instruct-2507 | yes (first reply in 38 min) | none in 30 min, nor after a restart |
+| OpenClaw 2026.10.10 | qwen3:8b | not on this hardware | none in 30 min, nor after a restart |
+| OpenCode 1.19, pi 1.5 | qwen3:8b | no office chat yet | none in 30 min, nor after a restart |
+
+Model server: Ollama 0.40 on a 4-core cloud server with 8 GB and no graphics card, so every
+reply took minutes. OpenClaw's opening instructions (about 12,800 tokens) took longer than its
+30-minute limit to read there. Use a graphics card or a Mac Studio for real work.
+
+- **Give Ollama a bigger window.** Its default (4096 tokens) cuts off an agent's instructions.
+  Start it with `OLLAMA_CONTEXT_LENGTH=16384`. Hermes needs 65536 and a model that supports
+  it (qwen3:8b stops at 40960); on 8 GB add `OLLAMA_KV_CACHE_TYPE=q4_0`.
+- **A small model is weak at tools.** Codex on qwen3:8b ran a command to read an attached file,
+  but asked for a permission it does not need and gave up. Use a larger model for file work.
+
 For an office where nothing may leave the building, one command turns off every outside
 connection the box makes on its own, and refuses every command that would make one. Save your
 office AI first: the office chat page that `local-only on` starts uses its address to pick the
@@ -648,9 +684,13 @@ sudo bash /media/usb/5dive-usb-<version>.run --ntp=192.168.1.1   # --ntp: your o
 
 It puts in the system packages 5dive needs from the file, installs 5dive and Claude Code (after
 checking Claude Code against Anthropic's checksum), saves 5dive's update key on the box, and turns
-on local-only mode with the office chat. It never connects to anything. Then add an agent that uses
-your office AI server (`sudo 5dive agent create <name> --type=claude
---base-url=http://<AI server>:<port> --model=<model>`).
+on local-only mode with the office chat. It never connects to anything. Then save your office AI
+server once and add an agent on it, in the office chat:
+
+```sh
+sudo 5dive account add office-ai --provider=custom --base-url=http://<lan-ip>:<port> --model=<model> --harness=claude
+sudo 5dive agent create <name> --type=claude --auth-profile=office-ai --channels=dashboard
+```
 
 What the file holds, and what it leaves out:
 

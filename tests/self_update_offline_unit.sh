@@ -59,6 +59,8 @@ P="$WORK/plugins"; mkdir -p "$P/.claude-plugin" "$P/plugins/dashboard/node_modul
 echo '{"name":"5dive-plugins","plugins":[{"name":"dashboard","source":"./plugins/dashboard"}]}' > "$P/.claude-plugin/marketplace.json"
 echo '{"name":"dashboard","dependencies":{"left-pad":"1"}}' > "$P/plugins/dashboard/package.json"
 echo '{"name":"left-pad"}' > "$P/plugins/dashboard/node_modules/left-pad/package.json"
+echo '{}' > "$P/plugins/dashboard/node_modules/left-pad/index.js.map"
+echo '{}' > "$P/plugins/dashboard/server.js.map"
 echo 'console.log("v2")' > "$P/plugins/dashboard/server.ts"
 printf -- '---\nname: notify-user\n---\n' > "$P/plugins/telegram/skills/notify-user/SKILL.md"
 S="$WORK/skills"; mkdir -p "$S/5dive-cli"; echo '# 5dive-cli v2' > "$S/5dive-cli/SKILL.md"
@@ -80,6 +82,17 @@ fi
 mem="$(tar -tf "$GOOD" | tr '\n' ' ')"
 [[ "$mem" == "manifest.json manifest.sig payload/bun payload/cli.tar.gz payload/plugins.tar.gz payload/skills.tar.gz " ]] \
   && ok_t "builder: exactly the six regular members, no folders" || bad_t "builder members" "$mem"
+# DIVE-7665: the whole file is gzipped (bun is stored raw inside it), the name
+# stays .tar, and the members inside are the plain format-1 tar a 0.117.0 box reads.
+[[ "$(head -c2 "$GOOD" | od -An -tx1 | tr -d ' ')" == 1f8b ]] && gzip -t "$GOOD" 2>/dev/null \
+  && [[ "$(gzip -dc "$GOOD" | tar -tf - | tr '\n' ' ')" == "$mem" ]] \
+  && ok_t "builder: the file is gzipped whole and holds the same six members (DIVE-7665)" \
+  || bad_t "builder: the file is not a gzipped format-1 tar" "$(head -c4 "$GOOD" | od -An -tx1)"
+pl="$(tar -xOf "$GOOD" payload/plugins.tar.gz | tar -tzf -)"
+if ! grep -q 'node_modules/left-pad/index.js.map' <<<"$pl" && grep -q 'node_modules/left-pad/package.json' <<<"$pl" \
+   && grep -q 'plugins/dashboard/server.js.map' <<<"$pl"; then
+  ok_t "builder: source maps inside node_modules are dropped, the packages and the plugin's own files kept"
+else bad_t "builder: source map pruning" "$(grep -E 'map|left-pad' <<<"$pl")"; fi
 # A tag whose installer predates the offline skips is refused (it would dial).
 mk_release "$WORK/rel-old" 2.0.0; sed -i '/^offline_update()/d' "$WORK/rel-old/install.sh"
 if ! bash "$B" "$WORK/rel-old" "$P" "$S" "$WORK/bun" "$WORK/out-old" "$WORK/key.pem" >/dev/null 2>"$WORK/e"; then
@@ -170,6 +183,36 @@ else
   bad_t "GOOD: the good file was refused" "$(cat "$WORK/why")"
 fi
 
+# 1b. DIVE-7665: a PLAIN format-1 file (what 0.117.0's builder wrote) is still
+#     accepted, and a gzipped file whose gzip bytes were changed is refused.
+PLAIN="$WORK/plain.tar"; gzip -dc "$GOOD" > "$PLAIN"
+if [[ "$(head -c2 "$PLAIN" | od -An -tx1 | tr -d ' ')" != 1f8b ]] && verify "$PLAIN" 1.0.0 && [[ "$_OU_VERSION" == 2.0.0 ]]; then
+  ok_t "PLAIN: an ungzipped format-1 file (the 0.117.0 shape) is still accepted"
+else bad_t "PLAIN: the 0.117.0-shape file was refused" "$(cat "$WORK/why")"; fi
+gz_tamper() { # <label> <python byte-offset expr, b = the file's bytes>
+  local f="$WORK/gz-$RANDOM.tar"; cp "$GOOD" "$f"
+  python3 -c 'import sys;p=sys.argv[1];b=bytearray(open(p,"rb").read());i=eval(sys.argv[2]);b[i]^=0xff;open(p,"wb").write(b)' "$f" "$2"
+  if verify "$f" 1.0.0; then bad_t "GZ: $1" "ACCEPTED — the box would have installed it"
+  elif [[ -n "$(cat "$WORK/why")" ]]; then ok_t "GZ: $1 — refused: \"$(cat "$WORK/why")\""
+  else bad_t "GZ: $1" "refused with no reason"; fi
+}
+gz_tamper "one byte of the compressed stream changed" 'len(b)//2'
+gz_tamper "the gzip checksum (CRC) changed, contents intact" 'len(b)-8'
+gz_tamper "the gzip header changed" '0'
+# Re-gzipped after a payload change: gzip is fine, the signed hashes are not.
+fx() { flip payload/bun; }
+GZB="$WORK/gz-bun.tgz.tar"; gzip -9nc "$(repack gz-bun fx)" > "$GZB"
+refused "GZ: a validly gzipped file with bun changed inside" "$GZB" 1.0.0 "changed after the file was signed"
+# The verifier block reads the gzipped file with the same code 0.117.0 shipped:
+# when that tag is here, run ITS bytes on the new file (CI's shallow checkout skips).
+if git rev-parse -q --verify 'refs/tags/v0.117.0' >/dev/null 2>&1 \
+   && old="$(git show v0.117.0:src/lib/offline_update.sh 2>/dev/null)" && [[ -n "$old" ]]; then
+  if ( eval "$(sed -n '/^# >>> DIVE-7577 offline update verifier/,/^# <<< DIVE-7577 offline update verifier/p' <<<"$old")"
+       st="$(mktemp -d "$WORK/o117.XXXXXX")"; _ou_verify "$GOOD" "$st" 1.0.0 0 && [[ "$_OU_VERSION" == 2.0.0 && -s "$st/payload/bun" ]] ); then
+    ok_t "0.117.0: the verifier 0.117.0 shipped takes the new gzipped file (a box on 0.117.0 can update from it)"
+  else bad_t "0.117.0: the shipped 0.117.0 verifier refuses the gzipped file"; fi
+else printf 'skip - 0.117.0: tag v0.117.0 not in this checkout\n'; fi
+
 # 2. ONE BYTE FLIPPED IN ANY PAYLOAD FILE.
 for p in bun cli.tar.gz plugins.tar.gz skills.tar.gz; do
   fx() { flip "payload/$FLIP"; }; FLIP="$p"
@@ -203,9 +246,11 @@ refused "MISSING: a payload file the manifest lists is absent" "$(repack missing
 # 8. A LINK MEMBER (never unpacked: it could point the unpack anywhere).
 fx() { ln -s /etc/passwd payload/link; }
 refused "LINK: a symlink inside the file" "$(repack link fx manifest.json manifest.sig payload/bun payload/cli.tar.gz payload/plugins.tar.gz payload/skills.tar.gz payload/link)" 1.0.0 "link or special file"
-DUP="$WORK/dup.tar"; cp "$GOOD" "$DUP"
+DUP="$WORK/dup.tar"; gzip -dc "$GOOD" > "$DUP"   # a tar can only be appended to uncompressed
 ( d="$(mktemp -d "$WORK/d.XXXXXX")" && cd "$d" && echo x > manifest.json && tar -rf "$DUP" manifest.json )
 refused "DUPLICATE: a second manifest.json appended after the signed one" "$DUP" 1.0.0 "twice"
+gzip -9nc "$DUP" > "$WORK/dup-gz.tar"
+refused "DUPLICATE: the same, gzipped" "$WORK/dup-gz.tar" 1.0.0 "twice"
 # 9. NO KEY PINNED / A PIN OTHERS CAN WRITE.
 OFFLINE_UPDATE_PUBKEY_FILE="$WORK/none.pem" OFFLINE_UPDATE_PUBKEY_PEM='' refused "NO KEY: a box with no update key refuses every file" "$GOOD" 1.0.0 "holds no update key"
 cp "$WORK/pub.pem" "$WORK/loose.pem"; chmod 666 "$WORK/loose.pem"

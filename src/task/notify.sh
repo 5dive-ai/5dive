@@ -370,15 +370,45 @@ cmd_task_gate_escalate() {
 # -> that agent's access.json), so an agent can only ever assert ITS OWN paired
 # human, never another bot's. Returns 0 when the chat verifies. Scope guard: this
 # proof clears only tier<2 gates (enforced at the call site, cmd_task_answer).
+#
+# DIVE-7765: sets TASK_CP_REASON to WHY it refused, so a caller never reports a
+# format error or a missing channel as an allowFrom miss (box bug 729: a
+# `telegram:<id>` value read "not in access.json allowFrom" and the agent went
+# hunting for other flags). The allowFrom sentence is now said for an allowFrom
+# miss only.
+TASK_CP_REASON=""
 _gate_channel_proof_ok() {
   local chat="$1"
-  [[ -n "$chat" ]] || return 1
+  TASK_CP_REASON=""
+  [[ -n "$chat" ]] || { TASK_CP_REASON="no chat id was given"; return 1; }
   # Numeric chat id only (a DM id is a positive integer) — rejects junk / any
   # attempt to smuggle a jq filter or a negative group id through the flag.
-  [[ "$chat" =~ ^[0-9]+$ ]] || return 1
-  _task_owner_channel || return 1
-  [[ -n "$TASK_CH_ACCESS" && -r "$TASK_CH_ACCESS" ]] || return 1
-  jq -e --arg c "$chat" '(.allowFrom // []) | index($c) != null' "$TASK_CH_ACCESS" >/dev/null 2>&1
+  [[ "$chat" =~ ^[0-9]+$ ]] || { TASK_CP_REASON="$(_gate_channel_proof_format_reason "$chat")"; return 1; }
+  _task_owner_channel || { TASK_CP_REASON="this seat has no paired Telegram channel to check chat ${chat} against"; return 1; }
+  [[ -n "$TASK_CH_ACCESS" && -r "$TASK_CH_ACCESS" ]] \
+    || { TASK_CP_REASON="this bot's access.json is not readable, so chat ${chat} cannot be checked"; return 1; }
+  jq -e --arg c "$chat" '(.allowFrom // []) | index($c) != null' "$TASK_CH_ACCESS" >/dev/null 2>&1 \
+    || { TASK_CP_REASON="chat ${chat} is not this bot's paired-human DM (not in access.json allowFrom)"; return 1; }
+}
+
+# DIVE-7765: the ONE parser every --channel-proof flag goes through (answer,
+# _task_channel, inbox --send, clear-recs). Our own surfaces print a chat as
+# `telegram:<id>`, so that prefix is stripped here, once. Nothing else is
+# loosened: what is left must still be a bare positive number, so a negative
+# group id or junk is refused, now with its OWN reason instead of the allowFrom
+# one. Empty stays empty (each caller already says "required"). Sets
+# TASK_CP_CHAT; fails the command on a format error. Never call it in $(…):
+# the fail would only leave the subshell.
+TASK_CP_CHAT=""
+_gate_channel_proof_format_reason() {
+  printf -- "--channel-proof takes the chat id as a number (e.g. 1234567890), got '%s'" "${1:0:64}"
+}
+_gate_channel_proof_parse() { # <raw flag value>
+  local raw="$1" v="${1#telegram:}"
+  if [[ -n "$v" && ! "$v" =~ ^[0-9]+$ ]]; then
+    fail "$E_USAGE" "$(_gate_channel_proof_format_reason "$raw")"
+  fi
+  TASK_CP_CHAT="$v"
 }
 
 # DIVE-2412: the Bot API seam for a channel citation, isolated in ONE function so
@@ -443,7 +473,7 @@ _gate_channel_session_ok() { # <chat_id> <message_id> <answer_value> <ident>
   TASK_CS_REASON="" TASK_CS_ORIGIN="" TASK_CS_AGE=""
   # (1) same trust anchor as DIVE-1305 — and it resolves TASK_CH_TOKEN for us.
   if ! _gate_channel_proof_ok "$chat"; then
-    TASK_CS_REASON="chat $chat is not this bot's paired-human DM (not in access.json allowFrom)"
+    TASK_CS_REASON="${TASK_CP_REASON:-chat $chat did not verify as the paired-human DM}"
     return 1
   fi
   if [[ ! "$msg" =~ ^[0-9]+$ ]]; then

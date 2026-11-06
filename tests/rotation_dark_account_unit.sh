@@ -84,6 +84,9 @@ cmd_config() {   # <name> set auth-profile=<target> — and the binding event's 
   mkdir -p "$TMP/bind"; date +%s >"$TMP/bind/$n"
 }
 with_registry_lock() { local fn="$1"; shift; "$fn" "$@"; }
+# DIVE-7747: rotate reads back the env file and auth link before it says
+# rotated:true. This harness does not own those files: they follow the registry.
+agent_profile_on_disk() { local p; p=$(registry_read | jq -r --arg n "$1" '.agents[$n].authProfile // ""'); printf '%s\t%s\n' "$p" "$p"; }
 usage_agent_home() { printf '%s/agent-%s\n' "$HOMES" "$1"; }
 account_binding_since() { cat "$TMP/bind/$1" 2>/dev/null; }
 _ROTATION_PROBE_CMD=false     # the live probe is down: no network in a harness

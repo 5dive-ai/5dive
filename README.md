@@ -213,6 +213,8 @@ When an agent needs a key, it sends you a one-time link and you paste it on your
 
 With `5dive push`, agents push code through your own GitHub App and never hold its token. [Delegated git push →](docs/delegated-push.md) · [Permissions and isolation →](https://5dive.ai/docs/5dive-cli#isolation)
 
+**Fully offline.** `sudo 5dive config local-only on` cuts every outside connection: agents run on your own AI (Ollama, LM Studio, vLLM) and you chat with them on an office page, with nothing leaving your network. [Local-only mode →](docs/guide.md#local-only-mode-nothing-leaves-your-network) · [For firms →](https://5dive.ai/enterprise?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme)
+
 ## Resources
 
 [Docs](https://5dive.ai/docs/5dive-cli?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme) · [Full guide](docs/guide.md) · [Roadmap](ROADMAP.md) · [Human gates](docs/human-gates.md) · [Triggers](docs/triggers.md) · [Docker](docker/README.md) · [Contributing](CONTRIBUTING.md) · [Security reports](https://github.com/5dive-ai/5dive/security/advisories/new)

@@ -97,6 +97,7 @@ CORE_FILES=(
   src/lib/quota_wall.sh
   src/lib/seat_refusal.sh
   src/lib/codex_quota.sh
+  src/lib/codex_login_sync.sh
   src/lib/agent_env.sh
   src/lib/verify_policy.sh
   src/lib/devteam.sh
@@ -194,6 +195,7 @@ LAZY_FILES=(
   src/cmd_plugin.sh
   src/cmd_secret.sh
   src/cmd_secret_drop.sh
+  src/cmd_agent_share.sh
   src/cmd_tool.sh
   src/cmd_hire_link.sh
   src/cmd_route.sh

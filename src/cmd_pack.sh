@@ -368,15 +368,31 @@ _pack_stage_skill_bodies() {   # _pack_stage_skill_bodies <skills-dir> <stage>
 # runs LAST, after everything is staged. No persona, no `persona` key: openagent
 # then refuses the file by name rather than guessing an identity.
 _pack_bundle_manifest() {   # _pack_bundle_manifest <stage> <has-persona:true|false>
-  local stage="$1" has_persona="$2" files f
-  files=$(cd "$stage" && find . -type f ! -path ./manifest.json -print0 | sort -z \
-    | while IFS= read -r -d '' f; do printf '%s\t%s\n' "${f#./}" "$(sha256sum <"$f" | cut -d' ' -f1)"; done \
-    | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}') || return 1
+  local stage="$1" has_persona="$2" fm
+  # DIVE-7806: the checksum map goes to jq as a FILE, never an argument. A
+  # memory pack of a long-lived seat lists thousands of facts, and one argv
+  # string over 128 KB is "Argument list too long" (measured: a 2.8k-fact seat).
+  # Outside the stage, or the map would checksum itself.
+  fm=$(mktemp) || return 1
+  # DIVE-7813: one sha256sum over the whole list (xargs batches it), not two
+  # processes per file — that was ~3ms a fact. sha256sum prints "<hash>  <path>"
+  # and, for a name holding a backslash or a newline, a leading backslash with
+  # the name escaped (backslash-backslash, backslash-n); jq undoes exactly that.
+  (cd "$stage" && find . -type f ! -path ./manifest.json -print0 | sort -z \
+    | xargs -0 -r sha256sum -- \
+    | jq -Rn '[inputs
+        | (startswith("\\")) as $esc
+        | (if $esc then .[1:] else . end)
+        | capture("^(?<h>[0-9a-f]{64}) [ *](?<p>.*)$")
+        | .p |= (if $esc then gsub("\\\\(?<c>.)"; if .c == "n" then "\n" elif .c == "r" then "\r" else .c end) else . end)
+        | {(.p | ltrimstr("./")): .h}] | add // {}') > "$fm" \
+    || { rm -f "$fm"; return 1; }
   jq --argjson bv "$OPENAGENT_BUNDLE_VERSION" --arg oa "$OPENAGENT_BUNDLE_SPEC" \
-     --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson hp "$has_persona" --argjson files "$files" \
+     --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson hp "$has_persona" --slurpfile files "$fm" \
      '. + {bundle_version: $bv, openagent: $oa, source_harness: "5dive", created_at: $at}
-        + (if $hp then {persona: "persona.yaml"} else {} end) + {files: $files}' \
-     "$stage/manifest.json" > "$stage/manifest.json.$$" || { rm -f "$stage/manifest.json.$$"; return 1; }
+        + (if $hp then {persona: "persona.yaml"} else {} end) + {files: $files[0]}' \
+     "$stage/manifest.json" > "$stage/manifest.json.$$" || { rm -f "$stage/manifest.json.$$" "$fm"; return 1; }
+  rm -f "$fm"
   mv "$stage/manifest.json.$$" "$stage/manifest.json"
 }
 
@@ -2253,6 +2269,30 @@ _pack_import_memory_target() {   # _pack_import_memory_target <type> <shape>
   fi
 }
 
+# DIVE-7724: make <cdir>/projects/<slug>/memory with EVERY component owned by
+# <owner>. `install -d -o <owner> <deep path>` owns only the last one: the
+# leading ~/.claude it had to create was root's, and on a Codex seat (no
+# ~/.claude before the import) that broke the app chat for good. Never follows
+# a symlinked component.
+_pack_seat_memdir_make() {   # _pack_seat_memdir_make <owner> <cdir> <mdir>
+  local owner="$1" cdir="$2" mdir="$3" d rel part
+  [[ "$mdir" == "$cdir"/* ]] || return 1
+  d="$cdir"; rel="${mdir#"$cdir"/}"
+  while :; do
+    [[ -L "$d" ]] && return 1
+    if [[ ! -e "$d" ]]; then
+      install -d -m 700 -o "$owner" -g "$owner" "$d" 2>/dev/null || return 1
+    elif [[ "$(stat -c %U "$d" 2>/dev/null)" != "$owner" ]]; then
+      chown "$owner:$owner" "$d" 2>/dev/null || return 1
+    fi
+    [[ -n "$rel" ]] || break
+    part="${rel%%/*}"
+    [[ "$rel" == */* ]] && rel="${rel#*/}" || rel=""
+    d="$d/$part"
+  done
+  return 0
+}
+
 # DIVE-4541: seed a CLAUDE seat's memory dir from a pack's staged memory, routed
 # on the shape of the staged bytes. Extracted from cmd_import so the routing is
 # executable without a seat: it is the branch that decides CONVERT vs verbatim
@@ -2292,33 +2332,67 @@ _pack_raw_memory() {
 }
 
 _pack_scope_memory() {
-  local memdir="$1" outdir="$2" kept=0 excluded=0 f base type optout
+  # DIVE-7813: ONE awk pass reads every fact's frontmatter (it was two awks, a
+  # basename and a cp per file, and the index two awks more: ~20ms a fact, so a
+  # 1600-fact share spent 33s here, twice, and pushed the core CI tier over its
+  # budget). The awk reads the file LIST on stdin and opens each with getline,
+  # so a big store never meets an argv limit and an empty or unreadable file is
+  # still classified (no type -> left out), exactly as before. Same rules per
+  # file: the first `type:` inside the leading frontmatter block, and any
+  # `export:/share: false` or `private: true` there opts it out.
+  local memdir="$1" outdir="$2" kept=0 excluded=0 line
+  local -a keep=()
   mkdir -p "$outdir"
-  while IFS= read -r f; do
-    base=$(basename "$f")
-    [[ "$base" == "MEMORY.md" ]] && continue
-    # Frontmatter type lives nested under metadata: (….type: <t>). Read the first
-    # `type:` inside the leading frontmatter block.
-    type=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^[[:space:]]*type:[[:space:]]*/{sub(/^[[:space:]]*type:[[:space:]]*/,""); gsub(/[[:space:]]+$/,""); print; exit}' "$f")
-    optout=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^[[:space:]]*(export|share):[[:space:]]*false/{print "1"; exit} n==1 && /^[[:space:]]*private:[[:space:]]*true/{print "1"; exit}' "$f")
-    if [[ "$type" == "reference" || "$type" == "project" ]] && [[ -z "$optout" ]]; then
-      cp "$f" "$outdir/$base"; kept=$((kept+1))
-    else
-      excluded=$((excluded+1))
-    fi
-  done < <(find "$memdir" -maxdepth 1 -name '*.md' 2>/dev/null | sort)
-  # Clean index over only what we kept.
+  while IFS= read -r line; do
+    case "$line" in
+      K$'\t'*) keep+=("${line#K$'\t'}"); kept=$((kept+1)) ;;
+      X$'\t'*) excluded=$((excluded+1)) ;;
+    esac
+  done < <(find "$memdir" -maxdepth 1 -name '*.md' \( -xtype f -printf 'F%p\n' -o -printf 'O%p\n' \) 2>/dev/null | sort -k1.2 | awk '
+    {
+      # F = a regular file (or a link to one); O = anything else, left out
+      # unread (mawk dies on a getline from a directory, gawk only warns).
+      kind = substr($0, 1, 1); f = substr($0, 2); b = f; sub(/.*\//, "", b)
+      if (b == "MEMORY.md") next
+      if (kind != "F") { print "X\t" f; next }
+      n = 0; type = ""; gotType = 0; optout = 0
+      while ((getline l < f) > 0) {
+        if (l ~ /^---[[:space:]]*$/) { n++; if (n >= 2) break; continue }
+        if (n != 1) continue
+        if (!gotType && l ~ /^[[:space:]]*type:[[:space:]]*/) {
+          t = l; sub(/^[[:space:]]*type:[[:space:]]*/, "", t); gsub(/[[:space:]]+$/, "", t)
+          type = t; gotType = 1
+        }
+        if (l ~ /^[[:space:]]*(export|share):[[:space:]]*false/ || l ~ /^[[:space:]]*private:[[:space:]]*true/) optout = 1
+      }
+      close(f)
+      print (((type == "reference" || type == "project") && !optout) ? "K" : "X") "\t" f
+    }')
+  (( ${#keep[@]} )) && printf '%s\0' "${keep[@]}" | xargs -0 cp -t "$outdir" --
+  # Clean index over only what we kept (same glob order, same line per fact).
   {
     echo "# Memory Index (distilled persona pack)"
     echo
+    local f
     for f in "$outdir"/*.md; do
-      [[ -e "$f" ]] || continue
-      [[ "$(basename "$f")" == "MEMORY.md" ]] && continue
-      local nm desc
-      nm=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^name:[[:space:]]*/{sub(/^name:[[:space:]]*/,""); print; exit}' "$f")
-      desc=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^description:[[:space:]]*/{sub(/^description:[[:space:]]*/,""); gsub(/^"|"$/,""); print; exit}' "$f")
-      [[ -n "$nm" ]] && echo "- [$nm]($(basename "$f")) — ${desc}"
-    done
+      [[ -f "$f" ]] || continue   # a dir here would end mawk's getline loop for every file
+      [[ "${f##*/}" == "MEMORY.md" ]] && continue
+      printf '%s\n' "$f"
+    done | awk '
+      {
+        f = $0; b = f; sub(/.*\//, "", b)
+        n = 0; nm = ""; desc = ""; gotNm = 0; gotDesc = 0
+        while ((getline l < f) > 0) {
+          if (l ~ /^---[[:space:]]*$/) { n++; if (n >= 2) break; continue }
+          if (n != 1) continue
+          if (!gotNm && l ~ /^name:[[:space:]]*/) { nm = l; sub(/^name:[[:space:]]*/, "", nm); gotNm = 1 }
+          if (!gotDesc && l ~ /^description:[[:space:]]*/) {
+            desc = l; sub(/^description:[[:space:]]*/, "", desc); gsub(/^"|"$/, "", desc); gotDesc = 1
+          }
+        }
+        close(f)
+        if (nm != "") print "- [" nm "](" b ") — " desc
+      }'
   } > "$outdir/MEMORY.md"
   printf '%s %s\n' "$kept" "$excluded"
 }
@@ -3308,7 +3382,7 @@ cmd_import() {
   # "explicitly asked for <type>" apart from "took the pack's baked-in type";
   # the from-persona synth defaults it to claude locally below.
   local from_persona="" p_type="" p_iso="standard" p_iso_set=0 p_model="" p_effort=""
-  local from_url=""
+  local from_url="" from_share=0
   # DIVE-2676: BYO credentials on the import path. Without these an import onto
   # an API-key-only seat provisions an agent that cannot reach a model at all.
   local p_provider="" p_api_key=""
@@ -3361,6 +3435,19 @@ cmd_import() {
       || fail "$E_USAGE" "give ONE of a pack, --from-persona or --from-url"
     [[ "$from_url" =~ ^https://[^[:space:]]+$ ]] \
       || fail "$E_VALIDATION" "--from-url must be an https URL"
+    # DIVE-7782: a share link (https://<box>/a/<id>, as `agent share` prints it)
+    # is a stranger's agent. Its pack sits beside the page; the copy is untrusted,
+    # so it starts at standard (sandboxed is allowed, admin never) and its hooks
+    # stay stripped whatever --allow-hooks says.
+    if [[ "$from_url" =~ ^(https://[^[:space:]?#]+)/a/([A-Za-z0-9_-]{22})(/|/pack\.tar\.gz)?$ ]]; then
+      from_share=1
+      from_url="${BASH_REMATCH[1]}/a/${BASH_REMATCH[2]}/pack.tar.gz"
+      [[ "$p_iso_set" == 1 && "$p_iso" == admin ]] \
+        && fail "$E_VALIDATION" "a shared agent is community-made and starts at standard, never admin (grant it more later, once you trust it: 5dive agent grant <name> admin)"
+      [[ "$p_iso_set" == 1 && "$p_iso" == sandboxed ]] || { p_iso=standard; p_iso_set=1; }
+      allow_hooks=0
+      step "A shared agent is community-made: it starts at standard isolation. Look it over, and connect your own keys."
+    fi
     step "Fetching pack from $(_pack_url_host "$from_url")"
     url_tmp=$(_pack_fetch_url "$from_url") \
       || fail "$E_GENERIC" "could not fetch the pack from $(_pack_url_host "$from_url") (expired or unreachable link)"
@@ -3544,6 +3631,11 @@ cmd_import() {
     isolation=admin
     step "First agent on this box: admin, so it can run the team (pass --isolation=standard to keep it least-privilege)"
   fi
+  # DIVE-7782: a pack a share made says so in its manifest; however it got here
+  # (a link, a downloaded file), it never comes up admin.
+  if [[ "$from_share" == 1 ]] || jq -e '.share.community_made == true' "$stage/manifest.json" >/dev/null 2>&1; then
+    [[ "$isolation" == admin || -z "$isolation" ]] && isolation=standard
+  fi
   [[ -n "$p_model" ]]  && model="$p_model"
   [[ -n "$p_effort" ]] && effort="$p_effort"
   # DIVE-2303: resolve a family ALIAS to the full current id before it reaches
@@ -3682,6 +3774,21 @@ cmd_import() {
   # line above did. BYO is left on that line: its profile is written by
   # cmd_create below, so there is no map to read yet, and the id is forwarded
   # to create as --model, which overrides the provider's tier map.
+  # DIVE-7786: a custom pack carries the id its source account resolved (the
+  # seeded OpenRouter slug), not a family. When the bound account maps a family
+  # to exactly that id, the pack asked for that family, and it is recorded below
+  # so `agent set-account` can move the seat later. A slug a Claude login cannot
+  # run lands as Sonnet instead of a seat that refuses every message.
+  if (( ! byo )) && [[ "$type" == claude && -n "$model_req" ]] && ! model_latest "$model_req" >/dev/null; then
+    local _mr_fam
+    _mr_fam=$(model_family_by_map "$model_req" "$profile")
+    if [[ -n "$_mr_fam" ]]; then
+      model_req="$_mr_fam"
+    elif ! claude_model_ok_on_anthropic "$model_req" && profile_is_anthropic_login "$profile"; then
+      step "The pack's model '$model_req' is not a Claude model, and account '$profile' is a Claude login: using Sonnet"
+      model_req=sonnet
+    fi
+  fi
   if (( ! byo )) && [[ -n "$model_req" ]]; then
     model=$(resolve_model_for_profile "$model_req" "$profile")
   fi
@@ -3754,6 +3861,9 @@ cmd_import() {
   fi
 
   local cdir="${AGENT_HOME_ROOT:-/home}/agent-${as}/.claude"
+  # DIVE-7724: a non-Claude seat has no ~/.claude yet. Make it the seat's now,
+  # before the persona, avatar and memory below write under it as root.
+  ! declare -F seat_claude_dir_ensure >/dev/null || seat_claude_dir_ensure "agent-${as}" || true
 
   # DIVE-2568: put distilled memory IN EFFECT for a harness that does not
   # auto-load 5dive's store. Must run BEFORE the install below, which routes this
@@ -3981,7 +4091,7 @@ cmd_import() {
       local slug mdir packed landed
       slug=$(printf '%s' "$eff_workdir" | sed 's#/#-#g')
       mdir="$cdir/projects/${slug}/memory"
-      install -d -o "agent-${as}" -g "agent-${as}" "$mdir" 2>/dev/null || true
+      _pack_seat_memdir_make "agent-${as}" "$cdir" "$mdir" || true
       # DIVE-4541: the shape of the staged bytes decides convert-vs-copy, and
       # that routing lives in _pack_seed_claude_memory so it is gradeable
       # without a seat.

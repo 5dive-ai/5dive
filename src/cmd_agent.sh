@@ -2026,10 +2026,13 @@ cmd_agent_heal_effort() {
 # level the seat ran at is written under the new keys, or a seat moving off a
 # legacy model would drop to the default effort (DIVE-4863). Idempotent; the
 # self-update fingerprint restarts idle seats onto it.
+# DIVE-7786: the same pass first REPAIRS a seat on a Claude login whose model
+# that login cannot run (a vendor slug), and names each one it touched.
 cmd_agent_float_models() {
   [[ $# -eq 0 ]] || fail "$E_USAGE" "agent _float_models takes no arguments"
   require_root
   local reg rows name rec profile home file cur model fam ids out own tmp a moved=0 failed=0
+  local want repaired=()
   reg=$(registry_read)
   a=$(models_json)
   rows=$(jq -r '.agents // {} | to_entries[] | select((.value.type // "claude") == "claude")
@@ -2039,6 +2042,24 @@ cmd_agent_float_models() {
     home="${AGENT_HOME_ROOT:-/home}/agent-${name}"
     file="$home/.claude/settings.json"
     [[ -f "$file" ]] || continue
+    # DIVE-7786: REPAIR a seat already stuck on a model its Claude login cannot
+    # run (a vendor slug kept by a set-account before this fix): Anthropic
+    # refuses every message, so the seat answers nothing. It moves to Sonnet, and
+    # each one is named on stderr ("repaired: …") so the update log says whom it
+    # touched. Booted or not: a dead id is never a choice worth keeping.
+    model=$(jq -r 'if type == "object" and (.model | type) == "string" then .model else "" end' "$file" 2>/dev/null) || model=""
+    if [[ -n "$model" ]] && ! claude_model_ok_on_anthropic "$model" && profile_is_anthropic_login "$profile"; then
+      want=$(resolve_model_for_profile sonnet "$profile")
+      if ( write_runtime_model claude "$name" "$want" ) >/dev/null 2>&1; then
+        registry_read | jq --arg n "$name" --arg m "$want" '.agents[$n].modelFamily = "sonnet"
+          | if (.agents[$n] | has("model")) then .agents[$n].model = $m else . end' | registry_write
+        repaired+=("$name")
+        printf 'repaired: %s %s -> %s (account %s cannot run it)\n' "$name" "$model" "$want" "$profile" >&2
+        rec=sonnet
+      else
+        failed=$((failed + 1)); continue
+      fi
+    fi
     jq -e '(.migrationVersion // null) != null' "$home/.claude.json" >/dev/null 2>&1 || continue
     [[ -z "$profile" || -z "$(profile_env_value "$profile" ANTHROPIC_BASE_URL)" ]] || continue
     cur=$(cat "$file" 2>/dev/null) || { failed=$((failed + 1)); continue; }
@@ -2058,7 +2079,9 @@ cmd_agent_float_models() {
     moved=$((moved + 1))
   done <<<"$rows"
   (( failed == 0 )) || { warn "model float failed for $failed agent(s)"; return 1; }
-  ok "moved $moved agent(s) onto their model family alias"
+  local rep_list="${repaired[*]-}"
+  ok "moved $moved agent(s) onto their model family alias${rep_list:+; repaired ${#repaired[@]} on a model their Claude login cannot run: $rep_list}" \
+    '{moved:($m|tonumber), repaired:($r | if . == "" then [] else split(" ") end)}' --arg m "$moved" --arg r "$rep_list"
 }
 
 # Atomically replace one document-root Codex TOML string key while preserving
@@ -2141,10 +2164,27 @@ PY
 CODEX_HEALTH_SCHEMA=1
 CODEX_HEALTH_REL=".codex/channels/dispatcher/health.json"
 
+# _channel_health_readable <path> -> exit 0 when this caller can PROVE whether
+# the record exists: the deepest ancestor it can see is one it may search, so a
+# missing child really is missing. Exit 1 when the walk stops at a directory it
+# cannot enter (a non-root seat reading another seat's 0700 `.codex`), or when
+# the file is plainly there and still came back empty: then "absent" would be a
+# guess (DIVE-7749).
+_channel_health_readable() { # <path>
+  local path="$1" d=""
+  if [[ -e "$path" ]]; then [[ -r "$path" ]]; return; fi
+  d="${path%/*}"
+  while [[ -n "$d" && ! -e "$d" ]]; do d="${d%/*}"; done
+  [[ -n "$d" ]] || d="/"
+  [[ -d "$d" && -x "$d" ]]
+}
+
 # _channel_health_read <name> -> the raw record on stdout, empty when there is
 # none. Three reads because the caller may be the agent itself, root, or a seat
-# that can only reach the file through the agent's own uid; every failure is one
-# answer (empty = absent), which the classifier then renders.
+# that can only reach the file through the agent's own uid. An empty answer is
+# ABSENT only when the caller could have seen the file (exit 0); when it could
+# not, the exit is 2 — "cannot read" and "absent" have different remedies, and
+# only one of them is a restart (DIVE-7749).
 _channel_health_read() { # <name>
   local name="$1"
   # Two `local`s on purpose (SC2318): the words of a single `local` are expanded
@@ -2156,6 +2196,8 @@ _channel_health_read() { # <name>
   [[ -n "$raw" ]] || raw=$(sudo -n -u "agent-${name}" cat "$path" 2>/dev/null) || raw=""
   [[ -n "$raw" ]] || raw=$(sudo -n cat "$path" 2>/dev/null) || raw=""
   printf '%s' "$raw"
+  [[ -n "$raw" ]] || _channel_health_readable "$path" || return 2
+  return 0
 }
 
 # _channel_health_classify <raw-json|""> <declared-csv> <yes|no service-active>
@@ -2243,12 +2285,19 @@ _channel_health_classify() {
 # evidence outranks a label.
 agent_channel_handshake() {
   local name="$1" declared="${2:-}" type="${3:-}" active="${4:-yes}"
-  local attempts="${5:-0}" max="${6:-2}" raw=""
+  local attempts="${5:-0}" max="${6:-2}" raw="" rc=0
   case "$declared" in
     ""|none|null) return 0 ;;
   esac
-  raw=$(_channel_health_read "$name")
+  raw=$(_channel_health_read "$name") || rc=$?
   if [[ -z "$raw" && "$type" != "codex" ]]; then return 0; fi
+  # DIVE-7749: the record may exist where this caller cannot look. Say so, the
+  # same way the tmux probe below does, and offer no repair: restarting a seat
+  # because its file is private fixes nothing.
+  if [[ -z "$raw" && "$rc" == 2 ]]; then
+    printf 'unknown|the Codex bridge handshake is not readable from this seat; run this as root on the box|none|\n'
+    return 0
+  fi
   _channel_health_classify "$raw" "$declared" "$active" "$attempts" "$max"
 }
 
@@ -2440,8 +2489,18 @@ cmd_info() {
   _op_state=$(_agent_operational_state "${active:-unknown}" "$_ha_state" "$_hs_state" "$sup" "$_iq_state")
   _auth_line=$(_agent_auth_display "$_ha_state" "$_ha_exp" "$_ha_refresh")
 
+  # DIVE-7747: the account the registry names vs the one the seat's files boot
+  # on. A rotation that moved the registry alone left three seats walled until
+  # their weekly reset while every surface printed the registry's account.
+  local _pd="" _pd_state="unmeasured"
+  if declare -F agent_profile_drift >/dev/null 2>&1; then
+    _pd=$(agent_profile_drift "$name" "$_info_prof"); case $? in
+      0) _pd_state="agrees" ;; 1) _pd_state="drift" ;; *) _pd_state="unmeasured" ;;
+    esac
+  fi
   local obj
   obj=$(jq -c \
+    --arg pdState "$_pd_state" --arg pdDetail "$_pd" \
     --argjson sup "$sup" \
     --arg qState "$_iq_state" --arg qWin "$_iq_win" --arg qPct "$_iq_pct" \
     --arg qReset "$_iq_reset" --arg qNote "$_iq_note" \
@@ -2493,6 +2552,8 @@ cmd_info() {
       },
       workdir: ($a.workdir // $default_wd),
       authProfile: ($a.authProfile // null),
+      # DIVE-7747: agrees | drift | unmeasured (files unreadable to this caller).
+      authProfileOnDisk: {state: $pdState, detail: (if $pdDetail == "" then null else $pdDetail end)},
       botUsername: ($a.botUsername // null),
       isolation: ($a.isolation // "admin"),
       # DIVE-2079: `isolation` above is the stored LABEL (and `// "admin"` means
@@ -2579,7 +2640,7 @@ cmd_info() {
                           elif .channelsBinding.state == "absent" then "unknown — \(.channelsBinding.detail)"
                           else "unknown — \(.channelsBinding.detail // "not probeable from here")" end)\(if .channelsBinding.evidence then "\n             ↳ \(.channelsBinding.evidence)" else "" end)"
        end),
-      "profile:     \(.authProfile // "-")",
+      "profile:     \(.authProfile // "-")\(if .authProfileOnDisk.state == "drift" then " — DRIFT: \(.authProfileOnDisk.detail)" else "" end)",
       "auth:        \($authLine)",
       "startup:     \(.health.startup.state)\(if .health.startup.reason then " — \(.health.startup.reason)" else "" end)",
       "workdir:     \(.workdir)",
@@ -2598,6 +2659,9 @@ cmd_info() {
        else empty end),
       (if .health.quota.state == "exhausted" then
          "\nWARNING: this seat CANNOT EXECUTE A SINGLE TOKEN. Its auth account \(.authProfile // "?") is at \(.health.quota.pct)% of its \(.health.quota.window) rate limit\(if .health.quota.resetsAt then " and does not reset until \(.health.quota.resetsAt)" else "" end). The process is \(.active), the credential parses, and neither fact matters until the window turns over — this is the one measurement that decides whether the seat can work, and before DIVE-4342 none of `agent list`, `liveness` or `supervisor` consulted it. Move the seat to an account with headroom (`sudo 5dive account usage` to find one, then `5dive agent config set auth-profile=<name> --agent=\(.name)`) or reassign what is queued behind it: 5dive task ls --assignee=\(.name)"
+       else empty end),
+      (if .authProfileOnDisk.state == "drift" then
+         "\nWARNING: this seat is NOT on the account the registry names (\(.authProfileOnDisk.detail)). Its next start boots on the env file and link, and usage, cooldowns and rotation reason about the registry one. Re-set the account to make all three agree and restart it: 5dive agent set-account \(.name) \(.authProfile // "default") (DIVE-7747)."
        else empty end),
       (if .health.auth.state == "refused" then
          "\nWARNING: this seat CANNOT ANSWER: its own last turn was refused by its AI account (\(.health.auth.refusal // "refused")). The credential file is present, so every file check reads ok, and a headless probe can still pass on an account that refuses the interactive client the seat runs. Fix the account (add credit, or set a new key with `5dive agent auth set`), which restarts the seat and clears this line (DIVE-7118)."

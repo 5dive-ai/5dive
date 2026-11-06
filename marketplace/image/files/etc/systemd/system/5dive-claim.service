@@ -1,0 +1,20 @@
+# DIVE-7756: connect this server to its owner's 5dive account with the one-time
+# code its hoster generated (/usr/local/lib/5dive-claim/claim.py). firstboot.sh
+# enables it on a new server; it is off in the image itself. It only calls out
+# (HTTPS to the 5dive API); nothing listens. It stops for good once the server
+# is linked, the code is used or expired, or 25 hours after first boot.
+[Unit]
+Description=5dive one-time connect (marketplace image)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/5dive-claim/closed
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /usr/local/lib/5dive-claim/claim.py
+Restart=on-failure
+RestartSec=30
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

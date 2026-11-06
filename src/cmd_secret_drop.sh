@@ -1071,7 +1071,8 @@ _secret_serve() {
   chmod 700 "$tmp"
   _secret_drop_server_py > "$tmp/server.py"
   local rc=0
-  python3 "$tmp/server.py" "$host" "$port" "$self" "$SECRET_DROP_DIR" "$idle" || rc=$?
+  # DIVE-7782: the box's share links (`agent share`) are static files this page serves.
+  SHARE_DIR="${SHARE_DIR:-${STATE_DIR}/shares}" python3 "$tmp/server.py" "$host" "$port" "$self" "$SECRET_DROP_DIR" "$idle" || rc=$?
   rm -rf "$tmp"
   return "$rc"
 }
@@ -1083,6 +1084,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST, PORT, BUNDLE, STORE, IDLE = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], int(sys.argv[5])
 TOKEN = re.compile(r"^/([A-Za-z0-9_-]{43})$")
+# DIVE-7782: a share link. /a/<id> is the page, plus its pack and portrait;
+# /a/_probe/<nonce> answers the nonce `config public-address` just wrote.
+SHARES = os.environ.get("SHARE_DIR", "")
+SHARE = re.compile(r"^/a/([A-Za-z0-9_-]{22})(?:/(|pack\.tar\.gz|avatar\.png))?$")
+PROBE = re.compile(r"^/a/_probe/([A-Za-z0-9_-]{22})$")
+SHARE_TYPES = {"": "text/html; charset=utf-8", "pack.tar.gz": "application/gzip", "avatar.png": "image/png"}
+SHARE_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'"
 MAX_BODY = 65536
 WINDOW, PER_CLIENT, GLOBAL = 600, 10, 60
 fails, fails_lock = {}, threading.Lock()
@@ -1235,18 +1243,35 @@ class Handler(BaseHTTPRequestHandler):
     def client(self):
         xff = self.headers.get("X-Forwarded-For", "")
         return (xff.split(",")[-1].strip() if xff else self.client_address[0]) or "?"
-    def send_page(self, code, body, ctype="text/html; charset=utf-8"):
+    def send_page(self, code, body, ctype="text/html; charset=utf-8", share=False):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "public, max-age=60" if share else "no-store")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Content-Security-Policy",
+        self.send_header("Content-Security-Policy", SHARE_CSP if share else
             "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.end_headers()
         if self.command != "HEAD": self.wfile.write(body)
+    def share(self, path):
+        # Static, public, read-only: a file under SHARES/<id>/, never a link to
+        # anywhere else, and never a lookup that counts against the token limit.
+        m = PROBE.match(path)
+        if m and SHARES:
+            f = os.path.join(SHARES, ".probe", m.group(1))
+            if os.path.isfile(f) and not os.path.islink(f):
+                return self.send_page(200, m.group(1).encode(), "text/plain; charset=utf-8")
+            return self.send_page(404, b"no", "text/plain; charset=utf-8")
+        m = SHARE.match(path)
+        name = {"": "index.html"}.get(m.group(2) or "", m.group(2)) if m else None
+        f = os.path.join(SHARES, m.group(1), name) if (m and SHARES) else None
+        if not f or not os.path.isfile(f) or os.path.islink(f) or os.path.islink(os.path.dirname(f)):
+            return self.send_page(404, page("This link does not work",
+                "<h1>This link does not work</h1><p>The agent is no longer shared, or the link was mistyped.</p>"))
+        with open(f, "rb") as fh: body = fh.read()
+        return self.send_page(200, body, SHARE_TYPES[m.group(2) or ""], share=True)
     def gone(self, rc):
         code, title, msg = GONE.get(rc, (500, "Something went wrong", "Nothing was saved. Try the link again in a minute."))
         if rc in (4, 11): record_fail(self.client())
@@ -1257,6 +1282,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/healthz":
             return self.send_page(200, b'{"ok":true}', "application/json")
+        if self.path.startswith("/a/"):
+            return self.share(self.path.split("?", 1)[0])
         if limited(self.client()):
             return self.send_page(429, page("Too many tries", "<h1>Too many tries</h1><p>Wait a few minutes.</p>"))
         h = self.token_hash()
@@ -1397,6 +1424,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def live_links():
     now = time.time()
+    # DIVE-7782: a live share keeps the page up (its link must open any time).
+    try:
+        if SHARES and any(os.path.isfile(os.path.join(SHARES, d, "share.json")) for d in os.listdir(SHARES)):
+            return True
+    except OSError: pass
     try:
         for name in os.listdir(STORE):
             try:

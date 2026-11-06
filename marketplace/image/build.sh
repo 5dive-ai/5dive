@@ -30,5 +30,11 @@ curl -fsSL "${FIVEDIVE_INSTALL_URL:-https://install.5dive.ai}" | bash
 install -D -m 0755 "$here/files/etc/update-motd.d/99-5dive" /etc/update-motd.d/99-5dive
 install -D -m 0755 "$here/firstboot.sh" /var/lib/cloud/scripts/per-instance/001_5dive
 
+# DIVE-7756: the one-time connect (the hoster's per-server code, no password).
+# firstboot.sh enables it on each new server; it is off in the image itself.
+install -D -m 0755 "$here/files/usr/local/lib/5dive-claim/claim.py" /usr/local/lib/5dive-claim/claim.py
+install -D -m 0644 "$here/files/etc/systemd/system/5dive-claim.service" /etc/systemd/system/5dive-claim.service
+systemctl daemon-reload
+
 apt-get -qqy autoremove
 apt-get -qqy clean

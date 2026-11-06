@@ -334,16 +334,21 @@ _rebal_apply() {
       lead_msg["${lead:--}"]+="${b} ${c}->${d}, "
     fi
   done <<<"$plan"
-  local l msg
+  local l msg reached=""
   for l in "${!lead_msg[@]}"; do
     msg="🔀 Rebalanced un-started rows between sibling seats: ${lead_msg[$l]%, } (a seat held a long un-started queue while its sibling was idle with quota; each row's body says why). Nothing to do; undo with 5dive task assign <row> <seat>. Preview the next pass: 5dive task rebalance --dry-run"
     if [[ "$l" == "-" ]]; then continue; fi
     if declare -F _hb_escalate >/dev/null 2>&1; then
-      _hb_escalate "rebalance" "task-engine" "rebalance" "$msg" "$l"
+      _hb_escalate "rebalance" "task-engine" "rebalance" "$msg" "$l" \
+        && reached+="${reached:+, }${l}"
     else
-      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$l" --from="task-engine" --message="$msg" ) >/dev/null 2>&1 || true
+      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$l" --from="task-engine" --message="$msg" ) >/dev/null 2>&1 \
+        && reached+="${reached:+, }${l}"
     fi
   done
+  # DIVE-7684: the leads a send actually reached, for the heartbeat's log line.
+  # This function runs in a command substitution, so a variable cannot carry it.
+  printf '#notified\t%s\n' "$reached"
   return 0
 }
 

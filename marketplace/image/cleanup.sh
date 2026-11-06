@@ -17,6 +17,10 @@ r="${IMAGE_ROOT:-}"
 rm -f  "$r/var/lib/5dive/gate-proof.key" "$r/etc/5dive/vault.key"
 rm -f  "$r/etc/5dive/connectord.env" "$r/etc/5dive/provisioning.env"
 rm -rf "$r/var/lib/5dive/tasks" "$r/var/lib/5dive/secret-drop"
+# DIVE-7756: the one-time connect's state is one server's (its start time, its
+# closed mark, first boot's done mark); a new server starts it fresh.
+rm -rf "$r/var/lib/5dive-claim"
+rm -f  "$r/var/log/5dive-claim.log" "$r/etc/systemd/system/multi-user.target.wants/5dive-claim.service"
 if [[ -d "$r/etc/5dive/connectors" ]]; then
   find "$r/etc/5dive/connectors" -mindepth 1 -delete
 fi
@@ -26,7 +30,10 @@ fi
 if [[ -f "$r/etc/machine-id" ]]; then
   : > "$r/etc/machine-id"
 fi
-rm -f  "$r/var/lib/dbus/machine-id"
+# Ubuntu's /var/lib/dbus/machine-id is a link to /etc/machine-id, emptied above:
+# keep the link (Vultr's clean_system fails on a missing one, DIVE-7717), remove
+# only a real copy of the id.
+[[ -L "$r/var/lib/dbus/machine-id" ]] || rm -f "$r/var/lib/dbus/machine-id"
 rm -f  "$r"/etc/ssh/ssh_host_*
 rm -rf "$r/var/lib/caddy/.local/share/caddy"
 for h in "$r/root" "$r"/home/*; do
@@ -36,8 +43,12 @@ done
 
 # The check: no key, token or certificate file is left in 5dive's state. A miss
 # here fails the build rather than shipping one server's key to every customer.
+# One file is exempt by its exact path: /etc/5dive/update-pubkey.pem is 5dive's
+# public release key (DIVE-7577), the same on every server and written by the
+# installer, so it belongs in the image (DIVE-7717).
 left=$(find "$r/etc/5dive" "$r/var/lib/5dive" -type f \
-  \( -name '*.key' -o -name '*.pem' -o -name '*token*' -o -name 'connectord.env' \) 2>/dev/null || true)
+  \( -name '*.key' -o -name '*.pem' -o -name '*token*' -o -name 'connectord.env' \) \
+  ! -path "$r/etc/5dive/update-pubkey.pem" 2>/dev/null || true)
 if [[ -n "$left" ]]; then
   echo "cleanup: per-server secrets are still in the image:" >&2
   echo "$left" >&2

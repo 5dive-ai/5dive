@@ -633,6 +633,14 @@ jobs:
           n=$(grep -c '^ok   - R1' root-arms-ho.txt) || n=0
           echo "R1 ok lines: $n"
           test "$n" -ge 8
+      - name: dive7724_codex_seat_login_unit as root, R arm required (DIVE-7724)
+        run: |
+          set -o pipefail
+          sudo -E env L7724_REQUIRE_ROOT_ARM=1 bash tests/dive7724_codex_seat_login_unit.sh | tee root-arms-7724.txt
+          if grep -q '^skip - R arm' root-arms-7724.txt; then echo "R arm was skipped under root"; exit 1; fi
+          n=$(grep -c '^ok   - R' root-arms-7724.txt) || n=0
+          echo "R ok lines: $n"
+          test "$n" -ge 12
       - name: self_update_offline_unit as root, the no-network arm required (DIVE-7577)
         run: |
           set -o pipefail

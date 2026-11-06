@@ -67,7 +67,7 @@ tnc() { # <desc> <needle> <haystack> — does NOT contain
 # the banner, so its two collaborators come with it. Extracting them (rather than
 # stubbing them away) is what keeps these arms grading the real fall-through: a
 # stub that always returns empty would grade a probe that can no longer exist.
-for _fn in agent_channels_binding _channel_health_read _channel_health_classify agent_channel_handshake; do
+for _fn in agent_channels_binding _channel_health_readable _channel_health_read _channel_health_classify agent_channel_handshake; do
   fnsrc=$(sed -n "/^${_fn}() {/,/^}/p" "$SRC/cmd_agent.sh")
   [[ -n "$fnsrc" ]] || { echo "FAIL: could not extract ${_fn} from $SRC/cmd_agent.sh"; exit 1; }
   eval "$fnsrc"

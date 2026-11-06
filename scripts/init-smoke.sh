@@ -196,7 +196,11 @@ PY
 # once its cells answered on OpenRouter, found the gateway up but loading no
 # 5dive platform ("No messaging platforms enabled"). Turning Hermes on in the app
 # and here is one follow-up; until then the cell says so instead of grading it.
-cell_has_webchat() { case "$(cell_type "$1")" in openclaw) return 0 ;; *) return 1 ;; esac; }
+# DIVE-7724: codex too. Its dashboard adapter is the same plugin, run by the
+# Codex dispatcher, so it reads the same .env and drains the same inbox. A Codex
+# seat whose ~/.claude is not its own crash-looped that adapter for 14.5 h
+# unseen, because this arm was openclaw only.
+cell_has_webchat() { case "$(cell_type "$1")" in openclaw|codex) return 0 ;; *) return 1 ;; esac; }
 
 FAKE_API_PORT=18999
 start_fake_api() {
@@ -238,6 +242,12 @@ webchat_arm() {
   home=$(getent passwd "agent-${NAME}" | cut -d: -f6)
   start_fake_api
   : > /tmp/webchat-replies.jsonl
+  # DIVE-7724: the install -d below would hand a root-owned ~/.claude back to the
+  # seat and hide the crash loop it causes, so the owner is graded first.
+  if [[ -d "$home/.claude" ]] && [[ "$(stat -c %U "$home/.claude")" != "agent-${NAME}" ]]; then
+    DETAIL="$home/.claude is owned by $(stat -c %U "$home/.claude"), not agent-${NAME}: the app chat adapter cannot make its inbox"
+    return 1
+  fi
   # The bridge's own override file (plugins/dashboard/server.ts reads it at boot).
   install -d -o "agent-${NAME}" -m 700 "$home/.claude" "$home/.claude/channels" "$home/.claude/channels/dashboard"
   printf 'DASHBOARD_API_BASE=http://127.0.0.1:%s\nCONNECTORD_TOKEN=init-smoke-not-a-token\n' "$FAKE_API_PORT" \

@@ -213,12 +213,13 @@ _task_usage() {
       And on ANY type, --needs=spend_authority|human_tap|secret_provision is
       HUMAN-ONLY by declaration: it outranks the tier and every routing kind.
   need <id> --withdraw                          cancel a pending gate that is now moot
-  answer <id> --value="..." [--proof=<token>] [--channel-proof=<chat> [--channel-msg=<id>]]
+  answer <id> --value="..." [--proof=<token>] [--channel-proof=<chat_id> [--channel-msg=<id>]]
       [--tap-uid=<tg user id> [--tap-username=<handle>] [--tap-msg=<message id>]]
       [--relay-agent=<name>]     a button tap: WHO tapped, and whose bot carried it
+      --channel-proof takes the Telegram chat id as a number (a telegram: prefix is accepted)
   clear-recs --channel-proof=<chat_id> [--only=<id>]     apply pending recommendations
   queue [--for=<agent>] [--json]                gates ROUTED TO YOU, filed without waking you
-  inbox [--send [--channel-proof=<chat>] [--only=<id>]]  every unanswered human gate IN THE FLEET (already
+  inbox [--send [--channel-proof=<chat_id>] [--only=<id>]]  every unanswered human gate IN THE FLEET (already
                                                 fleet-wide; --fleet accepted as a no-op); --send DMs the owner,
                                                 --only re-sends that one gate's alert
   inbox --messages                              what your agents sent you with \`agent send owner\` (the last 20)

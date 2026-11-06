@@ -115,6 +115,14 @@ eq_t 'client Claude binding: pack sonnet lands as the current claude id' \
 printf '%s\n' '{"packFormat":1,"agentName":"pin","config":{"type":"claude","model":"z-ai/glm-4.6"},"includes":{"memory":false}}' >"$TMP/manifest.json"
 eq_t 'a pack that pins a vendor id keeps it on OpenRouter' z-ai/glm-4.6 "$(import_as pin openrouter)"
 eq_t 'a pinned pack records no family' "" "$(jq -r '.agents.pin.modelFamily // ""' "$TMP/reg")"
+# DIVE-7786: a CUSTOM pack carries the slug its source account resolved.
+printf '%s\n' '{"packFormat":1,"agentName":"mira","config":{"type":"claude","model":"'"$FLASH"'"},"includes":{"memory":false}}' >"$TMP/manifest.json"
+eq_t 'custom pack slug onto the account that maps sonnet to it: kept' "$FLASH" "$(import_as mira openrouter)"
+eq_t '... and its family is recorded, so a later account move can follow it' sonnet \
+  "$(jq -r '.agents.mira.modelFamily // ""' "$TMP/reg")"
+eq_t 'custom pack slug onto a Claude login: lands as Sonnet, not a dead id' \
+  "$(model_latest sonnet)" "$(import_as mira2 client-claude)"
+eq_t '... with the family recorded' sonnet "$(jq -r '.agents.mira2.modelFamily // ""' "$TMP/reg")"
 
 echo '== 3. real cmd_config: the account switch re-derives the model =='
 # cmd_pack.sh redefines nothing cmd_config needs, but the import stubs above
@@ -128,6 +136,9 @@ ensure_state() { :; }
 audit_log() { :; }
 write_agent_env() { :; }
 link_agent_profile() { :; }
+# DIVE-7747: the env and link writers above are no-ops, so the move's read-back
+# is told they landed on the registry's account (this harness grades the model).
+agent_profile_on_disk() { local p; p=$(registry_read | jq -r --arg n "$1" '.agents[$n].authProfile // empty'); printf '%s\t%s\n' "$p" "$p"; }
 account_binding_record() { :; }
 install_channel_for_agent() { :; }
 systemd-run() { printf 'restart\n' >>"$TMP/restarts"; }
@@ -156,10 +167,17 @@ seat old "$(model_latest sonnet)" openrouter
 rc=$(set_acct old openrouter)
 eq_t 'the same-account re-set heals a pre-fix partner seat (the one-off)' "$FLASH" "$(live old)"
 
-# A deliberate pin survives a switch.
+# A deliberate pin survives a switch onto an account that can run it.
 seat pinned z-ai/glm-4.6 openrouter sonnet
-set_acct pinned client-claude >/dev/null
+set_acct pinned client-deepseek >/dev/null
 eq_t 'a deliberate vendor pin is not overwritten by a switch' z-ai/glm-4.6 "$(live pinned)"
+# DIVE-7786: ...but a Claude login can never run it, so there it becomes Sonnet.
+step() { printf '%s\n' "$*" >&2; }
+set_acct pinned client-claude >/dev/null
+step() { :; }
+eq_t 'a vendor pin moved onto a Claude login becomes Sonnet (RED before 7786)' "$(model_latest sonnet)" "$(live pinned)"
+grep -q "is not a Claude model" "$TMP/err" \
+  && ok_t '... and the step says why' || bad_t 'the floor printed no step' "$(cat "$TMP/err")"
 
 # A bare alias already follows the account on its own: left alone.
 seat bare sonnet openrouter
@@ -182,7 +200,52 @@ eq_t '... and becomes the remembered family' haiku "$(jq -r '.agents.both.modelF
 ( JSON_MODE=1; cmd_config both set model=z-ai/glm-4.6 ) >/dev/null 2>&1
 eq_t 'setting a pinned id forgets the family' "" "$(jq -r '.agents.both.modelFamily // ""' "$TMP/reg")"
 
+echo '== 3b. DIVE-7786: a seat with no recorded family on the seeded slug =='
+# alert-vale's mira: a custom pack on the seeded account, modelFamily null, and a
+# registry `model` stamped with the same slug.
+seat mira "$FLASH" openrouter
+jq --arg m "$FLASH" '.agents.mira.model = $m' "$TMP/reg" >"$TMP/reg.n" && mv "$TMP/reg.n" "$TMP/reg"
+rc=$(set_acct mira client-claude)
+eq_t 'connecting own Claude: rc' 0 "$rc"
+eq_t 'the slug is read back through the old account map: real Sonnet (RED before 7786)' "$(model_latest sonnet)" "$(live mira)"
+eq_t '... the family is recorded' sonnet "$(jq -r '.agents.mira.modelFamily // ""' "$TMP/reg")"
+eq_t '... and the registry model matches settings.json (RED before 7786)' "$(live mira)" "$(jq -r '.agents.mira.model // ""' "$TMP/reg")"
+set_acct mira openrouter >/dev/null
+eq_t 'moved back onto the seeded account: its mapped id again' "$FLASH" "$(live mira)"
+eq_t '... registry model follows' "$FLASH" "$(jq -r '.agents.mira.model // ""' "$TMP/reg")"
+# A seat with no registry model never grows one.
+seat nomodel "$FLASH" openrouter
+set_acct nomodel client-claude >/dev/null
+eq_t 'a seat with no registry model gets none' false "$(jq -r '.agents.nomodel | has("model")' "$TMP/reg")"
+# The speed verb (`config set model=sonnet effort=high`) also syncs the registry.
+seat speedy "$FLASH" client-claude
+jq --arg m "$FLASH" '.agents.speedy.model = $m' "$TMP/reg" >"$TMP/reg.n" && mv "$TMP/reg.n" "$TMP/reg"
+( JSON_MODE=1; cmd_config speedy set model=sonnet effort=high ) >/dev/null 2>&1
+eq_t 'speed verb: settings.json reads sonnet' sonnet "$(live speedy)"
+eq_t 'speed verb: the registry model matches (RED before 7786)' sonnet "$(jq -r '.agents.speedy.model // ""' "$TMP/reg")"
+# Deliberate Claude pins stay.
+seat opuspin claude-opus-5-5 openrouter
+set_acct opuspin client-claude >/dev/null
+eq_t 'a seat pinned to claude-opus-5-5 stays on it' claude-opus-5-5 "$(live opuspin)"
+seat oldpin claude-opus-4-1-20250805 client-deepseek
+set_acct oldpin client-claude >/dev/null
+eq_t 'an older claude id somebody chose stays on a Claude login' claude-opus-4-1-20250805 "$(live oldpin)"
+seat aliaspin 'opus[1m]' openrouter
+set_acct aliaspin client-claude >/dev/null
+eq_t 'a bare alias with a suffix stays' 'opus[1m]' "$(live aliaspin)"
+# An unknown account is never assumed to be a Claude login.
+seat ghost "$FLASH" openrouter
+set_acct ghost no-such-account >/dev/null
+eq_t 'a move to an account with no folder leaves the slug' "$FLASH" "$(live ghost)"
+# A Bedrock account takes its own ids.
+mkprof bedrock "" "" "" ""; printf 'CLAUDE_CODE_USE_BEDROCK=1\n' >>"$AUTH_PROFILES_DIR/bedrock/combined.env"
+seat br us.anthropic.claude-sonnet-4-5-v1:0 client-claude
+set_acct br bedrock >/dev/null
+eq_t 'a Bedrock account is not floored' us.anthropic.claude-sonnet-4-5-v1:0 "$(live br)"
+eq_t 'a stale map with no base url is still a Claude login' 0 "$(profile_is_anthropic_login stale-map; echo $?)"
+
 echo '== 4. create path wiring =='
+
 csrc=$(<"$SRC/cmd_agent_create.sh")
 [[ "$csrc" == *'_claude_create_model=$(resolve_model_for_profile "$_claude_create_model" "$profile")'* ]] \
   && ok_t 'agent create resolves a family alias against its bound account' \

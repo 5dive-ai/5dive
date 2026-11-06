@@ -54,6 +54,9 @@ cmd_config() {   # <name> set auth-profile=<target>
   registry_read | jq --arg n "$n" --arg v "$v" '.agents[$n].authProfile = $v' | registry_write
 }
 with_registry_lock() { local fn="$1"; shift; "$fn" "$@"; }
+# DIVE-7747: rotate reads back the env file and auth link before it says
+# rotated:true. This harness does not own those files: they follow the registry.
+agent_profile_on_disk() { local p; p=$(registry_read | jq -r --arg n "$1" '.agents[$n].authProfile // ""'); printf '%s\t%s\n' "$p" "$p"; }
 # DIVE-6149: an account nobody is fresh on is a destination when its REMEMBERED
 # reading proves room. Those records and seat caches live on the host; this
 # fixture names real account names, so point both at empty dirs.

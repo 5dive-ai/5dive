@@ -56,11 +56,13 @@ echo "== 2. agent _float_models =="
 fail() { printf 'FAIL(%s) %s\n' "$1" "$2" >&2; exit "${1:-1}"; }
 E_USAGE=2
 sed -n '/^cmd_agent_float_models()/,/^}/p' "$ROOT/src/cmd_agent.sh" >"$TMP/fn.sh"
+# DIVE-7786: the repair half writes through the real write_runtime_model.
+sed -n '/^write_runtime_model()/,/^}/p' "$ROOT/src/cmd_agent.sh" >>"$TMP/fn.sh"
 is "function extracted" "$(grep -c '^cmd_agent_float_models()' "$TMP/fn.sh")" "1"
 # shellcheck disable=SC1091
 source "$TMP/fn.sh"
 require_root() { :; }; warn() { :; }
-msg=""; ok() { msg="$*"; }
+msg=""; ok() { msg="$1"; }
 export AGENT_HOME_ROOT="$TMP/home" AUTH_PROFILES_DIR="$TMP/profiles"
 mkdir -p "$AUTH_PROFILES_DIR/or-acct" "$AUTH_PROFILES_DIR/claude-acct"
 printf 'ANTHROPIC_BASE_URL=https://openrouter.ai/api\nANTHROPIC_DEFAULT_SONNET_MODEL=deepseek/deepseek-v4.1-flash\n' >"$AUTH_PROFILES_DIR/or-acct/combined.env"
@@ -84,16 +86,41 @@ seat newhire 1 "{\"model\":\"$SONNET\",\"effortLevel\":\"high\",\"modelSettings\
 seat famdiff 1 '{"model":"claude-sonnet-5","effortLevel":"high"}'
 seat floats  1 '{"model":"sonnet","effortLevel":"high"}'
 seat codex   1 '{"model":"claude-sonnet-5"}'
-registry_read() { jq -n '{agents:{
+# DIVE-7786: stuck on the seeded OpenRouter slug under a Claude login.
+seat stuck    1 '{"model":"deepseek/deepseek-v4.1-flash-1017","effortLevel":"high"}'
+seat stucknew 0 '{"model":"z-ai/glm-4.6"}'
+seat orslug   1 '{"model":"deepseek/deepseek-v4.1-flash-1017"}'
+seat noacct   1 '{"model":"deepseek/deepseek-v4.1-flash-1017"}'
+seat opuspin  1 '{"model":"claude-opus-4-1-20250805"}'
+jq -n '{agents:{
   pinned:{type:"claude"}, acct:{type:"claude",authProfile:"claude-acct",modelFamily:"sonnet"},
   orseat:{type:"claude",authProfile:"or-acct"}, fresh:{type:"claude"}, chosen:{type:"claude"},
   haiku:{type:"claude"}, newhire:{type:"claude",modelFamily:"sonnet"},
-  famdiff:{type:"claude",modelFamily:"opus"}, floats:{type:"claude"}, codex:{type:"codex"}}}'; }
-cmd_agent_float_models; rc=$?
+  famdiff:{type:"claude",modelFamily:"opus"}, floats:{type:"claude"}, codex:{type:"codex"},
+  stuck:{type:"claude",authProfile:"claude-acct",model:"deepseek/deepseek-v4.1-flash-1017"},
+  stucknew:{type:"claude",authProfile:"claude-acct"}, orslug:{type:"claude",authProfile:"or-acct"},
+  noacct:{type:"claude"}, opuspin:{type:"claude",authProfile:"claude-acct"}}}' >"$TMP/reg.json"
+registry_read() { cat "$TMP/reg.json"; }
+registry_write() { cat >"$TMP/reg.json.n" && mv "$TMP/reg.json.n" "$TMP/reg.json"; }
+R() { jq -r --arg n "$1" ".agents[\$n].$2 // \"\"" "$TMP/reg.json"; }
+cmd_agent_float_models 2>"$TMP/float.err"; rc=$?
 first=$msg
 ok()  { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
 is "exits 0"                         "$rc" "0"
-is "count reported"                  "$first" "moved 4 agent(s) onto their model family alias"
+is "count reported, naming every seat it repaired" "$first" "moved 5 agent(s) onto their model family alias; repaired 2 on a model their Claude login cannot run: stuck stucknew"
+echo "-- DIVE-7786 repair --"
+is "stuck slug on a Claude login: repaired, then floats" "$(S stuck | jq -r .model)" "sonnet"
+is "...its effort kept"                "$(S stuck | jq -r .effortLevel)" "high"
+is "...registry family recorded"       "$(R stuck modelFamily)" "sonnet"
+is "...registry model follows settings" "$(R stuck model)" "$SONNET"
+is "never-booted stuck seat: repaired to the full id" "$(S stucknew | jq -r .model)" "$SONNET"
+is "...and no registry model is invented" "$(jq -r '.agents.stucknew | has("model")' "$TMP/reg.json")" "false"
+is "the update log names each repaired seat" "$(grep -c '^repaired: ' "$TMP/float.err")" "2"
+grep -q '^repaired: stuck deepseek/deepseek-v4.1-flash-1017 -> '"$SONNET"' (account claude-acct' "$TMP/float.err" \
+  && ok "...with what it was and what it is now" || no "repair line wrong: $(cat "$TMP/float.err")"
+is "a slug on the OpenRouter account it belongs to: untouched" "$(same orslug)" "same"
+is "a seat with no named account: untouched" "$(same noacct)" "same"
+is "an old claude id somebody chose: untouched" "$(same opuspin)" "same"
 is "sonnet-5 seat floats"            "$(S pinned | jq -r .model)" "sonnet"
 is "...at the level it ran at (id key)"    "$(S pinned | jq -r --arg s "$SONNET" '.modelSettings[$s].effortLevel')" "high"
 is "...and under the alias key"      "$(S pinned | jq -r '.modelSettings.sonnet.effortLevel')" "high"
@@ -111,13 +138,14 @@ is "recorded family disagrees: untouched" "$(same famdiff)" "same"
 is "already on the alias: untouched" "$(same floats)" "same"
 is "codex seat untouched"            "$(same codex)" "same"
 is "mode 600 kept"                   "$(stat -c %a "$AGENT_HOME_ROOT/agent-pinned/.claude/settings.json")" "600"
-for n in pinned haiku; do cp "$AGENT_HOME_ROOT/agent-$n/.claude/settings.json" "$TMP/$n.before"; done
-ok() { msg="$*"; }
-cmd_agent_float_models
+for n in pinned haiku stuck stucknew; do cp "$AGENT_HOME_ROOT/agent-$n/.claude/settings.json" "$TMP/$n.before"; done
+ok() { msg="$1"; }
+cmd_agent_float_models 2>"$TMP/float2.err"
 second=$msg
 ok()  { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
 is "second pass moves nothing"       "$second" "moved 0 agent(s) onto their model family alias"
-is "second pass does not rewrite"    "$(same pinned)/$(same haiku)" "same/same"
+is "second pass does not rewrite"    "$(same pinned)/$(same haiku)/$(same stuck)/$(same stucknew)" "same/same/same/same"
+is "second pass repairs nobody"      "$(grep -c '^repaired: ' "$TMP/float2.err")" "0"
 
 echo "== 3. wiring =="
 grep -q '_float_models)' "$ROOT/src/main.sh" && grep -q 'cmd_agent_float_models "\$@"' "$ROOT/src/main.sh" \
@@ -127,7 +155,9 @@ grep -q '"\$BIN_DIR/5dive" agent _float_models' "$ROOT/install.sh" \
 grep -q "grep -q 'cmd_agent_float_models' \"\$BIN_DIR/5dive\"" "$ROOT/install.sh" \
   && ok "installer skips a bundle that predates the verb" || no "installer would warn on every older bundle"
 h=$(grep -n 'agent _heal_effort >/dev/null' "$ROOT/install.sh" | cut -d: -f1)
-f=$(grep -n 'agent _float_models >/dev/null' "$ROOT/install.sh" | cut -d: -f1)
+f=$(grep -n '"\$BIN_DIR/5dive" agent _float_models' "$ROOT/install.sh" | head -1 | cut -d: -f1)
+grep -q "grep '^repaired: '" "$ROOT/install.sh" \
+  && ok "installer keeps the repaired lines in the update log" || no "installer drops the repaired lines"
 [[ -n "$h" && -n "$f" && "$f" -gt "$h" ]] && ok "the move runs after the effort heal" || no "the move must run after the effort heal (h=$h f=$f)"
 
 echo "-----"

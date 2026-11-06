@@ -39,6 +39,10 @@ with_registry_lock() { "$@"; }
 account_near_wall_state() { printf '%s' "$SOURCE_STATE"; }
 account_has_live_headroom() { [[ "$DEST_ROOMY" == 1 && "$1" == roomy ]]; }
 cmd_config() { printf '%s\n' "$*" >>"$CONFIG_CALLS"; }
+# DIVE-7747: rotate reads back the env file and auth link before it says
+# rotated:true. This harness does not own those files: they land on the account
+# cmd_config was last asked for.
+agent_profile_on_disk() { local p; p=$(sed -n 's/.*auth-profile=//p' "$CONFIG_CALLS" | tail -n1); printf '%s\t%s\n' "$p" "$p"; }
 # DIVE-6149: no host account records or seat caches reach the remembered-room proof.
 AUTH_PROFILES_DIR="$TMP/profiles"
 usage_agent_home() { printf '%s/agent-%s\n' "$TMP/home" "$1"; }

@@ -93,7 +93,10 @@ audit_log() { :; }
 registry_read() { cat "$TMP/reg"; }
 registry_write() { cat >"$TMP/reg"; }
 with_registry_lock() { "$@"; }
-link_agent_profile() { printf '%s %s\n' "$1" "${2:-}" >>"$TMP/links"; }
+# DIVE-7747: the move reads the link back before it queues the restart, so the
+# shim points it where the real one does (a no-op link is a move that did not land).
+link_agent_profile() { printf '%s %s\n' "$1" "${2:-}" >>"$TMP/links"
+  rm -f "$ENV_DIR/$1-auth.env"; [[ -z "${2:-}" ]] || ln -s "$AUTH_PROFILES_DIR/$2/combined.env" "$ENV_DIR/$1-auth.env"; }
 account_binding_record() { :; }
 plugin_seat_backfill() { :; }
 mod_seat_enabled() { return 1; }
@@ -346,7 +349,7 @@ w=$(switch_harness_warning Theo claude codex)
 mkdir -p "$AUTH_PROFILES_DIR/grokacct/grok/.grok"
 : >"$AUTH_PROFILES_DIR/grokacct/combined.env"
 printf '{"access_token":"x"}\n' >"$AUTH_PROFILES_DIR/grokacct/grok/.grok/auth.json"
-export FIVE_GROK_ARM_MARKER="$TMP/grok-unfreeze"; rm -f "$FIVE_GROK_ARM_MARKER"
+export FIVE_GROK_OFF_MARKER="$TMP/grok-off"; : >"$FIVE_GROK_OFF_MARKER"   # owner turned Grok off (DIVE-7802)
 grok_plugin_dir() { echo "$TMP/telegram-grok"; }
 TYPE_BIN[grok]=/bin/true
 DH="$SWITCH_HOME_ROOT/agent-dude"; DMEM="$DH/.claude/projects/-home-claude-projects/memory"
@@ -398,11 +401,11 @@ grep -q "^channel claude telegram dude $TOKEN_D  555$" "$TMP/calls" \
 # claude -> grok, owner's switch off, then on
 snap_reg=$(sha256sum <"$TMP/reg"); snap_home=$(find "$DH" -type f -exec sha256sum {} + | sort | sha256sum)
 rc=$(run cmd_agent_switch dude --to=grok --account=grokacct)
-[[ "$rc" != 0 ]] && grep -q 'Grok is off on this server' "$TMP/err" && grep -q 'sudo 5dive grok enable' "$TMP/err" \
+[[ "$rc" != 0 ]] && grep -q 'Grok is turned off on this server' "$TMP/err" && grep -q 'sudo 5dive grok enable' "$TMP/err" \
   && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" && "$(find "$DH" -type f -exec sha256sum {} + | sort | sha256sum)" == "$snap_home" ]] \
   && ok_t "G6 claude -> grok with Grok turned off is refused with the reason and how to turn it on; nothing changes" \
   || bad_t "G6 unarmed" "rc=$rc err=$(<"$TMP/err")"
-: >"$FIVE_GROK_ARM_MARKER"
+rm -f "$FIVE_GROK_OFF_MARKER"
 rc=$(run cmd_agent_switch dude --to=grok --account=claudeacct)
 [[ "$rc" != 0 ]] && grep -q 'no Grok sign-in' "$TMP/err" && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] \
   && ok_t "G7 claude -> grok onto an account with no Grok sign-in is refused, nothing changes" \
@@ -455,7 +458,7 @@ w=$(switch_harness_warning Dude grok claude); w2=$(switch_harness_warning Theo c
 [[ "$w" == "Moving Dude to your Claude plan switches it from Grok to Claude Code. Its memory and instructions are converted; this chat's history is not. You can switch back any time." \
    && "$w2" == "Moving Theo to your Grok plan switches it from Claude Code to Grok. Its memory and instructions are converted; this chat's history is not. You can switch back any time." ]] \
   && ok_t "G15 the sentence names Grok both ways" || bad_t "G15 warning" "$w | $w2"
-unset FIVE_GROK_ARM_MARKER
+unset FIVE_GROK_OFF_MARKER
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
