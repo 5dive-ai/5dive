@@ -131,7 +131,7 @@ poller cdx codex 300 4646 live
 # --- MUTATION: the verdict without the poll rank must turn arm 1 red ---------
 eval "$(declare -f _liv_verdict | sed '1s/_liv_verdict/_liv_verdict_REAL/')"
 eval "$(declare -f _liv_verdict | sed 's/"\$poll" == "stalled"/"$poll" == "never-matches"/')"
-declare -f _liv_verdict | grep -q '"stalled"' \
+grep -q '"stalled"' <<<"$(declare -f _liv_verdict)" \
   && bad_t "MUTATION applied" "the poll rank is still present; the mutant did not take" \
   || ok_t "MUTATION applied (the poll rank is gone from the verdict)"
 [[ "$(run stuck | jq -r '.data.seats[0].verdict')" == "alive" ]] \
