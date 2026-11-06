@@ -1730,8 +1730,10 @@ a2a_queue_flush_one() {
   while IFS= read -r f; do [[ -n "$f" ]] && files+=("$f"); done \
     < <(sudo -u "agent-${seat}" find "$dir" -maxdepth 1 -name '*.msg' 2>/dev/null | sort)
   (( ${#files[@]} > 0 )) || return 1
-  _a2a_spool_held "$seat" && return 2
   _hb_agent_idle "$seat" "${FIVE_A2A_QUEUE_IDLE_GAP:-0.4}" || return 1
+  # After the idle gate on purpose: a busy seat is polled every few seconds
+  # through the drain budget, and must not pay a transcript read per poll.
+  _a2a_spool_held "$seat" && return 2
   for (( i=0; i<${#files[@]}; i++ )); do
     f="${files[i]}"
     msg="$(sudo -u "agent-${seat}" cat "$f" 2>/dev/null)" || return 1
