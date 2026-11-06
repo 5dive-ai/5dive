@@ -2527,8 +2527,15 @@ install_channel_for_opencode_agent() {
   local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
   local user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
+  if [[ "$plugin" == "dashboard" ]]; then
+    # DIVE-7348: the web chat. 5dive-agent-start runs the dashboard server
+    # beside the seat (--runtime=opencode); it answers each message with one
+    # headless `opencode run` turn in the web chat's own session. No token here.
+    prepare_dashboard_bridge "$user"
+    return 0
+  fi
   [[ "$plugin" == "telegram" ]] \
-    || fail "$E_VALIDATION" "opencode channel plugin unsupported: $plugin (telegram only)"
+    || fail "$E_VALIDATION" "opencode channel plugin unsupported: $plugin (telegram or dashboard)"
   [[ -n "$token" ]] || fail "$E_VALIDATION" "opencode telegram channel requires a bot token"
   if [[ -n "$allowed_users" ]]; then
     valid_telegram_chat_id_list "$allowed_users" \
@@ -2663,8 +2670,15 @@ install_channel_for_pi_agent() {
   local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
   local user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
+  if [[ "$plugin" == "dashboard" ]]; then
+    # DIVE-7348: the web chat. 5dive-agent-start runs the dashboard server
+    # beside the seat (--runtime=pi); it answers each message with one
+    # headless `pi -p` turn in the web chat's own session. No token here.
+    prepare_dashboard_bridge "$user"
+    return 0
+  fi
   [[ "$plugin" == "telegram" ]] \
-    || fail "$E_VALIDATION" "pi channel plugin unsupported: $plugin (telegram only)"
+    || fail "$E_VALIDATION" "pi channel plugin unsupported: $plugin (telegram or dashboard)"
   [[ -n "$token" ]] || fail "$E_VALIDATION" "pi telegram channel requires a bot token"
   if [[ -n "$allowed_users" ]]; then
     valid_telegram_chat_id_list "$allowed_users" \
@@ -2936,8 +2950,9 @@ PI_EXT
 install_channel_for_agent() {
   local type="$1" plugin="$2" name="$3" token="$4" home_channel="${5:-}" allowed_users="${6:-}"
   # Dashboard has native-push support in Claude, a dispatcher adapter in Codex,
-  # a pane bridge in Grok (DIVE-7347) and Antigravity (DIVE-7351), and a spool
-  # bridge in Hermes and OpenClaw (DIVE-7349). Other runtimes still have no dashboard transport.
+  # a pane bridge in Grok (DIVE-7347) and Antigravity (DIVE-7351), a spool
+  # bridge in Hermes and OpenClaw (DIVE-7349), and a headless-turn bridge in Pi
+  # and OpenCode (DIVE-7348). Other runtimes still have no dashboard transport.
   if [[ "$plugin" == "dashboard" ]] && ! type_has_web_chat "$type"; then
     fail "$E_VALIDATION" "channels=dashboard requires type=$(web_chat_types_text) (agent '$name' is type $type)"
   fi

@@ -185,7 +185,9 @@ case "$TYPE" in
     # one box never collide. OPENCODE_BIN + OPENCODE_PROJECT_DIR are exported via
     # OPENCODE_OVERRIDE below. Resolver kept in sync with opencode_plugin_dir()
     # in agent_setup.sh (the boot script is standalone, so it's duplicated).
-    if [[ "$CHANNELS" == "telegram" ]]; then
+    # DIVE-7348: telegram anywhere in the list ("telegram,dashboard" once the
+    # web chat is on): the web chat runs beside the seat, below.
+    if [[ ",${CHANNELS}," == *,telegram,* ]]; then
       OPENCODE_PLUGIN_DIR=""
       for _c in "${TELEGRAM_OPENCODE_PLUGIN_DIR:-}" \
                 /usr/local/lib/5dive/telegram-opencode \
@@ -210,7 +212,8 @@ case "$TYPE" in
     # instead of the pi TUI. PI_BIN + PI_PROJECT_DIR are exported via
     # PI_OVERRIDE below. Resolver kept in sync with pi_plugin_dir() in
     # agent_setup.sh (the boot script is standalone, so it's duplicated).
-    if [[ "$CHANNELS" == "telegram" ]]; then
+    # DIVE-7348: telegram anywhere in the list, as for opencode above.
+    if [[ ",${CHANNELS}," == *,telegram,* ]]; then
       PI_PLUGIN_DIR=""
       for _c in "${TELEGRAM_PI_PLUGIN_DIR:-}" \
                 /usr/local/lib/5dive/telegram-pi \
@@ -291,7 +294,8 @@ case "$CH" in
       grok) : ;;  # DIVE-7347: MCP server wired into ~/.grok/config.toml below
       antigravity) : ;;  # DIVE-7351: MCP server wired into ~/.gemini/config/mcp_config.json below
       hermes|openclaw) : ;;  # DIVE-7349: the dashboard server runs beside the seat, below
-      *) echo "channels=dashboard requires type=claude, codex, grok, antigravity, hermes or openclaw (got type=$TYPE)" >&2; exit 2 ;;
+      pi|opencode) : ;;  # DIVE-7348: same, answering with one headless CLI turn per message
+      *) echo "channels=dashboard requires type=claude, codex, grok, antigravity, hermes, openclaw, pi or opencode (got type=$TYPE)" >&2; exit 2 ;;
     esac
     # DIVE-7724: every harness's chat server keeps its inbox under ~/.claude.
     # When the seat cannot make it (a root-owned ~/.claude), say so ONCE, here,
@@ -347,7 +351,7 @@ CODEX_OVERRIDE=""
 # is the bun --cwd). OPENCODE_SERVE_PORT is deliberately unset → the bridge
 # auto-picks a free port so concurrent opencode agents don't collide.
 OPENCODE_OVERRIDE=""
-if [[ "$TYPE" == "opencode" && "$CHANNELS" == "telegram" ]]; then
+if [[ "$TYPE" == "opencode" && ",${CHANNELS}," == *,telegram,* ]]; then
   OPENCODE_OVERRIDE="export OPENCODE_BIN=$(printf %q "/home/claude/.local/bin/opencode") OPENCODE_PROJECT_DIR=$(printf %q "$WORKDIR"); "
 fi
 # pi+telegram relay env (see the pi case in the type-dispatch). The relay hosts
@@ -356,7 +360,7 @@ fi
 # as its project dir (else it defaults to the plugin dir, which is the bun
 # --cwd). Mirrors OPENCODE_OVERRIDE.
 PI_OVERRIDE=""
-if [[ "$TYPE" == "pi" && "$CHANNELS" == "telegram" ]]; then
+if [[ "$TYPE" == "pi" && ",${CHANNELS}," == *,telegram,* ]]; then
   PI_OVERRIDE="export PI_BIN=$(printf %q "/home/claude/.local/bin/pi") PI_PROJECT_DIR=$(printf %q "$WORKDIR"); "
 fi
 # DIVE-7592: a hermes seat runs in Hermes' own approve-all mode, as grok
@@ -2828,7 +2832,12 @@ fi
 # spool's outbox: on hermes the 5dive channel plugin inside the messaging
 # gateway answers there, on openclaw the server itself asks the gateway with
 # `openclaw agent`.
-if [[ "$TYPE" == "hermes" || "$TYPE" == "openclaw" ]] && [[ ",${CHANNELS}," == *,dashboard,* ]]; then
+# DIVE-7348: pi and opencode the same way. There the server answers each
+# message with one headless turn of the seat's own CLI (`pi -p`, `opencode
+# run`) in the web chat's own session, from the seat's work folder, with the
+# provider variables the pane drops dropped here too (UNSET_CREDS).
+if [[ "$TYPE" == "hermes" || "$TYPE" == "openclaw" || "$TYPE" == "pi" || "$TYPE" == "opencode" ]] \
+   && [[ ",${CHANNELS}," == *,dashboard,* ]]; then
   DASH_PLUGIN_DIR=""
   for _c in "${DASHBOARD_PLUGIN_DIR:-}" \
             /usr/local/lib/5dive/dashboard \
@@ -2839,9 +2848,17 @@ if [[ "$TYPE" == "hermes" || "$TYPE" == "openclaw" ]] && [[ ",${CHANNELS}," == *
   if [[ -z "$DASH_PLUGIN_DIR" || -z "$DASH_BUN" ]]; then
     echo "warn: dashboard channel set for $TYPE agent '$NAME' but the dashboard plugin or bun was not found — web chat not wired" >&2
   else
+    DASH_ENV=()
+    if [[ "$TYPE" == "pi" || "$TYPE" == "opencode" ]]; then
+      # env takes its -u options before any NAME=value (after one, the next word is the command).
+      DASH_ENV=(env)
+      for _v in $UNSET_CREDS; do DASH_ENV+=(-u "$_v"); done
+      DASH_ENV+=("DASHBOARD_AGENT_WORKDIR=$WORKDIR")
+    fi
     (
+      if [[ "$TYPE" == "pi" || "$TYPE" == "opencode" ]]; then cd "$WORKDIR" 2>/dev/null || true; fi
       while /usr/bin/tmux has-session -t "$SESSION" 2>/dev/null; do
-        "$DASH_BUN" "$DASH_PLUGIN_DIR/server.ts" "--runtime=$TYPE" </dev/null || true
+        "${DASH_ENV[@]}" "$DASH_BUN" "$DASH_PLUGIN_DIR/server.ts" "--runtime=$TYPE" </dev/null || true
         echo "warn: $TYPE web chat bridge exited; restarting in 5s" >&2
         sleep 5
       done

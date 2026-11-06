@@ -11,8 +11,9 @@
 # Offline: the real boot-script blocks are extracted from bin/5dive-agent-start
 # and run against a fixture HOME (same shape as agent_start_cred_seed_unit.sh).
 #
-#   W1  type_has_web_chat: claude, codex, grok, hermes, openclaw yes; pi, "" no.
-#   W2  install_channel_for_agent refuses dashboard on a pi seat, naming the list.
+#   W1  type_has_web_chat: claude, codex, grok, hermes, openclaw yes; devin, "" no.
+#       (pi and opencode joined in DIVE-7348: tests/dive7348_pi_opencode_web_chat_unit.sh)
+#   W2  install_channel_for_agent refuses dashboard on a devin seat, naming the list.
 #   B1  channels=telegram,dashboard: both MCP tables written, the dashboard one
 #       runs the dashboard server with --runtime=grok.
 #   B2  a second boot rewrites the dashboard table, never duplicates it.
@@ -56,11 +57,11 @@ eq_t()  { [[ "$2" == "$3" ]] && ok_t "$1" || bad_t "$1" "expected [$2], got [$3]
 
 # --- who may take the web chat -------------------------------------------------
 got=""
-for t in claude codex grok antigravity hermes openclaw pi ""; do type_has_web_chat "$t" && got+="${t}:y " || got+="${t:-none}:n "; done
-eq_t "W1/A1 type_has_web_chat" "claude:y codex:y grok:y antigravity:y hermes:y openclaw:y pi:n none:n " "$got"
-out=$( ( install_channel_for_agent pi dashboard px "" ) 2>&1 ); rc=$?
-[[ $rc -ne 0 && "$out" == *"requires type=claude, codex, grok, antigravity, hermes or openclaw"* ]] \
-  && ok_t "W2/A1 pi refused, the message names the list" || bad_t "W2/A1 pi refused, the message names the list" "rc=$rc out=$out"
+for t in claude codex grok antigravity hermes openclaw devin ""; do type_has_web_chat "$t" && got+="${t}:y " || got+="${t:-none}:n "; done
+eq_t "W1/A1 type_has_web_chat" "claude:y codex:y grok:y antigravity:y hermes:y openclaw:y devin:n none:n " "$got"
+out=$( ( install_channel_for_agent devin dashboard px "" ) 2>&1 ); rc=$?
+[[ $rc -ne 0 && "$out" == *"requires type=claude, codex, grok, antigravity, hermes, openclaw, pi or opencode"* ]] \
+  && ok_t "W2/A1 devin refused, the message names the list" || bad_t "W2/A1 devin refused, the message names the list" "rc=$rc out=$out"
 
 # --- the boot script ------------------------------------------------------------
 WORK=$(mktemp -d)
