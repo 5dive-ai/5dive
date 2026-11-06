@@ -8,6 +8,8 @@
 #
 # Pure: no root, no systemd, no network. Run: bash tests/dive7833_hermes_webchat_unit.sh
 set -uo pipefail
+TMP=""
+trap 'rc=$?; [[ -n "$TMP" ]] && rm -rf "$TMP"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
@@ -15,7 +17,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); echo "ok   $1"; }
 bad_t() { FAIL=$((FAIL+1)); echo "FAIL $1"; }
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+TMP=$(mktemp -d)
 
 START=bin/5dive-agent-start
 fn=$(sed -n '/^hermes_fivedive_reenable() {/,/^}/p' "$START")

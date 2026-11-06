@@ -298,17 +298,24 @@ webchat_arm() {
   # your OK ... Reply /approve". The owner answers in the same chat; so does this
   # arm, at most twice, and the sum must still arrive. That grades the approval
   # round trip through the web chat as well.
-  local approvals=0
-  while (( approvals < 2 )) \
-        && ! jq -r '.body // empty' /tmp/webchat-replies.jsonl 2>/dev/null | grep -qw -- "$want" \
-        && jq -r '.body // empty' /tmp/webchat-replies.jsonl 2>/dev/null | tail -c 2000 | grep -q '/approve'; do
+  # Each reply body is captured first and matched from a herestring: no writer
+  # process piped into grep -q (tests/epipe_corpus_guard_unit.sh, B3).
+  local approvals=0 bodies recent seen
+  webchat_bodies() { jq -r '.body // empty' "$@" 2>/dev/null; }
+  bodies=$(webchat_bodies /tmp/webchat-replies.jsonl)
+  recent=$bodies; (( ${#recent} > 2000 )) && recent=${recent: -2000}
+  while (( approvals < 2 )) && ! grep -qw -- "$want" <<<"$bodies" && grep -q '/approve' <<<"$recent"; do
     approvals=$((approvals + 1))
     echo "web chat: the agent asked for approval; answering /approve in the chat ($approvals)"
-    local seen; seen=$(wc -l < /tmp/webchat-replies.jsonl)
+    seen=$(wc -l < /tmp/webchat-replies.jsonl)
     drop_inbox "$inbox" "/approve"
     for _ in $(seq 1 100); do
-      (( $(wc -l < /tmp/webchat-replies.jsonl) > seen )) && jq -r '.body // empty' /tmp/webchat-replies.jsonl | grep -qw -- "$want" && break
-      (( $(wc -l < /tmp/webchat-replies.jsonl) > seen )) && jq -r '.body // empty' /tmp/webchat-replies.jsonl | tail -n +"$((seen + 1))" | grep -q '/approve' && break
+      if (( $(wc -l < /tmp/webchat-replies.jsonl) > seen )); then
+        bodies=$(webchat_bodies /tmp/webchat-replies.jsonl)
+        grep -qw -- "$want" <<<"$bodies" && break
+        recent=$(tail -n +"$((seen + 1))" /tmp/webchat-replies.jsonl | webchat_bodies)
+        grep -q '/approve' <<<"$recent" && break
+      fi
       sleep 3
     done
   done

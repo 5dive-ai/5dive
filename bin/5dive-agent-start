@@ -967,8 +967,9 @@ hermes_gateway_unit_installed() {
 hermes_fivedive_reenable() {
   [[ ",${CHANNELS:-}," == *,dashboard,* ]] || return 0
   [[ -e "$HOME/.hermes/plugins/fivedive" && -x "${BIN:-}" ]] || return 0
-  sed -n '/^plugins:/,/^[^[:space:]#]/p' "$HOME/.hermes/config.yaml" 2>/dev/null \
-    | grep -qE '^[[:space:]]*-[[:space:]]*["'"'"']?fivedive["'"'"']?[[:space:]]*$' && return 0
+  local plugs
+  plugs=$(sed -n '/^plugins:/,/^[^[:space:]#]/p' "$HOME/.hermes/config.yaml" 2>/dev/null)
+  grep -qE '^[[:space:]]*-[[:space:]]*["'"'"']?fivedive["'"'"']?[[:space:]]*$' <<<"$plugs" && return 0
   "$BIN" plugins enable fivedive --no-allow-tool-override </dev/null >/dev/null 2>&1 \
     || "$BIN" plugins enable fivedive </dev/null >/dev/null 2>&1 \
     || { echo "warn: hermes plugins enable fivedive failed — the 5dive app chat will not answer" >&2; return 1; }
