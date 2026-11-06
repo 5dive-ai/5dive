@@ -41,7 +41,7 @@ has "guard sits after is_known_type" "DIVE-1221/1222 -> DIVE-7802: Grok is ON by
 has "not a patch"              "NOT A PATCH. The xAI upload path is still live"
 has "risk acceptance recorded" "OWNER RISK ACCEPTANCE"
 has "create-not-run caveat"    "It gates CREATE, not"
-if grep -qF 'grok-unfreeze}' "$SRC" || grep -qF 'FIVE_GROK_ARM_MARKER' "$SRC"; then
+if grep -qE 'grok-unfreeze\}|FIVE_GROK_ARM_MARKER' "$SRC"; then
   bad "the old opt-in arm marker is still read by create"
 else
   ok "the old opt-in arm marker is no longer read by create"
