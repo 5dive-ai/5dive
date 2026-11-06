@@ -956,6 +956,25 @@ hermes_gateway_unit_installed() {
   return 1
 }
 
+# DIVE-7833: the 5dive app chat on a hermes seat is a platform plugin
+# (~/.hermes/plugins/fivedive, linked by `agent config set channels=dashboard`)
+# that hermes loads only when config.yaml lists it under plugins.enabled. The
+# content seed below copies the account's config.yaml over the seat's on every
+# boot, which dropped that line: the gateway came up with "No messaging
+# platforms enabled" and no web chat message was ever answered. So, like the
+# model pin (DIVE-7333), the seat re-enables it after the seed. Only with the
+# chat on and the plugin linked; a no-op when the line is already there.
+hermes_fivedive_reenable() {
+  [[ ",${CHANNELS:-}," == *,dashboard,* ]] || return 0
+  [[ -e "$HOME/.hermes/plugins/fivedive" && -x "${BIN:-}" ]] || return 0
+  local plugs
+  plugs=$(sed -n '/^plugins:/,/^[^[:space:]#]/p' "$HOME/.hermes/config.yaml" 2>/dev/null)
+  grep -qE '^[[:space:]]*-[[:space:]]*["'"'"']?fivedive["'"'"']?[[:space:]]*$' <<<"$plugs" && return 0
+  "$BIN" plugins enable fivedive --no-allow-tool-override </dev/null >/dev/null 2>&1 \
+    || "$BIN" plugins enable fivedive </dev/null >/dev/null 2>&1 \
+    || { echo "warn: hermes plugins enable fivedive failed — the 5dive app chat will not answer" >&2; return 1; }
+}
+
 # >>> custom-ai renderers (DIVE-7568) >>>
 # «Your own AI»: an account saved with `account add --provider=custom` carries
 # FIVEDIVE_CUSTOM_{HARNESS,BASE_URL,MODEL,API_KEY} in its combined.env, which
@@ -1210,6 +1229,8 @@ if [[ "$TYPE" == "hermes" ]]; then
   # DIVE-7568: your own AI wins over the seeded config, before the gateway
   # restart below reads it.
   custom_ai_apply hermes
+  # DIVE-7833: and the app chat plugin, which the seed above just un-enabled.
+  hermes_fivedive_reenable || true
   # hermes' messaging gateway is a long-lived user daemon that survives
   # `systemctl restart 5dive-agent@<name>` (cmd_restart bounces the tmux
   # unit; the gateway is a separate `loginctl enable-linger`'d process that

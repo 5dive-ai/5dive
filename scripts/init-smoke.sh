@@ -19,7 +19,7 @@
 #   init           `5dive init` stopped, asked something unexpected, or failed
 #   pin            the seat could not be put on the cheapest model
 #   reply          the agent's own answer never arrived, or was wrong
-#   webchat        (openclaw) a 5dive app chat message got no answer, or a wrong one,
+#   webchat        (openclaw, codex, hermes) a 5dive app chat message got no answer, or a wrong one,
 #                  or one was answered while the web chat was still off (negative control)
 #   readme         (claude on 24.04) a command the README shows failed on this box
 #                  (DIVE-7370, scripts/init-smoke-readme.py; it runs on a skipped
@@ -191,16 +191,15 @@ PY
 # in the container, so a stand-in on loopback answers the bridge's calls and
 # records the reply: everything from the inbox to the outbound POST is real,
 # the seat's gateway and model included.
-# DIVE-7417: openclaw only. The app has the Hermes web chat OFF (DIVE-7349 scope
-# cut: no Hermes turn had ever answered), and this arm on hermes, first reached
-# once its cells answered on OpenRouter, found the gateway up but loading no
-# 5dive platform ("No messaging platforms enabled"). Turning Hermes on in the app
-# and here is one follow-up; until then the cell says so instead of grading it.
+# DIVE-7417 found the hermes gateway up but loading no 5dive platform ("No
+# messaging platforms enabled"), and the app turned the Hermes web chat off.
+# DIVE-7833: graded again; on a red, hermes_webchat_why shows the gateway's own
+# view (plugin link, plugins.enabled, which FIVEDIVE_* names its .env holds).
 # DIVE-7724: codex too. Its dashboard adapter is the same plugin, run by the
 # Codex dispatcher, so it reads the same .env and drains the same inbox. A Codex
 # seat whose ~/.claude is not its own crash-looped that adapter for 14.5 h
 # unseen, because this arm was openclaw only.
-cell_has_webchat() { case "$(cell_type "$1")" in openclaw|codex) return 0 ;; *) return 1 ;; esac; }
+cell_has_webchat() { case "$(cell_type "$1")" in openclaw|codex|hermes) return 0 ;; *) return 1 ;; esac; }
 
 FAKE_API_PORT=18999
 start_fake_api() {
@@ -235,6 +234,23 @@ PY
 drop_inbox() {
   jq -cn --arg t "$2" '{text: $t, chat_id: "dashboard"}' \
     | sudo -u "agent-${NAME}" bash -c 'mkdir -p "$1" && cat > "$1/.m.tmp" && mv "$1/.m.tmp" "$1/m.json"' _ "$1"
+}
+
+# DIVE-7833: what the hermes gateway was given, never a value from its .env.
+hermes_webchat_why() {
+  local home="$1"
+  echo "--- hermes web chat wiring ---"
+  ls -la "$home/.hermes/plugins/" 2>&1 | tail -5
+  readlink -f "$home/.hermes/plugins/fivedive" 2>&1
+  ls -la "$(readlink -f "$home/.hermes/plugins/fivedive")" 2>&1 | head -8
+  sed -n '/^plugins:/,/^[^ ]/p' "$home/.hermes/config.yaml" 2>&1 | head -12
+  echo ".env names: $(sed -n 's/^\([A-Z_]*\)=.*/\1/p' "$home/.hermes/.env" 2>/dev/null | tr '\n' ' ')"
+  ls -laR "$home/.hermes/channels" 2>&1 | head -20
+  ps -eo user,pid,args 2>/dev/null | grep -E 'hermes|server.ts' | grep -v grep | cut -c1-200
+  for f in gateway-fallback.log logs/gateway.log logs/errors.log; do
+    [[ -r "$home/.hermes/$f" ]] && { echo "--- hermes $f ---"; tail -25 "$home/.hermes/$f"; }
+  done
+  return 0
 }
 
 webchat_arm() {
@@ -277,10 +293,36 @@ webchat_arm() {
     grep -q . /tmp/webchat-replies.jsonl 2>/dev/null && break
     sleep 3
   done
+  # DIVE-7833: a hermes gateway keeps Hermes' approval step (DIVE-7592: only the
+  # pane runs approve-all), so the model's first command can come back as "needs
+  # your OK ... Reply /approve". The owner answers in the same chat; so does this
+  # arm, at most twice, and the sum must still arrive. That grades the approval
+  # round trip through the web chat as well.
+  # Each reply body is captured first and matched from a herestring: no writer
+  # process piped into grep -q (tests/epipe_corpus_guard_unit.sh, B3).
+  local approvals=0 bodies recent seen
+  webchat_bodies() { jq -r '.body // empty' "$@" 2>/dev/null; }
+  bodies=$(webchat_bodies /tmp/webchat-replies.jsonl)
+  recent=$bodies; (( ${#recent} > 2000 )) && recent=${recent: -2000}
+  while (( approvals < 2 )) && ! grep -qw -- "$want" <<<"$bodies" && grep -q '/approve' <<<"$recent"; do
+    approvals=$((approvals + 1))
+    echo "web chat: the agent asked for approval; answering /approve in the chat ($approvals)"
+    seen=$(wc -l < /tmp/webchat-replies.jsonl)
+    drop_inbox "$inbox" "/approve"
+    for _ in $(seq 1 100); do
+      if (( $(wc -l < /tmp/webchat-replies.jsonl) > seen )); then
+        bodies=$(webchat_bodies /tmp/webchat-replies.jsonl)
+        grep -qw -- "$want" <<<"$bodies" && break
+        recent=$(tail -n +"$((seen + 1))" /tmp/webchat-replies.jsonl | webchat_bodies)
+        grep -q '/approve' <<<"$recent" && break
+      fi
+      sleep 3
+    done
+  done
   echo "--- web chat replies ---"; cat /tmp/webchat-replies.jsonl
   if ! grep -q . /tmp/webchat-replies.jsonl; then
     # DIVE-7417: on hermes the answer comes from its gateway; show why it is not up.
-    [[ -r "$home/.hermes/gateway-fallback.log" ]] && { echo "--- hermes gateway (run by the seat) ---"; tail -20 "$home/.hermes/gateway-fallback.log"; }
+    [[ "$(cell_type "$CELL")" == hermes ]] && hermes_webchat_why "$home"
     DETAIL="a web chat message got no reply in 300s"; return 1
   fi
   if ! jq -r '.body // empty' /tmp/webchat-replies.jsonl | grep -qw -- "$want"; then
@@ -416,8 +458,6 @@ run_arm() {
     if cell_has_webchat "$CELL"; then
       step webchat
       webchat_arm || { show_seat; finish fail; }
-    elif [[ "$(cell_type "$CELL")" == hermes ]]; then
-      echo "webchat: not graded on hermes, its web chat is off in the app (DIVE-7349 follow-up)"
     fi
     if cell_has_readme "$CELL" "$OS"; then readme_arm || finish fail; fi
     STEP="" DETAIL=""
