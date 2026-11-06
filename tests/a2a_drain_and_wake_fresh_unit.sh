@@ -246,6 +246,37 @@ is "F: cmd_send still reports queued:true" "true" "$(jq -r '.data.queued' <<<"$o
   && ok_t "F: cmd_send's receipt carries the live depth" \
   || bad_t "F: cmd_send's receipt carries the live depth" "$(jq -r '.data.reason' <<<"$out")"
 
+# --- F2: DIVE-7820 — every queued receipt says how to STOP the seat ----------
+# Three holds to dev sat in the spool while it paid (2026-11-06). wake-task does
+# not end a turn; `agent halt` does, so the receipt names it at every depth.
+h0="$(_a2a_queued_reason 0 dev)"
+h3="$(_a2a_queued_reason 3 dev)"
+hs="$(_a2a_queued_reason 3 dev 1)"
+hn="$(_a2a_queued_reason)"
+[[ "$h0" == *"'5dive agent halt dev'"* ]] && ok_t "F2: depth 0 names 'agent halt <name>'" \
+  || bad_t "F2: depth 0 names 'agent halt <name>'" "$h0"
+[[ "$h3" == *"'5dive agent halt dev'"* ]] && ok_t "F2: depth 3 names 'agent halt <name>'" \
+  || bad_t "F2: depth 3 names 'agent halt <name>'" "$h3"
+[[ "$h3" == *"wake-task"* ]] && ok_t "F2: depth 3 keeps the wake-task queue-jump line" \
+  || bad_t "F2: depth 3 keeps the wake-task queue-jump line" "$h3"
+[[ "$h0" == "target is mid-attempt — queued, delivers at its next idle or wake (DIVE-4214)"* \
+   && "$h3" == "target is mid-attempt — queued, delivers at its next idle or wake (DIVE-4214)"* ]] \
+  && ok_t "F2: the pre-4296 sentence is still the PREFIX" \
+  || bad_t "F2: the pre-4296 sentence is still the PREFIX" "$h0 | $h3"
+[[ "$hs" == *"ask a lead seat to halt dev"* && "$hs" != *"5dive agent halt"* ]] \
+  && ok_t "F2: a scoped caller is told to ask a lead seat, and given no halt command" \
+  || bad_t "F2: a scoped caller is told to ask a lead seat, and given no halt command" "$hs"
+[[ "$hn" == *"agent halt <agent>"* && "$hn" != *"spool"* ]] \
+  && ok_t "F2: no name still points at halt, and invents no depth" \
+  || bad_t "F2: no name still points at halt, and invents no depth" "$hn"
+# End to end through cmd_send: prose and the additive JSON key.
+rm -rf "${TMPROOT}/agent-ops"
+out="$(IDLE_RC=1 JSON_MODE=1 cmd_send ops --message="hold, do not pay" 2>/dev/null)"
+[[ "$(jq -r '.data.reason' <<<"$out")" == *"'5dive agent halt ops'"* ]] \
+  && ok_t "F2: cmd_send's queued receipt carries the halt command" \
+  || bad_t "F2: cmd_send's queued receipt carries the halt command" "$(jq -r '.data.reason' <<<"$out")"
+is "F2: cmd_send's receipt has the halt_hint key" "5dive agent halt ops" "$(jq -r '.data.halt_hint' <<<"$out")"
+
 # --- G: source control — the literal is gone ---------------------------------
 grep -q '_hb_wake "$name" "false"' src/cmd_heartbeat.sh \
   && bad_t "G: wake-task no longer hard-codes fresh=false" "the literal is back" \
