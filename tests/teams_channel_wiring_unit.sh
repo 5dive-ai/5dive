@@ -89,6 +89,13 @@ grep -qF '{"plugin":"teams","marketplace":"5dive-plugins"}' <<<"$FIVEDIVE_CHANNE
   t agent config x set channels=dashboard && echo "ok config control (dashboard allowed)" || echo "FAIL config control: dashboard refused"
   out=$( ( local_only_gate agent teams connect x ) 2>&1 )
   [[ "$out" == *"Microsoft Teams"* && $(wc -l <<<"$out") -eq 1 ]] && echo "ok the refusal is one line naming Teams" || echo "FAIL oneline: $out"
+  # DIVE-7658 design change: the firm's IT may open Teams alone.
+  FIVE_LOCAL_ONLY_ALLOW_FILE=$(mktemp); export FIVE_LOCAL_ONLY_ALLOW_FILE; echo teams > "$FIVE_LOCAL_ONLY_ALLOW_FILE"
+  t agent teams connect x && echo "ok allow teams → connect passes" || echo "FAIL allow teams: connect still refused"
+  t agent create x --type=claude $L --channels=teams && echo "ok allow teams → --channels=teams passes" || echo "FAIL allow teams: create refused"
+  t agent config x set channels=telegram,teams && echo "FAIL allow teams let telegram through" || echo "ok allow teams → telegram still refused"
+  rm -f "$FIVE_LOCAL_ONLY_ALLOW_FILE"
+  t agent teams connect x && echo "FAIL allow file gone, connect allowed" || echo "ok allow file gone → connect refused again"
   rm -f "$FIVE_LOCAL_ONLY_FILE"
 ) >"${TMPDIR:-/tmp}/teams_lo.$$" 2>&1
 while read -r st rest; do

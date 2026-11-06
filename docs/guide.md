@@ -659,6 +659,13 @@ works; an office apt mirror is used with plain `apt` as root. `sudo 5dive config
 puts back exactly what it changed, except the office chat: it keeps running, because it only
 answers on your office network (stop it with `sudo 5dive local serve --stop`).
 
+**Microsoft Teams on a local-only box.** Teams is shut by default. Your IT can open it alone with
+`sudo 5dive config local-only allow teams`: agents can then be Teams contacts, and only Teams
+messages go out, to Microsoft. Everything else above stays refused, and `check` still names any
+other outside connection as a LEAK. `sudo 5dive config local-only deny teams` shuts it again. Teams
+needs internet and one address Microsoft can reach (your IT publishes it, e.g. through your VPN or
+reverse proxy); the IT steps are in the teams plugin's IT guide.
+
 ### No internet at all: install from a USB stick
 
 A new Ubuntu 24.04 server that has never been online becomes a local-only 5dive box from one file.
