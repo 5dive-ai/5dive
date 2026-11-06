@@ -379,6 +379,19 @@ _lo_proc_is_teams() {
   (( n > 0 ))
 }
 
+# DIVE-7826: `_lo_proxy_is_teams <ss process field> <local addr:port>` — 0 when
+# the connection is Microsoft reaching the Teams endpoint through this box's
+# Caddy: the process is caddy, on its web port (443/80), and `agent teams
+# connect` published a teams-<agent> route in the Caddyfile. Inbound to that
+# route is the Teams traffic IT allowed, not the box dialing out.
+_lo_caddyfile() { printf '%s/etc/caddy/Caddyfile' "$(_lo_root)"; }
+_lo_proxy_is_teams() {
+  local field="$1" lport="${2##*:}"
+  [[ "$field" == *'(("caddy",'* ]] || return 1
+  [[ "$lport" == 443 || "$lport" == 80 ]] || return 1
+  grep -qE '^[[:space:]]*# 5dive-route:begin teams-[A-Za-z0-9_-]+ port=[0-9]+ ' "$(_lo_caddyfile)" 2>/dev/null
+}
+
 _lo_line() { printf '%-5s %-34s  %s\n' "$1" "$2" "$3"; }   # DIVE-7579 (m2): two spaces always (the panel splits on them)
 
 _lo_check() {
@@ -447,18 +460,18 @@ _lo_check() {
     printf '\nWatching connections for %ss (anything that is not this box or your network counts)...\n' "$watch"
     local -A seen=() teams_seen=()
     local teams_open=0; local_only_allows teams && teams_open=1
-    local i line peer host proc tick="${FIVE_LOCAL_ONLY_TICK:-1}"
+    local i line laddr peer host proc tick="${FIVE_LOCAL_ONLY_TICK:-1}"
     for (( i = 0; i < watch; i++ )); do
       while IFS= read -r line; do
         # Netid State Recv-Q Send-Q Local:Port Peer:Port [Process]
-        read -r _ st _ _ _ peer proc <<<"$line"
+        read -r _ st _ _ laddr peer proc <<<"$line"
         case "$st" in ESTAB|SYN-SENT|SYN-RECV) ;; *) continue ;; esac
         host="${peer%:*}"; host="${host#[}"; host="${host%]}"; host="${host%%%*}"
         [[ -n "$host" && "$host" != "*" ]] || continue
         _lo_host_is_local "$host" && continue
         # DIVE-7658: with Teams open, the teams plugin's own connections are
         # the allowed ones (it sends only to Microsoft's hosts, plugin hosts.ts).
-        if (( teams_open )) && _lo_proc_is_teams "${proc:-}"; then
+        if (( teams_open )) && { _lo_proc_is_teams "${proc:-}" || _lo_proxy_is_teams "${proc:-}" "$laddr"; }; then
           teams_seen["$peer"]=1; continue
         fi
         seen["$peer ${proc:-}"]=1
