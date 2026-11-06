@@ -92,10 +92,8 @@ run_arm() {
   [[ -n "${out//[[:space:]]/}" ]] || { DETAIL="$bin --version printed nothing"; finish fail; }
 
   step create
-  # Grok agents are off until the server owner turns them on (DIVE-7066); the
-  # owner's `grok enable` asks y/N on a terminal, so write its marker directly,
-  # as managed provisioning does.
-  [[ "$TYPE" == grok ]] && install -d /etc/5dive/arm && touch /etc/5dive/arm/grok-unfreeze
+  # Grok agents are on by default (DIVE-7802); clear an owner off switch, if any.
+  [[ "$TYPE" == grok ]] && rm -f /etc/5dive/arm/grok-off
   timeout 600 5dive agent create "$name" --type="$TYPE" --channels=none --defer-auth \
     --no-skills --no-team-bot --no-heartbeat 2>&1 | tee /tmp/create.log
   rc=${PIPESTATUS[0]}

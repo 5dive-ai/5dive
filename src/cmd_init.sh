@@ -77,14 +77,13 @@ _init_warn() {
   printf '  %s!%s %s\n' "$amber" "$reset" "$*" >&2
 }
 
-# DIVE-7333: Grok agents need the owner's opt-in (5dive grok enable). Run that
-# same warning and y/N here, in a subshell so a refusal (not root, an agent
-# seat) prints its reason and returns instead of ending the wizard.
+# DIVE-7802: Grok is on by default; no opt-in question. Picking it shows the
+# one-line xAI note. Only an owner's earlier `5dive grok disable` stops it, and
+# then the wizard says how to undo that and lets them pick another.
 _init_grok_on() {
-  [[ -e "$(_grok_marker)" ]] && return 0
-  _init_note "Grok is off on this server. Turn it on first:"
-  ( cmd_grok_enable ) >&2 || true
-  [[ -e "$(_grok_marker)" ]]
+  if grok_is_on; then _init_note "$GROK_WARNING"; return 0; fi
+  _init_note "$GROK_OFF_MSG"
+  return 1
 }
 
 # _init_pick <out-var> <title> <default-1-based> <value|label|description>...
@@ -354,9 +353,9 @@ USAGE
     [pi]="Pi"
     [devin]="Devin"
   )
-  # DIVE-7333: Grok is off until the owner turns it on, and create refuses it then.
-  # Say so in the menu and ask BEFORE the install and sign-in, not after them.
-  [[ -e "$(_grok_marker)" ]] || type_desc[grok]="xAI Grok CLI — off here, you'll be asked to turn it on"
+  # DIVE-7802: Grok is on unless the owner ran `5dive grok disable`; say so in
+  # the menu, and check BEFORE the install and sign-in, not after them.
+  grok_is_on || type_desc[grok]="xAI Grok CLI — turned off on this server"
   local -a type_menu=()
   local t
   for t in "${types[@]}"; do

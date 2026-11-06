@@ -313,7 +313,7 @@ Agents:
                                                      # move an agent between Claude Code, Codex and Grok IN PLACE: same name,
                                                      # unix user, bot, tasks and grants; memory + instructions converted,
                                                      # the old side's files kept so switching back is instant (DIVE-5501).
-                                                     # To Grok needs Grok turned on (5dive grok enable) (DIVE-7414)
+                                                     # To Grok is refused after 5dive grok disable (DIVE-7414)
 
 Default workdir: ${DEFAULT_WORKDIR}
 
@@ -600,9 +600,8 @@ Health:
     --note tells Claude Code seats when to use it (DIVE-6143).
 
   5dive grok enable | disable | status
-    Let this server make Grok agents (DIVE-7066). enable shows one warning
-    and asks the owner to confirm at a terminal; disable stops new Grok
-    agents (existing ones keep running).
+    Grok agents are on by default (DIVE-7802). disable stops new Grok
+    agents here (existing ones keep running); enable undoes it.
 
   5dive doctor [--fix] [--dry-run] [--caps] [--category=deps|types|auth|creds|registry|shelld|channels|host|memory|mod|policy|plugins|caps|models]
     Walks deps (tmux/jq/bun/python3/nvm/node/npm), type bins, live auth
@@ -1454,9 +1453,9 @@ main() {
       AUDIT_CMD="machine"; AUDIT_ARGS=("$@")
       cmd_machine "$@" ;;
     grok)
-      # DIVE-7066: the server owner's own Grok opt-in (src/cmd_grok.sh). enable/
-      # disable write or remove the root-owned arm marker, so cmd_grok checks
-      # root itself; status is a read. Audited: who turned Grok on or off.
+      # DIVE-7066/7802: the server owner's own Grok off switch (src/cmd_grok.sh).
+      # disable/enable write or remove the root-owned off marker, so cmd_grok
+      # checks root itself; status is a read. Audited: who turned Grok on or off.
       case "${1:-}" in enable|disable) AUDIT_CMD="grok"; AUDIT_ARGS=("$@") ;; esac
       cmd_grok "$@" ;;
     doctor)

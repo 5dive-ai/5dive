@@ -34,8 +34,8 @@
 # Grok for good. Grok reads ~/.claude/CLAUDE.md (TYPE_PERSONA_FILE) and its
 # memory is the 5dive store, so Claude <-> Grok shares both files: nothing is
 # copied, the carried block only points at the handoff (and, to Grok, which
-# loads no MEMORY.md, the memory index). To Grok also needs the owner's switch
-# (`5dive grok enable`), the same one `agent create --type=grok` asks for.
+# loads no MEMORY.md, the memory index). Grok is on by default (DIVE-7802); to
+# Grok is refused only after the owner's `5dive grok disable`, like create.
 
 SWITCH_CARRY_MARKER="5dive:carried-instructions"
 SWITCH_CODEX_MEM_MARKER="5dive:codex-memory"
@@ -61,8 +61,8 @@ _switch_label() {
 
 _switch_is_type() { [[ " ${SWITCH_TYPES[*]} " == *" ${1:-} "* ]]; }
 
-# The owner's switch for Grok agents (cmd_grok.sh): the marker create reads.
-_switch_grok_on() { [[ -e "${FIVE_GROK_ARM_MARKER:-/etc/5dive/arm/grok-unfreeze}" ]]; }
+# On unless the owner ran `5dive grok disable` (cmd_grok.sh): the marker create reads.
+_switch_grok_on() { [[ ! -e "${FIVE_GROK_OFF_MARKER:-/etc/5dive/arm/grok-off}" ]]; }
 
 # The plain sentence every surface shows before a switch. One string, so the
 # CLI refusal, the Mini App and the dashboard cannot drift apart.
@@ -438,9 +438,9 @@ cmd_agent_switch() {
   _switch_is_type "$from" \
     || fail "$E_VALIDATION" "agent '$name' is type $from — switch moves between claude, codex and grok only"
   [[ "$from" != "$to" ]] || fail "$E_VALIDATION" "agent '$name' already runs $(_switch_label "$to")"
-  # The owner's own opt-in, the one `agent create --type=grok` refuses without.
+  # The owner's own opt-out, the one `agent create --type=grok` respects.
   if [[ "$to" == grok ]] && ! _switch_grok_on; then
-    fail "$E_VALIDATION" "Grok is off on this server: its tool sends your agent's notes and chat turns to xAI after every turn. The server owner can turn it on with: sudo 5dive grok enable"
+    fail "$E_VALIDATION" "Grok is turned off on this server (the owner turned it off). To turn it back on: sudo 5dive grok enable"
   fi
 
   # ---- pre-flight: every refusal below changes nothing ----

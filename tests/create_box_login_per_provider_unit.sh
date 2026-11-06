@@ -57,7 +57,7 @@ for _t in claude codex grok; do
 done
 cmd_install() { printf 'INSTALL-ATTEMPTED %s\n' "$*"; return 1; }
 export FIVEDIVE_CHAT_ONLY_MARK="$TMP/chat-only"
-export FIVE_GROK_ARM_MARKER="$TMP/grok-unfreeze"; : > "$FIVE_GROK_ARM_MARKER"
+export FIVE_GROK_OFF_MARKER="$TMP/grok-off"; rm -f "$FIVE_GROK_OFF_MARKER"   # Grok on (DIVE-7802 default)
 OAUTH='{"auth_mode":"chatgpt","tokens":{"refresh_token":"fixture"}}'
 
 # box [shared:<type>]... [<acct>:claude|<acct>:codex|<acct>:grok|<acct>:demo|<acct>:]...

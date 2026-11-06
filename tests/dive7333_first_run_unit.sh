@@ -122,19 +122,20 @@ echo "== F: the boot does not breadcrumb a seat that holds its key =="
 seed=$(sed -n '/if (( _OC_STATE_READ == 1 )); then/,/assert_cred_seeded openclaw/p' bin/5dive-agent-start)
 has 'a seat-held key with an unreadable account db is cred_seed_ok' "$seed" '"$OPENCLAW_STATE_AUTH_PY" has "$LOCAL_OPENCLAW_STATE"'
 
-echo "== G: init asks to turn Grok on before the install and sign-in =="
+echo "== G: init checks Grok's off switch before the install and sign-in (DIVE-7802: on by default) =="
 # shellcheck source=/dev/null
 source "$SRC/cmd_grok.sh"; source "$SRC/cmd_init.sh"; set +e
-export FIVE_GROK_ARM_MARKER="$TMP/arm/grok-unfreeze"
-ENABLED=0
-cmd_grok_enable() { ENABLED=1; [[ "${ANSWER:-n}" == y ]] && { mkdir -p "$TMP/arm"; : >"$FIVE_GROK_ARM_MARKER"; }; return 0; }
-ANSWER=n; _init_grok_on 2>/dev/null; is 'Grok off and the owner says no: init does not go on with Grok' "$?" 1
-ANSWER=y; _init_grok_on 2>/dev/null; is 'the owner says yes: init goes on with Grok'                     "$?" 0
-ENABLED=0; _init_grok_on 2>/dev/null; is 'already on: no second question'                                "$ENABLED/$?" 0/0
-cmd_grok_enable() { fail "$E_PERMISSION" "only the server owner can turn Grok on"; }
-rm -f "$FIVE_GROK_ARM_MARKER"
-( _init_grok_on 2>/dev/null; echo "rc=$?" ) >"$TMP/g.out"
-is 'a refused enable returns to the wizard instead of ending it' "$(tail -1 "$TMP/g.out")" 'rc=1'
+export FIVE_GROK_OFF_MARKER="$TMP/arm/grok-off"; rm -f "$FIVE_GROK_OFF_MARKER"
+ASKED=0
+cmd_grok_enable() { ASKED=1; return 0; }
+o=$(_init_grok_on 2>&1); rc=$?
+is 'no off marker: init goes on with Grok, asks nothing'        "$ASKED/$rc" 0/0
+[[ "$o" == *"to xAI after every turn"* ]]; is 'and shows the one-line xAI note' "$?" 0
+mkdir -p "$TMP/arm"; : >"$FIVE_GROK_OFF_MARKER"
+( _init_grok_on 2>"$TMP/g.err"; echo "rc=$?" ) >"$TMP/g.out"
+is 'owner turned Grok off: returns to the wizard instead of ending it' "$(tail -1 "$TMP/g.out")/$ASKED" 'rc=1/0'
+grep -qF 'sudo 5dive grok enable' "$TMP/g.err"; is 'and says how to turn it back on' "$?" 0
+rm -f "$FIVE_GROK_OFF_MARKER"
 BODY=$(declare -f cmd_init)
 pre=${BODY%%cmd_install \"\$type\"*}; pre=${pre%%auth login*}
 [[ "$pre" == *_init_grok_on* ]]; is 'the Grok question comes before the install and the sign-in' "$?" 0
