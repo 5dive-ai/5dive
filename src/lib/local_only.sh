@@ -265,8 +265,9 @@ local_only_url_is_local() {
 }
 
 # The one refusal sentence. Plain words: the owner reads this, not a developer.
+# `local_only_refuse <what> [is|are]` — "are" when <what> names several things.
 local_only_refuse() {
-  fail "$E_PERMISSION" "$1 is turned off on this box: local-only mode is on, so nothing may connect outside your network. To allow it again, an admin runs: sudo 5dive config local-only off"
+  fail "$E_PERMISSION" "$1 ${2:-is} turned off on this box: local-only mode is on, so nothing may connect outside your network. To allow it again, an admin runs: sudo 5dive config local-only off"
 }
 
 # `_lo_model_target_ok <args...>` — a model credential or endpoint command
@@ -351,14 +352,27 @@ _lo_channels_outside() {   # <csv> → 0 when it names a channel that dials out
   return 1
 }
 
+# DIVE-7826: the channels that are OFF right now, as one phrase. Teams leaves
+# the list once the firm's IT opened it, so the refusal never names an allowed
+# channel. Prints "<list>|<is|are>".
+_lo_channels_off_phrase() {
+  local -a off=(Telegram Discord Buzz)
+  local_only_allows teams || off+=("Microsoft Teams")
+  local n=${#off[@]} out="${off[0]}" i
+  for (( i = 1; i < n - 1; i++ )); do out+=", ${off[i]}"; done
+  (( n > 1 )) && out+=" and ${off[n-1]}"
+  printf '%s|%s' "$out" "$( (( n > 1 )) && echo are || echo is )"
+}
+_lo_refuse_channels() { local p; p=$(_lo_channels_off_phrase); local_only_refuse "${p%|*}" "${p##*|}"; }
+
 # `_lo_channel_flags_ok <args...>` — refuse Telegram/Discord/Buzz channels and
 # bot tokens on create/clone.
 _lo_channel_flags_ok() {
   local a
   for a in "$@"; do
     case "$a" in
-      --telegram-*|--discord-token=*) local_only_refuse "Telegram and Discord" ;;
-      --channels=*) _lo_channels_outside "${a#--channels=}" && local_only_refuse "Telegram, Discord, Buzz and Microsoft Teams" ;;
+      --telegram-*|--discord-token=*) local_only_refuse "Telegram and Discord" are ;;
+      --channels=*) _lo_channels_outside "${a#--channels=}" && _lo_refuse_channels ;;
     esac
   done
   return 0
@@ -423,7 +437,7 @@ local_only_gate() {
     hire-link)
       # Every path calls 5dive's servers: a slug reads the online catalogue and
       # asks for a link, --create drafts on 5dive, --hire hires through it.
-      local_only_refuse "Hire links (they are made on 5dive's servers)" ;;
+      local_only_refuse "Hire links (they are made on 5dive's servers)" are ;;
     pkg)
       # apt fetches from the internet mirrors in the box's sources list. An
       # office with its own mirror installs as root with apt directly.
@@ -495,8 +509,8 @@ local_only_gate() {
           [[ "${2:-}" == set ]] || return 0
           for a in "${@:3}"; do
             case "$a" in
-              telegram.*|discord.*) local_only_refuse "Telegram and Discord" ;;
-              channels=*) _lo_channels_outside "${a#channels=}" && local_only_refuse "Telegram, Discord, Buzz and Microsoft Teams" ;;
+              telegram.*|discord.*) local_only_refuse "Telegram and Discord" are ;;
+              channels=*) _lo_channels_outside "${a#channels=}" && _lo_refuse_channels ;;
             esac
           done ;;
         auth)

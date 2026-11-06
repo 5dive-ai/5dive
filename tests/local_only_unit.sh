@@ -357,12 +357,55 @@ printf '%s\n' 'tcp SYN-SENT 0 0 10.0.0.2:40300 203.0.113.9:443 users:(("node",pi
   && ok_ "TEAMS: any other process going out is still a LEAK with Teams open" || bad_ "TEAMS watch leak" "rc=$rc $(cat "$TMPD/t.out")"
 ( _lo_proc_is_teams() { return 0; }; _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
 [[ $rc == 0 ]] && ok_ "MUTANT: a teams test that waves every process through hides the LEAK (the arm above would red)" || bad_ "MUTANT teams proc" "rc=$rc"
+# DIVE-7826: Microsoft reaching the Teams endpoint through this box's Caddy is
+# the allowed Teams traffic, not a LEAK — only with a teams-<agent> route
+# published and only on Caddy's web port.
+CF="$TMPD/root/etc/caddy/Caddyfile"; mkdir -p "${CF%/*}"
+printf '%s\n' '# 5dive-route:begin teams-ada port=39142 by=root' 'teams-ada.example.test {' '    reverse_proxy 127.0.0.1:39142' '}' '# 5dive-route:end teams-ada' > "$CF"
+CADDY_IN='tcp ESTAB 0 0 10.0.0.2:443 198.51.100.30:51514 users:(("caddy",pid=55,fd=12))'
+printf '%s\n' "$CADDY_IN" > "$STUB_SS"
+( _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 0 ]] && grep -q '^ok    Microsoft Teams (your IT allowed it): 1' "$TMPD/t.out" && ! grep -q '^LEAK' "$TMPD/t.out" \
+  && ok_ "CADDY: Microsoft's inbound to Caddy on the published Teams route is ok, exit 0" || bad_ "CADDY teams ok" "rc=$rc $(cat "$TMPD/t.out")"
+( _lo_proxy_is_teams() { return 1; }; _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 1 ]] && grep -q '198.51.100.30:51514' "$TMPD/t.out" \
+  && ok_ "MUTANT: drop the Caddy exception → the Teams route reads as a LEAK (the arm above reds)" || bad_ "MUTANT caddy" "rc=$rc"
+printf '%s\n' '# 5dive-route:begin shop port=8100 by=root' 'shop.example.test {' '    reverse_proxy 127.0.0.1:8100' '}' '# 5dive-route:end shop' > "$CF"
+( _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 1 ]] && grep -q '^LEAK  outside connections seen: 1' "$TMPD/t.out" \
+  && ok_ "CADDY: with no teams route published, outside traffic to Caddy is still a LEAK" || bad_ "CADDY no route" "rc=$rc"
+printf '%s\n' '# 5dive-route:begin teams-ada port=39142 by=root' > "$CF"
+printf '%s\n' 'tcp ESTAB 0 0 10.0.0.2:40500 203.0.113.40:443 users:(("caddy",pid=55,fd=13))' > "$STUB_SS"
+( _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 1 ]] && grep -q '203.0.113.40:443' "$TMPD/t.out" \
+  && ok_ "CADDY: Caddy dialing out from a high port is still a LEAK (only its web port is the Teams route)" || bad_ "CADDY out" "rc=$rc"
+printf '%s\n' 'tcp ESTAB 0 0 10.0.0.2:443 198.51.100.30:51514 users:(("nginx",pid=56,fd=12))' > "$STUB_SS"
+( _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 1 ]] && ok_ "CADDY: another process on 443 is not waved through as Teams" || bad_ "CADDY other proc" "rc=$rc"
+# DIVE-7826: the channels refusal names only the channels that are off.
+( local_only_gate agent create x --type=claude --base-url=http://127.0.0.1:1 --channels=telegram ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc != 0 ]] && grep -q 'Telegram, Discord and Buzz are turned off on this box' "$TMPD/t.out" && ! grep -q 'Microsoft Teams' "$TMPD/t.out" \
+  && ok_ "REFUSAL: with Teams open the channels refusal leaves Teams out and says 'are'" || bad_ "REFUSAL open" "rc=$rc $(cat "$TMPD/t.out")"
+( local_only_gate agent config x set channels=telegram ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc != 0 ]] && grep -q 'Telegram, Discord and Buzz are turned off' "$TMPD/t.out" && ! grep -q 'Microsoft Teams' "$TMPD/t.out" \
+  && ok_ "REFUSAL: the agent config channels= refusal leaves Teams out too" || bad_ "REFUSAL update" "rc=$rc $(cat "$TMPD/t.out")"
+( local_only_gate agent create x --type=claude --base-url=http://127.0.0.1:1 --telegram-token=1 ) >"$TMPD/t.out" 2>&1
+grep -q 'Telegram and Discord are turned off' "$TMPD/t.out" && ok_ "REFUSAL: 'Telegram and Discord are turned off'" || bad_ "REFUSAL tg grammar" "$(cat "$TMPD/t.out")"
+: > "$CF"; : > "$STUB_SS"
 ( _lo_allow off teams ) >"$TMPD/t.out" 2>&1; rc=$?
 [[ $rc == 0 && ! -e "$AF" ]] && ! local_only_allows teams && ok_ "TEAMS: deny teams shuts it (file gone)" || bad_ "TEAMS deny" "rc=$rc"
 printf '%s\n' 'tcp ESTAB 0 0 10.0.0.2:40200 198.51.100.20:443 users:(("bun",pid=77,fd=9))' > "$STUB_SS"
 ( _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
 [[ $rc == 1 ]] && grep -q '^LEAK  outside connections seen: 1' "$TMPD/t.out" \
   && ok_ "TEAMS: shut → the teams plugin going out is a LEAK again" || bad_ "TEAMS shut watch" "rc=$rc"
+printf '%s\n' '# 5dive-route:begin teams-ada port=39142 by=root' > "$CF"; printf '%s\n' "$CADDY_IN" > "$STUB_SS"
+( _lo_check --watch=1 ) >"$TMPD/t.out" 2>&1; rc=$?
+[[ $rc == 1 ]] && grep -q '198.51.100.30:51514' "$TMPD/t.out" \
+  && ok_ "CADDY: Teams shut → inbound to the Teams route is a LEAK again" || bad_ "CADDY shut" "rc=$rc"
+: > "$CF"; : > "$STUB_SS"
+( local_only_gate agent create x --type=claude --base-url=http://127.0.0.1:1 --channels=telegram ) >"$TMPD/t.out" 2>&1
+grep -q 'Telegram, Discord, Buzz and Microsoft Teams are turned off' "$TMPD/t.out" \
+  && ok_ "REFUSAL: Teams shut → the refusal names Teams too, with 'are'" || bad_ "REFUSAL shut" "$(cat "$TMPD/t.out")"
 ( local_only_gate agent teams connect x ) >/dev/null 2>&1 && bad_ "TEAMS shut connect" "passed" || ok_ "TEAMS: shut → agent teams connect refused again"
 ( _lo_allow on teams; _lo_off ) >/dev/null 2>&1
 [[ ! -e "$AF" ]] && ok_ "TEAMS: local-only off forgets the opening, so the next on starts fully offline" || bad_ "TEAMS off" "allow file left"
