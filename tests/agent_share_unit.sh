@@ -246,6 +246,19 @@ eq_t '7806/2 ...carrying all 1600' 1600 "$(jq -r '.data.memory' <<<"$(grep '^{' 
 rm -rf "$TMP/mb"; mkdir -p "$TMP/mb" && tar -xzf "$(_share_dir_of_agent big)/pack.tar.gz" -C "$TMP/mb"
 eq_t '7806/2 ...each one in the sealed checksums' 1601 "$(jq '[.files | keys[] | select(startswith("memory/"))] | length' "$TMP/mb/manifest.json")"
 (cmd_agent_unshare big) >/dev/null 2>&1
+# DIVE-7813: the distil reads every fact in ONE awk pass. A directory named
+# *.md in the store must be left out unread, on mawk too: mawk dies on a
+# getline from a directory (gawk only warns), and that death would drop every
+# fact after it.
+if command -v mawk >/dev/null 2>&1; then
+  mkdir -p "$TMP/mawkbin" "$TMP/mem/mk/odd.md"; ln -sf "$(command -v mawk)" "$TMP/mawkbin/awk"
+  atom mk zz-last reference "The last fact still lands."; atom mk aa-first project "So does the first."
+  got=$(PATH="$TMP/mawkbin:$PATH" _pack_scope_memory "$TMP/mem/mk" "$TMP/mk-out")
+  eq_t '7813 mawk: a *.md directory is left out, both facts kept' "2 1" "$got"
+  eq_t '7813 mawk: ...and both are in the index' 2 "$(grep -c '^- \[' "$TMP/mk-out/MEMORY.md")"
+else
+  ok_t '7813 mawk arm skipped: no mawk on this runner'
+fi
 # Arm 3: one leaky line in a knowledge fact refuses the WHOLE share, names it.
 leak_arm() { # <agent> <line> <expected file:line: kind>
   fixture "$1" ""; memfix "$1"; atom "$1" deploy-notes project "$2"

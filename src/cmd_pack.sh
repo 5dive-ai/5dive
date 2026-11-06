@@ -368,15 +368,24 @@ _pack_stage_skill_bodies() {   # _pack_stage_skill_bodies <skills-dir> <stage>
 # runs LAST, after everything is staged. No persona, no `persona` key: openagent
 # then refuses the file by name rather than guessing an identity.
 _pack_bundle_manifest() {   # _pack_bundle_manifest <stage> <has-persona:true|false>
-  local stage="$1" has_persona="$2" f fm
+  local stage="$1" has_persona="$2" fm
   # DIVE-7806: the checksum map goes to jq as a FILE, never an argument. A
   # memory pack of a long-lived seat lists thousands of facts, and one argv
   # string over 128 KB is "Argument list too long" (measured: a 2.8k-fact seat).
   # Outside the stage, or the map would checksum itself.
   fm=$(mktemp) || return 1
+  # DIVE-7813: one sha256sum over the whole list (xargs batches it), not two
+  # processes per file — that was ~3ms a fact. sha256sum prints "<hash>  <path>"
+  # and, for a name holding a backslash or a newline, a leading backslash with
+  # the name escaped (backslash-backslash, backslash-n); jq undoes exactly that.
   (cd "$stage" && find . -type f ! -path ./manifest.json -print0 | sort -z \
-    | while IFS= read -r -d '' f; do printf '%s\t%s\n' "${f#./}" "$(sha256sum <"$f" | cut -d' ' -f1)"; done \
-    | jq -Rn '[inputs | split("\t") | {(.[0]): .[1]}] | add // {}') > "$fm" \
+    | xargs -0 -r sha256sum -- \
+    | jq -Rn '[inputs
+        | (startswith("\\")) as $esc
+        | (if $esc then .[1:] else . end)
+        | capture("^(?<h>[0-9a-f]{64}) [ *](?<p>.*)$")
+        | .p |= (if $esc then gsub("\\\\(?<c>.)"; if .c == "n" then "\n" elif .c == "r" then "\r" else .c end) else . end)
+        | {(.p | ltrimstr("./")): .h}] | add // {}') > "$fm" \
     || { rm -f "$fm"; return 1; }
   jq --argjson bv "$OPENAGENT_BUNDLE_VERSION" --arg oa "$OPENAGENT_BUNDLE_SPEC" \
      --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson hp "$has_persona" --slurpfile files "$fm" \
@@ -2323,33 +2332,67 @@ _pack_raw_memory() {
 }
 
 _pack_scope_memory() {
-  local memdir="$1" outdir="$2" kept=0 excluded=0 f base type optout
+  # DIVE-7813: ONE awk pass reads every fact's frontmatter (it was two awks, a
+  # basename and a cp per file, and the index two awks more: ~20ms a fact, so a
+  # 1600-fact share spent 33s here, twice, and pushed the core CI tier over its
+  # budget). The awk reads the file LIST on stdin and opens each with getline,
+  # so a big store never meets an argv limit and an empty or unreadable file is
+  # still classified (no type -> left out), exactly as before. Same rules per
+  # file: the first `type:` inside the leading frontmatter block, and any
+  # `export:/share: false` or `private: true` there opts it out.
+  local memdir="$1" outdir="$2" kept=0 excluded=0 line
+  local -a keep=()
   mkdir -p "$outdir"
-  while IFS= read -r f; do
-    base=$(basename "$f")
-    [[ "$base" == "MEMORY.md" ]] && continue
-    # Frontmatter type lives nested under metadata: (….type: <t>). Read the first
-    # `type:` inside the leading frontmatter block.
-    type=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^[[:space:]]*type:[[:space:]]*/{sub(/^[[:space:]]*type:[[:space:]]*/,""); gsub(/[[:space:]]+$/,""); print; exit}' "$f")
-    optout=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^[[:space:]]*(export|share):[[:space:]]*false/{print "1"; exit} n==1 && /^[[:space:]]*private:[[:space:]]*true/{print "1"; exit}' "$f")
-    if [[ "$type" == "reference" || "$type" == "project" ]] && [[ -z "$optout" ]]; then
-      cp "$f" "$outdir/$base"; kept=$((kept+1))
-    else
-      excluded=$((excluded+1))
-    fi
-  done < <(find "$memdir" -maxdepth 1 -name '*.md' 2>/dev/null | sort)
-  # Clean index over only what we kept.
+  while IFS= read -r line; do
+    case "$line" in
+      K$'\t'*) keep+=("${line#K$'\t'}"); kept=$((kept+1)) ;;
+      X$'\t'*) excluded=$((excluded+1)) ;;
+    esac
+  done < <(find "$memdir" -maxdepth 1 -name '*.md' \( -xtype f -printf 'F%p\n' -o -printf 'O%p\n' \) 2>/dev/null | sort -k1.2 | awk '
+    {
+      # F = a regular file (or a link to one); O = anything else, left out
+      # unread (mawk dies on a getline from a directory, gawk only warns).
+      kind = substr($0, 1, 1); f = substr($0, 2); b = f; sub(/.*\//, "", b)
+      if (b == "MEMORY.md") next
+      if (kind != "F") { print "X\t" f; next }
+      n = 0; type = ""; gotType = 0; optout = 0
+      while ((getline l < f) > 0) {
+        if (l ~ /^---[[:space:]]*$/) { n++; if (n >= 2) break; continue }
+        if (n != 1) continue
+        if (!gotType && l ~ /^[[:space:]]*type:[[:space:]]*/) {
+          t = l; sub(/^[[:space:]]*type:[[:space:]]*/, "", t); gsub(/[[:space:]]+$/, "", t)
+          type = t; gotType = 1
+        }
+        if (l ~ /^[[:space:]]*(export|share):[[:space:]]*false/ || l ~ /^[[:space:]]*private:[[:space:]]*true/) optout = 1
+      }
+      close(f)
+      print (((type == "reference" || type == "project") && !optout) ? "K" : "X") "\t" f
+    }')
+  (( ${#keep[@]} )) && printf '%s\0' "${keep[@]}" | xargs -0 cp -t "$outdir" --
+  # Clean index over only what we kept (same glob order, same line per fact).
   {
     echo "# Memory Index (distilled persona pack)"
     echo
+    local f
     for f in "$outdir"/*.md; do
-      [[ -e "$f" ]] || continue
-      [[ "$(basename "$f")" == "MEMORY.md" ]] && continue
-      local nm desc
-      nm=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^name:[[:space:]]*/{sub(/^name:[[:space:]]*/,""); print; exit}' "$f")
-      desc=$(awk '/^---[[:space:]]*$/{n++; next} n==1 && /^description:[[:space:]]*/{sub(/^description:[[:space:]]*/,""); gsub(/^"|"$/,""); print; exit}' "$f")
-      [[ -n "$nm" ]] && echo "- [$nm]($(basename "$f")) — ${desc}"
-    done
+      [[ -f "$f" ]] || continue   # a dir here would end mawk's getline loop for every file
+      [[ "${f##*/}" == "MEMORY.md" ]] && continue
+      printf '%s\n' "$f"
+    done | awk '
+      {
+        f = $0; b = f; sub(/.*\//, "", b)
+        n = 0; nm = ""; desc = ""; gotNm = 0; gotDesc = 0
+        while ((getline l < f) > 0) {
+          if (l ~ /^---[[:space:]]*$/) { n++; if (n >= 2) break; continue }
+          if (n != 1) continue
+          if (!gotNm && l ~ /^name:[[:space:]]*/) { nm = l; sub(/^name:[[:space:]]*/, "", nm); gotNm = 1 }
+          if (!gotDesc && l ~ /^description:[[:space:]]*/) {
+            desc = l; sub(/^description:[[:space:]]*/, "", desc); gsub(/^"|"$/, "", desc); gotDesc = 1
+          }
+        }
+        close(f)
+        if (nm != "") print "- [" nm "](" b ") — " desc
+      }'
   } > "$outdir/MEMORY.md"
   printf '%s %s\n' "$kept" "$excluded"
 }
