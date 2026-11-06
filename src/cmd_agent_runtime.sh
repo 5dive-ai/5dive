@@ -1504,15 +1504,56 @@ _a2a_should_queue() {
 # been waiting an hour. Position and the force verb are the two facts that turn
 # the receipt into a decision. The pre-4296 sentence is preserved verbatim as the
 # prefix — callers (and tests) that match on it are unaffected.
+#
+# DIVE-7820: and it now ALWAYS says how to STOP the seat. On 2026-11-06 main sent
+# dev three "hold, do not pay" messages; each came back queued, the only verb the
+# receipt named was wake-task (which does not end a turn and orphans the claim,
+# DIVE-4724), and dev paid from the earlier go while the holds sat in the spool.
+# `agent halt` is the one verb that ENDS the running turn, so the receipt names
+# it — depth 0 included, because a 1-deep spool is still read after the turn.
+# Args: <depth> [<name>] [<scoped>]; scoped=1 is a caller that cannot halt.
 _a2a_queued_reason() {
-  local depth="${1:-}" base
+  local depth="${1:-}" name="${2:-}" scoped="${3:-0}" base
   base="target is mid-attempt — queued, delivers at its next idle or wake (DIVE-4214)"
   if [[ "$depth" =~ ^[0-9]+$ ]] && (( depth > 0 )); then
     base="${base}; it is #${depth} in that seat's spool"
     if (( depth > 1 )); then base="${base} ($(( depth - 1 )) ahead of it)"; fi
     base="${base}. The heartbeat drains the spool on its own tick (minutes apart, DIVE-6414), not the moment the seat goes idle, so a reply can wait out a short ask --timeout; to jump the queue, force the seat onto the row with '5dive heartbeat wake-task <agent> <task_id>'"
   fi
+  base="${base}. $(_a2a_halt_hint "$name" "$scoped" queued)"
   printf '%s\n' "$base"
+}
+
+# DIVE-7820 — the stop pointer, shared by the queued receipt above and the
+# urgent-to-a-busy-seat receipt, so the two can never word the escape apart.
+# <mode> is `queued` (the message stays in the spool and is read after the halt)
+# or `urgent` (it was typed into a running turn, and halt's Escape + C-u clears
+# the composer, so the stop has to be sent again after the halt).
+# A scoped caller cannot halt (cmd_halt refuses it at the top), so it is told to
+# ask a lead seat, in cmd_halt's own refusal words, and is given no command.
+# DIVE-7820: did the target read BUSY? Same predicate and gap _a2a_should_queue
+# uses, so "busy" means the thing the spool means. Unknown (no predicate, or
+# blocked/unreadable) is NOT busy: the pointer is a hint, never a guess.
+_a2a_target_busy() {
+  declare -F _hb_agent_idle >/dev/null 2>&1 || return 1
+  local _irc=0
+  _hb_agent_idle "$1" "${FIVE_A2A_QUEUE_IDLE_GAP:-0.4}" || _irc=$?
+  (( _irc == 1 ))
+}
+
+_a2a_halt_hint() {
+  local name="${1:-}" scoped="${2:-0}" mode="${3:-queued}" after
+  [[ -n "$name" ]] || name="<agent>"
+  if [[ "$mode" == "urgent" ]]; then
+    after="then send it again (the halt clears what was typed)"
+  else
+    after="this message stays queued and is read once the turn has ended"
+  fi
+  if [[ "$scoped" == "1" ]]; then
+    printf "The seat will not read this before its current turn ends. If it is a stop or hold on something underway (a payment, a merge, a delete), ask a lead seat to halt %s first — this caller cannot end another seat's turn\n" "$name"
+  else
+    printf "The seat will not read this before its current turn ends. If it is a stop or hold on something underway (a payment, a merge, a delete), end that turn first with '5dive agent halt %s'; %s\n" "$name" "$after"
+  fi
 }
 
 # _a2a_guard_holds <guard> — is a SPOOLED message still true at DELIVERY time?
@@ -2886,10 +2927,14 @@ cmd_deliver() {
   if ! _agent_delivery_inbox "$target" >/dev/null 2>&1 && ! wait_agent_input_ready "$target"; then
     step "agent '$target' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
-  local _rc=0 _delivered=1 _queued=0 _reason="" _summary="" _vouch=0
+  local _rc=0 _delivered=1 _queued=0 _reason="" _summary="" _vouch=0 _halt_hint=""
   # DIVE-5098: the typed operator line only for a measured local seat.
   _wake_sender_vouchable "$s" "$_caller" && _vouch=1
   if (( urgent_eff )); then
+    # DIVE-7820: an urgent send is typed into a running turn and read only when
+    # it ends, so a busy target gets the stop pointer. This path is the scoped
+    # caller's, which cannot halt: it is told to ask a lead seat.
+    _a2a_target_busy "$target" && _halt_hint="$(_a2a_halt_hint "$target" 1 urgent)"
     _WAKE_VOUCH="$_vouch" _A2A_INTERRUPTING=1 inject_and_submit "$target" "$payload" || _rc=$?
   else
     _WAKE_VOUCH="$_vouch" inject_and_submit "$target" "$payload" || _rc=$?
@@ -2908,7 +2953,8 @@ cmd_deliver() {
     # message was already in the spool, and the sender re-sent it (6 copies on a
     # box, 2026-10-19). A failed read is an unknown depth, not a failed send.
     local _depth=""; _depth="$(_a2a_queue_depth "$target")" || _depth=""; _depth="${_depth//[^0-9]/}"
-    _reason="$(_a2a_queued_reason "$_depth")" || _reason="$(_a2a_queued_reason)" || true
+    # DIVE-7820: scoped=1 — the caller of `_deliver` holds only the a2a grant.
+    _reason="$(_a2a_queued_reason "$_depth" "$target" 1)" || _reason="$(_a2a_queued_reason "" "$target" 1)" || true
     # DIVE-6414: the audit row said `result=ok code=0` for a spooled message
     # exactly as for a typed one, so a reader of agent-audit.log took "queued"
     # for "delivered" (measured on a box 2026-10-17). The rc stays 0 — the
@@ -2926,7 +2972,7 @@ cmd_deliver() {
     # DIVE-4769: the urgent split, for the reason written out at cmd_send's
     # receipt — T21 pins the ordinary expression in this source byte-for-byte.
     if (( urgent )); then
-      ok "delivered to agent '$target'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}" \
+      ok "delivered to agent '$target'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}${_halt_hint:+ }${_halt_hint}${_halt_hint:+.}" \
          '({name:$n, delivered:true, from:$s, urgent:($ue=="1"), urgent_requested:true}
            + (if ($t|length) > 0 then {tier:$t} else {} end))' \
          --arg n "$target" --arg s "$s" --arg t "$tier" --arg ue "$urgent_eff"
@@ -3842,7 +3888,7 @@ cmd_send() {
     step "agent '$name' input prompt not detected after 45s — sending best-effort (may be lost if still booting)"
   fi
 
-  local _rc=0 _sent=1 _queued=0 _reason="" _summary="" _vouch=0
+  local _rc=0 _sent=1 _queued=0 _reason="" _summary="" _vouch=0 _halt_hint=""
   # DIVE-5098: the typed operator line only when the sender measures as a local
   # seat. An a2a relay (`--from=<contact>` from root), a spoofed or --raw send
   # keeps the bare paste — see _wake_sender_vouchable.
@@ -3851,6 +3897,9 @@ cmd_send() {
   # _A2A_INTERRUPTING is the SAME door the flush and the TUI control lines use
   # (_a2a_should_queue reads it first), so there is one bypass, not two.
   if (( urgent_eff )); then
+    # DIVE-7820: see cmd_deliver. The direct path's caller can halt, so the
+    # pointer is the ready-to-run command.
+    _a2a_target_busy "$name" && _halt_hint="$(_a2a_halt_hint "$name" 0 urgent)"
     _WAKE_VOUCH="$_vouch" _A2A_INTERRUPTING=1 inject_and_submit "$name" "$payload" || _rc=$?
   else
     _WAKE_VOUCH="$_vouch" inject_and_submit "$name" "$payload" || _rc=$?
@@ -3867,7 +3916,11 @@ cmd_send() {
     _queued=1
     # DIVE-6586: non-fatal receipt reads, as in cmd_deliver (the comment is there).
     local _depth=""; _depth="$(_a2a_queue_depth "$name")" || _depth=""; _depth="${_depth//[^0-9]/}"
-    _reason="$(_a2a_queued_reason "$_depth")" || _reason="$(_a2a_queued_reason)" || true
+    _reason="$(_a2a_queued_reason "$_depth" "$name" 0)" || _reason="$(_a2a_queued_reason "" "$name" 0)" || true
+    # DIVE-7820: the additive `halt_hint` key is the ready-to-run command, so it
+    # is only ever set on this direct path; the scoped `_deliver` (whose caller
+    # cannot halt) carries the "ask a lead seat" pointer in its prose only.
+    _halt_hint="5dive agent halt ${name}"
     AUDIT_ARGS+=("queued=1" "spool_depth=${_depth:-unknown}")   # DIVE-6414, as in cmd_deliver
   elif (( _rc != 0 )); then
     _sent=0
@@ -3932,14 +3985,15 @@ cmd_send() {
     # line. Both branches now build their optional keys the one way that cannot
     # annihilate the object it is building.
     if (( urgent )); then
-      ok "sent to agent '$name'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}" \
+      ok "sent to agent '$name'.${urgent_note:+ (}${urgent_note}${urgent_note:+)}${_halt_hint:+ }${_halt_hint}${_halt_hint:+.}" \
          '({name:$n, sent:true, bytes:($p|length), woken:($w=="1"), urgent:($ue=="1"), urgent_requested:true}
+           + (if ($hh|length) > 0 then {halt_hint:"5dive agent halt \($n)"} else {} end)
            + (if ($rd|length) > 0 then {ready:$rd} else {} end)
            + (if ($s|length) > 0 then {from:$s} else {} end)
            + (if ($i|length) > 0 then {msg_id:$i} else {} end)
            + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
            + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end))' \
-         --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg ue "$urgent_eff"
+         --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg ue "$urgent_eff" --arg hh "$_halt_hint"
       return 0
     fi
     # The pre-DIVE-2362 receipt, and still it: same keys, same order. The four
@@ -3972,8 +4026,9 @@ cmd_send() {
          + (if ($rc|length) > 0 then {reply_to_chat:$rc} else {} end)
          + (if ($rm|length) > 0 then {reply_to_msg:$rm} else {} end)
          + (if $ur == "1" then {urgent:($ue=="1"), urgent_requested:true} else {} end)
+         + (if ($hh|length) > 0 then {halt_hint:"5dive agent halt \($n)"} else {} end)
          + {reason:$reason})' \
-       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg reason "$_reason" --arg q "$_queued" --arg ur "$urgent" --arg ue "$urgent_eff"
+       --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg reason "$_reason" --arg q "$_queued" --arg ur "$urgent" --arg ue "$urgent_eff" --arg hh "$_halt_hint"
   fi
 }
 

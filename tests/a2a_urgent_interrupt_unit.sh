@@ -197,5 +197,24 @@ is "T8: urgent:false (budget was spent)"  "false" "$(jq -r '.data.urgent' <<<"$o
 is "T8: urgent_requested:true"            "true"  "$(jq -r '.data.urgent_requested' <<<"$out")"
 hasnt "T8: and the envelope does not claim it" "urgent=1" "$(typed_text)"
 
+# --- T9: DIVE-7820 — an urgent to a BUSY seat points at `agent halt` ----------
+# The typed urgent is read only when the running turn ends, so a stop on a money
+# step needs the verb that ENDS it. An idle target gets no such pointer.
+reset_arm; reset_budget
+out="$(IDLE_RC=1 JSON_MODE=1 cmd_send quinn --urgent --message="hold, do not pay" 2>/dev/null)"
+is "T9: busy urgent carries halt_hint"   "5dive agent halt quinn" "$(jq -r '.data.halt_hint' <<<"$out")"
+prose="$(IDLE_RC=1 cmd_send quinn --urgent --message="hold, do not pay" 2>/dev/null | tail -1)"
+has "T9: busy urgent prose names the halt command" "'5dive agent halt quinn'" "$prose"
+has "T9: and says to send again after the halt"    "send it again" "$prose"
+reset_arm; reset_budget
+out="$(IDLE_RC=0 JSON_MODE=1 cmd_send quinn --urgent --message="hold, do not pay" 2>/dev/null)"
+is "T9: idle urgent has no halt_hint"    "null" "$(jq -r '.data.halt_hint // "null"' <<<"$out")"
+# The scoped path (`_deliver`, whose caller holds only the a2a grant and cannot
+# halt): the pointer says to ask a lead seat, and gives no command.
+reset_arm; reset_budget
+prose="$( (actor_routing_agent() { printf "main\n"; }; require_root() { :; }; IDLE_RC=1 cmd_deliver --urgent quinn "hold, do not pay") 2>&1 | tail -3)" || true
+has   "T9: scoped busy urgent says ask a lead seat" "ask a lead seat to halt quinn" "$prose"
+hasnt "T9: scoped busy urgent gives no halt command" "5dive agent halt" "$prose"
+
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
