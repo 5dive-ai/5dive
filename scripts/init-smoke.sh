@@ -293,6 +293,25 @@ webchat_arm() {
     grep -q . /tmp/webchat-replies.jsonl 2>/dev/null && break
     sleep 3
   done
+  # DIVE-7833: a hermes gateway keeps Hermes' approval step (DIVE-7592: only the
+  # pane runs approve-all), so the model's first command can come back as "needs
+  # your OK ... Reply /approve". The owner answers in the same chat; so does this
+  # arm, at most twice, and the sum must still arrive. That grades the approval
+  # round trip through the web chat as well.
+  local approvals=0
+  while (( approvals < 2 )) \
+        && ! jq -r '.body // empty' /tmp/webchat-replies.jsonl 2>/dev/null | grep -qw -- "$want" \
+        && jq -r '.body // empty' /tmp/webchat-replies.jsonl 2>/dev/null | tail -c 2000 | grep -q '/approve'; do
+    approvals=$((approvals + 1))
+    echo "web chat: the agent asked for approval; answering /approve in the chat ($approvals)"
+    local seen; seen=$(wc -l < /tmp/webchat-replies.jsonl)
+    drop_inbox "$inbox" "/approve"
+    for _ in $(seq 1 100); do
+      (( $(wc -l < /tmp/webchat-replies.jsonl) > seen )) && jq -r '.body // empty' /tmp/webchat-replies.jsonl | grep -qw -- "$want" && break
+      (( $(wc -l < /tmp/webchat-replies.jsonl) > seen )) && jq -r '.body // empty' /tmp/webchat-replies.jsonl | tail -n +"$((seen + 1))" | grep -q '/approve' && break
+      sleep 3
+    done
+  done
   echo "--- web chat replies ---"; cat /tmp/webchat-replies.jsonl
   if ! grep -q . /tmp/webchat-replies.jsonl; then
     # DIVE-7417: on hermes the answer comes from its gateway; show why it is not up.

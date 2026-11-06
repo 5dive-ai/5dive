@@ -78,5 +78,11 @@ wc=$(bash -c "source <(sed -n '/^cell_type()/p;/^cell_has_webchat()/p' $SM); for
 [[ "$wc" == yy ]] && ok_t "init-smoke grades the web chat on both hermes cells" || bad_t "init-smoke hermes web chat: $wc"
 grep -q 'webchat: not graded on hermes' "$SM" && bad_t "init-smoke still skips the hermes web chat" || ok_t "no 'not graded' skip line left"
 
+# Run 42271431924: all four hermes cells answered the web chat, first with
+# Hermes' "needs your OK ... Reply /approve" (the gateway keeps approvals,
+# DIVE-7592). The arm answers /approve in the chat, as the owner would.
+arm=$(sed -n '/^webchat_arm() {/,/^}/p' "$SM")
+[[ "$arm" == *'drop_inbox "$inbox" "/approve"'* && "$arm" == *'approvals < 2'* ]] \
+  && ok_t "the web chat arm answers an approval prompt in the chat, at most twice" || bad_t "the web chat arm does not answer /approve"
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))
