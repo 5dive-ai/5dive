@@ -3443,7 +3443,7 @@ _hb_pane_composer_holds() {
     [[ "$last" == "$text" || "$last" == "$text "* ]] && return 0
     return 1
   fi
-  local tail8; tail8=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 8)
+  local tail8; tail8=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 8) || return 2
   [[ "$tail8" == *"$text"* ]] && return 0
   return 1
 }
