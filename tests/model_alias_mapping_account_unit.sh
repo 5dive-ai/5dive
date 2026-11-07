@@ -197,7 +197,7 @@ seat both "$FLASH" openrouter sonnet
 ( JSON_MODE=1; cmd_config both set auth-profile=client-claude model=haiku ) >/dev/null 2>&1
 eq_t 'an explicit model= in the same call wins' haiku "$(live both)"
 eq_t '... and becomes the remembered family' haiku "$(jq -r '.agents.both.modelFamily // ""' "$TMP/reg")"
-( JSON_MODE=1; cmd_config both set model=z-ai/glm-4.6 ) >/dev/null 2>&1
+( JSON_MODE=1; cmd_config both set model=claude-opus-4-8 ) >/dev/null 2>&1
 eq_t 'setting a pinned id forgets the family' "" "$(jq -r '.agents.both.modelFamily // ""' "$TMP/reg")"
 
 echo '== 3b. DIVE-7786: a seat with no recorded family on the seeded slug =='

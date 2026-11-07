@@ -243,6 +243,95 @@ claude_model_ok_on_anthropic() {
   [[ "$m" =~ ^claude-[a-z0-9.-]+(\[[a-z0-9]+\])?$ || "$m" =~ ^[a-z]+(\[[a-z0-9]+\])?$ ]]
 }
 
+# ---------------------------------------------------------------------------
+# `agent config set model=` on a claude seat (DIVE-7895).
+#
+# The set wrote any charset-valid string into settings.json, and a wrong id is
+# persisted: every turn then fails model_not_found, every restart boots back
+# into it, and only root hand-editing the file recovers the seat. The rule is
+# open by default (lodar 11-07: "freedom ... not overprotective"): refuse only
+# what provably cannot run on the seat's account, warn on anything 5dive does
+# not know, and remember the previous model so the undo is one command.
+# ---------------------------------------------------------------------------
+
+# claude_model_alias_known <model> -> rc 0 for a family alias or a Claude Code
+# built-in alias (default, best, opusplan), with or without a [1m]-style suffix.
+claude_model_alias_known() {
+  local m="${1:-}"
+  m="${m%%\[*}"
+  [[ -n "$m" ]] || return 1
+  case "$m" in default|best|opusplan) return 0 ;; esac
+  grep -qxF -- "$m" <<<"$(model_families)"
+}
+
+# claude_model_id_known <model> -> rc 0 when <model> (suffix stripped) is an id
+# this CLI has pinned for some family: model_latest or model_previous.
+claude_model_id_known() {
+  local m="${1:-}" fam fams
+  m="${m%%\[*}"
+  [[ "$m" == claude-* ]] || return 1
+  fams=$(model_families)
+  while read -r fam; do
+    [[ "$m" == "$(model_latest "$fam")" ]] && return 0
+    grep -qxF -- "$m" <<<"$(model_previous "$fam")" && return 0
+  done <<<"$fams"
+  return 1
+}
+
+# claude_model_servable_on_anthropic <model> -> rc 0 when Anthropic can be sent
+# <model> at all: a known alias, or a claude-* id (a newer release than this CLI
+# knows is still a claude-* id, so it is not refused). Stricter than
+# claude_model_ok_on_anthropic, which lets any bare word through for set-account.
+claude_model_servable_on_anthropic() {
+  local m="${1:-}"
+  claude_model_alias_known "$m" && return 0
+  [[ "$m" =~ ^claude-[a-z0-9.-]+(\[[a-z0-9]+\])?$ ]]
+}
+
+# claude_seat_on_anthropic_login <profile> <settings.json> -> rc 0 when a claude
+# seat talks to Anthropic itself. A bound seat asks its account. An unbound seat
+# runs on the box's own Claude login unless the connector file or the seat's own
+# settings.json routes it elsewhere (a base url, Bedrock, Vertex, Foundry).
+claude_seat_on_anthropic_login() {
+  local p="${1:-}" settings="${2:-}" f url v val env
+  if [[ -n "$p" ]]; then
+    profile_is_anthropic_login "$p"; return
+  fi
+  f="${CONNECTORS_DIR:-/etc/5dive/connectors}/anthropic.env"
+  if [[ -r "$f" ]]; then
+    for v in ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY; do
+      val=$(grep -E "^${v}=" "$f" 2>/dev/null | tail -1 | cut -d= -f2-) || val=""
+      val="${val%\"}"; val="${val#\"}"
+      if [[ "$v" == ANTHROPIC_BASE_URL ]]; then
+        [[ -z "$val" || "$val" =~ ^https://api\.anthropic\.com(/|$) ]] || return 1
+      else
+        [[ -z "$val" || "$val" == 0 || "$val" == false ]] || return 1
+      fi
+    done
+  fi
+  if [[ -n "$settings" ]]; then
+    env=$(priv_read "$settings" jq -c '.env // {}' "$settings" 2>/dev/null) || env=""
+    [[ -n "$env" ]] || env='{}'
+    jq -e '(.ANTHROPIC_BASE_URL // "") as $u
+           | ($u == "" or ($u | test("^https://api\\.anthropic\\.com(/|$)")))
+             and ([.CLAUDE_CODE_USE_BEDROCK, .CLAUDE_CODE_USE_VERTEX, .CLAUDE_CODE_USE_FOUNDRY]
+                  | all(. == null or . == "" or . == "0" or . == "false" or . == 0 or . == false))' \
+      <<<"$env" >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
+# claude_model_mapped_by_profile <model> <profile> -> rc 0 when <model> is one of
+# the account's own tier ids (ANTHROPIC_DEFAULT_*_MODEL): the account vouches.
+claude_model_mapped_by_profile() {
+  local m="${1:-}" p="${2:-}" fam
+  [[ -n "$m" && -n "$p" ]] || return 1
+  for fam in opus sonnet haiku; do
+    [[ "$(profile_alias_model "$p" "$fam")" == "$m" ]] && return 0
+  done
+  return 1
+}
+
 # models_json -> {"opus":"claude-opus-5-5",...}. This is what the telegram plugin
 # reads at boot so its /model picker can't drift from the CLI again.
 models_json() {
