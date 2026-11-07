@@ -22,7 +22,8 @@ block="$(sed -n '/^# >>> DIVE-7451 voice default/,/^# <<< DIVE-7451 voice defaul
 grep -q '_va_decide()' <<<"$block" || { bad_t "DIVE-7451 block not found in src/cmd_plugin.sh"; echo "$PASS passed, $FAIL failed"; exit 1; }
 WORK="$(mktemp -d)"; B_DISK=20000
 
-# box [disk-mb] [managed:yes|no] [hears:yes|no] [registered:yes|no] — a fresh fake box.
+# box [disk-mb] [managed:yes|no] [hears:yes|no] [registered:yes|no] [engine:yes|no]
+# — a fresh fake box. engine: local whisper's /health answers (the curl stub).
 box() {
   rm -rf "$WORK/b"; mkdir -p "$WORK/b/state" "$WORK/b/plugins" "$WORK/b/sd"
   printf '{}\n' > "$WORK/b/plugins/installed.json"
@@ -32,6 +33,7 @@ box() {
   [[ "${2:-no}" == yes ]] && : > "$WORK/b/provisioning.env"
   [[ "${3:-no}" == yes ]] && { printf '#!/bin/sh\n' > "$WORK/b/transcribe"; chmod +x "$WORK/b/transcribe"; }
   [[ "${4:-no}" == yes ]] && printf '{"voice@5dive-voice":{"plugin":"voice"}}\n' > "$WORK/b/plugins/installed.json"
+  [[ "${5:-yes}" == yes ]] && : > "$WORK/b/engine"
   return 0
 }
 # run '<shell code>' — the block in a subshell on the fake box.
@@ -42,12 +44,15 @@ run() {
     export SELF_UPDATE_PROVISIONING="$WORK/b/provisioning.env" FIVEDIVE_TRANSCRIBE_BIN="$WORK/b/transcribe"
     export FIVEDIVE_VOICE_AUTO_CLI="$WORK/b/cli" VA_SYSTEMD_DIR="$WORK/b/sd"
     export FIVEDIVE_VOICE_AUTO_DISK_MB="$B_DISK" FIVEDIVE_VOICE_AUTO_POLL_SECS=0
+    export FIVEDIVE_VOICE_LIB="$WORK/b/voice-backend.sh"
     JSON_MODE=0; E_USAGE=2; E_GENERIC=1; E_TIMEOUT=11; TERM=dumb
     fail(){ printf 'FAILED: %s\n' "${2:-}"; exit "${1:-1}"; }
     ok(){ printf 'OK — %s\n' "$1"; }; warn(){ :; }
     _plugin_installed_json(){ echo "$WORK/b/plugins/installed.json"; }
     systemd-run(){ echo "systemd-run $*" >> "$WORK/b/calls"; }
     systemctl(){ return 3; }   # no unit is active
+    # The engine's /health: never the real :8765 (this host runs whisper-service).
+    curl(){ printf '%s\n' "$*" >> "$WORK/b/curl"; [[ -e "$WORK/b/engine" ]]; }
     eval "$block"
     eval "$code"
   ) 2>&1
@@ -58,13 +63,63 @@ calls(){ cat "$WORK/b/calls"; }
 # --- the decision, pure: managed > on > installing > declined > ask -----------
 dec(){ run "_va_decide $*"; }
 bad=""
-for c in "1 0 0 '' managed" "1 1 0 off managed" "0 1 0 off on" "0 1 1 '' on" "0 0 1 off installing" \
+for c in "1 0 0 '' managed" "1 1 0 off managed" "0 1 0 off on" "0 1 1 '' installing" "0 0 1 off installing" \
          "0 0 0 off declined" "0 0 0 '' ask" "0 0 0 on ask"; do
   set -- $c; want="${!#}"; got="$(eval "dec $1 $2 $3 $4")"
   [[ "$got" == "$want" ]] || bad+="[$c -> $got] "
 done
-[[ -z "$bad" ]] && ok_t "decide: 8 cases (managed > on > installing > declined > ask; a yes that never finished is asked again)" \
+[[ -z "$bad" ]] && ok_t "decide: 8 cases (managed > installing > on > declined > ask; a yes that never finished is asked again)" \
                 || bad_t "decide" "$bad"
+# DIVE-7855: the 5th input is "the engine answers". A wrapper with a dead engine is never on.
+bad=""
+# (choice "-" = none: run joins its args with $*, which would drop an empty one)
+for c in "0 1 0 - 1 on" "0 1 0 - 0 broken" "0 1 0 off 0 broken" "0 1 1 - 0 installing" "1 1 0 - 0 managed" "0 0 0 - 0 ask"; do
+  set -- $c; want="${!#}"; got="$(eval "dec $1 $2 $3 $4 $5")"
+  [[ "$got" == "$want" ]] || bad+="[$c -> $got] "
+done
+[[ -z "$bad" ]] && ok_t "decide: 6 engine cases (wrapper + engine up -> on; wrapper + engine down -> broken; setup running -> installing)" \
+                || bad_t "decide engine" "$bad"
+
+# --- DIVE-7855 (report 761): the wrapper alone is not hearing ---------------------
+box 20000 no yes yes no
+out="$(run 'cmd_plugin_auto_voice --status')"
+if ! grep -q 'voice: on' <<<"$out" && grep -q 'voice: broken' <<<"$out" && grep -q 'not answering' <<<"$out" \
+   && grep -qF "$WORK/b/state/voice-auto.log" <<<"$out" && grep -q '127.0.0.1:8765/health' "$WORK/b/curl" 2>/dev/null; then
+  ok_t "REPORT 761: wrapper on the box, whisper not answering, no setup running -> broken (names the log), never 'voice: on'"
+else bad_t "REPORT 761" "$out | curl=$(cat "$WORK/b/curl" 2>/dev/null)"; fi
+box 20000 no yes yes yes
+out="$(run 'cmd_plugin_auto_voice --status')"
+grep -q 'voice: on' <<<"$out" && ok_t "ON needs the engine: wrapper + /health 200 -> on" || bad_t "ON engine up" "$out"
+box 20000 no yes yes no
+out="$(FIVEDIVE_VOICE_AUTO_INSTALLING=1 run 'cmd_plugin_auto_voice --status')"
+grep -q 'voice: installing' <<<"$out" && [[ ! -s "$WORK/b/curl" ]] \
+  && ok_t "MID-SETUP: wrapper already written but setup still running -> installing (engine not even asked)" || bad_t "MID-SETUP" "$out"
+# Hearing on OpenRouter needs no local whisper: the engine's own lib says where hearing runs.
+box 20000 no yes yes no
+printf 'voice_effective_stt_backend(){ echo openrouter; }\n' > "$WORK/b/voice-backend.sh"
+out="$(run 'cmd_plugin_auto_voice --status')"
+grep -q 'voice: on' <<<"$out" && [[ ! -s "$WORK/b/curl" ]] \
+  && ok_t "OPENROUTER: hearing on OpenRouter + wrapper -> on, local /health not required" || bad_t "OPENROUTER" "$out | curl=$(cat "$WORK/b/curl" 2>/dev/null)"
+printf 'voice_effective_stt_backend(){ echo "5dive voice: falling back" >&2; echo local; }\n' > "$WORK/b/voice-backend.sh"
+out="$(run 'cmd_plugin_auto_voice --status')"
+grep -q 'voice: broken' <<<"$out" && ! grep -q 'falling back' <<<"$out" \
+  && ok_t "OPENROUTER falling back to local (no key / local-only) + dead whisper -> broken, the lib's stderr kept out" || bad_t "OPENROUTER fallback" "$out"
+rm -f "$WORK/b/voice-backend.sh"
+# --wait: setup ends with the wrapper written and the engine dead -> a failure, not "ready".
+box 20000 no yes yes no
+out="$(run '_va_installing(){ n=$(cat "$WORK/b/n" 2>/dev/null || echo 0); echo $((n+1)) > "$WORK/b/n"; (( n < 2 )); }; cmd_plugin_auto_voice --wait')"; rc=$?
+! grep -q 'is ready' <<<"$out" && grep -q 'not answering' <<<"$out" && grep -qF "$WORK/b/state/voice-auto.log" <<<"$out" && (( rc == 1 )) \
+  && ok_t "WAIT on a dead engine: setup ends, engine down -> exits 1 with the log path, never 'ready'" || bad_t "WAIT broken" "rc=$rc $out"
+# --on on a broken box re-runs setup (repair); the plugin is not added again.
+box 20000 no yes yes no
+out="$(run 'cmd_plugin_auto_voice --on')"
+if grep -q "systemd-run --unit=5dive-voice-auto-setup.* plugin setup voice --yes" <<<"$(calls)" && ! grep -q 'plugin add' <<<"$(calls)" \
+   && [[ "$(st)" == "choice=on source=owner " ]] && grep -q 'Repairing' <<<"$out"; then
+  ok_t "REPAIR: --on on a broken box re-runs setup in the background, adds nothing, records on/owner"
+else bad_t "REPAIR" "$out | calls=$(calls) state=$(st)"; fi
+box 20000 no yes yes no
+out="$(run 'cmd_plugin_auto_voice --off')"
+grep -q 'still installed' <<<"$out" && ok_t "OFF on a broken box says voice is still installed and how to remove it" || bad_t "OFF broken" "$out"
 
 # --- first use on a fresh 4 GB box: asked, nothing installed -------------------
 box 20000
@@ -117,10 +172,11 @@ out="$(run 'cmd_plugin_auto_voice --on')"
   && ok_t "ADD FAILS: nothing recorded, so the next ask can try again" || bad_t "ADD FAILS" "$out | $(st)"
 
 # --- wait: the note that asked is heard after this --------------------------------
+# (setup writes the wrapper at its step 4 and then ends: installing until it ends)
 box 20000
-out="$(run '_va_installing(){ n=$(cat "$WORK/b/n" 2>/dev/null || echo 0); echo $((n+1)) > "$WORK/b/n"; (( n == 2 )) && { printf "#!/bin/sh\n" > "$FIVEDIVE_TRANSCRIBE_BIN"; chmod +x "$FIVEDIVE_TRANSCRIBE_BIN"; }; return 0; }; cmd_plugin_auto_voice --wait; echo "rc=$?"')"
+out="$(run '_va_installing(){ n=$(cat "$WORK/b/n" 2>/dev/null || echo 0); echo $((n+1)) > "$WORK/b/n"; (( n == 2 )) && { printf "#!/bin/sh\n" > "$FIVEDIVE_TRANSCRIBE_BIN"; chmod +x "$FIVEDIVE_TRANSCRIBE_BIN"; }; (( n < 3 )); }; cmd_plugin_auto_voice --wait; echo "rc=$?"')"
 grep -q 'Speech-to-text is ready' <<<"$out" && grep -q 'rc=0' <<<"$out" \
-  && ok_t "WAIT: blocks while installing, returns 0 the moment it hears" || bad_t "WAIT" "$out"
+  && ok_t "WAIT: blocks while installing, returns 0 once setup ends and it hears" || bad_t "WAIT" "$out"
 box 20000
 out="$(FIVEDIVE_VOICE_AUTO_INSTALLING=1 run 'cmd_plugin_auto_voice --wait --timeout=0')"; rc=$?
 grep -q 'still installing' <<<"$out" && (( rc == 11 )) \
