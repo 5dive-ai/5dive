@@ -15,7 +15,8 @@
 # key; (d) expired cert; (e) cert by another root; (f) key_id not its pubkey's;
 # (g) manifest signed by an uncertified key; (h) root present, no trust; (i) no
 # root: the direct pin, unchanged; (j) the kept list: a lower serial does not
-# un-revoke, and a list is kept only after the whole file verified; (k) a root
+# un-revoke, an EQUAL serial with other bytes does not either (both lists
+# apply), and a list is kept only after the whole file verified; (k) a root
 # key file others can write; (l) the pre-DIVE-7888 verifier takes a file WITH
 # trust. Then the builder's refusals, --write-pubkey, and MUTANTS that drop one
 # check each and must let the matching bad file through.
@@ -252,6 +253,20 @@ OFFLINE_UPDATE_STATE_DIR="$LOOSE" accepted "(j) a kept list others can write is 
 fresh_state; cp "$TJ2/revoked.json" "$OFFLINE_UPDATE_STATE_DIR/update-revoked.json"; cp "$TJ1/revoked.sig" "$OFFLINE_UPDATE_STATE_DIR/update-revoked.sig"
 accepted "(j) a kept list whose signature does not verify is ignored" "$OLDKEY"
 
+# (j) EQUAL SERIAL (quinn, DIVE-7888 iteration 1): the box keeps serial-1 [SKOLD];
+# SKOLD's file carries a DIFFERENT serial-1 list ([]). Equal serials cannot be
+# ordered, so both lists apply and SKOLD stays revoked.
+TQ="$WORK/trust-q"; mkcert "$TQ" "$WORK/root.pem" "$WORK/sk.pub" "$LATER"; mkrev "$TQ" "$WORK/root.pem" 1 "$SKOLD_ID"
+TIE1="$(variant tie1 "$TQ" "$WORK/sk.pem")"
+fresh_state; TIE_DIR="$OFFLINE_UPDATE_STATE_DIR"
+accepted "(j=) a file signed by SK carrying serial-1 [SKOLD] verifies on a fresh box" "$TIE1"
+cmp -s "$TIE_DIR/update-revoked.json" "$TQ/revoked.json" && ok_t "(j=) the box keeps serial-1 [SKOLD]" || bad_t "(j=) serial-1 [SKOLD] not kept"
+cp -a "$TIE_DIR" "$WORK/state-tie"   # an untouched copy for the mutant
+refused "(j=) then SKOLD's file with the OTHER serial-1 list ([]) is refused" "$OLDKEY" "has been revoked"
+cmp -s "$TIE_DIR/update-revoked.json" "$TQ/revoked.json" \
+  && ok_t "(j=) an equal serial did not replace the kept list" || bad_t "(j=) the equal-serial list replaced the kept one"
+accepted "(j=) control: SK's file with serial-1 [] still verifies there (the union refuses only what a list names)" "$GOOD"
+
 # (k) ROOT KEY FILE OTHERS CAN WRITE.
 cp "$WORK/root.pub" "$WORK/loose-root.pub"; chmod 666 "$WORK/loose-root.pub"
 OFFLINE_UPDATE_ROOT_PUBKEY_FILE="$WORK/loose-root.pub" refused "(k) a root key file others can write is not trusted (refused, not skipped)" "$GOOD" "cannot be trusted as the root key"
@@ -325,6 +340,8 @@ mutant "no expiry check (d)" 's/(( now < not_after ))/true/' "$EXPIRED"
 mutant "no root check on the certificate (e)" 's/_ou_sig_ok "\$root" "\$t\/signing_key"/true/' "$OTHERROOT"
 mutant "no key_id recomputation (f)" 's/"\$(_ou_key_id "\$skey")" == "\$key_id"/1 == 1/' "$BADID"
 mutant "the manifest checked with the pinned key, not the certified one (g)" 's/^    key="\$meta\/certified.pem"$/    key="$OFFLINE_UPDATE_PUBKEY_FILE"/' "$UNCERT"
-mutant "the higher kept serial ignored (j)" 's/if (( kept_serial > got )); then list="\$kept"/if false; then :/' "$JKILL" "$KEPT_DIR"
+cp -a "$KEPT_DIR" "$WORK/state-j"
+mutant "the higher kept serial ignored (j)" 's/if (( kept_serial >= got )); then union=1/if false; then :/' "$JKILL" "$WORK/state-j"
+mutant "an equal kept serial ignored (j=)" 's/if (( kept_serial >= got )); then union=1/if (( kept_serial > got )); then union=1/' "$OLDKEY" "$WORK/state-tie"
 
 finish

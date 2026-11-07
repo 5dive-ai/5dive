@@ -191,7 +191,10 @@ _ou_chain() {
   jq -e '.format == 1 and .kind == "5dive-revocations" and (.serial|type == "number") and .serial >= 1
          and (.revoked|type == "array") and all(.revoked[]; type == "string")' "$t/revoked" >/dev/null 2>&1 \
     || { _OU_WHY="the list of revoked keys in this file is not in a format this 5dive reads"; return 1; }
-  local st kept list="$t/revoked" got kept_serial
+  # Only a STRICTLY higher serial replaces the kept list. On an equal or lower
+  # serial BOTH lists apply (union): two root-signed lists sharing a serial must
+  # not let a file un-revoke a key with the list it carries.
+  local st kept got kept_serial union=0
   st="$(_ou_state_dir)"; kept="$st/update-revoked.json"
   got="$(jq -r '.serial | floor' "$t/revoked")"
   [[ "$got" =~ ^[0-9]{1,15}$ ]] || { _OU_WHY="the list of revoked keys in this file is not in a format this 5dive reads"; return 1; }
@@ -199,12 +202,13 @@ _ou_chain() {
      && _ou_sig_ok "$root" "$kept" "$st/update-revoked.sig"; then
     kept_serial="$(jq -r '.serial | floor' "$kept" 2>/dev/null)" || kept_serial=0
     [[ "$kept_serial" =~ ^[0-9]{1,15}$ ]] || kept_serial=0
-    if (( kept_serial > got )); then list="$kept"
-    elif (( kept_serial < got )); then _OU_KEEP_REVOKED="$t"; fi
+    if (( kept_serial >= got )); then union=1
+    else _OU_KEEP_REVOKED="$t"; fi
   else
     _OU_KEEP_REVOKED="$t"
   fi
-  if jq -e --arg k "$key_id" '.revoked | index($k) != null' "$list" >/dev/null 2>&1; then
+  if jq -e --arg k "$key_id" '.revoked | index($k) != null' "$t/revoked" >/dev/null 2>&1 \
+     || { (( union )) && jq -e --arg k "$key_id" '.revoked | index($k) != null' "$kept" >/dev/null 2>&1; }; then
     _OU_KEEP_REVOKED=""
     _OU_WHY="the key that signed this file has been revoked by 5dive — refused"; return 1
   fi

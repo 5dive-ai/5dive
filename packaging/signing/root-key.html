@@ -94,7 +94,7 @@
     <p>Leave the box empty unless the 5dive team asked you to block a key.</p>
     <label for="n-serial">List number</label>
     <input type="number" id="n-serial" value="1" min="1" autocomplete="off">
-    <p class="ok">Use 1 the first time. Add 1 each time you make a new list.</p>
+    <p class="ok">Use 1 the first time, with no keys blocked. A list that blocks a key needs a higher number than every list before it.</p>
     <label for="t-rev">Keys to block (one per line)</label>
     <textarea id="t-rev" autocomplete="off" spellcheck="false"></textarea>
     <button id="b-sign">Approve and finish</button>
@@ -197,7 +197,10 @@ async function buildPublicFile(master, update, days, serial, revokedText, nowMs)
   if (ids.includes(update.keyId)) throw new Error("You are blocking the same key you are approving.");
   const notAfter = Math.floor(nowMs / 1000) + wholeNumber(days, 1, 3650, "Days") * 86400;
   const sk = enc.encode(signingKeyJson(update.pem, update.keyId, notAfter));
-  const rv = enc.encode(revokedJson(wholeNumber(serial, 1, 1e9, "List number"), ids));
+  const n = wholeNumber(serial, 1, 1e9, "List number");
+  // List 1 is the first ceremony's empty list. Blocking on 1 would make a second list 1 that boxes cannot order.
+  if (ids.length && n < 2) throw new Error("To block a key, set List number higher than every list you made before (2 or more).");
+  const rv = enc.encode(revokedJson(n, ids));
   return JSON.stringify({
     root_pubkey_pem: master.publicPem, root_fingerprint: master.fingerprint,
     signing_key_json_b64: b64(sk), signing_key_sig_b64: b64(await signBytes(master, sk)),

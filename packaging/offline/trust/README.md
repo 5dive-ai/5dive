@@ -14,6 +14,10 @@ Four files, all made at the owner's key ceremony, all PUBLIC:
 Commit them byte for byte as the ceremony wrote them: the signatures cover the
 exact bytes.
 
+A new `revoked.json` replaces the checked-in one only with a HIGHER `serial`
+(or the same bytes). Two different lists with one serial cannot be ordered: a
+box then applies both, and the ceremony page refuses to block a key on list 1.
+
 Only public files go here. Never the root's private key, never the signing
 key's private key (that stays in the `OFFLINE_UPDATE_SIGNING_KEY` repo secret).
 

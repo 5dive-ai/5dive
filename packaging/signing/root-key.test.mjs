@@ -103,6 +103,8 @@ check("NEG: private key rejected as master if wrong type (X25519)", await throws
 check("NEG: bad revoked id rejected", await throwsAsync(() => P.buildPublicFile(m, { pem: P.DEFAULT_UPDATE_KEY, keyId: keyIdOssl }, 365, 1, "abc", now)));
 check("NEG: days 0 / 1.5 / 99999 rejected", await throwsAsync(() => P.buildPublicFile(m, { pem: P.DEFAULT_UPDATE_KEY, keyId: keyIdOssl }, 0, 1, "", now)) && await throwsAsync(() => P.buildPublicFile(m, { pem: P.DEFAULT_UPDATE_KEY, keyId: keyIdOssl }, 1.5, 1, "", now)) && await throwsAsync(() => P.buildPublicFile(m, { pem: P.DEFAULT_UPDATE_KEY, keyId: keyIdOssl }, 99999, 1, "", now)));
 check("NEG: serial 0 rejected", await throwsAsync(() => P.buildPublicFile(m, { pem: P.DEFAULT_UPDATE_KEY, keyId: keyIdOssl }, 365, 0, "", now)));
+check("NEG: blocking a key on list number 1 refused (no second list 1 with different bytes)", await throwsAsync(() => P.buildPublicFile(m, { pem: P.DEFAULT_UPDATE_KEY, keyId: keyIdOssl }, 365, 1, "c".repeat(64), now)));
+check("blocking a key on list number 2 accepted", !(await throwsAsync(() => P.buildPublicFile(m, { pem: P.DEFAULT_UPDATE_KEY, keyId: keyIdOssl }, 365, 2, "c".repeat(64), now))));
 check("NEG: master key refused as its own update key", await throwsAsync(async () => P.buildPublicFile(m, await P.importUpdateKey(m.publicPem), 365, 1, "", now)));
 check("NEG: revoking the key being approved refused", await throwsAsync(() => P.buildPublicFile(m, { pem: P.DEFAULT_UPDATE_KEY, keyId: keyIdOssl }, 365, 1, keyIdOssl, now)));
 
