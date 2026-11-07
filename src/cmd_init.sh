@@ -291,101 +291,15 @@ _init_nightly_ask() {
   echo >&2
 }
 
-cmd_init() {
-  # --- Flags: --quiet/--demo suppress sub-process noise (see _init_run) ---
-  local _arg
-  for _arg in "$@"; do
-    case "$_arg" in
-      --quiet|--demo) _INIT_QUIET=1 ;;
-      -h|--help)
-        cat >&2 <<'USAGE'
-5dive init [--quiet]
-  Interactive first-run wizard: install a runtime, authenticate, and create
-  your first agent.
-  --quiet, --demo   Hide install/create sub-process output behind a spinner
-                    (a clean capture for demos); full logs go to
-                    /tmp/5dive-init-<ts>.log. Default streams everything.
-  Last, on a self-hosted box, it asks once whether to turn on nightly
-  updates (recommended; off unless you say yes).
-USAGE
-        return 0 ;;
-      *) fail "$E_USAGE" "unknown flag '$_arg' (see: 5dive init --help)" ;;
-    esac
-  done
-  if (( _INIT_QUIET == 1 )); then
-    _INIT_LOG="/tmp/5dive-init-$(date +%Y%m%d-%H%M%S)-$$.log"
-    : > "$_INIT_LOG" 2>/dev/null || _INIT_LOG="/tmp/5dive-init-$$.log"
-  fi
-
-  # Fail fast before any prompts: every step the wizard drives (agent install /
-  # create, channel wiring) is root-only — without this guard an unprivileged
-  # user answers the whole questionnaire and dies mid-create instead.
-  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "init must run as root (sudo 5dive init)"
-  if [[ ! -t 0 ]]; then
-    fail "$E_USAGE" "5dive init is interactive — run it in a real terminal (not a pipe)"
-  fi
-
-  _init_welcome
-  _init_section 1 4 "Choose a runtime" \
-    "Pick the coding agent that will power your first teammate."
-
-  # --- Step 1: pick a type ---
-  local -a types=(claude codex antigravity grok hermes openclaw opencode pi devin)
-  local -A type_desc=(
-    [claude]="Anthropic's Claude — recommended"
-    [codex]="OpenAI Codex"
-    [antigravity]="Google Antigravity CLI"
-    [grok]="xAI Grok CLI"
-    [hermes]="Open-source agent — bring your own provider"
-    [openclaw]="Open-source agent — bring your own provider"
-    [opencode]="Open-source agent — bring your own provider"
-    [pi]="Extension-based coding agent — bring your own provider"
-    [devin]="Cognition's Devin CLI"
-  )
-  local -A type_label=(
-    [claude]="Claude Code"
-    [codex]="Codex"
-    [antigravity]="Antigravity"
-    [grok]="Grok"
-    [hermes]="Hermes"
-    [openclaw]="OpenClaw"
-    [opencode]="OpenCode"
-    [pi]="Pi"
-    [devin]="Devin"
-  )
-  # DIVE-7802: Grok is on unless the owner ran `5dive grok disable`; say so in
-  # the menu, and check BEFORE the install and sign-in, not after them.
-  grok_is_on || type_desc[grok]="xAI Grok CLI — turned off on this server"
-  local -a type_menu=()
-  local t
-  for t in "${types[@]}"; do
-    type_menu+=("$t|${type_label[$t]}|${type_desc[$t]}")
-  done
-  local type
-  while true; do
-    _init_pick type "Pick an agent type:" 1 "${type_menu[@]}"
-    if [[ "$type" != "grok" ]] || _init_grok_on; then break; fi
-    _init_note "Grok stays off. Pick another agent type."
-  done
-
-  # --- Step 2: install binary if missing ---
-  _init_section 2 4 "Connect ${type_label[$type]}" \
-    "Use an existing sign-in, an interactive login, or your own provider key."
-  if ! _init_run "Setting up the ${type_label[$type]} CLI" cmd_install "$type"; then
-    fail "$E_NOT_INSTALLED" "failed to install $type — try '5dive agent install $type' manually"
-  fi
-  echo >&2
-
-  # --- Step 3: auth ---
-  local auth_ok=0 auth_summary="Existing credentials"
-  local byo_provider="" byo_key="" create_model="" create_provider="" create_key=""
-  # Probe current auth state — cmd_auth_status returns 0 if any creds exist.
-  if 5dive agent auth status --probe --type="$type" --json 2>/dev/null | jq -e '.ok and (.data | any(.status == "ok"))' >/dev/null 2>&1; then
-    _init_ok "${type_label[$type]} is already authenticated"
-    auth_ok=1
-  fi
-
-  if (( auth_ok == 0 )); then
+# DIVE-7848: init's AI step, on its own so `agent import` runs the same one when
+# the box has no AI of the seat's type. Dynamic scope: it sets the CALLER's
+# auth_summary, byo_provider, byo_key, create_provider, create_key and
+# create_model, so a caller declares those locals first. A sign-in or a key it
+# saves goes into the box's shared login; a custom provider (byo_*) and pi's or
+# Codex-on-OpenRouter's key (create_*) are wired at create by the caller. The
+# body keeps cmd_init's indentation, which the init tests read.
+_init_ai_step() { # <type> <label>
+  local type="$1" label="$2"
     case "$type" in
       claude)
         local auth_choice
@@ -490,7 +404,7 @@ USAGE
         auth_summary="$provider API key"
         ;;
       antigravity|grok)
-        _init_note "Opening ${type_label[$type]}'s interactive sign-in…"
+        _init_note "Opening ${label}'s interactive sign-in…"
         5dive agent auth login "$type" || fail "$E_AUTH_REQUIRED" "auth failed"
         auth_summary="Interactive sign-in"
         ;;
@@ -565,6 +479,104 @@ USAGE
         auth_summary="$provider API key"
         ;;
     esac
+}
+
+cmd_init() {
+  # --- Flags: --quiet/--demo suppress sub-process noise (see _init_run) ---
+  local _arg
+  for _arg in "$@"; do
+    case "$_arg" in
+      --quiet|--demo) _INIT_QUIET=1 ;;
+      -h|--help)
+        cat >&2 <<'USAGE'
+5dive init [--quiet]
+  Interactive first-run wizard: install a runtime, authenticate, and create
+  your first agent.
+  --quiet, --demo   Hide install/create sub-process output behind a spinner
+                    (a clean capture for demos); full logs go to
+                    /tmp/5dive-init-<ts>.log. Default streams everything.
+  Last, on a self-hosted box, it asks once whether to turn on nightly
+  updates (recommended; off unless you say yes).
+USAGE
+        return 0 ;;
+      *) fail "$E_USAGE" "unknown flag '$_arg' (see: 5dive init --help)" ;;
+    esac
+  done
+  if (( _INIT_QUIET == 1 )); then
+    _INIT_LOG="/tmp/5dive-init-$(date +%Y%m%d-%H%M%S)-$$.log"
+    : > "$_INIT_LOG" 2>/dev/null || _INIT_LOG="/tmp/5dive-init-$$.log"
+  fi
+
+  # Fail fast before any prompts: every step the wizard drives (agent install /
+  # create, channel wiring) is root-only — without this guard an unprivileged
+  # user answers the whole questionnaire and dies mid-create instead.
+  [[ $EUID -eq 0 ]] || fail "$E_PERMISSION" "init must run as root (sudo 5dive init)"
+  if [[ ! -t 0 ]]; then
+    fail "$E_USAGE" "5dive init is interactive — run it in a real terminal (not a pipe)"
+  fi
+
+  _init_welcome
+  _init_section 1 4 "Choose a runtime" \
+    "Pick the coding agent that will power your first teammate."
+
+  # --- Step 1: pick a type ---
+  local -a types=(claude codex antigravity grok hermes openclaw opencode pi devin)
+  local -A type_desc=(
+    [claude]="Anthropic's Claude — recommended"
+    [codex]="OpenAI Codex"
+    [antigravity]="Google Antigravity CLI"
+    [grok]="xAI Grok CLI"
+    [hermes]="Open-source agent — bring your own provider"
+    [openclaw]="Open-source agent — bring your own provider"
+    [opencode]="Open-source agent — bring your own provider"
+    [pi]="Extension-based coding agent — bring your own provider"
+    [devin]="Cognition's Devin CLI"
+  )
+  local -A type_label=(
+    [claude]="Claude Code"
+    [codex]="Codex"
+    [antigravity]="Antigravity"
+    [grok]="Grok"
+    [hermes]="Hermes"
+    [openclaw]="OpenClaw"
+    [opencode]="OpenCode"
+    [pi]="Pi"
+    [devin]="Devin"
+  )
+  # DIVE-7802: Grok is on unless the owner ran `5dive grok disable`; say so in
+  # the menu, and check BEFORE the install and sign-in, not after them.
+  grok_is_on || type_desc[grok]="xAI Grok CLI — turned off on this server"
+  local -a type_menu=()
+  local t
+  for t in "${types[@]}"; do
+    type_menu+=("$t|${type_label[$t]}|${type_desc[$t]}")
+  done
+  local type
+  while true; do
+    _init_pick type "Pick an agent type:" 1 "${type_menu[@]}"
+    if [[ "$type" != "grok" ]] || _init_grok_on; then break; fi
+    _init_note "Grok stays off. Pick another agent type."
+  done
+
+  # --- Step 2: install binary if missing ---
+  _init_section 2 4 "Connect ${type_label[$type]}" \
+    "Use an existing sign-in, an interactive login, or your own provider key."
+  if ! _init_run "Setting up the ${type_label[$type]} CLI" cmd_install "$type"; then
+    fail "$E_NOT_INSTALLED" "failed to install $type — try '5dive agent install $type' manually"
+  fi
+  echo >&2
+
+  # --- Step 3: auth ---
+  local auth_ok=0 auth_summary="Existing credentials"
+  local byo_provider="" byo_key="" create_model="" create_provider="" create_key=""
+  # Probe current auth state — cmd_auth_status returns 0 if any creds exist.
+  if 5dive agent auth status --probe --type="$type" --json 2>/dev/null | jq -e '.ok and (.data | any(.status == "ok"))' >/dev/null 2>&1; then
+    _init_ok "${type_label[$type]} is already authenticated"
+    auth_ok=1
+  fi
+
+  if (( auth_ok == 0 )); then
+    _init_ai_step "$type" "${type_label[$type]}"
     echo >&2
   fi
 

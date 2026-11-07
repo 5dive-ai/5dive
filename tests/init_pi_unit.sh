@@ -19,7 +19,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # cover the interactive wiring without creating a real user or agent.
 # shellcheck source=../src/cmd_init.sh
 source "$ROOT/src/cmd_init.sh"
-body="$(declare -f cmd_init)"
+body="$(declare -f cmd_init; declare -f _init_ai_step)"
 
 assert_has() {
   local needle="$1" message="$2"

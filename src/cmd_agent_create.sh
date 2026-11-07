@@ -2913,6 +2913,21 @@ selfcheck_chat_plugin_ready() { # <name> <plugin>
   fi
 }
 
+# DIVE-7848: the self-check's line for a seat created with deferred auth.
+# `agent import` on a box with no AI yet marks the seat awaitsAi and the first
+# AI added to the box moves it onto that login (adopt_ai_waiting_agents), so the
+# per-agent `auth login … --auth-profile=<agent>` line is the wrong advice
+# there: it binds the seat to an empty account of its own. Import says which
+# case this is through FIVEDIVE_CREATE_AWAITS_AI=1 on its cmd_create call.
+selfcheck_deferred_auth_issue() {
+  local type="$1" profile="$2"
+  if [[ "${FIVEDIVE_CREATE_AWAITS_AI:-0}" == 1 ]]; then
+    printf '%s\n' "no AI on this server yet (agent can't think until you add one; it starts by itself then): sudo 5dive init"
+  else
+    printf '%s\n' "auth was deferred (agent is UNAUTHED — can't think until you log in): sudo 5dive agent auth login $type${profile:+ --auth-profile=$profile}"
+  fi
+}
+
 # DIVE-2025: can the agent actually READ its credential?
 #
 # The self-check used to answer this by reading `defer_auth` — a flag recording
@@ -4766,7 +4781,7 @@ cmd_create() {
   esac
   # auth: deferred login still pending, so the first turn will stall.
   if (( defer_auth )); then
-    _hc_issues+=("auth was deferred (agent is UNAUTHED — can't think until you log in): sudo 5dive agent auth login $type${profile:+ --auth-profile=$profile}")
+    _hc_issues+=("$(selfcheck_deferred_auth_issue "$type" "$profile")")
   else
     # DIVE-2025: a completed login used to be checked by NOTHING — not even an
     # ok entry — so a credential that never reached the agent still printed

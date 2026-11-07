@@ -136,7 +136,7 @@ mkdir -p "$TMP/arm"; : >"$FIVE_GROK_OFF_MARKER"
 is 'owner turned Grok off: returns to the wizard instead of ending it' "$(tail -1 "$TMP/g.out")/$ASKED" 'rc=1/0'
 grep -qF 'sudo 5dive grok enable' "$TMP/g.err"; is 'and says how to turn it back on' "$?" 0
 rm -f "$FIVE_GROK_OFF_MARKER"
-BODY=$(declare -f cmd_init)
+BODY=$(declare -f cmd_init; declare -f _init_ai_step)
 pre=${BODY%%cmd_install \"\$type\"*}; pre=${pre%%auth login*}
 [[ "$pre" == *_init_grok_on* ]]; is 'the Grok question comes before the install and the sign-in' "$?" 0
 

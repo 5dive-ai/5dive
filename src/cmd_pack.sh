@@ -3370,6 +3370,70 @@ _import_parse_args() {
   done
 }
 
+# DIVE-7848: does any login on this box sign a <type> seat in? The shared login
+# (init's), or an account. Claude, Codex and Grok accounts are read per harness
+# (_create_has_login); another type's account counts when it holds any key, as
+# auth_creds_present reads it.
+_import_box_has_ai() { # <type>
+  local type="$1" d
+  lazy_need _create_has_login
+  _create_has_login "$type" && return 0
+  [[ -n "${AUTH_PROFILES_DIR:-}" && -d "${AUTH_PROFILES_DIR}" ]] || return 1
+  for d in "${AUTH_PROFILES_DIR}"/*/; do
+    [[ -d "$d" ]] || continue
+    _create_has_login "$type" "$(basename "$d")" && return 0
+  done
+  return 1
+}
+
+# DIVE-7848: a person at a terminal who can answer init's AI step. Never in
+# --json, never off a TTY (the lead running the app's hire in chat), never
+# when FIVEDIVE_NO_PROMPT is set.
+_import_can_ask_ai() {
+  [[ -t 0 && -t 2 ]] && (( ! ${JSON_MODE:-0} )) && [[ -z "${FIVEDIVE_NO_PROMPT:-}" ]] \
+    && [[ "${EUID:-$(id -u)}" -eq 0 ]]
+}
+
+# DIVE-7848: ask once, then run init's AI step (_init_ai_step). A sign-in or a
+# key it saves lands in the shared login, which the caller re-reads; a custom
+# provider, or pi's or Codex-on-OpenRouter's key, comes back as the import's own
+# --provider/--api-key (and --model), the create path init itself takes. The
+# step runs in a subshell, so a sign-in that fails ends the step, not the import.
+_import_connect_ai() { # <type> <agent>
+  local type="$1" agent="$2" label now res
+  lazy_need _init_ai_step _init_pick
+  label="${type^}"
+  case "$type" in
+    claude) label="Claude Code" ;; codex) label="OpenAI Codex" ;; grok) label="xAI Grok CLI" ;;
+    opencode) label="OpenCode" ;; openclaw) label="OpenClaw" ;; pi) label="Pi" ;;
+  esac
+  printf '\n  This server has no AI for %s yet. Without one, %s cannot think.\n\n' "$label" "$agent" >&2
+  _init_pick now "Connect an AI now?" 1 \
+    "now|Connect it now|Sign in or paste a key; $agent answers when this ends" \
+    "later|Later|$agent starts by itself when you add an AI (sudo 5dive init)"
+  [[ "$now" == now ]] || return 1
+  if [[ ! -x "${TYPE_BIN[$type]:-/nonexistent}" ]]; then
+    cmd_install "$type" >&2 || { warn "could not install the $label CLI — '$agent' waits for an AI instead"; return 1; }
+  fi
+  if ! res=$(
+    auth_summary="" byo_provider="" byo_key="" create_provider="" create_key="" create_model=""
+    { _init_ai_step "$type" "$label"; } >&2
+    declare -p byo_provider byo_key create_provider create_key create_model
+  ); then
+    warn "the AI was not connected — '$agent' waits for one and starts by itself when you add it"
+    return 1
+  fi
+  local byo_provider="" byo_key="" create_provider="" create_key="" create_model=""
+  eval "$res"
+  if [[ -n "$byo_provider" ]]; then
+    p_provider="$byo_provider" p_api_key="$byo_key"
+  elif [[ -n "$create_provider" ]]; then
+    p_provider="$create_provider" p_api_key="$create_key"
+    [[ -z "$create_model" ]] || { p_model="$create_model"; model="$create_model"; }
+  fi
+  return 0
+}
+
 cmd_import() {
   require_root
   local pack="" as="" channels="" tg_token="" dc_token="" profile="" workdir=""
@@ -3737,6 +3801,24 @@ cmd_import() {
     shared_login=1
     step "No --auth-profile: using this box's shared AI login (the one 5dive init saved)"
   fi
+  # DIVE-7848: no AI of this type anywhere on the box (a fresh self-hosted
+  # server). At a terminal, run init's AI step here, so the agent answers when
+  # this command ends. Off a terminal (the lead asked in chat), or when the
+  # owner says later, the agent is marked as waiting, and the first AI added to
+  # the box afterwards (`5dive init`, `account login`, `account set`, `agent auth
+  # login|set`) moves it onto that login and starts it (adopt_ai_waiting_agents).
+  local awaits_ai=0
+  if (( ! shared_login )) && [[ -z "$profile" && -z "$p_provider" && -z "$p_api_key" ]] \
+     && ! _import_box_has_ai "$type"; then
+    if _import_can_ask_ai; then
+      _import_connect_ai "$type" "$as" || true
+      if [[ -z "$p_provider" ]] && auth_creds_present "$type" >/dev/null 2>&1; then
+        shared_login=1
+        step "Using the AI you just connected"
+      fi
+    fi
+    (( shared_login )) || [[ -n "$p_provider" ]] || awaits_ai=1
+  fi
   (( shared_login )) || [[ -n "$profile" ]] || profile="$as"
 
   # Build the create argv. Skills are re-added afterwards (best-effort) so one
@@ -3839,8 +3921,14 @@ cmd_import() {
   # Recreate via the canonical create path (its ok-envelope suppressed so import
   # emits a single envelope). The registry lock is reentrant, so this is safe.
   step "Recreating agent '$as' from pack (type=$type)"
-  ( cmd_create "${cargs[@]}" ) >/dev/null \
+  ( FIVEDIVE_CREATE_AWAITS_AI="$awaits_ai" cmd_create "${cargs[@]}" ) >/dev/null \
     || { rm -rf "$stage"; fail "$E_GENERIC" "create step failed while importing '$as'"; }
+  # DIVE-7848: the seat waits for the box's first AI (see awaits_ai above).
+  if (( awaits_ai )); then
+    local _aw_reg; _aw_reg=$(registry_read)
+    jq --arg n "$as" '.agents[$n].awaitsAi = true' <<<"$_aw_reg" | registry_write
+    step "No AI on this server yet: '$as' starts by itself when you add one (sudo 5dive init, or the AI tab in the app)"
+  fi
   # DIVE-5163: remember the family the pack asked for, so `agent set-account`
   # can re-derive the model for another account (see src/lib/models.sh).
   if [[ "$type" == "claude" ]] && model_latest "$model_req" >/dev/null; then

@@ -1028,7 +1028,8 @@ _agent_verb_dispatch() {
               cmd_auth_login "$@" ;;
             set)
               AUDIT_CMD="agent auth set"; AUDIT_ARGS=("$@")
-              cmd_auth_set "$@" ;;
+              # DIVE-7848: a key saved here can be the box's first AI.
+              cmd_auth_set "$@" && adopt_ai_waiting_agents "$(_ai_arg_account "$@")" ;;
             start)
               AUDIT_CMD="agent auth start"; AUDIT_ARGS=("$@")
               cmd_auth_start "$@" ;;
@@ -1089,7 +1090,8 @@ _account_verb_dispatch() {
           # registry lock like `add`/`rename`/`remove`. `audit_log` redacts
           # `--api-key=` before anything reaches the log (src/lib/audit.sh).
           AUDIT_CMD="account set"; AUDIT_ARGS=("$@")
-          with_registry_lock cmd_account_set "$@" ;;
+          # DIVE-7848: a key saved here can be the box's first AI.
+          with_registry_lock cmd_account_set "$@" && adopt_ai_waiting_agents "$(_ai_arg_account --positional "$@")" ;;
         # DIVE-7568: does this AI server work for an agent? Read-only, no lock.
         test)   cmd_account_test "$@" ;;
         # DIVE-7599: find AI servers on the office network. Read-only, private

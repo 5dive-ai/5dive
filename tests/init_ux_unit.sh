@@ -22,7 +22,7 @@ cd "$(dirname "$0")/.."
 # shellcheck disable=SC1091
 # shellcheck source=../src/cmd_init.sh
 source src/cmd_init.sh
-body="$(declare -f cmd_init)"
+body="$(declare -f cmd_init; declare -f _init_ai_step)"
 
 # These are literal source fragments; expansion would defeat the assertion.
 # shellcheck disable=SC2016
