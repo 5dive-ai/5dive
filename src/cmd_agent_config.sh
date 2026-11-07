@@ -388,6 +388,29 @@ cmd_config() {
       fail "$E_VALIDATION" "telegram.account-url requires channels=telegram (current: $_tg_pre_channels)"
     fi
   fi
+  # DIVE-7895: an explicit model= on a claude seat is checked against the
+  # account the seat will run on (after any auth-profile= in this same call),
+  # BEFORE anything is written. A Claude login refuses what Anthropic can never
+  # serve; every other account takes the id with a warning naming the undo, and
+  # the model it replaces is kept in the registry (.modelPrev) for that undo.
+  if [[ "$type" == "claude" && -n "$new_model" ]]; then
+    local _mv_prof _mv_cur _mv_settings
+    _mv_prof=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
+    _mv_settings="${AGENT_HOME_ROOT:-/home}/agent-${name}/.claude/settings.json"
+    _mv_cur=$(resolve_agent_model claude "$name") || _mv_cur=""
+    if claude_seat_on_anthropic_login "$_mv_prof" "$_mv_settings"; then
+      claude_model_servable_on_anthropic "$new_model" \
+        || fail "$E_VALIDATION" "'$new_model' is not a Claude model, and agent '$name' runs on a Claude login (account '${_mv_prof:-this box}'), which cannot serve it. Use a family: $(model_families | paste -sd, - | sed 's/,/, /g') (or a claude-* id). To run another vendor's model, move the seat to an account for it first (auth-profile=<account>)."
+      claude_model_alias_known "$new_model" || claude_model_id_known "$new_model" \
+        || warn "'$new_model' is a claude-* id 5dive does not know yet. If Anthropic does not serve it, agent '$name' stops answering after the restart. Undo: 5dive agent config $name set model=${_mv_cur:-sonnet}"
+    elif ! claude_model_alias_known "$new_model" && ! claude_model_id_known "$new_model" \
+        && ! claude_model_mapped_by_profile "$new_model" "$_mv_prof"; then
+      warn "'$new_model' is not a model 5dive knows. It is accepted because account '${_mv_prof:-this box}' may serve it, but if the id is wrong agent '$name' stops answering after the restart. Undo: 5dive agent config $name set model=${_mv_cur:-sonnet}"
+    fi
+    if [[ -n "$_mv_cur" && "$_mv_cur" != "$new_model" ]]; then
+      reg=$(jq --arg n "$name" --arg p "$_mv_cur" '.agents[$n].modelPrev = $p' <<<"$reg")
+    fi
+  fi
   # DIVE-5163: moving a claude seat to another account re-derives its model the
   # way create/import did, so a seat that asked for "sonnet" gets real Claude
   # Sonnet on a client's own Claude account and the account's mapped id (e.g.
