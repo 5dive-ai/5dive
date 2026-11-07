@@ -1457,6 +1457,13 @@ main() {
       # more than the noise it costs.
       AUDIT_CMD="host"; AUDIT_ARGS=("$@")
       cmd_host "$@" ;;
+    backup)
+      # DIVE-7873: nightly encrypted copy of the box's agents in R2, owner-held
+      # key (src/cmd_backup.sh). Every verb but status checks root itself.
+      # Audited: who enabled, ran or restored a backup (the code is never an arg
+      # we log: restore takes it by --code, so it is dropped from the audit).
+      case "${1:-}" in enable|run|restore) AUDIT_CMD="backup ${1}"; AUDIT_ARGS=() ;; esac
+      cmd_backup "$@" ;;
     machine)
       # DIVE-5622: attach any machine the user can SSH into; agents reach it as
       # `ssh <name>`. add/rm write root-owned ssh config, so they require root

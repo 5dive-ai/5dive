@@ -986,6 +986,19 @@ DISKCRON
     else
       rm -f /etc/cron.d/5dive-disk
     fi
+    # DIVE-7873: the nightly encrypted backup to R2. The first run enables itself
+    # (key on the box, recovery code to the owner); `backup enable` later rewrites
+    # this file with a per-box minute. Never overwrite that one.
+    if grep -q 'cmd_backup_run' "$BIN_DIR/5dive" 2>/dev/null; then
+      if [[ ! -f /etc/cron.d/5dive-backup ]]; then
+        _bk_m=$(( $(hostname | cksum | cut -d' ' -f1) % 60 ))
+        printf '# DIVE-7873: nightly encrypted backup to R2 (5dive backup --help)\n%s 3 * * * root /usr/local/bin/5dive backup run >/dev/null 2>&1\n' "$_bk_m" > /etc/cron.d/5dive-backup
+        chmod 644 /etc/cron.d/5dive-backup
+        ok "/etc/cron.d/5dive-backup (nightly encrypted backup)"
+      fi
+    else
+      rm -f /etc/cron.d/5dive-backup
+    fi
   fi
 
   # DIVE-6853: the heartbeat tick driver. Managed boxes get it from provisioning;
@@ -1953,6 +1966,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   rm -f "$BIN_DIR/5dive" "$BIN_DIR/5dive-agent-start" "$BIN_DIR/5dive-agent-stop-notify"
   ok "removed CLI binaries"
   rm -f /etc/cron.d/5dive-disk   # DIVE-5190: its target is the binary just removed
+  rm -f /etc/cron.d/5dive-backup   # DIVE-7873: same reason; the R2 copy and the owner's key stay
   rm -f /etc/cron.d/5dive-heartbeat   # DIVE-6853: same
   rm -f /etc/profile.d/5dive-asks.sh   # DIVE-7077: same
   if [[ -d "$LIB_DIR" ]]; then
