@@ -56,6 +56,21 @@ _share_no_address_msg() {
   printf '%s' "this box has no public address, so a share link would not open. Tell your lead agent your public address (\"my public address is https://...\"), or run: sudo 5dive config public-address=https://<your name>"
 }
 
+# DIVE-7862: a refusal the app branches on, by a machine-readable reason in the
+# --json envelope (error.reason), never by matching its sentence. The sentence
+# stays for a terminal. Reasons: no_public_address (agent share), and from
+# `config public-address`: hosted, invalid_address, unreachable.
+_share_fail() { # <code> <reason> <message>
+  local code="$1" reason="$2"; shift 2
+  if (( JSON_MODE )); then
+    jq -cn --argjson c "$code" --arg cl "$(err_class_for "$code")" --arg m "$*" --arg r "$reason" \
+      '{ok:false, error:{code:$c, class:$cl, message:$m, reason:$r}}'
+  fi
+  echo "error: $*" >&2
+  mark_reported
+  exit "$code"
+}
+
 # The share dir of an agent, or rc 1.
 _share_dir_of_agent() {
   local a="$1" d
@@ -301,7 +316,7 @@ cmd_agent_share() {
   valid_name "$name" || fail "$E_VALIDATION" "invalid agent name: $name"
   require_root agent share
   command -v python3 >/dev/null 2>&1 || fail "$E_NOT_INSTALLED" "agent share needs python3"
-  local base; base=$(_share_base_url) || fail "$E_CONFLICT" "$(_share_no_address_msg)"
+  local base; base=$(_share_base_url) || _share_fail "$E_CONFLICT" no_public_address "$(_share_no_address_msg)"
 
   local work; work=$(mktemp -d) || fail "$E_GENERIC" "no temp dir"
   # DIVE-7806: --with-memory distils the seat's facts and seals them into the
@@ -423,7 +438,7 @@ cmd_public_address() {
   local v="${1:-}"
   require_root config public-address
   if _secret_drop_domain >/dev/null 2>&1; then
-    fail "$E_CONFLICT" "this box is hosted by 5dive: its public address is set already ($(_share_base_url))"
+    _share_fail "$E_CONFLICT" hosted "this box is hosted by 5dive: its public address is set already ($(_share_base_url))"
   fi
   if [[ "$v" == clear || "$v" == default ]]; then
     if [[ -f "$SECRET_DROP_CONF" ]]; then
@@ -431,11 +446,11 @@ cmd_public_address() {
     fi
     ok "public-address cleared" '{public_address:null}'; return 0
   fi
-  [[ "$v" == http://* ]] && fail "$E_VALIDATION" "public-address must be https (got http)"
+  [[ "$v" == http://* ]] && _share_fail "$E_VALIDATION" invalid_address "The address must start with https:// (got http)."
   [[ "$v" == https://* ]] || v="https://$v"
   v="${v%/}"
   [[ "$v" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._/-]*)?$ ]] \
-    || fail "$E_VALIDATION" "public-address must look like https://box.example.com (got '$1')"
+    || _share_fail "$E_VALIDATION" invalid_address "That doesn't look like a web address. Write it like https://box.example.com (got '$1')."
   _secret_drop_ensure_server >/dev/null 2>&1 || true
   if _public_address_probe "$v"; then
     mkdir -p "${SECRET_DROP_CONF%/*}"
@@ -450,7 +465,7 @@ cmd_public_address() {
     if _secret_https_enable domain "$host" && _public_address_probe "https://$host"; then
       ok "public-address = https://$host (checked: it reaches this box)" '{public_address:$v, via:"box"}' --arg v "https://$host"; return 0
     fi
-    fail "$E_CONFLICT" "public-address not set: https://$host does not reach this box (${SECRET_HTTPS_WHY:-the check came back empty}). Point the name at this box's IP, open ports 80 and 443, and try again."
+    _share_fail "$E_CONFLICT" unreachable "Not saved: https://$host doesn't lead to this server yet (${SECRET_HTTPS_WHY:-the check came back empty}). Point the name at this server's IP address, open ports 80 and 443, and try again."
   fi
-  fail "$E_CONFLICT" "public-address not set: $v does not reach this box. Its proxy or tunnel must forward to 127.0.0.1:${SECRET_DROP_PORT} on this box."
+  _share_fail "$E_CONFLICT" unreachable "Not saved: $v doesn't lead to this server. Its proxy or tunnel must forward to port ${SECRET_DROP_PORT} on this server."
 }

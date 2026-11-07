@@ -107,6 +107,43 @@ has_t 'no address names the lead door' "$out" "Tell your lead agent your public 
 has_t 'no address names the command' "$out" "sudo 5dive config public-address=https://"
 [[ ! -d "$SHARE_DIR" ]] && ok_t 'no address publishes nothing' || bad_t 'no address publishes nothing' "$(ls -R "$SHARE_DIR")"
 
+echo '== DIVE-7862: the no-address refusal carries a reason the app branches on =='
+out=$( (JSON_MODE=1; cmd_agent_share alpha) 2>/dev/null ); rc=$?
+eq_t 'json no address exits E_CONFLICT' "$E_CONFLICT" "$rc"
+eq_t 'json no address: error.reason' no_public_address "$(jq -r '.error.reason' <<<"$out" 2>/dev/null)"
+eq_t 'json no address: ok false' false "$(jq -r '.ok' <<<"$out" 2>/dev/null)"
+has_t 'json no address keeps the sentence' "$(jq -r '.error.message' <<<"$out" 2>/dev/null)" "no public address"
+
+echo '== DIVE-7862: config public-address answers with a reason too =='
+SECRET_DROP_CONF="$TMP/drop/secret-drop.conf"
+_secret_drop_ensure_server() { :; }
+_secret_drop_domain() { printf '5dive.ai'; }
+out=$( (JSON_MODE=1; cmd_public_address https://box.example.com) 2>/dev/null ); rc=$?
+eq_t 'hosted box: refused E_CONFLICT' "$E_CONFLICT" "$rc"
+eq_t 'hosted box: reason hosted' hosted "$(jq -r '.error.reason' <<<"$out" 2>/dev/null)"
+_secret_drop_domain() { return 1; }
+out=$( (JSON_MODE=1; cmd_public_address 'https://bad host') 2>/dev/null ); rc=$?
+eq_t 'bad address: E_VALIDATION' "$E_VALIDATION" "$rc"
+eq_t 'bad address: reason invalid_address' invalid_address "$(jq -r '.error.reason' <<<"$out" 2>/dev/null)"
+out=$( (JSON_MODE=1; cmd_public_address http://box.example.com) 2>/dev/null )
+eq_t 'http address: reason invalid_address' invalid_address "$(jq -r '.error.reason' <<<"$out" 2>/dev/null)"
+# Negative control: the address does not lead here, so nothing is saved.
+_public_address_probe() { return 1; }
+_secret_https_enable() { SECRET_HTTPS_WHY="no answer on port 80"; return 1; }
+out=$( (JSON_MODE=1; cmd_public_address https://agents.example.com) 2>/dev/null ); rc=$?
+eq_t 'unreachable name: E_CONFLICT' "$E_CONFLICT" "$rc"
+eq_t 'unreachable name: reason unreachable' unreachable "$(jq -r '.error.reason' <<<"$out" 2>/dev/null)"
+has_t 'unreachable name says why, in plain words' "$(jq -r '.error.message' <<<"$out" 2>/dev/null)" "doesn't lead to this server yet (no answer on port 80)"
+out=$( (JSON_MODE=1; cmd_public_address https://proxy.example.com/agents) 2>/dev/null )
+eq_t 'unreachable proxy: reason unreachable' unreachable "$(jq -r '.error.reason' <<<"$out" 2>/dev/null)"
+not_t 'unreachable proxy: no loopback ip in the words' "$(jq -r '.error.message' <<<"$out" 2>/dev/null)" "127.0.0.1"
+[[ ! -s "$SECRET_DROP_CONF" ]] && ok_t 'unreachable: nothing saved' || bad_t 'unreachable: nothing saved' "$(cat "$SECRET_DROP_CONF")"
+_public_address_probe() { return 0; }
+out=$( (JSON_MODE=1; cmd_public_address https://agents.example.com/) 2>/dev/null ); rc=$?
+eq_t 'reachable: saved' 0 "$rc"
+eq_t 'reachable: address in the answer' https://agents.example.com "$(jq -r '.data.public_address' <<<"$out" 2>/dev/null)"
+has_t 'reachable: written for share links' "$(cat "$SECRET_DROP_CONF" 2>/dev/null)" "SECRET_DROP_BASE_URL=https://agents.example.com"
+
 echo '== share: the recipe =='
 _secret_drop_base_url() { printf 'https://box.example.com'; }
 printf 'PNGBYTES' > "$TMP/fixture/alpha.png"
