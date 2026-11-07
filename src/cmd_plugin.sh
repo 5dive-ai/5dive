@@ -2722,7 +2722,7 @@ cmd_plugin_auto_upgrade() {
 # the first voice note in any channel, a tap on voice mode in the app, or the
 # owner asking for voice. The agent asks once (projects/CLAUDE.md, the
 # 5dive:voice-offer block, reads `--status`), and this verb is what it runs:
-#   --status  on | installing | declined | ask | managed (+ the one question)
+#   --status  on | installing | broken | declined | ask | managed (+ the one question)
 #   --on      the owner said yes: add the plugin now, set it up in the background
 #   --wait    block until it hears (the note that asked is heard after this)
 #   --off     the owner said no: recorded, and the agent never asks again unasked
@@ -2742,9 +2742,24 @@ _va_disk_mb() {
   local d; d=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}') || d=""
   [[ "$d" =~ ^[0-9]+$ ]] && printf '%s\n' "$d" || printf '0\n'
 }
-# It hears: the wrapper every channel runs is on this box. A registered plugin
-# whose setup never finished does NOT count, so the agent can offer it again.
+# The wrapper every channel runs is on this box. A registered plugin whose setup
+# never finished does NOT count, so the agent can offer it again.
 _va_hears() { [[ -x "${FIVEDIVE_TRANSCRIBE_BIN:-/usr/local/bin/5dive-transcribe}" ]]; }
+# DIVE-7855: the wrapper alone is not hearing. Setup writes it even when the
+# engine never came up (report 761: the model download hung, nothing listened on
+# :8765, and --status said "on"). So "on" also needs the engine to answer: local
+# whisper's /health, unless hearing runs on OpenRouter. Where hearing runs is the
+# engine's own answer (voice-backend.sh, local-only mode included), not restated.
+VA_HEALTH_URL="${FIVEDIVE_VOICE_HEALTH_URL:-http://127.0.0.1:8765/health}"
+_va_stt_backend() {
+  local lib="${FIVEDIVE_VOICE_LIB:-/usr/local/lib/5dive/voice-backend.sh}" b=""
+  [[ -r "$lib" ]] && b="$( . "$lib" >/dev/null 2>&1 && voice_effective_stt_backend 2>/dev/null )"
+  [[ "$b" == openrouter ]] && printf 'openrouter\n' || printf 'local\n'
+}
+_va_engine_up() {
+  [[ "$(_va_stt_backend)" == openrouter ]] && return 0
+  curl -fsS --max-time 2 "$VA_HEALTH_URL" >/dev/null 2>&1
+}
 # The background setup is still running (its unit, or the no-systemd child).
 _va_installing() {
   [[ -n "${FIVEDIVE_VOICE_AUTO_INSTALLING:-}" ]] && { [[ "$FIVEDIVE_VOICE_AUTO_INSTALLING" == 1 ]]; return; }
@@ -2762,21 +2777,27 @@ _va_record() {  # _va_record on|off owner
   rm -f "$tmp" 2>/dev/null; return 1
 }
 
-# _va_decide <managed> <hears> <installing> <choice> — pure. One verdict:
-# managed | on | installing | declined | ask. Nothing here ever installs.
+# _va_decide <managed> <hears> <installing> <choice> [<engine-up>] — pure. One
+# verdict: managed | installing | on | broken | declined | ask. Nothing here ever
+# installs. A setup still running is "installing" even once its wrapper is
+# written (DIVE-7855: the wrapper lands before setup ends). A wrapper whose
+# engine does not answer is "broken", never "on".
 _va_decide() {
   (( $1 )) && { printf 'managed\n'; return 0; }
-  (( $2 )) && { printf 'on\n'; return 0; }
   (( $3 )) && { printf 'installing\n'; return 0; }
+  if (( $2 )); then
+    (( ${5:-1} )) && printf 'on\n' || printf 'broken\n'
+    return 0
+  fi
   [[ "${4:-}" == off ]] && { printf 'declined\n'; return 0; }
   printf 'ask\n'
 }
 _va_verdict() {
-  local m=0 h=0 i=0
+  local m=0 h=0 i=0 e=0
   _va_managed && m=1
-  _va_hears && h=1
   _va_installing && i=1
-  _va_decide "$m" "$h" "$i" "$(_va_kv choice)"
+  if _va_hears; then h=1; (( m || i )) || { _va_engine_up && e=1; }; fi
+  _va_decide "$m" "$h" "$i" "$(_va_kv choice)" "$e"
 }
 
 # _va_install — the owner said yes. Add the plugin now (seconds), hand the slow
@@ -2784,9 +2805,11 @@ _va_verdict() {
 # unit — the same `plugin setup voice --yes` a Cloud build's setup unit runs —
 # and record it as the owner's. Returns 1 when the plugin could not be added;
 # nothing is recorded then, so the next ask can try again.
+# _va_install [repair] — repair skips the add: the plugin is there, its engine
+# is not answering (verdict broken), and setup is what brings it up.
 _va_install() {
   local bin="${FIVEDIVE_VOICE_AUTO_CLI:-/usr/local/bin/5dive}" log; log="$(_va_log)"
-  "$bin" plugin add voice --yes >>"$log" 2>&1 || return 1
+  [[ "${1:-}" == repair ]] || "$bin" plugin add voice --yes >>"$log" 2>&1 || return 1
   rm -f "$(_va_state_file).pid" 2>/dev/null
   if command -v systemd-run >/dev/null 2>&1 && [[ -d "${VA_SYSTEMD_DIR:-/run/systemd/system}" ]] \
      && { systemctl reset-failed "$VA_SETUP_UNIT" >/dev/null 2>&1; \
@@ -2823,6 +2846,7 @@ cmd_plugin_auto_voice() {
         managed)    prose="voice: managed — 5dive set voice up on this server; nothing to offer" ;;
         on)         prose="voice: on — voice notes are heard on this server (5dive-transcribe <file>)" ;;
         installing) prose="voice: installing — wait for it: 5dive plugin auto-voice --wait" ;;
+        broken)     prose="voice: broken — speech-to-text is installed but its engine is not answering, so voice notes are not heard. Repair: sudo 5dive plugin auto-voice --on, then 5dive plugin auto-voice --wait. Details: $(_va_log), journalctl -u whisper-service" ;;
         declined)   prose="voice: declined — the owner said no; do not offer it again unless they ask for voice" ;;
         ask)        prose="voice: ask — ask the owner once: «$VA_ASK» Yes: sudo 5dive plugin auto-voice --on. No: sudo 5dive plugin auto-voice --off" ;;
       esac
@@ -2830,7 +2854,7 @@ cmd_plugin_auto_voice() {
       return 0 ;;
     --off)
       _va_record off owner || fail "$E_GENERIC" "could not write $(_va_state_file)"
-      local more=""; [[ "$v" == on ]] && more=" Voice is still installed; remove it with: sudo 5dive plugin remove voice"
+      local more=""; [[ "$v" == on || "$v" == broken ]] && more=" Voice is still installed; remove it with: sudo 5dive plugin remove voice"
       ok "Voice stays off on this server; it will not be offered again unless you ask for it.$more" '{choice:"off", source:"owner"}'
       return 0 ;;
     --on)
@@ -2838,6 +2862,11 @@ cmd_plugin_auto_voice() {
         managed)    ok "This server's voice is set up by 5dive." '{verdict:"managed"}'; return 0 ;;
         on)         _va_record on owner || true; ok "Speech-to-text is already on this server." '{verdict:"on"}'; return 0 ;;
         installing) ok "Speech-to-text is installing. Wait for it: 5dive plugin auto-voice --wait" '{verdict:"installing"}'; return 0 ;;
+        broken)
+          _va_install repair || fail "$E_GENERIC" "voice could not be repaired (see $(_va_log))"
+          ok "Repairing speech-to-text on this server: its setup runs again in the background. Wait for it: 5dive plugin auto-voice --wait" \
+             '{verdict:"installing", repair:true}'
+          return 0 ;;
       esac
       local disk; disk="$(_va_disk_mb)"
       (( disk >= VA_MIN_DISK_MB )) \
@@ -2854,6 +2883,7 @@ cmd_plugin_auto_voice() {
       case "$v" in
         on|managed) ok "Speech-to-text is ready: hear a note with 5dive-transcribe <file>" '{verdict:$v}' --arg v "$v"; return 0 ;;
         installing) fail "$E_TIMEOUT" "still installing after ${timeout}s; run 5dive plugin auto-voice --wait again" ;;
+        broken)     fail "$E_GENERIC" "speech-to-text is installed but its engine is not answering, so voice notes are not heard yet; see $(_va_log) and journalctl -u whisper-service. Repair: sudo 5dive plugin auto-voice --on" ;;
         *)          fail "$E_GENERIC" "speech-to-text is not installing and not ready (verdict: $v); see $(_va_log)" ;;
       esac ;;
   esac
