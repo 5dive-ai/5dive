@@ -120,7 +120,9 @@ _ou_trusted_file() {
   local own mode
   own="$(stat -c %u "$1" 2>/dev/null)" || return 1
   mode="$(stat -c %a "$1" 2>/dev/null)" || return 1
-  [[ "$own" == 0 || "$own" == "$(id -u)" ]] && (( (8#$mode & 8#022) == 0 ))
+  [[ "$own" == 0 || "$own" == "$(id -u)" ]] || return 1
+  (( (8#$mode & 8#022) == 0 )) || return 1
+  return 0
 }
 
 # _ou_root_key <out> — the root key this box trusts, written to <out>.

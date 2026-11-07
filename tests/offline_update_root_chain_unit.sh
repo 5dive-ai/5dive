@@ -344,4 +344,5 @@ cp -a "$KEPT_DIR" "$WORK/state-j"
 mutant "the higher kept serial ignored (j)" 's/if (( kept_serial >= got )); then union=1/if false; then :/' "$JKILL" "$WORK/state-j"
 mutant "an equal kept serial ignored (j=)" 's/if (( kept_serial >= got )); then union=1/if (( kept_serial > got )); then union=1/' "$OLDKEY" "$WORK/state-tie"
 
-finish
+echo; echo "$PASS passed, $FAIL failed"
+exit $(( FAIL > 0 ))
