@@ -2492,10 +2492,14 @@ cmd_info() {
   # DIVE-7747: the account the registry names vs the one the seat's files boot
   # on. A rotation that moved the registry alone left three seats walled until
   # their weekly reset while every surface printed the registry's account.
-  local _pd="" _pd_state="unmeasured"
+  # DIVE-7861: rc 1 (drift) and rc 2 (unreadable) are ANSWERS, not failures.
+  # A bare `_pd=$(…); case $?` let `set -e` end the run on rc 1 before `case`
+  # read it, so the one surface meant to show drift died on every drifted seat.
+  local _pd="" _pd_state="unmeasured" _pdrc=0
   if declare -F agent_profile_drift >/dev/null 2>&1; then
-    _pd=$(agent_profile_drift "$name" "$_info_prof"); case $? in
-      0) _pd_state="agrees" ;; 1) _pd_state="drift" ;; *) _pd_state="unmeasured" ;;
+    _pd=$(agent_profile_drift "$name" "$_info_prof") || _pdrc=$?
+    case $_pdrc in
+      0) _pd_state="agrees" ;; 1) _pd_state="drift" ;; *) _pd_state="unmeasured"; _pd="" ;;
     esac
   fi
   local obj
