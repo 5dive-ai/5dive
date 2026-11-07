@@ -2178,6 +2178,26 @@ cmd_auth_set() {
      --arg t "$type" --arg v "$var" --arg p "${profile:-}"
 }
 
+# _auth_install_if_missing <type> — DIVE-7851. A self-hosted box ships Claude
+# Code only, so the app's one line for ChatGPT (`account add chatgpt && agent
+# auth login codex ...`) died with "codex not installed" on every fresh box.
+# Sign-in now installs a missing runtime first, the way `agent import`/`create`
+# (cmd_agent_create) and `agent switch` already do. Installing needs root, so a
+# non-root caller is handed to require_root (re-exec under sudo when allowed).
+# cmd_install runs in a subshell with prose output on stderr: its own `fail`
+# then ends only the subshell, and this command still reports in its own mode.
+_auth_install_if_missing() {
+  local type="$1" bin="${TYPE_BIN[$1]}"
+  [[ -x "$bin" ]] && return 0
+  [[ -n "${TYPE_INSTALL[$type]:-}" ]] \
+    || fail "$E_NOT_INSTALLED" "$type not installed at $bin, and no installer is configured for it"
+  require_root
+  step "$type is not installed on this box yet: installing it first (one time)"
+  ( JSON_MODE=0; cmd_install "$type" ) >&2 \
+    || fail "$E_NOT_INSTALLED" "$type not installed at $bin: installing it failed (see above). Retry with: sudo 5dive agent install $type"
+  [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "$type not installed at $bin"
+}
+
 cmd_auth_login() {
   local type="" profile=""
   while [[ $# -gt 0 ]]; do
@@ -2191,7 +2211,7 @@ cmd_auth_login() {
   [[ -n "$type" ]] || fail "$E_USAGE" "usage: 5dive agent auth login <type> [--auth-profile=<name>]"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type"
   local bin="${TYPE_BIN[$type]}"
-  [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "$type not installed at $bin"
+  _auth_install_if_missing "$type"
   if [[ -n "$profile" ]]; then
     valid_profile_name "$profile" \
       || fail "$E_VALIDATION" "invalid --auth-profile (lowercase letters/digits/_-, start letter, <=32 chars)"
@@ -2771,7 +2791,7 @@ cmd_auth_start() {
     *) fail "$E_VALIDATION" "device-code flow supports claude/codex/antigravity/grok — for $type use: auth set --api-key --provider=<id>" ;;
   esac
   local bin="${TYPE_BIN[$type]}"
-  [[ -x "$bin" ]] || fail "$E_NOT_INSTALLED" "$type not installed at $bin"
+  _auth_install_if_missing "$type"
   if [[ -n "$profile" ]]; then
     valid_profile_name "$profile" \
       || fail "$E_VALIDATION" "invalid --auth-profile (lowercase letters/digits/_-, start letter, <=32 chars)"
