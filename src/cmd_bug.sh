@@ -229,6 +229,7 @@ _bug_usage() {
   cat >&2 <<'EOF'
 5dive bug --what=<text> [--verb=<name>] [--exit=<code>] [--argv=<line>]
           [--no-probes] [--file [--owner-approved]] [--save=<path>]
+sudo 5dive bug --support-code=<code>     (once per box; =none removes it)
 
 Preview (default): builds the diagnostic payload and prints it. Sends nothing.
 Preview freely; send it only after your owner agrees.
@@ -265,10 +266,17 @@ approved --file sends it.
                   carry it out and attach it in Support in the 5dive app).
                   Needs --what. Nothing leaves this box, so no owner yes.
 
+  --support-code=<code>
+                  save your firm's 5dive support code (5D-XXXX-XXXX, shown on
+                  Support in the 5dive app) on this box. Every report it sends
+                  then carries it, so 5dive handles it as your firm's, first.
+                  Needs root. --support-code=none removes it.
+
 The payload is a fixed allowlist: version, OS, bash version, install method,
-the verb that failed, its exit code, selfcheck probe name+verdict pairs, and
-the two fields you supply yourself — --what and --argv. Nothing else is
-collected, and every byte is printed before it is sent.
+the verb that failed, its exit code, selfcheck probe name+verdict pairs, the
+two fields you supply yourself — --what and --argv — and the support code
+when this box has one. Nothing else is collected, and every byte is printed
+before it is sent.
 EOF
 }
 
@@ -365,6 +373,53 @@ _bug_collect_probes() {
   jq -c '[ .probes[]? | {probe: .probe, verdict: .verdict} ]' <<<"$raw" 2>/dev/null || printf '[]'
 }
 
+# DIVE-7885: an enterprise firm's support code, saved once per box by its IT
+# (`sudo 5dive bug --support-code=<code>`). It is not a secret and grants
+# nothing: 5dive's API only uses it to file this box's reports under the firm,
+# ahead of the normal triage order. World-readable on purpose, so a seat's own
+# `5dive bug` can read it without root.
+_bug_support_code_file() { printf '%s' "${FIVE_SUPPORT_CODE_FILE:-/etc/5dive/support-code}"; }
+
+# _bug_support_code_norm <text> — the code uppercased if it is one, else nothing.
+_bug_support_code_norm() {
+  local c="${1^^}"
+  c="${c//[[:space:]]/}"
+  if [[ "$c" =~ ^5D-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$ ]]; then
+    printf '%s' "$c"
+    return 0
+  fi
+  return 1
+}
+
+# _bug_support_code — the saved code, or nothing (no file, unreadable, or not a code).
+_bug_support_code() {
+  local f raw=""
+  f=$(_bug_support_code_file)
+  [[ -r "$f" ]] || return 0
+  raw=$(head -c 64 -- "$f" 2>/dev/null) || return 0
+  _bug_support_code_norm "$raw"
+}
+
+# _bug_set_support_code <code|none> — save or remove it. Root, because the file
+# sits in /etc/5dive beside the box's other settings.
+_bug_set_support_code() {
+  local want="$1" f code
+  f=$(_bug_support_code_file)
+  if [[ "${want,,}" == "none" || -z "$want" ]]; then
+    rm -f -- "$f" 2>/dev/null || fail "$E_PERMISSION" "could not remove ${f} — run it with sudo"
+    ok "support code removed; this box's reports go in the normal order again" '{support_code:null}'
+    return 0
+  fi
+  code=$(_bug_support_code_norm "$want")
+  [[ -n "$code" ]] || fail "$E_USAGE" "that is not a 5dive support code: it looks like 5D-XXXX-XXXX (see Support in the 5dive app)"
+  mkdir -p -- "$(dirname -- "$f")" 2>/dev/null
+  if ! ( umask 022; printf '%s\n' "$code" > "$f" ) 2>/dev/null; then
+    fail "$E_PERMISSION" "could not write ${f} — run it with sudo: sudo 5dive bug --support-code=${code}"
+  fi
+  chmod 0644 -- "$f" 2>/dev/null
+  ok "support code ${code} saved: every bug report from this box now carries it" '{support_code:$c}' --arg c "$code"
+}
+
 # _bug_render_payload <verb> <exit_code> <include_probes:0|1> — the entire
 # allowlist. Every key is named on the jq template line below; adding a new
 # field to the payload means editing this one line on purpose, never a
@@ -394,9 +449,11 @@ _bug_render_payload() {
     --argjson what "$what_json" \
     --argjson invocation "$argv_json" \
     --argjson probes "$probes_json" \
+    --arg support_code "$(_bug_support_code)" \
     '{version:$version, os:$os, bash_version:$bash_version,
       install_method:$install_method, verb:$verb, exit_code:$exit_code,
-      what:$what, invocation:$invocation, probes:$probes}'
+      what:$what, invocation:$invocation, probes:$probes}
+     + (if $support_code == "" then {} else {support_code:$support_code} end)'
 }
 
 cmd_bug() {
@@ -410,6 +467,7 @@ cmd_bug() {
       --no-probes) include_probes=0; shift ;;
       --file)      do_file=1; shift ;;
       --owner-approved) owner_approved=1; shift ;;
+      --support-code=*) _bug_set_support_code "${1#--support-code=}"; return $? ;;
       --save=*)    save="${1#--save=}"; shift
                    [[ -n "$save" ]] || fail "$E_USAGE" "--save needs a file path, e.g. --save=support-file.json" ;;
       -h|--help)   _bug_usage; return 0 ;;
