@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; form-action 'none'; base-uri 'none'">
+<meta name="referrer" content="no-referrer">
+<title>5dive Master Key</title>
+<style>
+  :root { --bg:#f6f6f4; --card:#fff; --ink:#1a1a1a; --muted:#666; --line:#ddd; --accent:#1d5fd1; --warn:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#121212; --card:#1e1e1e; --ink:#eee; --muted:#aaa; --line:#333; --accent:#6ea0ff; --warn:#ff8a80; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:17px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width:560px; margin:0 auto; padding:24px 16px 48px; }
+  section { display:none; background:var(--card); border:1px solid var(--line); border-radius:14px; padding:22px; }
+  section.on { display:block; }
+  h1 { font-size:24px; margin:0 0 6px; }
+  .step { color:var(--muted); font-size:14px; margin:0 0 4px; }
+  p { margin:10px 0; }
+  button { display:block; width:100%; margin:12px 0 0; padding:16px; font-size:18px; font-weight:600;
+           border:0; border-radius:12px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.alt { background:transparent; color:var(--accent); border:2px solid var(--accent); }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  textarea, input[type=number] { width:100%; font:13px/1.4 ui-monospace, Menlo, Consolas, monospace; padding:10px;
+           border:1px solid var(--line); border-radius:10px; background:var(--bg); color:var(--ink); }
+  textarea { height:150px; resize:vertical; }
+  input[type=number] { font-size:18px; max-width:160px; }
+  label { display:block; margin-top:14px; font-weight:600; }
+  label.check { font-weight:normal; display:flex; gap:10px; align-items:flex-start; margin-top:18px; }
+  label.check input { width:22px; height:22px; flex:none; margin-top:2px; }
+  .id { font:15px/1.6 ui-monospace, Menlo, Consolas, monospace; word-break:break-all; background:var(--bg); padding:10px; border-radius:10px; }
+  .warn { color:var(--warn); font-weight:600; }
+  .ok { color:var(--muted); font-size:15px; }
+  #err { color:var(--warn); font-weight:600; min-height:1.5em; }
+</style>
+</head>
+<body>
+<main>
+  <section id="s-old" class="on">
+    <h1>This browser is too old</h1>
+    <p>Please update Chrome, Safari or Firefox, then open this page again.</p>
+  </section>
+
+  <section id="s-start">
+    <h1>5dive master key</h1>
+    <p>Your master key approves 5dive updates. It stays on this device. Nothing is sent anywhere.</p>
+    <button id="b-create">Create the master key</button>
+    <button id="b-have" class="alt">I already have a master key</button>
+  </section>
+
+  <section id="s-new">
+    <p class="step">Step 1 of 4</p>
+    <h1>Save your master key</h1>
+    <p><b>Paste this into your password manager now.</b></p>
+    <textarea id="t-priv" readonly autocomplete="off" spellcheck="false"></textarea>
+    <button id="b-copy">Copy</button>
+    <button id="b-backup" class="alt">Save backup file</button>
+    <p class="warn">Never send this to anyone, not even 5dive.</p>
+    <label class="check"><input type="checkbox" id="c-saved" autocomplete="off">
+      I saved it in my password manager and kept the backup</label>
+    <button id="b-new-next" disabled>Continue</button>
+  </section>
+
+  <section id="s-load">
+    <p class="step">Step 1 of 4</p>
+    <h1>Open your master key</h1>
+    <p>Paste your master key from your password manager, or open your backup file.</p>
+    <textarea id="t-load" autocomplete="off" spellcheck="false" placeholder="-----BEGIN PRIVATE KEY-----"></textarea>
+    <label>Or open the backup file <input type="file" id="f-load" accept=".txt,.pem,text/plain"></label>
+    <button id="b-load">Use this key</button>
+    <div id="load-ok" hidden>
+      <p>Master key ID:</p>
+      <p class="id" id="load-fp"></p>
+      <p>Check that it matches the master key ID you were given.</p>
+      <button id="b-load-next">It matches, continue</button>
+    </div>
+  </section>
+
+  <section id="s-update">
+    <p class="step">Step 2 of 4</p>
+    <h1>Approve the update key</h1>
+    <p>This is the update key from the 5dive team. Leave it as it is unless they sent you a new one.</p>
+    <textarea id="t-upd" autocomplete="off" spellcheck="false"></textarea>
+    <label for="n-days">Valid for (days)</label>
+    <input type="number" id="n-days" value="365" min="1" max="3650" autocomplete="off">
+    <button id="b-upd-next">Next</button>
+  </section>
+
+  <section id="s-revoke">
+    <p class="step">Step 3 of 4</p>
+    <h1>Blocked keys</h1>
+    <p>Leave the box empty unless the 5dive team asked you to block a key.</p>
+    <label for="n-serial">List number</label>
+    <input type="number" id="n-serial" value="1" min="1" autocomplete="off">
+    <p class="ok">Use 1 the first time, with no keys blocked. A list that blocks a key needs a higher number than every list before it.</p>
+    <label for="t-rev">Keys to block (one per line)</label>
+    <textarea id="t-rev" autocomplete="off" spellcheck="false"></textarea>
+    <button id="b-sign">Approve and finish</button>
+  </section>
+
+  <section id="s-out">
+    <p class="step">Step 4 of 4</p>
+    <h1>Send this file to 5dive</h1>
+    <button id="b-pub">Save file for 5dive</button>
+    <p>This file is safe to send to the 5dive team. It contains no secret.</p>
+    <p>Master key ID:</p>
+    <p class="id" id="out-fp"></p>
+    <button id="b-done" class="alt">Done (clear this page)</button>
+  </section>
+
+  <p id="err"></p>
+</main>
+
+<script>
+"use strict";
+// >>> pure  (no page access: crypto and text formats only; tested by root-key.test.mjs)
+const DEFAULT_UPDATE_KEY = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAf9KHm4dxpSPYZDHIeDI+mA4yHuPavXzwmsw3+POZW10=\n-----END PUBLIC KEY-----\n";
+const ED = { name: "Ed25519" };
+const enc = new TextEncoder();
+
+function b64(bytes) { let s = ""; for (const b of bytes) s += String.fromCharCode(b); return btoa(s); }
+function unb64(text) { return Uint8Array.from(atob(text), c => c.charCodeAt(0)); }
+function hex(bytes) { return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join(""); }
+async function sha256hex(bytes) { return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))); }
+
+function toPem(label, der) {
+  const body = b64(new Uint8Array(der)).match(/.{1,64}/g).join("\n");
+  return `-----BEGIN ${label}-----\n${body}\n-----END ${label}-----\n`;
+}
+function fromPem(label, text) {
+  const m = String(text).match(new RegExp(`-----BEGIN ${label}-----([A-Za-z0-9+/=\\s]+)-----END ${label}-----`));
+  if (!m) throw new Error("That does not look like the right key text.");
+  return unb64(m[1].replace(/\s+/g, ""));
+}
+
+async function ed25519Supported() {
+  try { await crypto.subtle.generateKey(ED, false, ["sign", "verify"]); return true; } catch { return false; }
+}
+
+// Master key = { privateKey, publicKey, privatePem (PKCS#8), publicPem (SPKI), fingerprint (sha256 hex of SPKI DER) }
+async function describeMaster(privateKey, publicKey) {
+  const spki = new Uint8Array(await crypto.subtle.exportKey("spki", publicKey));
+  const pkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", privateKey));
+  return { privateKey, publicKey, privatePem: toPem("PRIVATE KEY", pkcs8),
+           publicPem: toPem("PUBLIC KEY", spki), fingerprint: await sha256hex(spki) };
+}
+async function createMasterKey() {
+  const kp = await crypto.subtle.generateKey(ED, true, ["sign", "verify"]);
+  return describeMaster(kp.privateKey, kp.publicKey);
+}
+async function loadMasterKey(pemText) {
+  const priv = await crypto.subtle.importKey("pkcs8", fromPem("PRIVATE KEY", pemText), ED, true, ["sign"]);
+  const { x } = await crypto.subtle.exportKey("jwk", priv);          // public half, derived by the browser
+  const pub = await crypto.subtle.importKey("jwk", { kty: "OKP", crv: "Ed25519", x }, ED, true, ["verify"]);
+  return describeMaster(priv, pub);
+}
+
+// Update key: PEM as pasted, \n line endings, one trailing \n. Must import as an Ed25519 public key.
+async function importUpdateKey(pemText) {
+  const pem = String(pemText).replace(/\r\n?/g, "\n").trim() + "\n";
+  if (!/^-----BEGIN PUBLIC KEY-----\n[A-Za-z0-9+/=\n]+-----END PUBLIC KEY-----\n$/.test(pem))
+    throw new Error("The update key text is not complete. Paste it again exactly as you got it.");
+  const der = fromPem("PUBLIC KEY", pem);
+  try { await crypto.subtle.importKey("spki", der, ED, true, ["verify"]); }
+  catch { throw new Error("That is not a valid update key."); }
+  return { pem, keyId: await sha256hex(der) };
+}
+
+function wholeNumber(value, min, max, what) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${what} must be a whole number from ${min} to ${max}.`);
+  return n;
+}
+function parseRevokedIds(text) {
+  const ids = String(text).toLowerCase().split(/[\s,]+/).filter(Boolean);
+  for (const id of ids) if (!/^[0-9a-f]{64}$/.test(id)) throw new Error(`This blocked key is not valid: ${id.slice(0, 20)}…`);
+  return [...new Set(ids)];
+}
+// Exact bytes the boxes verify: compact JSON, keys in this order.
+function signingKeyJson(pem, keyId, notAfter) {
+  return JSON.stringify({ format: 1, kind: "5dive-signing-key", key_id: keyId, pubkey: pem, not_after: notAfter });
+}
+function revokedJson(serial, ids) {
+  return JSON.stringify({ format: 1, kind: "5dive-revocations", serial, revoked: ids });
+}
+async function signBytes(master, bytes) {
+  const sig = new Uint8Array(await crypto.subtle.sign(ED, master.privateKey, bytes));
+  if (sig.length !== 64 || !(await crypto.subtle.verify(ED, master.publicKey, sig, bytes)))
+    throw new Error("Signing failed its own check. Do not use this result.");
+  return sig;
+}
+async function buildPublicFile(master, update, days, serial, revokedText, nowMs) {
+  const ids = parseRevokedIds(revokedText);
+  if (update.keyId === master.fingerprint) throw new Error("That update key is the master key itself. Use the key from 5dive.");
+  if (ids.includes(update.keyId)) throw new Error("You are blocking the same key you are approving.");
+  const notAfter = Math.floor(nowMs / 1000) + wholeNumber(days, 1, 3650, "Days") * 86400;
+  const sk = enc.encode(signingKeyJson(update.pem, update.keyId, notAfter));
+  const n = wholeNumber(serial, 1, 1e9, "List number");
+  // List 1 is the first ceremony's empty list. Blocking on 1 would make a second list 1 that boxes cannot order.
+  if (ids.length && n < 2) throw new Error("To block a key, set List number higher than every list you made before (2 or more).");
+  const rv = enc.encode(revokedJson(n, ids));
+  return JSON.stringify({
+    root_pubkey_pem: master.publicPem, root_fingerprint: master.fingerprint,
+    signing_key_json_b64: b64(sk), signing_key_sig_b64: b64(await signBytes(master, sk)),
+    revoked_json_b64: b64(rv), revoked_sig_b64: b64(await signBytes(master, rv)),
+  }, null, 2) + "\n";
+}
+// <<< pure
+
+// ---- page ----
+const $ = id => document.getElementById(id);
+let master = null, update = null, copied = false;
+
+function show(id) {
+  document.querySelectorAll("section").forEach(s => s.classList.toggle("on", s.id === id));
+  $("err").textContent = "";
+  window.scrollTo(0, 0);
+}
+function download(name, text, type) {
+  const url = URL.createObjectURL(new Blob([text], { type }));
+  const a = Object.assign(document.createElement("a"), { href: url, download: name });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+function guard(fn) {
+  return async () => { $("err").textContent = ""; try { await fn(); } catch (e) { $("err").textContent = e.message || String(e); } };
+}
+
+$("b-create").onclick = guard(async () => {
+  master = await createMasterKey();
+  $("t-priv").value = master.privatePem;
+  show("s-new");
+});
+$("b-copy").onclick = guard(async () => {
+  copied = true;
+  try { await navigator.clipboard.writeText(master.privatePem); }
+  catch { $("t-priv").select(); document.execCommand("copy"); }
+  $("b-copy").textContent = "Copied";
+});
+$("b-backup").onclick = () => download("5dive-master-key-backup.txt", master.privatePem, "text/plain");
+$("c-saved").onchange = () => { $("b-new-next").disabled = !$("c-saved").checked; };
+$("b-new-next").onclick = () => { $("t-priv").value = ""; show("s-update"); };
+
+$("b-have").onclick = () => show("s-load");
+$("f-load").onchange = guard(async () => {
+  const file = $("f-load").files[0];
+  if (file) { $("t-load").value = await file.text(); $("f-load").value = ""; $("b-load").click(); }
+});
+$("b-load").onclick = guard(async () => {
+  $("load-ok").hidden = true;
+  try { master = await loadMasterKey($("t-load").value); }
+  catch { throw new Error("That is not a valid master key. Paste the whole text, including the BEGIN and END lines."); }
+  $("load-fp").textContent = master.fingerprint;
+  $("load-ok").hidden = false;
+});
+$("b-load-next").onclick = () => { $("t-load").value = ""; show("s-update"); };
+
+$("b-upd-next").onclick = guard(async () => {
+  update = await importUpdateKey($("t-upd").value);
+  wholeNumber($("n-days").value, 1, 3650, "Days");
+  show("s-revoke");
+});
+$("b-sign").onclick = guard(async () => {
+  const file = await buildPublicFile(master, update, $("n-days").value, $("n-serial").value, $("t-rev").value, Date.now());
+  $("b-pub").onclick = () => download("5dive-master-key-PUBLIC.json", file, "application/json");
+  $("out-fp").textContent = master.fingerprint;
+  show("s-out");
+});
+$("b-done").onclick = async () => {
+  if (copied) { try { await navigator.clipboard.writeText(""); } catch {} }
+  document.querySelectorAll("textarea, input").forEach(el => { el.value = ""; });
+  master = update = null;
+  location.reload();
+};
+
+(async () => {
+  $("t-upd").value = DEFAULT_UPDATE_KEY;
+  show(window.crypto && crypto.subtle && await ed25519Supported() ? "s-start" : "s-old");
+})();
+</script>
+</body>
+</html>

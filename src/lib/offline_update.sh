@@ -37,6 +37,28 @@
 # (a repo admin generates it once, see the workflow header), the key below is
 # empty, nothing is pinned, and this verb refuses EVERY file. A box that cannot
 # check a signature must not install.
+#
+# THE OFFLINE ROOT (DIVE-7888). The key above signs every file, and it lives in a
+# GitHub secret: one stolen maintainer login could sign a file every box takes,
+# forever. So a box that holds 5dive's ROOT key (held by the owner, never on a
+# server) trusts the signing key only as far as the root CERTIFIED it:
+#   signing-key.json  {"format":1,"kind":"5dive-signing-key","key_id":"<sha256 of
+#                     the signing key's DER public key>","pubkey":"<PEM>",
+#                     "not_after":<unix seconds>}               + raw ed25519 sig by ROOT
+#   revoked.json      {"format":1,"kind":"5dive-revocations","serial":<n>,
+#                     "revoked":["<key_id>",…]}                 + raw ed25519 sig by ROOT
+# (the same two files and fields as the online design, DIVE-7816). They ride
+# INSIDE manifest.json, base64, as
+#   "trust": {"signing_key":…,"signing_key_sig":…,"revoked":…,"revoked_sig":…}
+# because a box on an older release refuses any extra tar member but ignores an
+# extra manifest field: the same file still installs there, by manifest.sig.
+# The exact certified bytes are checked, then parsed — key order and spacing do
+# not matter. key_id is RECOMPUTED from the pubkey the certificate carries.
+# The box keeps the highest-serial revocation list it has ever accepted
+# ($OFFLINE_UPDATE_STATE_DIR/update-revoked.json): a file carrying an older list
+# does not un-revoke a key. A newer list is kept only once the whole file has
+# verified. When this box has NO root (none compiled in, no update-root.pem),
+# step 1 is exactly the pinned-key check above, unchanged.
 
 # The release public key, compiled in. EMPTY until a repo admin generates the
 # signing key (OFFLINE_UPDATE_SIGNING_KEY on the 5dive repo) and pastes its
@@ -45,6 +67,12 @@
 OFFLINE_UPDATE_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAf9KHm4dxpSPYZDHIeDI+mA4yHuPavXzwmsw3+POZW10=
 -----END PUBLIC KEY-----'
+
+# The offline ROOT public key, compiled in (DIVE-7888). EMPTY until the owner's
+# key ceremony; then pasted here (`openssl pkey -in root.pem -pubout`). While it
+# is empty and /etc/5dive/update-root.pem is absent, nothing below changes.
+# install.sh writes it to $OFFLINE_UPDATE_ROOT_PUBKEY_FILE (`--write-pubkey`).
+OFFLINE_UPDATE_ROOT_PUBKEY_PEM=''
 
 # >>> DIVE-7577 offline update verifier
 #     (tests/self_update_offline_unit.sh extracts this block VERBATIM between
@@ -81,6 +109,130 @@ _ou_pinned_key() {
 }
 
 _ou_sha256() { sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
+
+# ---- DIVE-7888: the offline root -> certified signing key -> revocation chain
+_ou_root_file()  { printf '%s\n' "${OFFLINE_UPDATE_ROOT_PUBKEY_FILE:-/etc/5dive/update-root.pem}"; }
+_ou_state_dir()  { printf '%s\n' "${OFFLINE_UPDATE_STATE_DIR:-/var/lib/5dive}"; }
+
+# _ou_trusted_file <path> — 0 when root (or the caller) owns it and group/other
+# cannot write it. The rule the pinned key file is held to above.
+_ou_trusted_file() {
+  local own mode
+  own="$(stat -c %u "$1" 2>/dev/null)" || return 1
+  mode="$(stat -c %a "$1" 2>/dev/null)" || return 1
+  [[ "$own" == 0 || "$own" == "$(id -u)" ]] || return 1
+  (( (8#$mode & 8#022) == 0 )) || return 1
+  return 0
+}
+
+# _ou_root_key <out> — the root key this box trusts, written to <out>.
+# 0 = a root is present (the chain is REQUIRED); 1 = no root on this box (the
+# pinned-key path); 2 = refused: a root key file is there but cannot be trusted.
+_ou_root_key() {
+  local out="$1" f; f="$(_ou_root_file)"
+  if [[ -e "$f" ]]; then
+    _ou_trusted_file "$f" || {
+      _OU_WHY="the update root key file $f is not owned by root or is writable by others — it cannot be trusted as the root key"
+      return 2; }
+    cp "$f" "$out" 2>/dev/null && [[ -s "$out" ]] && return 0
+  fi
+  if [[ -n "$OFFLINE_UPDATE_ROOT_PUBKEY_PEM" ]]; then
+    printf '%s\n' "$OFFLINE_UPDATE_ROOT_PUBKEY_PEM" > "$out" && return 0
+  fi
+  return 1
+}
+
+# _ou_sig_ok <pubkey.pem> <data> <sig> — raw ed25519 over the exact bytes. (The
+# flags are ordered so this line never reads `pkeyutl -verify`: the signature
+# mutant in tests/self_update_offline_unit.sh cuts from the first such line —
+# the manifest check in _ou_verify — to its closing `fi`.)
+_ou_sig_ok() {
+  openssl pkeyutl -pubin -inkey "$1" -verify -rawin -in "$2" -sigfile "$3" >/dev/null 2>&1
+}
+_ou_key_id() { # <pubkey.pem> — sha256 of the DER SubjectPublicKeyInfo
+  openssl pkey -pubin -in "$1" -outform DER 2>/dev/null | sha256sum | awk '{print $1}'
+}
+
+# _ou_chain <meta> <root.pem> — the manifest's trust object, checked against
+# the root. 0 = <meta>/certified.pem is the key manifest.sig must verify with,
+# and _OU_KEEP_REVOKED names a newer root-signed list to keep once the whole
+# file verifies (empty = nothing to keep). 1 = refused, _OU_WHY says why.
+_ou_chain() {
+  local meta="$1" root="$2" m="$1/manifest.json" t="$1/trust" k v
+  _OU_KEEP_REVOKED=""
+  jq -e '.trust | type == "object"' "$m" >/dev/null 2>&1 \
+    || { _OU_WHY="this file is not signed by 5dive's root key (it carries no certificate for its signing key)"; return 1; }
+  mkdir -m 700 "$t" || { _OU_WHY="internal: could not create $t"; return 1; }
+  for k in signing_key signing_key_sig revoked revoked_sig; do
+    v="$(jq -r --arg k "$k" '.trust[$k] | strings' "$m" 2>/dev/null)" || v=""
+    [[ -n "$v" ]] && base64 -d <<<"$v" > "$t/$k" 2>/dev/null && [[ -s "$t/$k" ]] \
+      || { _OU_WHY="this file's certificate from 5dive's root key is incomplete or damaged ($k)"; return 1; }
+  done
+
+  # The signing key, certified by the ROOT.
+  _ou_sig_ok "$root" "$t/signing_key" "$t/signing_key_sig" \
+    || { _OU_WHY="the key that signed this file is not certified by 5dive's root key — the file was changed or was not made by 5dive"; return 1; }
+  jq -e '.format == 1 and .kind == "5dive-signing-key" and (.key_id|type == "string")
+         and (.pubkey|type == "string") and (.not_after|type == "number")' "$t/signing_key" >/dev/null 2>&1 \
+    || { _OU_WHY="the signing key certificate in this file is not in a format this 5dive reads"; return 1; }
+  local skey="$meta/certified.pem" key_id not_after now
+  jq -r '.pubkey' "$t/signing_key" > "$skey"
+  key_id="$(jq -r '.key_id' "$t/signing_key")"
+  [[ "$key_id" =~ ^[0-9a-f]{64}$ && "$(_ou_key_id "$skey")" == "$key_id" ]] \
+    || { _OU_WHY="the signing key certificate in this file names a different key than it carries — refused"; return 1; }
+  not_after="$(jq -r '.not_after | floor' "$t/signing_key" 2>/dev/null)" || not_after=""
+  [[ "$not_after" =~ ^[0-9]{1,12}$ ]] \
+    || { _OU_WHY="the signing key certificate in this file has no usable expiry date"; return 1; }
+  now="${OFFLINE_UPDATE_NOW:-$(date +%s)}"
+  (( now < not_after )) \
+    || { _OU_WHY="the key that signed this file expired on $(date -u -d "@$not_after" +%F 2>/dev/null || echo "$not_after") — if that date has not passed yet, check this box's clock"; return 1; }
+
+  # Revocation: the highest-serial root-signed list this box has ever accepted.
+  _ou_sig_ok "$root" "$t/revoked" "$t/revoked_sig" \
+    || { _OU_WHY="the list of revoked keys in this file is not signed by 5dive's root key — refused"; return 1; }
+  jq -e '.format == 1 and .kind == "5dive-revocations" and (.serial|type == "number") and .serial >= 1
+         and (.revoked|type == "array") and all(.revoked[]; type == "string")' "$t/revoked" >/dev/null 2>&1 \
+    || { _OU_WHY="the list of revoked keys in this file is not in a format this 5dive reads"; return 1; }
+  # Only a STRICTLY higher serial replaces the kept list. On an equal or lower
+  # serial BOTH lists apply (union): two root-signed lists sharing a serial must
+  # not let a file un-revoke a key with the list it carries.
+  local st kept got kept_serial union=0
+  st="$(_ou_state_dir)"; kept="$st/update-revoked.json"
+  got="$(jq -r '.serial | floor' "$t/revoked")"
+  [[ "$got" =~ ^[0-9]{1,15}$ ]] || { _OU_WHY="the list of revoked keys in this file is not in a format this 5dive reads"; return 1; }
+  if [[ -f "$kept" && -f "$st/update-revoked.sig" ]] && _ou_trusted_file "$kept" && _ou_trusted_file "$st/update-revoked.sig" \
+     && _ou_sig_ok "$root" "$kept" "$st/update-revoked.sig"; then
+    kept_serial="$(jq -r '.serial | floor' "$kept" 2>/dev/null)" || kept_serial=0
+    [[ "$kept_serial" =~ ^[0-9]{1,15}$ ]] || kept_serial=0
+    if (( kept_serial >= got )); then union=1
+    else _OU_KEEP_REVOKED="$t"; fi
+  else
+    _OU_KEEP_REVOKED="$t"
+  fi
+  if jq -e --arg k "$key_id" '.revoked | index($k) != null' "$t/revoked" >/dev/null 2>&1 \
+     || { (( union )) && jq -e --arg k "$key_id" '.revoked | index($k) != null' "$kept" >/dev/null 2>&1; }; then
+    _OU_KEEP_REVOKED=""
+    _OU_WHY="the key that signed this file has been revoked by 5dive — refused"; return 1
+  fi
+  return 0
+}
+
+# _ou_keep_revoked — store the newer root-signed list, after the WHOLE file
+# verified. A box that cannot store it still installs; it warns.
+_ou_keep_revoked() {
+  local t="${_OU_KEEP_REVOKED:-}" st; [[ -n "$t" ]] || return 0
+  st="$(_ou_state_dir)"
+  # Never `install -d -m` an existing state dir: that would re-mode /var/lib/5dive.
+  if { [[ -d "$st" ]] || install -d -m 755 "$st" 2>/dev/null; } \
+     && cp "$t/revoked" "$st/update-revoked.json.tmp.$$" 2>/dev/null && cp "$t/revoked_sig" "$st/update-revoked.sig.tmp.$$" 2>/dev/null \
+     && chmod 644 "$st/update-revoked.json.tmp.$$" "$st/update-revoked.sig.tmp.$$" \
+     && mv -f "$st/update-revoked.sig.tmp.$$" "$st/update-revoked.sig" && mv -f "$st/update-revoked.json.tmp.$$" "$st/update-revoked.json"; then
+    _OU_KEEP_REVOKED=""; return 0
+  fi
+  rm -f "$st/update-revoked.json.tmp.$$" "$st/update-revoked.sig.tmp.$$" 2>/dev/null
+  warn "could not keep the update file's list of revoked keys in $st"
+  return 0
+}
 
 # _ou_verify <file> <stage> <installed-version> <allow-downgrade 0|1>
 # 0 = verified and unpacked: <stage>/payload/* are the signed files and
@@ -120,16 +272,27 @@ _ou_verify() {
   [[ -n "${seen[manifest.json]:-}" ]] || { _OU_WHY="the file has no manifest"; return 1; }
   [[ -n "${seen[manifest.sig]:-}" ]] || { _OU_WHY="the file is not signed (no signature in it)"; return 1; }
 
-  # 1. The signature, against the PINNED key.
-  local meta="$stage/.meta" key
+  # 1. The signature, against the PINNED key — or, on a box that holds the
+  #    offline ROOT (DIVE-7888), against the signing key the root certified.
+  local meta="$stage/.meta" key root rrc=0
   mkdir -m 700 "$meta" || { _OU_WHY="internal: could not create $meta"; return 1; }
-  key="$meta/pinned.pem"
-  _ou_pinned_key "$key" || return 1
+  key="$meta/pinned.pem" root="$meta/root.pem" _OU_KEEP_REVOKED=""
+  _ou_root_key "$root" || rrc=$?
+  (( rrc != 2 )) || return 1
+  if (( rrc == 1 )); then
+    _ou_pinned_key "$key" || return 1
+  fi
   tar -xf "$file" -C "$meta" --no-same-owner --no-same-permissions manifest.json manifest.sig 2>/dev/null \
     || { _OU_WHY="could not read the manifest from the file"; return 1; }
+  local bad_sig="the signature does not match 5dive's update key — the file was changed or was not made by 5dive"
+  if (( rrc == 0 )); then
+    _ou_chain "$meta" "$root" || return 1
+    key="$meta/certified.pem"
+    bad_sig="the signature does not match the signing key 5dive's root key certified — the file was changed or was not made by 5dive"
+  fi
   if ! openssl pkeyutl -verify -pubin -inkey "$key" -rawin \
          -in "$meta/manifest.json" -sigfile "$meta/manifest.sig" >/dev/null 2>&1; then
-    _OU_WHY="the signature does not match 5dive's update key — the file was changed or was not made by 5dive"
+    _OU_WHY="$bad_sig"
     return 1
   fi
 
@@ -179,6 +342,7 @@ _ou_verify() {
   cli_ver="$(grep -m1 'readonly FIVE_VERSION=' "$stage/cli/5dive" 2>/dev/null | sed -E 's/.*="([^"]+)".*/\1/')" || cli_ver=""
   [[ "$cli_ver" == "$ver" && -f "$stage/cli/install.sh" ]] \
     || { _OU_WHY="the update's 5dive is version '${cli_ver:-none}', not the $ver its manifest names"; return 1; }
+  _ou_keep_revoked
   _OU_VERSION="$ver"
   return 0
 }
@@ -277,16 +441,22 @@ _ou_install_bun() {
 # <<< DIVE-7577 offline update verifier
 
 # `self-update --write-pubkey` (root, called by install.sh): pin the compiled
-# key on the box. A CLI with no key writes nothing and leaves an existing pin.
+# keys on the box — the release key, and (DIVE-7888) the offline root key. A CLI
+# with no key of a kind writes nothing for it and leaves an existing file.
 _ou_write_pubkey() {
-  [[ -n "$OFFLINE_UPDATE_PUBKEY_PEM" ]] || return 0
-  local f; f="$(_ou_pubkey_file)"
+  _ou_write_key_file "$OFFLINE_UPDATE_PUBKEY_PEM" "$(_ou_pubkey_file)" "update key"
+  _ou_write_key_file "$OFFLINE_UPDATE_ROOT_PUBKEY_PEM" "$(_ou_root_file)" "update root key"
+  return 0
+}
+_ou_write_key_file() { # <pem> <file> <what>
+  local pem="$1" f="$2"
+  [[ -n "$pem" ]] || return 0
   if install -d -m 755 "$(dirname "$f")" \
-     && printf '%s\n' "$OFFLINE_UPDATE_PUBKEY_PEM" > "$f.tmp.$$" \
+     && printf '%s\n' "$pem" > "$f.tmp.$$" \
      && chmod 644 "$f.tmp.$$" && mv -f "$f.tmp.$$" "$f"; then
     return 0
   fi
-  rm -f "$f.tmp.$$"; warn "could not write the update key to $f"
+  rm -f "$f.tmp.$$"; warn "could not write the $3 to $f"
   return 0
 }
 

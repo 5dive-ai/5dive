@@ -14,6 +14,15 @@
 # <signing-key>   the ed25519 private key (PEM). Without it the file is built
 #                 UNSIGNED, and every box refuses an unsigned file.
 #
+# OFFLINE_TRUST_DIR=<dir> (DIVE-7888, optional): the offline root's PUBLIC
+#                 certificate for the signing key — signing-key.json,
+#                 signing-key.sig, revoked.json, revoked.sig (see
+#                 packaging/offline/trust/README.md). They are embedded in the
+#                 manifest as "trust" before it is signed. Refused when the
+#                 certificate is for another key than <signing-key>, has expired,
+#                 is revoked, or does not verify against the root key compiled
+#                 into <release-tree>/5dive.
+#
 # Prints the path of <out-dir>/5dive-offline-<version>.tar. The format is read
 # by src/lib/offline_update.sh (_ou_verify); change the two together.
 #
@@ -53,6 +62,48 @@ grep -q '^offline_update()' "$tree/install.sh" || die "$tree/install.sh predates
 [[ -f "$skills/5dive-cli/SKILL.md" ]] || die "$skills has no 5dive-cli skill"
 [[ -x "$bun" && -s "$bun" ]] || die "no bun binary at $bun"
 [[ -z "$key" || -s "$key" ]] || die "no signing key at $key"
+
+# The offline root key the tag's 5dive carries (empty before the ceremony, or a
+# tag that predates DIVE-7888).
+compiled_root() {
+  awk -v q="'" -v p="OFFLINE_UPDATE_ROOT_PUBKEY_PEM='" '
+    function out(l) { if (substr(l, length(l)) == q) { print substr(l, 1, length(l) - 1); exit } print l }
+    !on && index($0, p) == 1 { on = 1; out(substr($0, length(p) + 1)); next }
+    on { out($0) }' "$1"
+}
+root_pem="$(compiled_root "$tree/5dive")"
+trust="${OFFLINE_TRUST_DIR:-}" trust_json=""
+if [[ -n "$trust" ]]; then
+  [[ -n "$key" ]] || die "a trust folder needs the signing key it certifies"
+  for t in signing-key.json signing-key.sig revoked.json revoked.sig; do
+    [[ -s "$trust/$t" ]] || die "$trust/$t is missing"
+  done
+  tw="$(mktemp -d)"; trap 'rm -rf "$tw"' EXIT
+  jq -r '.pubkey' "$trust/signing-key.json" > "$tw/cert.pem" || die "$trust/signing-key.json is not JSON"
+  cert_id="$(openssl pkey -pubin -in "$tw/cert.pem" -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+  key_id="$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+  [[ "$cert_id" == "$key_id" ]] \
+    || die "the certificate in $trust is for another key than the one signing this file (certified ${cert_id:0:16}…, signing ${key_id:0:16}…)"
+  [[ "$(jq -r '.key_id' "$trust/signing-key.json")" == "$key_id" ]] || die "the certificate's key_id is not its key's"
+  na="$(jq -r '.not_after | floor' "$trust/signing-key.json")"
+  [[ "$na" =~ ^[0-9]{1,12}$ ]] && (( na > $(date +%s) )) || die "the certificate in $trust has expired (or has no expiry)"
+  jq -e --arg k "$key_id" '.revoked | index($k) == null' "$trust/revoked.json" >/dev/null \
+    || die "the signing key is on the revocation list in $trust"
+  if [[ -n "${root_pem//[[:space:]]/}" ]]; then
+    printf '%s\n' "$root_pem" > "$tw/root.pem"
+    for t in signing-key revoked; do
+      openssl pkeyutl -verify -pubin -inkey "$tw/root.pem" -rawin -in "$trust/$t.json" -sigfile "$trust/$t.sig" >/dev/null 2>&1 \
+        || die "$trust/$t.sig does not verify against the root key compiled into $tree/5dive"
+    done
+  fi
+  b64() { base64 -w0 < "$1"; }
+  trust_json="$(jq -cn --arg a "$(b64 "$trust/signing-key.json")" --arg b "$(b64 "$trust/signing-key.sig")" \
+    --arg c "$(b64 "$trust/revoked.json")" --arg d "$(b64 "$trust/revoked.sig")" \
+    '{signing_key: $a, signing_key_sig: $b, revoked: $c, revoked_sig: $d}')"
+  rm -rf "$tw"
+elif [[ -n "${root_pem//[[:space:]]/}" && -n "$key" ]]; then
+  echo "build-offline: this tag's 5dive trusts an offline root key and no OFFLINE_TRUST_DIR was given — boxes that hold the root will refuse this file" >&2
+fi
 
 # Every plugin's dependencies present (the same test the box's offline start
 # makes, src/lib/local_only.sh plugin_deps_complete).
@@ -102,7 +153,8 @@ done
 # machine's, unless OFFLINE_ARCH says otherwise. A box of another kind refuses it.
 arch="${OFFLINE_ARCH:-$(uname -m)}"
 jq -n --arg v "$ver" --arg a "$arch" --arg c "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson f "$files" \
-  '{format: 1, version: $v, arch: $a, created: $c, files: $f}' > "$stage/manifest.json"
+  --argjson t "${trust_json:-null}" \
+  '{format: 1, version: $v, arch: $a, created: $c, files: $f} + (if $t then {trust: $t} else {} end)' > "$stage/manifest.json"
 
 members=(manifest.json)
 if [[ -n "$key" ]]; then

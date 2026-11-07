@@ -45,10 +45,11 @@ done
 # here fails the build rather than shipping one server's key to every customer.
 # One file is exempt by its exact path: /etc/5dive/update-pubkey.pem is 5dive's
 # public release key (DIVE-7577), the same on every server and written by the
-# installer, so it belongs in the image (DIVE-7717).
+# installer, so it belongs in the image (DIVE-7717). So is
+# /etc/5dive/update-root.pem, the public offline root key (DIVE-7888).
 left=$(find "$r/etc/5dive" "$r/var/lib/5dive" -type f \
   \( -name '*.key' -o -name '*.pem' -o -name '*token*' -o -name 'connectord.env' \) \
-  ! -path "$r/etc/5dive/update-pubkey.pem" 2>/dev/null || true)
+  ! -path "$r/etc/5dive/update-pubkey.pem" ! -path "$r/etc/5dive/update-root.pem" 2>/dev/null || true)
 if [[ -n "$left" ]]; then
   echo "cleanup: per-server secrets are still in the image:" >&2
   echo "$left" >&2
