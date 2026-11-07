@@ -379,7 +379,11 @@ _bug_support_code_file() { printf '%s' "${FIVE_SUPPORT_CODE_FILE:-/etc/5dive/sup
 _bug_support_code_norm() {
   local c="${1^^}"
   c="${c//[[:space:]]/}"
-  [[ "$c" =~ ^5D-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$ ]] && printf '%s' "$c"
+  if [[ "$c" =~ ^5D-[0-9A-HJKMNP-TV-Z]{4}-[0-9A-HJKMNP-TV-Z]{4}$ ]]; then
+    printf '%s' "$c"
+    return 0
+  fi
+  return 1
 }
 
 # _bug_support_code — the saved code, or nothing (no file, unreadable, or not a code).
