@@ -25,6 +25,7 @@ SRC=src
 export GH_ORG="5dive-ai"
 BUG_TMP=$(mktemp -d)
 export XDG_STATE_HOME="$BUG_TMP/state" FIVE_BUG_ASKED_LEDGER="$BUG_TMP/box-asked.tsv"
+export FIVE_SUPPORT_CODE_FILE="$BUG_TMP/no-support-code"   # DIVE-7885: the pin below is a box with none
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/self.sh cmd_selfcheck.sh cmd_bug.sh; do
   source "$SRC/$f"
