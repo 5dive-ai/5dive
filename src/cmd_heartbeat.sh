@@ -3364,18 +3364,87 @@ _hb_send_line() {
     return 1
   fi
   sleep 0.4
+  # DIVE-7870: a CONTROL line (/clear, /goal clear, /compact) starts no turn on
+  # a non-claude TUI — Codex resets the chat and stays idle BY DESIGN, so the
+  # leave-idle check below can never pass for it: five Enters, rc 1, and a
+  # `heartbeat --fresh` Codex pane seat failed its wake at "/clear injection"
+  # every tick and never received a row (box bug 766, teal-fox, 2026-11-07).
+  # For a control line the accept signal is the COMPOSER: the typed line has
+  # left it. It is still verified — an unsent /clear left in the composer fires
+  # at the seat's next turn boundary and wipes a working seat (DIVE-4642), so a
+  # line that is still there after the bound fails loudly and is cleared.
+  local _hb_ctl=0 _hb_hold=0
+  # Same set as _agent_dispatch_is_tui_control (cmd_agent_runtime.sh), matched
+  # here so this path never depends on that module being loaded.
+  case "${text//[[:space:]]/}" in /clear|/goalclear|/compact) _hb_ctl=1 ;; esac
   while (( tries < 5 )); do
     _hb_send_keys_step "$name" "submit (Enter, attempt $((tries+1)))" Enter || { _hb_landed_check "$name" "$_hb_body" && return 0; return 1; }
     sleep 0.5
+    if (( _hb_ctl )); then
+      _hb_hold=0; _hb_pane_composer_holds "$name" "$_hb_body" || _hb_hold=$?
+      if (( _hb_hold == 1 )); then
+        _hb_log "[$name] control line '${_hb_body}' accepted: it left the composer (Enter attempt $((tries+1))); a control line starts no turn, so the seat staying idle is expected (DIVE-7870)" 2>/dev/null || true
+        return 0
+      fi
+    fi
     # idle()==0 means the Enter did not take (still at the prompt) -> retry; any
     # other state (busy/blocked/unknown) means the composer accepted it.
     _hb_agent_idle "$name" 0.4 || return 0
     tries=$((tries+1))
   done
+  if (( _hb_ctl )); then
+    # DIVE-4642 on this path: do not leave the control line behind to fire later.
+    sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
+    if (( _hb_hold == 2 )); then
+      _HB_SEND_FAIL_REASON="submit not verified (rc 1): control line '${_hb_body}' — the seat stayed idle after ${tries} Enter attempts and its composer could not be read, so nobody can say the line left it (composer C-u'd so nothing fires later; DIVE-7870)"
+    else
+      _HB_SEND_FAIL_REASON="submit not accepted (rc 1): control line '${_hb_body}' was still in the composer after ${tries} Enter attempts and the seat stayed idle (composer C-u'd so nothing fires later; DIVE-7870, DIVE-4642)"
+    fi
+    _hb_log "[$name] ${_HB_SEND_FAIL_REASON}" 2>/dev/null || true
+    return 1
+  fi
   # DIVE-4310: this exit was the silent one — five Enters, the seat never left
   # idle, and the function returned 1 with nothing written anywhere.
   _HB_SEND_FAIL_REASON="submit not accepted (rc 1): the seat was still idle after ${tries} Enter attempts — the paste never committed (DIVE-1217 path)"
   _hb_log "[$name] ${_HB_SEND_FAIL_REASON}" 2>/dev/null || true
+  return 1
+}
+
+# DIVE-7870: does a NON-CLAUDE seat's composer still hold <text>?
+#   0 = it does (the line is unsent)   1 = it does not (the line left it)
+#   2 = cannot tell (pane unreadable, or no composer found for a glyph runtime)
+# Plain capture (no -e): the codex placeholder ("Ask Codex to do anything",
+# "Improve documentation in @filename") then reads as text, which is fine — it
+# never equals a typed control line.
+# - A runtime with a composer GLYPH (codex "›"): the composer is the LAST line
+#   led by the glyph. Codex echoes past user messages with the same glyph
+#   ("› [5dive-msg …]"), but always ABOVE the composer, so only the last one is
+#   read. It holds the text when its content starts with it; a slash-command
+#   popup row ("› /clear  start a new chat") is therefore counted as holding
+#   too, which is the safe direction (retry, then fail loudly).
+# - Any other runtime (marker is a placeholder/footer or unknown): the text
+#   appearing anywhere in the bottom 8 non-blank lines counts as holding —
+#   again the side that fails loudly, never a false accept.
+_hb_pane_composer_holds() {
+  local name="$1" text="$2" pane marker line c last="" found=0
+  pane=$(sudo -u "agent-${name}" tmux capture-pane -p -t "agent-${name}" 2>/dev/null) || return 2
+  [[ -n "${pane//[[:space:]]/}" ]] || return 2
+  pane="${pane//$'\xc2\xa0'/ }"
+  marker=$(_hb_idle_marker "$(agent_type "$name" 2>/dev/null)" 2>/dev/null) || marker=""
+  if [[ "$marker" == "›" || "$marker" == "❯" ]]; then
+    while IFS= read -r line; do
+      c="${line#"${line%%[![:space:]]*}"}"
+      [[ "$c" == "$marker"* ]] || continue
+      found=1; c="${c#"$marker"}"
+      c="${c#"${c%%[![:space:]]*}"}"; c="${c%"${c##*[![:space:]]}"}"
+      last="$c"
+    done <<<"$pane"
+    (( found )) || return 2
+    [[ "$last" == "$text" || "$last" == "$text "* ]] && return 0
+    return 1
+  fi
+  local tail8; tail8=$(grep -v '^[[:space:]]*$' <<<"$pane" | tail -n 8) || return 2
+  [[ "$tail8" == *"$text"* ]] && return 0
   return 1
 }
 
