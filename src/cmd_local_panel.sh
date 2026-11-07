@@ -84,7 +84,7 @@ readonly LP_VALUE_MAX=8192
 # here is refused; a wrong argument count is refused.
 _lp_spec() {
   case "$1" in
-    team|board|secrets|settings|update-install|update-status) printf '' ;;
+    team|board|secrets|settings|update-install|update-status|support-file) printf '' ;;
     agent-add)     printf 'agent account?' ;;
     agent-restart|agent-remove) printf 'agent' ;;
     gate-answer)   printf 'ident value' ;;
@@ -193,7 +193,7 @@ _lp_local_only_rows() {
 }
 
 # _lp_run <verb> [args] — the allowlisted action; prints data JSON (rc 0) or an
-# error message (rc 1). The value for secret-set is in $LP_INPUT.
+# error message (rc 1). The value for secret-set (and support-file's description) is in $LP_INPUT.
 _lp_run() {
   local verb="$1"; shift
   local d
@@ -237,6 +237,24 @@ _lp_run() {
       [[ -n "$LP_INPUT" ]] || { printf 'the value is empty'; return 1; }
       _lp_cli_json secret write "$1" --connector=tools < <(printf '%s' "$LP_INPUT") >/dev/null || return 1
       jq -cn --arg n "$1" '{name:$n, saved:true}' ;;
+    # DIVE-7886: a Support file for a box with no internet. The description
+    # comes on stdin (free text never rides the socket's argv), the file is
+    # exactly what `5dive bug --save` writes — the payload `5dive bug --file`
+    # would send — and it goes back to the page as a string so the download is
+    # those bytes. Nothing is sent anywhere, and the description stays out of
+    # the audit line like a secret value does.
+    support-file)
+      [[ -n "${LP_INPUT//[[:space:]]/}" ]] || { printf 'Describe the problem first.'; return 1; }
+      (( ${#LP_INPUT} <= 2000 )) || { printf 'the description is too long (2000 characters at most)'; return 1; }
+      local sf err
+      sf=$(mktemp) || { printf 'could not make the file'; return 1; }
+      if ! err=$(_lp_cli_json bug --verb=support-file --what="$LP_INPUT" --save="$sf" </dev/null); then
+        rm -f -- "$sf"
+        [[ "$err" == *token-shaped* ]] && { printf 'Remove the password or key from your text first.'; return 1; }
+        printf '%s' "$err"; return 1
+      fi
+      jq -Rsc --arg n "5dive-support-file-$(date -u +%Y%m%d-%H%M).json" '{name:$n, file:.}' <"$sf"
+      rm -f -- "$sf" ;;
     settings)
       jq -cn --argjson lo "$(_lp_local_only_rows)" --argjson a "$(_lp_accounts)" \
         --argjson up "$(_lp_update_ready && echo true || echo false)" --arg v "${FIVE_VERSION:-}" \
@@ -405,7 +423,7 @@ _lp_exec() {
     LP_INPUT=$(head -c $((LP_VALUE_MAX + 1)))
   else
     argv=("$@")
-    [[ "${argv[0]:-}" == secret-set && ! -t 0 ]] && LP_INPUT=$(head -c $((LP_VALUE_MAX + 1)))
+    [[ ( "${argv[0]:-}" == secret-set || "${argv[0]:-}" == support-file ) && ! -t 0 ]] && LP_INPUT=$(head -c $((LP_VALUE_MAX + 1)))
   fi
   local verb="${argv[0]:-}" why args
   args=$(printf '%s ' "${argv[@]:1}"); args="${args% }"

@@ -554,6 +554,14 @@ async function panelSide(req: Request, p: string, dev: Device): Promise<Response
     if (!url || !model || !AGENT_RE.test(agent)) return json({ error: "Pick an AI server and a model, and name your first agent." }, 400);
     return reply(await panelExec(["ai-setup", url, model, agent], dev.id, "", 600_000));
   }
+  // DIVE-7886: a Support file. The description goes to root on stdin; root
+  // answers with the file's text, which the page saves as is. Nothing is sent.
+  if (p === "/api/panel/support-file" && post) {
+    const what = typeof b.what === "string" ? b.what : "";
+    if (!what.trim()) return json({ error: "Describe the problem first." }, 400);
+    if (what.length > 2000) return json({ error: "That is too long (2000 characters at most)." }, 400);
+    return reply(await panelExec(["support-file"], dev.id, what, 120_000));
+  }
   return json({ error: "not found" }, 404);
 }
 
@@ -784,7 +792,7 @@ nav.tabs button b{display:block;font-size:22px;font-weight:400}nav.tabs button.o
 .btn{border:0;border-radius:999px;background:var(--accent);color:#fff;font-size:15px;font-weight:600;padding:9px 16px;cursor:pointer}
 .btn.line{background:transparent;color:var(--accent);border:1px solid var(--accent)}.btn.red{background:transparent;color:var(--bad);border:1px solid var(--bad)}
 .btn:disabled{opacity:.5}.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}.row .btn{text-transform:capitalize}
-input{width:100%;padding:12px;font:inherit;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);margin:6px 0}
+input,textarea{width:100%;padding:12px;font:inherit;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);margin:6px 0}textarea{resize:vertical}
 .ok{color:var(--live)}.leak{color:var(--bad);font-weight:600}.big{font-size:20px;font-weight:600;margin:4px 0}
 .toast{position:fixed;left:16px;right:16px;bottom:84px;margin:auto;max-width:520px;padding:12px 14px;border-radius:12px;background:var(--ink);color:var(--bg);display:none}
 .empty{padding:32px 8px;text-align:center;color:var(--mute)}
@@ -888,7 +896,11 @@ const views = {
         '<div class="item"><div class="grow"><b>' + esc(v.name) + (v.id === d.me ? " (this one)" : "") + '</b><span>' + (v.role === "owner" ? "Can manage" : "Chat only") + ' · last seen ' + esc(seen(v.last_seen)) + '</span></div><button class="btn red" data-rv="' + esc(v.id) + '">Remove</button></div>').join("") + '</div>' +
       (d.updateFromFile ? '<div class="card"><h3>Update</h3><p class="mute">This server runs 5dive ' + esc(d.version || "") + '. Got an update file from your IT team? Pick it and install.</p>' +
         '<input type="file" id="uf" accept=".tar"><button class="btn" id="ub">Install update</button><p id="us" class="mute"></p>' +
-        '<details id="ul" hidden><summary class="mute">What the last install said</summary><pre id="ulog" class="mute" style="white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px"></pre></details></div>' : "");
+        '<details id="ul" hidden><summary class="mute">What the last install said</summary><pre id="ulog" class="mute" style="white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px"></pre></details></div>' : "") +
+      // DIVE-7886: a Support file for a server with no internet (marketing's words).
+      '<div class="card"><h3>Need help?</h3><p class="mute">No internet on this server? Save a support file, then attach it in Support in the 5dive app from any computer.</p>' +
+        '<textarea id="sw" rows="3" maxlength="2000" placeholder="What went wrong?"></textarea><button class="btn" id="sb">Save support file</button>' +
+        '<p class="mute">It holds this server&#39;s version and system details, its health checks and your text. Nothing else.</p></div>';
     app.onclick = async (e) => {
       const t = e.target.closest("button[data-test]"), r = e.target.closest("button[data-rv]");
       if (t) {
@@ -900,10 +912,28 @@ const views = {
       if (r && confirm("Remove this device? It will need a new code to come back.")) act(r, "/api/panel/revoke", { id: r.dataset.rv }, "Device removed");
       if (e.target.id === "ub") installUpdate();
       if (e.target.id === "inv") invite();
+      if (e.target.id === "sb") supportFile(e.target);
     };
     if (d.updateFromFile) { try { const u = await api("/api/panel/update"); if (u && u.state === "running") watchUpdate(); else if (u && u.state !== "none") updateDone(u); } catch (er) {} }
   },
 };
+// DIVE-7886: save a Support file. The text root answers with is the file,
+// byte for byte (a Blob of a string is its UTF-8), downloaded under root's name.
+async function supportFile(btn) {
+  const what = $("#sw").value;
+  if (!what.trim()) { toast("Describe the problem first."); return; }
+  btn.disabled = true; const t = btn.textContent; btn.textContent = "Working…";
+  try {
+    const d = await api("/api/panel/support-file", { what });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([d.file], { type: "application/json" }));
+    a.download = d.name || "5dive-support-file.json";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    toast("Saved. Now attach it in Support in the 5dive app.");
+  } catch (e) { toast(e.message); }
+  btn.disabled = false; btn.textContent = t;
+}
 // DIVE-7599: invite a person. Their name, Chat or Manage, then the one-time
 // code and the address to hand over. The code is shown once, here only.
 function invite() {
