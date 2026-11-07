@@ -385,7 +385,96 @@ normalize_profile_seed_perms() {
   return 0
 }
 
+# DIVE-7848: every sign-in that lands goes through here, so a seat waiting for
+# the box's first AI (an import on a box with none) is moved onto it here too.
 restart_profile_agents() {
+  _restart_profile_agents_bound "$@"
+  adopt_ai_waiting_agents "${1:-}"
+  return 0
+}
+
+# DIVE-7848: the login a seat waiting for its first AI moves to. Prints an
+# account name, or "default" for the box's shared login (`5dive init`'s).
+# rc 1: none yet. In order: <prefer> (the login that just landed), the shared
+# login, the login of this type added last (account default), the one account
+# of this type. An account is taken only for Claude, Codex and Grok, the types
+# whose account sign-in is read per harness (_create_has_login); any other
+# type's seat waits for the shared login, which is read per type.
+_ai_login_for() { # <type> [prefer]
+  local type="$1" prefer="${2:-}" acct=""
+  lazy_need _create_has_login _create_sole_account account_default_v
+  local per_harness=0
+  [[ "$type" == claude || "$type" == codex || "$type" == grok ]] && per_harness=1
+  if (( per_harness )) && [[ -n "$prefer" && "$prefer" != default ]] \
+     && [[ -f "${AUTH_PROFILES_DIR}/${prefer}/combined.env" ]] && _create_has_login "$type" "$prefer"; then
+    printf '%s\n' "$prefer"; return 0
+  fi
+  if _create_has_login "$type"; then printf 'default\n'; return 0; fi
+  (( per_harness )) || return 1
+  if declare -F account_default_v >/dev/null && account_default_v "$type" 2>/dev/null \
+     && [[ "$ACCOUNT_DEFAULT_TYPE" == "$type" && -n "$ACCOUNT_DEFAULT_ACCOUNT" ]] \
+     && _create_has_login "$type" "$ACCOUNT_DEFAULT_ACCOUNT"; then
+    printf '%s\n' "$ACCOUNT_DEFAULT_ACCOUNT"; return 0
+  fi
+  acct=$(_create_sole_account "$type" 2>/dev/null) && [[ -n "$acct" ]] && { printf '%s\n' "$acct"; return 0; }
+  return 1
+}
+
+# DIVE-7848: the account a sign-in verb names: --auth-profile=<n> (`agent auth
+# set <type>`), or with --positional its first word (`account set <name>`).
+# Empty: the shared login.
+_ai_arg_account() { # [--positional] <verb args...>
+  local a first="" positional=0
+  [[ "${1:-}" == --positional ]] && { positional=1; shift; }
+  for a in "$@"; do
+    case "$a" in
+      --auth-profile=*) printf '%s' "${a#--auth-profile=}"; return 0 ;;
+      -*) ;;
+      *) [[ -n "$first" ]] || first="$a" ;;
+    esac
+  done
+  (( positional )) && printf '%s' "$first"
+  return 0
+}
+
+_ai_wait_clear_locked() { # <agent>
+  local reg
+  reg=$(registry_read) || return 1
+  jq --arg n "$1" 'if .agents[$n] then .agents[$n] |= del(.awaitsAi) else . end' <<<"$reg" | registry_write
+}
+
+# DIVE-7848: move every seat marked awaitsAi onto the first login that signs
+# its type in, through `agent set-account`'s own plumbing (registry, env file,
+# auth link, deferred restart), and clear the mark. A seat that got its own
+# login meanwhile (the per-agent line the import printed) just loses the mark.
+# Best-effort: it never fails the sign-in that called it.
+adopt_ai_waiting_agents() { # [login that just landed]
+  local prefer="${1:-}" reg rows name type own to where
+  [[ -f "${REGISTRY:-}" ]] || return 0
+  reg=$(registry_read 2>/dev/null) || return 0
+  rows=$(jq -r '.agents // {} | to_entries[] | select(.value.awaitsAi == true)
+                | [.key, (.value.type // "claude"), (.value.authProfile // "")] | @tsv' <<<"$reg" 2>/dev/null) || return 0
+  [[ -n "$rows" ]] || return 0
+  lazy_need _create_has_login cmd_config
+  while IFS=$'\t' read -r name type own; do
+    [[ -n "$name" ]] || continue
+    if [[ -n "$own" ]] && _create_has_login "$type" "$own"; then
+      with_registry_lock _ai_wait_clear_locked "$name" || true
+      continue
+    fi
+    to=$(_ai_login_for "$type" "$prefer") || continue
+    if [[ "$to" == default ]]; then where="this server's AI login"; else where="account '$to'"; fi
+    step "'$name' was waiting for an AI: moving it to $where and starting it"
+    if ( with_registry_lock cmd_config "$name" set "auth-profile=$to" ) >/dev/null; then
+      with_registry_lock _ai_wait_clear_locked "$name" || true
+    else
+      warn "could not move '$name' onto $where — run: sudo 5dive agent set-account $name $to"
+    fi
+  done <<<"$rows"
+  return 0
+}
+
+_restart_profile_agents_bound() {
   local profile="${1:-}"
   # DIVE-1188: normalize seed-cred perms before the agents boot so the very
   # next start reads the fresh token without sudo.
