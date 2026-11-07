@@ -199,10 +199,10 @@ unset CLAUDE_CONFIG_DIR
 cd "$HOME"
 TMPDIR=$(mktemp -d -t skill-XXXXXX)
 trap 'rm -rf "$TMPDIR"' EXIT
-# DIVE-7860: every failure after staging goes through die, which drops the staging dir.
+# DIVE-7860: every failure after staging goes through _stage_die (indented: the bundle indexer reads column-0 `name() {` lines as module functions), which drops the staging dir.
 # (Not a second EXIT trap: the trap text above is a classified census entry.)
 STAGE=""; OLD=""
-die() { [ -z "$STAGE" ] || rm -rf "$STAGE"; echo "ERROR: $*" >&2; exit 1; }
+  _stage_die() { [ -z "$STAGE" ] || rm -rf "$STAGE"; echo "ERROR: $*" >&2; exit 1; }
 timeout 60 git clone --depth=1 "https://github.com/$SOURCE.git" "$TMPDIR/repo" >/dev/null 2>&1 \
   || { echo "ERROR: could not clone https://github.com/$SOURCE.git" >&2; exit 1; }
 # Read the commit off the clone while it's still around — the EXIT trap only
@@ -220,17 +220,17 @@ mkdir -p "$HOME/$INSTALL_DIR"
 # staging dirs out of the skill listing.
 DEST="$HOME/$INSTALL_DIR/$SKILL"
 STAGE=$(mktemp -d "$HOME/$INSTALL_DIR/.$SKILL.new.XXXXXX") \
-  || die "cannot write to $INSTALL_DIR (owner: $(stat -c %U "$HOME/$INSTALL_DIR" 2>/dev/null || echo '?'))"
-chmod 755 "$STAGE" || die "cannot set the mode of the staged $SKILL"
-cp -r "$SRC_DIR/." "$STAGE/" || die "copy of $SKILL into $INSTALL_DIR failed"
-[ -f "$STAGE/SKILL.md" ] || die "staged $SKILL has no SKILL.md"
+  || _stage_die "cannot write to $INSTALL_DIR (owner: $(stat -c %U "$HOME/$INSTALL_DIR" 2>/dev/null || echo '?'))"
+chmod 755 "$STAGE" || _stage_die "cannot set the mode of the staged $SKILL"
+cp -r "$SRC_DIR/." "$STAGE/" || _stage_die "copy of $SKILL into $INSTALL_DIR failed"
+[ -f "$STAGE/SKILL.md" ] || _stage_die "staged $SKILL has no SKILL.md"
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
   OLD="$HOME/$INSTALL_DIR/.$SKILL.old.$$"
-  mv -T "$DEST" "$OLD" || { OLD=""; die "cannot move the old $INSTALL_DIR/$SKILL aside"; }
+  mv -T "$DEST" "$OLD" || { OLD=""; _stage_die "cannot move the old $INSTALL_DIR/$SKILL aside"; }
 fi
 if ! mv -T "$STAGE" "$DEST"; then
   [ -z "$OLD" ] || mv -T "$OLD" "$DEST" || true
-  die "cannot put the new $INSTALL_DIR/$SKILL in place (old copy restored)"
+  _stage_die "cannot put the new $INSTALL_DIR/$SKILL in place (old copy restored)"
 fi
 STAGE=""
 [ -z "$OLD" ] || rm -rf "$OLD" || echo "warn: could not remove $OLD" >&2
