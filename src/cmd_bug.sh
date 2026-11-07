@@ -228,7 +228,7 @@ _bug_asked_record() {
 _bug_usage() {
   cat >&2 <<'EOF'
 5dive bug --what=<text> [--verb=<name>] [--exit=<code>] [--argv=<line>]
-          [--no-probes] [--file [--owner-approved]]
+          [--no-probes] [--file [--owner-approved]] [--save=<path>]
 sudo 5dive bug --support-code=<code>     (once per box; =none removes it)
 
 Preview (default): builds the diagnostic payload and prints it. Sends nothing.
@@ -260,6 +260,11 @@ about prints "already asked on <date>; don't ask again", and the owner is asked
 about at most one bug a day. If the API cannot be reached the report is saved
 under ${XDG_STATE_HOME:-$HOME/.local/state}/5dive/bug-spool/ and the next
 approved --file sends it.
+
+  --save=<path>   write the SAME payload --file would send to <path> instead of
+                  sending it (a Support file, for a server with no internet:
+                  carry it out and attach it in Support in the 5dive app).
+                  Needs --what. Nothing leaves this box, so no owner yes.
 
   --support-code=<code>
                   save your firm's 5dive support code (5D-XXXX-XXXX, shown on
@@ -452,7 +457,7 @@ _bug_render_payload() {
 }
 
 cmd_bug() {
-  local verb="" exit_code="" include_probes=1 do_file=0 owner_approved=0 what="" argv=""
+  local verb="" exit_code="" include_probes=1 do_file=0 owner_approved=0 what="" argv="" save=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --verb=*)    verb="${1#--verb=}"; shift ;;
@@ -463,6 +468,8 @@ cmd_bug() {
       --file)      do_file=1; shift ;;
       --owner-approved) owner_approved=1; shift ;;
       --support-code=*) _bug_set_support_code "${1#--support-code=}"; return $? ;;
+      --save=*)    save="${1#--save=}"; shift
+                   [[ -n "$save" ]] || fail "$E_USAGE" "--save needs a file path, e.g. --save=support-file.json" ;;
       -h|--help)   _bug_usage; return 0 ;;
       *) fail "$E_USAGE" "unknown flag: $1 (see: 5dive bug --help)" ;;
     esac
@@ -501,6 +508,28 @@ cmd_bug() {
   # what actually SURVIVED it — a bare token with no flag around it.
   if (( do_file )) && _bug_secret_scan "$what$(_bug_redact_argv "$argv")"; then
     fail "$E_USAGE" "refusing to file: --what/--argv carries a token-shaped string, and this sends it off the box. Remove it and re-run."
+  fi
+
+  # DIVE-7886: --save is the offline box's way out. The same checks as --file
+  # (a description, no token-shaped text), the same _bug_render_payload, and
+  # the bytes written are exactly the bytes _bug_post hands curl
+  # (--data-binary "$payload", no trailing newline). It never reaches
+  # _bug_post, the spool or the asked-ledger: nothing leaves the box, so there
+  # is no owner yes to ask for — whoever carries the file out is that yes.
+  if [[ -n "$save" ]]; then
+    (( do_file )) && fail "$E_USAGE" "--save and --file are two different ways out; pick one"
+    [[ -n "${what//[[:space:]]/}" ]] \
+      || fail "$E_USAGE" "refusing to save a Support file with no description. Re-run with --what=\"what you were doing, what you expected, what you saw\"."
+    _bug_secret_scan "$what$(_bug_redact_argv "$argv")" \
+      && fail "$E_USAGE" "refusing to save: --what/--argv carries a token-shaped string, and this file is meant to leave the box. Remove it and re-run."
+    local sp
+    sp=$(_bug_render_payload "$verb" "$exit_code" "$include_probes" "$what" "$argv")
+    if ! ( umask 077; printf '%s' "$sp" > "$save" ) 2>/dev/null; then
+      fail "$E_PERMISSION" "could not write ${save}"
+    fi
+    ok "Support file saved to ${save}. Attach it in Support in the 5dive app from any computer with internet. Nothing was sent." \
+      '{saved:true, path:$f, bytes:$n}' --arg f "$save" --argjson n "$(wc -c < "$save")"
+    return 0
   fi
 
   local payload key asked_on="" ask_owner=0
