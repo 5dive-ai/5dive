@@ -43,6 +43,7 @@ echo '{"agents":{}}' > "$root/var/lib/5dive/agents.json"
 echo '# Team wiki' > "$root/var/lib/5dive/wiki/index.md"
 echo 'Host *' > "$root/etc/ssh/ssh_config"
 printf -- '-----BEGIN PUBLIC KEY-----\nMCow\n-----END PUBLIC KEY-----\n' > "$root/etc/5dive/update-pubkey.pem"
+printf -- '-----BEGIN PUBLIC KEY-----\nMCow\n-----END PUBLIC KEY-----\n' > "$root/etc/5dive/update-root.pem"   # DIVE-7888
 
 if out=$(IMAGE_ROOT="$root" bash $img/cleanup.sh 2>&1); then ok "clean-up exits 0 on a built tree"; else bad "clean-up failed: $out"; fi
 for f in var/lib/5dive/gate-proof.key etc/5dive/vault.key etc/5dive/connectord.env \
@@ -55,7 +56,7 @@ done
 [[ -f "$root/etc/machine-id" && ! -s "$root/etc/machine-id" ]] && ok "machine id emptied, file kept" \
   || bad "machine id not emptied (or file gone: systemd needs it present and empty)"
 for f in var/lib/5dive/agents.json var/lib/5dive/wiki/index.md etc/ssh/ssh_config etc/5dive/connectors \
-         etc/5dive/update-pubkey.pem; do
+         etc/5dive/update-pubkey.pem etc/5dive/update-root.pem; do
   [[ -e "$root/$f" ]] && ok "kept: /$f" || bad "clean-up removed install state: /$f"
 done
 
@@ -78,7 +79,7 @@ fi
 rm -f "$root/var/lib/5dive/new-feature.key"
 # 2b. The release key's exemption is its exact path only (DIVE-7717): the same
 #     name anywhere else, or another .pem beside it, still fails the build.
-for stray in var/lib/5dive/update-pubkey.pem etc/5dive/update-privkey.pem; do
+for stray in var/lib/5dive/update-pubkey.pem etc/5dive/update-privkey.pem var/lib/5dive/update-root.pem; do
   echo secret > "$root/$stray"
   if IMAGE_ROOT="$root" bash $img/cleanup.sh >/dev/null 2>&1; then
     bad "clean-up passed with /$stray in the image"

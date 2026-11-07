@@ -19,6 +19,9 @@ name: offline-update
 #   gh secret set OFFLINE_UPDATE_SIGNING_KEY < offline-update.pem
 #   openssl pkey -in offline-update.pem -pubout   # paste into OFFLINE_UPDATE_PUBKEY_PEM
 #                                                 # in src/lib/offline_update.sh, then shred the file
+# DIVE-7888: once the owner's offline root key exists, its PUBLIC certificate for
+# that signing key goes in packaging/offline/trust/ (README there); a publish then
+# embeds it, and boxes that hold the root check it.
 # Until the secret exists the file is built UNSIGNED and NOT attached: every box
 # refuses an unsigned file, so publishing one would only mislead. That is the
 # safe failure, chosen on purpose.
@@ -126,8 +129,15 @@ jobs:
         env:
           TAG: ${{ steps.p.outputs.tag }}
           EVENT: ${{ github.event_name }}
+          PUBLISH: ${{ steps.p.outputs.publish }}
         run: |
           set -euo pipefail
+          # DIVE-7888: the offline root's certificate for the REAL signing key,
+          # when one is checked in. Only a publish signs with that key.
+          trust=""
+          if [[ "$PUBLISH" == true && -n "${SIGN_KEY:-}" && -f packaging/offline/trust/signing-key.json ]]; then
+            trust="$PWD/packaging/offline/trust"; echo "TRUST_USED=1" >> "$GITHUB_ENV"
+          fi
           if [[ "$EVENT" == pull_request ]]; then
             # A PR is graded on ITS tree (the tags predate it): built, and given a
             # throwaway release number the builder accepts.
@@ -140,7 +150,7 @@ jobs:
           else
             git worktree add -q --detach "$RUNNER_TEMP/tree" "$TAG"
           fi
-          f="$(bash packaging/offline/build-offline.sh "$RUNNER_TEMP/tree" _plugins _skills "$(command -v bun)" "$RUNNER_TEMP/out" ${SIGN_KEY:+"$SIGN_KEY"})"
+          f="$(OFFLINE_TRUST_DIR="$trust" bash packaging/offline/build-offline.sh "$RUNNER_TEMP/tree" _plugins _skills "$(command -v bun)" "$RUNNER_TEMP/out" ${SIGN_KEY:+"$SIGN_KEY"})"
           ls -la "$f"
           echo "OFFLINE_FILE=$f" >> "$GITHUB_ENV"
 
@@ -151,7 +161,9 @@ jobs:
           eval "$(sed -n '/^version_lt() {/,/^}/p' src/cmd_selfupdate.sh)"
           warn() { echo "warn: $*" >&2; }
           . src/lib/offline_update.sh
-          export OFFLINE_UPDATE_PUBKEY_FILE="$RUNNER_TEMP/offline-update.pub.pem"
+          export OFFLINE_UPDATE_PUBKEY_FILE="$RUNNER_TEMP/offline-update.pub.pem" OFFLINE_UPDATE_STATE_DIR="$RUNNER_TEMP/ou-state"
+          # A file built without the root's certificate is checked by the pinned key (DIVE-7888).
+          [[ -n "${TRUST_USED:-}" ]] || { OFFLINE_UPDATE_ROOT_PUBKEY_PEM=''; export OFFLINE_UPDATE_ROOT_PUBKEY_FILE="$RUNNER_TEMP/no-root.pem"; }
           st="$(mktemp -d)"
           _ou_verify "$OFFLINE_FILE" "$st" 0.0.0 0 || { echo "::error::the built file is refused: $_OU_WHY"; exit 1; }
           echo "accepted: version $_OU_VERSION"
