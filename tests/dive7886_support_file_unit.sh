@@ -65,7 +65,7 @@ chk "B5 keys are EXACTLY the allowlist" \
   '["bash_version","exit_code","install_method","invocation","os","probes","verb","version","what"]' "$(jq -cS keys "$F")"
 chk "B6 probes carry probe+verdict only" '[["probe","verdict"]]' "$(jq -c '[.probes[] | keys] | unique' "$F")"
 if grep -qF -- "$MARK" "$F"; then fail_t "B7 the planted PII marker reached the file"; else ok_t "B7 the PII marker in selfcheck's free text never reaches the file"; fi
-yes_ "B8 the token in --argv is redacted in the file, as in what is sent" 'jq -r .invocation "$F" | grep -qF -- "--token=<redacted>" && ! grep -qF abc123 "$F"'
+yes_ "B8 the token in --argv is redacted in the file, as in what is sent" 'grep -qF -- "--token=<redacted>" <<<"$(jq -r .invocation "$F")" && ! grep -qF abc123 "$F"'
 chk "B9 the description is the caller's own text" "$WHAT" "$(jq -r .what "$F")"
 perm=$(stat -c %a "$F")
 chk "B10 the file is private to whoever saved it (0600)" 600 "$perm"
