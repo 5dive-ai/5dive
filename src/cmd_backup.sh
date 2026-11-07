@@ -85,9 +85,13 @@ usage: 5dive backup <command>
 Nightly encrypted copy of this box's agents in Cloudflare R2, outside the
 server provider. Only the owner holds the key (the recovery code).
 
-  enable [--auto]       set up and schedule the nightly backup (root). Makes the
+  enable [--auto] [--new-key]
+                        set up and schedule the nightly backup (root). Makes the
                         key, sends the owner the recovery code once. --auto: the
                         unattended form the nightly update runs; it never fails it.
+                        A box whose owner already has a backup waits for a restore
+                        instead; --new-key starts a new key anyway (the owner lost
+                        the old code and gives up those backups).
   run                   back up now (root; the nightly job runs this)
   status [--json]       last backup, its result, and whether it is scheduled
   code                  show the recovery code again (root)
@@ -178,6 +182,13 @@ _bk_repo_probe() {   # <password file>
   local rc=0; _bk_r "$1" cat config >/dev/null 2>&1 || rc=$?
   return "$rc"
 }
+# Re-key a repository: the new password opens it, every other key is removed.
+_bk_rekey() {   # <password file that opens it now> <new password file>
+  _bk_r "$1" key add --new-password-file "$2" >/dev/null 2>&1 || return 1
+  local ids id; ids=$(_bk_r "$2" key list --json 2>/dev/null | jq -r '.[] | select(.current | not) | .id') || return 1
+  for id in $ids; do _bk_r "$2" key remove "$id" >/dev/null 2>&1 || return 1; done
+  _bk_repo_probe "$2" && ! _bk_repo_probe "$1"
+}
 
 # ---- the API ------------------------------------------------------------------
 
@@ -242,7 +253,7 @@ cmd_backup_status() {
   if [[ "$st" != "{}" ]]; then
     jq -r '"last run: \(.lastRunAt) \(if .ok then "ok" else "FAILED: \(.error)" end)", "last good backup: \(.lastOkAt // "never")"' <<<"$st"
   fi
-  [[ "$state" == restore-available ]] && echo "an earlier backup of this box exists: restore it with 5dive backup restore --code=<recovery code>"
+  [[ "$state" == restore-available ]] && echo "an earlier backup of this owner's server exists: restore it with 5dive backup restore --code=<recovery code> --from=<box-N> (5dive backup sources lists them)"
   return 0
 }
 
@@ -311,8 +322,9 @@ _bk_enable_fail() {   # <auto> <code> <msg> — --auto never fails the nightly u
 
 cmd_backup_enable() {
   require_root
-  local auto=0 a
-  for a in "$@"; do case "$a" in --auto) auto=1 ;; --json) JSON_MODE=1 ;; *) fail "$E_USAGE" "unknown flag: $a" ;; esac; done
+  local auto=0 newkey=0 a
+  for a in "$@"; do case "$a" in --auto) auto=1 ;; --new-key) newkey=1 ;; --json) JSON_MODE=1 ;; *) fail "$E_USAGE" "unknown flag: $a" ;; esac; done
+  (( auto && newkey )) && fail "$E_USAGE" "--new-key is the owner's choice; the unattended --auto never makes it"
   local dir s; dir=$(_bk_dir); s=$(_bk_state); mkdir -p "$s" "$dir"; chmod 0700 "$dir"
   _bk_restic_install || { _bk_enable_fail "$auto" "$E_NOT_INSTALLED" "could not install restic ${BACKUP_RESTIC_VERSION}"; return 0; }
   local why; why=$(_bk_enroll) || { _bk_enable_fail "$auto" "$E_GENERIC" "the 5dive API did not give this box backup storage (${why:-http ${BK_HTTP:-?}})"; return 0; }
@@ -327,8 +339,10 @@ cmd_backup_enable() {
       *) _bk_enable_fail "$auto" "$E_GENERIC" "backup storage unreachable (restic rc $rc)"; return 0 ;;
     esac
   else
-    # No key here. A backup already in this box's place means this is a fresh
-    # box of an owner who has one: never start a new key over it.
+    # No key here. A backup already under this OWNER's prefix (this box's place,
+    # or an earlier box's: a fresh box gets a new server id) means the owner
+    # has a key already. Never make a second one over it, and never DM a second
+    # code an owner in a disaster could save over the only one that opens it.
     local probe; probe=$(mktemp); printf 'x' >"$probe"
     _bk_repo_probe "$probe" || rc=$?; rm -f "$probe"
     if [[ $rc -eq 12 || $rc -eq 0 ]]; then
@@ -337,6 +351,13 @@ cmd_backup_enable() {
       return 0
     fi
     [[ $rc -eq 10 ]] || { _bk_enable_fail "$auto" "$E_GENERIC" "backup storage unreachable (restic rc $rc)"; return 0; }
+    local repos; repos=$(_bk_list_repos) || { _bk_enable_fail "$auto" "$E_GENERIC" "could not list this owner's earlier backups, so no key was made"; return 0; }
+    if [[ -n "$repos" ]] && (( ! newkey )); then
+      echo restore-available >"$s/state"
+      echo "backup: this owner already has a backup ($(paste -sd, <<<"$repos")). Restore it: 5dive backup restore --code=<recovery code> --from=$(tail -n 1 <<<"$repos")"
+      echo "backup: or, if the code is lost, start over with a new key: 5dive backup enable --new-key"
+      return 0
+    fi
     local code; code=$(_bk_code_new) || { _bk_enable_fail "$auto" "$E_GENERIC" "could not make a key"; return 0; }
     _bk_write0600 "$dir/key" "$code" || { _bk_enable_fail "$auto" "$E_GENERIC" "could not save the key"; return 0; }
     _bk_r "$dir/key" init >/dev/null 2>&1 || { _bk_enable_fail "$auto" "$E_GENERIC" "could not create the backup repository"; return 0; }
@@ -372,12 +393,12 @@ cmd_backup_run() {
   fi
   if [[ "$(cat "$s/state" 2>/dev/null)" == restore-available ]]; then
     _bk_env_load >/dev/null 2>&1 || true
-    _bk_report false "waiting for the owner's recovery code to restore an earlier backup" "" ""
+    _bk_report false "waiting for the owner's recovery code to restore an earlier backup (5dive backup restore), or 5dive backup enable --new-key" "" ""
     return 0
   fi
   exec 9>"$s/run.lock"; flock -n 9 || fail "$E_CONFLICT" "a backup is already running"
   local log; log=$(_bk_log); mkdir -p "$(dirname "$log")" 2>/dev/null || true
-  local err="" bytes="" snap="" rc=0 out
+  local err="" bytes="" snap="" rc=0 out errf
   if [[ ! -r "$dir/key" ]]; then
     err="no backup key on this box"
   elif ! _bk_enroll >/dev/null; then
@@ -390,7 +411,9 @@ cmd_backup_run() {
     local ex=() e p paths=()
     for e in "${BACKUP_EXCLUDES[@]}"; do ex+=(--exclude "$e"); done
     for p in "${BACKUP_PATHS[@]}"; do [[ -e "$p" ]] && paths+=("$p"); done
-    out=$(_bk_r "$dir/key" backup --json --exclude-caches "${ex[@]}" "${paths[@]}" 2>>"$log") || rc=$?
+    errf=$(mktemp)
+    out=$(_bk_r "$dir/key" backup --json --exclude-caches "${ex[@]}" "${paths[@]}" 2>"$errf") || rc=$?
+    cat "$errf" >>"$log" 2>/dev/null
     # rc 3 = some files could not be read (a socket, a file gone mid-run): the
     # snapshot is still written and usable.
     if [[ $rc -eq 0 || $rc -eq 3 ]]; then
@@ -403,8 +426,11 @@ cmd_backup_run() {
         (( fr )) && printf '%s forget rc=%s (snapshot %s is safe)\n' "$(date -u +%FT%TZ)" "$fr" "$snap" >>"$log"
       fi
     else
-      err="restic backup failed (rc $rc): $(tail -n 1 "$log" 2>/dev/null | cut -c1-300)"
+      # The error is THIS run's restic stderr, never an older line of the log.
+      local last; last=$(grep -v '^[[:space:]]*$' "$errf" 2>/dev/null | tail -n 1 | cut -c1-300)
+      err="restic backup failed (rc $rc): ${last:-restic printed no error}"
     fi
+    rm -f "$errf"
   fi
   local ok=true; [[ -n "$err" ]] && ok=false
   _bk_status_write "$ok" "$err" "${bytes:-0}" "$snap"
@@ -419,13 +445,17 @@ cmd_backup_run() {
 
 # The repositories under this owner's prefix (box-<id>/), via S3 ListObjectsV2.
 # The credential and session token reach curl from a 0600 config file, not argv.
+# Non-zero when the listing itself failed: an empty answer is "no backups", a
+# failed one is "unknown", and a caller deciding whether to make a key must
+# never read the second as the first.
 _bk_list_repos() {
-  local cfg; cfg=$(mktemp) || return 1; chmod 0600 "$cfg"
+  local cfg out rc=0; cfg=$(mktemp) || return 1; chmod 0600 "$cfg"
   printf 'user = "%s:%s"\nheader = "x-amz-security-token: %s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_SESSION_TOKEN" >"$cfg"
   local u="${BK_ENDPOINT%/}/${BK_BUCKET}?list-type=2&delimiter=%2F&prefix=${BK_PREFIX//\//%2F}"
-  curl -sS --max-time 30 --aws-sigv4 "aws:amz:auto:s3" -K "$cfg" "$u" 2>/dev/null \
-    | grep -oE "<Prefix>${BK_PREFIX}box-[0-9]+/</Prefix>" | sed -E 's#.*(box-[0-9]+)/</Prefix>#\1#'
+  out=$(curl -sS --fail --max-time 30 --aws-sigv4 "aws:amz:auto:s3" -K "$cfg" "$u" </dev/null 2>/dev/null) || rc=$?
   rm -f "$cfg"
+  [[ $rc -eq 0 && "$out" == *"<ListBucketResult"* ]] || return 1
+  { grep -oE "<Prefix>${BK_PREFIX}box-[0-9]+/</Prefix>" <<<"$out" || true; } | sed -E 's#.*(box-[0-9]+)/</Prefix>#\1#' | sort -t- -k2,2n
 }
 cmd_backup_sources() {
   require_root
@@ -529,6 +559,21 @@ cmd_backup_restore() {
   for n in "${names[@]}"; do systemctl stop "5dive-agent@${n}.service" >/dev/null 2>&1 || true; done
   _bk_restore_apply "$stage" "$(_bk_root)" || { rm -f "$pw"; fail "$E_GENERIC" "copying the restored files into place failed; the staged copy is at $stage"; }
   # The restored key becomes this box's key: later backups use the owner's code.
+  # Back up from here on: into THIS box's own repository, opened by the owner's
+  # code. If that place already holds a repository under another key (one this
+  # box made before the restore), re-key it with the box's old key; if nothing
+  # here opens it, say backups are NOT running instead of claiming they are.
+  _bk_env_load || true
+  local own_err="" prc=0
+  _bk_repo_probe "$pw" || prc=$?
+  case "$prc" in
+    0) ;;
+    10) _bk_r "$pw" init >/dev/null 2>&1 || own_err="could not create this box's backup repository $BK_REPO" ;;
+    12) if ! { [[ -r "$dir/key" ]] && _bk_repo_probe "$dir/key" && _bk_rekey "$dir/key" "$pw"; }; then
+          own_err="$BK_REPO already holds a backup under a different key, and nothing on this box opens it"
+        fi ;;
+    *) own_err="backup storage unreachable (restic rc $prc)" ;;
+  esac
   _bk_write0600 "$dir/key" "$norm"; rm -f "$pw"
   date -u +%FT%TZ >"$s/code-delivered"   # the owner just typed it
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -536,12 +581,17 @@ cmd_backup_restore() {
     systemctl enable "5dive-agent@${n}.service" >/dev/null 2>&1 || true
     systemctl restart "5dive-agent@${n}.service" >/dev/null 2>&1 || warn "agent $n did not start; 5dive doctor shows why"
   done
-  # Back up from here on: into this box's own repository with the same key.
-  _bk_env_load || true
-  local prc=0; _bk_repo_probe "$dir/key" || prc=$?
-  [[ $prc -eq 10 ]] && _bk_r "$dir/key" init >/dev/null 2>&1
   _bk_cron_install; echo on >"$s/state"
   rm -rf "$stage"
-  if (( JSON_MODE )); then jq -cn --arg f "$src" --argjson n "${#names[@]}" '{ok:true, restoredFrom:$f, agents:$n}'
+  if [[ -n "$own_err" ]]; then
+    _bk_status_write false "$own_err" 0 ""
+    _bk_report false "$own_err" "" ""
+    printf '%s restore from %s ok; nightly backups NOT running: %s\n' "$(date -u +%FT%TZ)" "$src" "$own_err" >>"$(_bk_log)" 2>/dev/null || true
+  fi
+  if (( JSON_MODE )); then jq -cn --arg f "$src" --argjson n "${#names[@]}" --arg r "$BK_REPO" --arg e "$own_err" \
+      '{ok:true, restoredFrom:$f, agents:$n, backupRepo:$r, backups:($e==""), backupError:(if $e=="" then null else $e end)}'
+  elif [[ -n "$own_err" ]]; then
+    echo "restored $src: ${#names[@]} agent(s) back"
+    echo "WARNING: nightly backups are NOT running: $own_err" >&2
   else echo "restored $src: ${#names[@]} agent(s) back; nightly backups continue as $BK_REPO"; fi
 }
