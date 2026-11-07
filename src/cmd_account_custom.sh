@@ -163,7 +163,8 @@ cmd_account_add_custom() {
   # DIVE-7659: the same call the office panel makes (cmd_local_panel.sh agent-add).
   # agent create defaults to channels=none, so without --channels=dashboard the
   # new agent has no chat at all, in the office chat or in 5dive.app. Only for a
-  # harness that has a web chat; pi and opencode take no chat channel.
+  # harness that has a web chat; every custom harness has one since pi and
+  # opencode joined (DIVE-7348), the check stays for a future one without.
   local chat_flag=""
   type_has_web_chat "$harness" && chat_flag=" --channels=dashboard"
   ok "account '$name' saved: ${harness} on ${url} (model ${model})${key:+, with a key}. New agent: sudo 5dive agent create <name> --type=${harness} --auth-profile=${name}${chat_flag}" \
