@@ -48,12 +48,12 @@ reset() {
   export FIVE_CONNECTORD_ENV="$TMP/w/etc/connectord.env" FIVE_API_BASE_FILE="$TMP/none" FIVE_API_BASE="https://api.test"
   printf 'CONNECTORD_TOKEN=boxtok_SECRET123\n' >"$FIVE_CONNECTORD_ENV"
   REGISTRY="$TMP/w/state/agents.json"; printf '{"agents":{"ava":{}}}' >"$REGISTRY"
-  : >"$TMP/curl.argv"; : >"$TMP/curl.stdin"; : >"$TMP/curl.body"; : >"$TMP/restic.argv"; : >"$TMP/tg"; : >"$TMP/restic.pw"
+  : >"$TMP/curl.argv"; : >"$TMP/curl.stdin"; : >"$TMP/curl.body"; : >"$TMP/restic.argv"; : >"$TMP/tg"; : >"$TMP/restic.pw"; : >"$TMP/restic.sess"
   export RESTIC_PROBE_RC=10 RESTIC_BACKUP_RC=0 T="$TMP"
   # restic stub: logs the repository + argv, and the password it was given.
   cat >"$FIVE_BACKUP_RESTIC" <<'EOF'
 #!/usr/bin/env bash
-printf '%s %s\n' "${RESTIC_REPOSITORY:-}" "$*" >>"$T/restic.argv"
+printf '%s %s\n' "${RESTIC_REPOSITORY:-}" "$*" >>"$T/restic.argv"; printf '%s\n' "${AWS_SESSION_TOKEN:-}" >>"$T/restic.sess"
 [[ -n "${RESTIC_PASSWORD_FILE:-}" ]] && printf 'pw=%s mode=%s\n' "$(cat "$RESTIC_PASSWORD_FILE")" "$(stat -c %a "$RESTIC_PASSWORD_FILE")" >>"$T/restic.pw"
 case " $* " in
   *" cat config"*) [[ "$(cat "$RESTIC_PASSWORD_FILE")" == "${RESTIC_GOOD_PW:-}" ]] && exit 0; exit "$RESTIC_PROBE_RC" ;;
@@ -73,7 +73,7 @@ esac
 exit 0
 EOF
   chmod +x "$FIVE_BACKUP_RESTIC"
-  ENROLL_BODY='{"endpoint":"https://acct.r2.cloudflarestorage.com","bucket":"5dive-bk-0123456789abcdef01234567","accessKeyId":"AKID1","secretAccessKey":"deadbeef","region":"auto","serverId":42}'
+  ENROLL_BODY='{"endpoint":"https://acct.eu.r2.cloudflarestorage.com","bucket":"5dive-box-backups","prefix":"o-0123456789abcdef01234567/","accessKeyId":"AKID1","secretAccessKey":"deadbeef","sessionToken":"sess.TOKEN_1","region":"auto","serverId":42}'
   ENROLL_HTTP=200
 }
 # curl stub: argv, stdin (the auth header) and the body. Writes the answer to -o.
@@ -117,7 +117,8 @@ K=$(code_on_box)
 check "enable: rc 0" '[[ $(rc) == 0 ]]'
 check "enable: the key file is 0600 and holds a valid code" '[[ $(stat -c %a "$FIVE_BACKUP_DIR/key") == 600 && -n "$(_bk_code_normalize "$K")" ]]'
 check "enable: r2.env is 0600 and names repo box-42" '[[ $(stat -c %a "$FIVE_BACKUP_DIR/r2.env") == 600 ]] && grep -q "^BACKUP_REPO=box-42$" "$FIVE_BACKUP_DIR/r2.env"'
-check "enable: the repository is this owner's bucket, path box-42" 'grep -q "^s3:https://acct.r2.cloudflarestorage.com/5dive-bk-0123456789abcdef01234567/box-42 .* init" "$TMP/restic.argv"'
+check "enable: the repository is box-42 under this owner's prefix" 'grep -q "^s3:https://acct.eu.r2.cloudflarestorage.com/5dive-box-backups/o-0123456789abcdef01234567/box-42 .* init" "$TMP/restic.argv"'
+check "enable: restic got the temporary credential's session token" 'grep -qx "sess.TOKEN_1" "$TMP/restic.sess"'
 check "enable: restic got the key via a 0600 password file" 'grep -q "^pw=$K mode=600$" "$TMP/restic.pw"'
 check "enable: cron scheduled nightly as root" 'grep -qE "^[0-9]+ [2-4] \* \* \* root /usr/local/bin/5dive backup run" "$FIVE_BACKUP_CRON"'
 check "enable: the owner got the code in a DM, with the no-recovery warning" 'grep -q "chat=1234567890" "$TMP/tg" && grep -q "$(_bk_code_pretty "$K")" "$TMP/tg" && grep -q "nobody can restore" "$TMP/tg"'
@@ -141,11 +142,16 @@ check "rollout: a box with no 5dive identity is left alone" '[[ $(rc) == 0 && ! 
 # --- enrol refusals -------------------------------------------------------------
 reset; ENROLL_BODY='{"endpoint":"https://acct.r2.cloudflarestorage.com","bucket":"../other-box","accessKeyId":"A","secretAccessKey":"b","serverId":42}'; run enable
 check "a malformed enrol answer writes no storage settings and no key" '[[ $(rc) != 0 && ! -e "$FIVE_BACKUP_DIR/r2.env" && ! -e "$FIVE_BACKUP_DIR/key" ]]'
+for bad in '"prefix":"../o-x/"' '"prefix":""' '"sessionToken":"a$(id)"' '"sessionToken":"a b"'; do
+  reset; ENROLL_BODY=$(jq -c ". + {${bad}}" <<<"$ENROLL_BODY"); run enable
+  check "a malformed enrol answer ($bad) writes nothing" '[[ $(rc) != 0 && ! -e "$FIVE_BACKUP_DIR/r2.env" && ! -e "$FIVE_BACKUP_DIR/key" ]]'
+done
 reset; ENROLL_HTTP=503; ENROLL_BODY='{"code":"backup_not_configured"}'; run enable --auto
 check "--auto: an unready API never fails the caller, and says why" '[[ $(rc) == 0 ]] && grep -q "backup_not_configured" "$FIVE_BACKUP_LOG"'
 
 # --- run -------------------------------------------------------------------------
-reset; ( cmd_backup enable ) >/dev/null 2>&1; K=$(code_on_box); : >"$TMP/curl.body"; run run
+reset; ( cmd_backup enable ) >/dev/null 2>&1; K=$(code_on_box); : >"$TMP/curl.body"; : >"$TMP/curl.argv"; run run
+check "run: re-enrols first (the credential lives 36 h)" '[[ $(grep -c "/enroll" "$TMP/curl.argv") -ge 1 ]]'
 check "run: ok, snapshot recorded in status.json" '[[ $(rc) == 0 ]] && jq -e ".ok == true and .snapshot == \"abc123\"" "$FIVE_BACKUP_STATE/status.json" >/dev/null'
 check "run: reported ok to the API with the snapshot" 'grep -q "\"ok\":true" "$TMP/curl.body" && grep -q abc123 "$TMP/curl.body"'
 check "run: caches and the key dir are excluded" 'grep -q -- "--exclude node_modules" "$TMP/restic.argv" && grep -q -- "--exclude /etc/5dive/backup" "$TMP/restic.argv"'
@@ -168,7 +174,7 @@ run restore --code=abcd-efgh-jklm-npqr-stuv-wxyz-2345
 check "restore without --yes only checks the key" '[[ $(rc) == 0 && ! -e "$FIVE_BACKUP_ROOT/home" ]] && grep -q "opens box-42" "$TMP/out"'
 : >"$TMP/sys"; : >"$TMP/restic.argv"; run restore --code=abcd-efgh-jklm-npqr-stuv-wxyz-2345 --from=box-7 --yes
 check "restore: rc 0" '[[ $(rc) == 0 ]] || { cat "$TMP/out"; false; }'
-check "restore: read from the named box's repository" 'grep -q "^s3:https://acct.r2.cloudflarestorage.com/5dive-bk-0123456789abcdef01234567/box-7 .*restore latest" "$TMP/restic.argv"'
+check "restore: read from the named box's repository, under the owner's prefix" 'grep -q "^s3:https://acct.eu.r2.cloudflarestorage.com/5dive-box-backups/o-0123456789abcdef01234567/box-7 .*restore latest" "$TMP/restic.argv"'
 check "restore: the agent's memory is back" 'grep -q "blue door" "$FIVE_BACKUP_ROOT/home/agent-ava/MEMORY.md"'
 check "restore: its bot connector and unit drop-in are back" '[[ -f "$FIVE_BACKUP_ROOT/etc/5dive/connectors/telegram-ava.env" && -f "$FIVE_BACKUP_ROOT/etc/systemd/system/$UNIT_D/x.conf" ]]'
 check "IDENTITY: the old box's token never overwrites the new box's" 'grep -q NEW_BOX "$FIVE_BACKUP_ROOT/etc/5dive/connectord.env"'

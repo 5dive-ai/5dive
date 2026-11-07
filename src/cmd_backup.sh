@@ -13,16 +13,18 @@
 # DM from the box's own bot. If an owner loses both the box and the code, nobody
 # can restore it, 5dive included. The message that carries the code says so.
 #
-# STORAGE ISOLATION is the API's job (5dive-api src/lib/r2-backup.ts): the box
-# enrols with its box identity (CONNECTORD_TOKEN, the DIVE-5168 rule: on curl's
-# stdin, never argv) and receives S3 credentials scoped by Cloudflare to ONE
-# bucket, its owner's. A box cannot name another bucket; the API derives it from
-# the authenticated box. Inside that bucket each box writes its own repository
-# `box-<server id>`, so a fresh box of the same owner can restore a named older one.
+# STORAGE ISOLATION is Cloudflare's, minted by the API (5dive-api
+# src/lib/r2-backup.ts): before every run the box enrols with its box identity
+# (CONNECTORD_TOKEN, the DIVE-5168 rule: on curl's stdin, never argv) and gets a
+# 36 h R2 temporary credential for its OWNER's prefix `o-<hash>/` in one shared
+# bucket, and nothing else. A box cannot name another prefix; the API derives it
+# from the authenticated box. Under that prefix each box writes its own restic
+# repository `box-<server id>`, so a fresh box of the same owner can restore a
+# named older one.
 #
 # Layout (FIVE_BACKUP_* are harness seams; nothing on a box sets them):
 #   /etc/5dive/backup/key      the recovery code, normalised (0600 root)
-#   /etc/5dive/backup/r2.env   endpoint, bucket, repo, S3 keys (0600 root)
+#   /etc/5dive/backup/r2.env   endpoint, bucket, prefix, repo, the current 36 h credential (0600 root)
 #   /var/lib/5dive/backup/     status.json, state, code-delivered, run.lock (not in the copy)
 #   /var/lib/5dive/backup-users.tsv  the agent users by uid, so a restore can recreate them
 #   /etc/cron.d/5dive-backup   the nightly run
@@ -158,14 +160,14 @@ _bk_restic_install() {
 _bk_env_load() {   # [repo override]
   local f; f="$(_bk_dir)/r2.env"
   [[ -r "$f" ]] || return 1
-  local R2_ENDPOINT="" R2_BUCKET="" BACKUP_REPO="" R2_ACCESS_KEY_ID="" R2_SECRET_ACCESS_KEY=""
+  local R2_ENDPOINT="" R2_BUCKET="" R2_PREFIX="" BACKUP_REPO="" R2_ACCESS_KEY_ID="" R2_SECRET_ACCESS_KEY="" R2_SESSION_TOKEN=""
   # shellcheck disable=SC1090
   source "$f"
-  [[ -n "$R2_ENDPOINT" && -n "$R2_BUCKET" && -n "$BACKUP_REPO" && -n "$R2_ACCESS_KEY_ID" ]] || return 1
-  export RESTIC_REPOSITORY="s3:${R2_ENDPOINT%/}/${R2_BUCKET}/${1:-$BACKUP_REPO}"
-  export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+  [[ -n "$R2_ENDPOINT" && -n "$R2_BUCKET" && -n "$R2_PREFIX" && -n "$BACKUP_REPO" && -n "$R2_ACCESS_KEY_ID" && -n "$R2_SESSION_TOKEN" ]] || return 1
+  export RESTIC_REPOSITORY="s3:${R2_ENDPOINT%/}/${R2_BUCKET}/${R2_PREFIX}${1:-$BACKUP_REPO}"
+  export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" AWS_SESSION_TOKEN="$R2_SESSION_TOKEN"
   export AWS_DEFAULT_REGION=auto
-  BK_ENDPOINT="$R2_ENDPOINT" BK_BUCKET="$R2_BUCKET" BK_REPO="$BACKUP_REPO"
+  BK_ENDPOINT="$R2_ENDPOINT" BK_BUCKET="$R2_BUCKET" BK_PREFIX="$R2_PREFIX" BK_REPO="$BACKUP_REPO"
 }
 _bk_r() {   # restic with the box key; <password file> <args...>
   local pw="$1"; shift
@@ -196,13 +198,14 @@ _bk_api() {   # <method> <path> [json body]  — body on stdout, sets BK_HTTP
 }
 _bk_enroll() {
   local j; j=$(_bk_api POST /enroll '{}') || { echo "$j" | jq -r '.code // empty' 2>/dev/null; return 1; }
-  local ep b ak sk sid
-  ep=$(jq -r '.endpoint // empty' <<<"$j"); b=$(jq -r '.bucket // empty' <<<"$j")
+  local ep b px ak sk st sid
+  ep=$(jq -r '.endpoint // empty' <<<"$j"); b=$(jq -r '.bucket // empty' <<<"$j"); px=$(jq -r '.prefix // empty' <<<"$j")
   ak=$(jq -r '.accessKeyId // empty' <<<"$j"); sk=$(jq -r '.secretAccessKey // empty' <<<"$j")
-  sid=$(jq -r '.serverId // empty' <<<"$j")
-  [[ "$ep" =~ ^https://[a-z0-9.-]+$ && "$b" =~ ^[a-z0-9-]{3,63}$ && "$ak" =~ ^[A-Za-z0-9]+$ \
-     && "$sk" =~ ^[A-Za-z0-9]+$ && "$sid" =~ ^[0-9]+$ ]] || return 1
-  _bk_write0600 "$(_bk_dir)/r2.env" "$(printf 'R2_ENDPOINT=%s\nR2_BUCKET=%s\nBACKUP_REPO=box-%s\nR2_ACCESS_KEY_ID=%s\nR2_SECRET_ACCESS_KEY=%s\n' "$ep" "$b" "$sid" "$ak" "$sk")"
+  st=$(jq -r '.sessionToken // empty' <<<"$j"); sid=$(jq -r '.serverId // empty' <<<"$j")
+  # Every value lands in a file `source`d as root: only shell-inert characters.
+  [[ "$ep" =~ ^https://[a-z0-9.-]+$ && "$b" =~ ^[a-z0-9-]{3,63}$ && "$px" =~ ^o-[0-9a-f]{24}/$ \
+     && "$ak" =~ ^[A-Za-z0-9]+$ && "$sk" =~ ^[A-Za-z0-9]+$ && "$st" =~ ^[A-Za-z0-9+/=._-]+$ && "$sid" =~ ^[0-9]+$ ]] || return 1
+  _bk_write0600 "$(_bk_dir)/r2.env" "$(printf 'R2_ENDPOINT=%s\nR2_BUCKET=%s\nR2_PREFIX=%s\nBACKUP_REPO=box-%s\nR2_ACCESS_KEY_ID=%s\nR2_SECRET_ACCESS_KEY=%s\nR2_SESSION_TOKEN=%s\n' "$ep" "$b" "$px" "$sid" "$ak" "$sk" "$st")"
 }
 _bk_report() {   # <ok true|false> <error> <bytes> <snapshot>
   local body; body=$(jq -cn --argjson ok "$1" --arg e "${2:0:500}" --arg b "${3:-0}" --arg s "${4:-}" --arg r "${BK_REPO:-}" \
@@ -312,9 +315,7 @@ cmd_backup_enable() {
   for a in "$@"; do case "$a" in --auto) auto=1 ;; --json) JSON_MODE=1 ;; *) fail "$E_USAGE" "unknown flag: $a" ;; esac; done
   local dir s; dir=$(_bk_dir); s=$(_bk_state); mkdir -p "$s" "$dir"; chmod 0700 "$dir"
   _bk_restic_install || { _bk_enable_fail "$auto" "$E_NOT_INSTALLED" "could not install restic ${BACKUP_RESTIC_VERSION}"; return 0; }
-  if [[ ! -r "$dir/r2.env" ]]; then
-    local why; why=$(_bk_enroll) || { _bk_enable_fail "$auto" "$E_GENERIC" "the 5dive API did not give this box backup storage (${why:-http ${BK_HTTP:-?}})"; return 0; }
-  fi
+  local why; why=$(_bk_enroll) || { _bk_enable_fail "$auto" "$E_GENERIC" "the 5dive API did not give this box backup storage (${why:-http ${BK_HTTP:-?}})"; return 0; }
   _bk_env_load || { _bk_enable_fail "$auto" "$E_GENERIC" "backup storage settings are unreadable"; return 0; }
   local rc=0
   if [[ -r "$dir/key" ]]; then
@@ -379,6 +380,8 @@ cmd_backup_run() {
   local err="" bytes="" snap="" rc=0 out
   if [[ ! -r "$dir/key" ]]; then
     err="no backup key on this box"
+  elif ! _bk_enroll >/dev/null; then
+    err="the 5dive API did not give this box backup storage (http ${BK_HTTP:-?})"
   elif ! _bk_env_load; then
     err="backup storage settings missing"
   else
@@ -414,15 +417,19 @@ cmd_backup_run() {
 
 # ---- sources ---------------------------------------------------------------------
 
-# The repositories in this owner's bucket (box-<id>/), via S3 ListObjectsV2.
+# The repositories under this owner's prefix (box-<id>/), via S3 ListObjectsV2.
+# The credential and session token reach curl from a 0600 config file, not argv.
 _bk_list_repos() {
-  local u="${BK_ENDPOINT%/}/${BK_BUCKET}?list-type=2&delimiter=%2F"
-  curl -sS --max-time 30 --aws-sigv4 "aws:amz:auto:s3" --user "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" "$u" 2>/dev/null \
-    | grep -oE '<Prefix>box-[0-9]+/</Prefix>' | sed -E 's#<Prefix>(box-[0-9]+)/</Prefix>#\1#'
+  local cfg; cfg=$(mktemp) || return 1; chmod 0600 "$cfg"
+  printf 'user = "%s:%s"\nheader = "x-amz-security-token: %s"\n' "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_SESSION_TOKEN" >"$cfg"
+  local u="${BK_ENDPOINT%/}/${BK_BUCKET}?list-type=2&delimiter=%2F&prefix=${BK_PREFIX//\//%2F}"
+  curl -sS --max-time 30 --aws-sigv4 "aws:amz:auto:s3" -K "$cfg" "$u" 2>/dev/null \
+    | grep -oE "<Prefix>${BK_PREFIX}box-[0-9]+/</Prefix>" | sed -E 's#.*(box-[0-9]+)/</Prefix>#\1#'
+  rm -f "$cfg"
 }
 cmd_backup_sources() {
   require_root
-  [[ -r "$(_bk_dir)/r2.env" ]] || _bk_enroll >/dev/null || fail "$E_GENERIC" "the 5dive API did not give this box backup storage"
+  _bk_enroll >/dev/null || fail "$E_GENERIC" "the 5dive API did not give this box backup storage"
   _bk_env_load || fail "$E_GENERIC" "backup storage settings are unreadable"
   local r; r=$(_bk_list_repos)
   [[ -n "$r" ]] || { echo "no backups yet"; return 0; }
@@ -496,7 +503,7 @@ cmd_backup_restore() {
   [[ "$snap" == latest || "$snap" =~ ^[0-9a-f]{8,64}$ ]] || fail "$E_VALIDATION" "--snapshot takes a snapshot id or latest"
   local dir s; dir=$(_bk_dir); s=$(_bk_state); mkdir -p "$s" "$dir"; chmod 0700 "$dir"
   _bk_restic_install || fail "$E_NOT_INSTALLED" "could not install restic ${BACKUP_RESTIC_VERSION}"
-  [[ -r "$dir/r2.env" ]] || _bk_enroll >/dev/null || fail "$E_GENERIC" "the 5dive API did not give this box backup storage"
+  _bk_enroll >/dev/null || fail "$E_GENERIC" "the 5dive API did not give this box backup storage"
   _bk_env_load "$from" || fail "$E_GENERIC" "backup storage settings are unreadable"
   local src="${from:-$BK_REPO}"
   local pw; pw=$(mktemp); chmod 0600 "$pw"; printf '%s' "$norm" >"$pw"
