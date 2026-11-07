@@ -267,13 +267,14 @@ claude_model_alias_known() {
 # claude_model_id_known <model> -> rc 0 when <model> (suffix stripped) is an id
 # this CLI has pinned for some family: model_latest or model_previous.
 claude_model_id_known() {
-  local m="${1:-}" fam
+  local m="${1:-}" fam fams
   m="${m%%\[*}"
   [[ "$m" == claude-* ]] || return 1
+  fams=$(model_families)
   while read -r fam; do
     [[ "$m" == "$(model_latest "$fam")" ]] && return 0
     grep -qxF -- "$m" <<<"$(model_previous "$fam")" && return 0
-  done < <(model_families)
+  done <<<"$fams"
   return 1
 }
 
