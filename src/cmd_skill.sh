@@ -94,6 +94,17 @@ _skill_read_result() {
   rm -f "$f"
 }
 
+# _skill_err_line <stderr-file> -> the installer's first `ERROR:` line, else its first
+# non-empty stderr line, one line, at most 200 chars (DIVE-7860). Empty if none.
+_skill_err_line() {
+  local f="$1" line=""
+  [[ -s "$f" ]] || return 0
+  line=$(grep -m1 '^ERROR:' "$f" 2>/dev/null || true)
+  [[ -n "$line" ]] || line=$(grep -m1 -v -e '^[[:space:]]*$' -e '^warn:' "$f" 2>/dev/null || true)
+  line=${line//$'\r'/}
+  printf '%s' "${line:0:200}"
+}
+
 cmd_skill_add() {
   local name="$1"; shift
   local source="" skill="" force=0
@@ -113,7 +124,7 @@ cmd_skill_add() {
   valid_skill_id "$skill" \
     || fail "$E_VALIDATION" "invalid skill id: '$skill'"
 
-  local user="agent-${name}" home="/home/agent-${name}"
+  local user="agent-${name}" home="${AGENT_HOME_ROOT:-/home}/agent-${name}"
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
 
@@ -169,13 +180,31 @@ cmd_skill_add() {
   if _skill_needs_manual_install "$type"; then
     local run_as="sudo -u $user -H"
     [[ "$isolation" == "sandboxed" ]] && run_as=""
-    if ! $run_as env HOME="$home" SOURCE="$source" SKILL="$skill" INSTALL_DIR="$install_dir" RESULT_FILE="$result_file" bash -s >&2 <<'SKILL_ADD_MANUAL'
+    # DIVE-7860: the skills dir itself must belong to the seat BEFORE anything runs as
+    # the seat. A root (sandboxed) run used to leave ~/.grok/skills root-owned; when
+    # isolation later resolved to standard, the seat's `rm -rf` emptied the skill but
+    # could not unlink it from the root-owned parent, `set -e` exited 1, and the seat
+    # kept an EMPTY skill dir every night (chill-gorge, 2026-11-01..07). Same helper
+    # the pack path got for the same dir in DIVE-7420. It refuses a link or a file
+    # component, and so do we: a root install must not follow one.
+    agent_owned_dir "$user" "$home" "$home/$install_dir" \
+      || fail "$E_VALIDATION" "skills dir $home/$install_dir is a link or not a directory — refusing to install '$skill' for agent '$name'"
+    # DIVE-7860: the installer's stderr is kept so its first ERROR:/stderr line can
+    # reach the caller and the audit row; before this the only record was `code 1`.
+    local err_file
+    err_file=$(mktemp -t skill-err-XXXXXX)
+    if ! $run_as env HOME="$home" SOURCE="$source" SKILL="$skill" INSTALL_DIR="$install_dir" RESULT_FILE="$result_file" bash -s >&2 2>"$err_file" <<'SKILL_ADD_MANUAL'
 set -euo pipefail
 unset CLAUDE_CONFIG_DIR
 cd "$HOME"
 TMPDIR=$(mktemp -d -t skill-XXXXXX)
 trap 'rm -rf "$TMPDIR"' EXIT
-timeout 60 git clone --depth=1 "https://github.com/$SOURCE.git" "$TMPDIR/repo" >/dev/null 2>&1
+# DIVE-7860: every failure after staging goes through _stage_die (indented: the bundle indexer reads column-0 `name() {` lines as module functions), which drops the staging dir.
+# (Not a second EXIT trap: the trap text above is a classified census entry.)
+STAGE=""; OLD=""
+  _stage_die() { [ -z "$STAGE" ] || rm -rf "$STAGE"; echo "ERROR: $*" >&2; exit 1; }
+timeout 60 git clone --depth=1 "https://github.com/$SOURCE.git" "$TMPDIR/repo" >/dev/null 2>&1 \
+  || { echo "ERROR: could not clone https://github.com/$SOURCE.git" >&2; exit 1; }
 # Read the commit off the clone while it's still around — the EXIT trap only
 # fires when this shell ends, but the manifest write below wants the sha.
 RESOLVED_SHA=$(/usr/bin/git -C "$TMPDIR/repo" rev-parse HEAD 2>/dev/null || echo "")
@@ -185,9 +214,27 @@ for d in "$TMPDIR/repo/$SKILL" "$TMPDIR/repo/skills/$SKILL"; do
 done
 [ -n "$SRC_DIR" ] || { echo "ERROR: skill '$SKILL' not found in $SOURCE (looked at top-level and skills/)" >&2; exit 1; }
 mkdir -p "$HOME/$INSTALL_DIR"
-rm -rf "$HOME/$INSTALL_DIR/$SKILL"
-cp -r "$SRC_DIR" "$HOME/$INSTALL_DIR/$SKILL"
-[ -d "$HOME/$INSTALL_DIR/$SKILL" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
+# DIVE-7860: stage the new copy as a sibling, then swap. The old copy is moved aside
+# only once the new one is complete, and put back if the swap fails, so a failed
+# install leaves the previous skill intact, never an empty dir. Dot-names keep the
+# staging dirs out of the skill listing.
+DEST="$HOME/$INSTALL_DIR/$SKILL"
+STAGE=$(mktemp -d "$HOME/$INSTALL_DIR/.$SKILL.new.XXXXXX") \
+  || _stage_die "cannot write to $INSTALL_DIR (owner: $(stat -c %U "$HOME/$INSTALL_DIR" 2>/dev/null || echo '?'))"
+chmod 755 "$STAGE" || _stage_die "cannot set the mode of the staged $SKILL"
+cp -r "$SRC_DIR/." "$STAGE/" || _stage_die "copy of $SKILL into $INSTALL_DIR failed"
+[ -f "$STAGE/SKILL.md" ] || _stage_die "staged $SKILL has no SKILL.md"
+if [ -e "$DEST" ] || [ -L "$DEST" ]; then
+  OLD="$HOME/$INSTALL_DIR/.$SKILL.old.$$"
+  mv -T "$DEST" "$OLD" || { OLD=""; _stage_die "cannot move the old $INSTALL_DIR/$SKILL aside"; }
+fi
+if ! mv -T "$STAGE" "$DEST"; then
+  [ -z "$OLD" ] || mv -T "$OLD" "$DEST" || true
+  _stage_die "cannot put the new $INSTALL_DIR/$SKILL in place (old copy restored)"
+fi
+STAGE=""
+[ -z "$OLD" ] || rm -rf "$OLD" || echo "warn: could not remove $OLD" >&2
+[ -f "$DEST/SKILL.md" ] || { echo "ERROR: $INSTALL_DIR/$SKILL missing after install" >&2; exit 1; }
 # DIVE-2282 manifest write. Absolute tool paths: the agent's PATH is whatever
 # its login shell/nvm left behind, and this must not depend on that.
 MANIFEST="$HOME/$INSTALL_DIR/.skills-manifest.json"
@@ -219,10 +266,23 @@ fi
 echo "manual-installed $SKILL → $HOME/$INSTALL_DIR/$SKILL"
 SKILL_ADD_MANUAL
     then
-      rm -f "$result_file"
-      fail "$E_GENERIC" "skill install failed for '$skill' on agent '$name'"
+      local err_line
+      err_line=$(_skill_err_line "$err_file")
+      cat "$err_file" >&2 2>/dev/null || true
+      rm -f "$result_file" "$err_file"
+      # The audit row the EXIT trap writes carries this (src/lib/audit.sh).
+      # shellcheck disable=SC2034  # read by on_exit_audit (src/lib/audit.sh)
+      AUDIT_ERROR="$err_line"
+      fail "$E_GENERIC" "skill install failed for '$skill' on agent '$name'${err_line:+: $err_line}"
     fi
-    [[ "$isolation" == "sandboxed" ]] && chown -R "${user}:${user}" "$home/$install_dir/$skill" "$home/$install_dir/.skills-manifest.json" 2>/dev/null || true
+    cat "$err_file" >&2 2>/dev/null || true
+    rm -f "$err_file"
+    # DIVE-7860: after a ROOT run, hand back the skills dir too (agent_owned_dir only
+    # touches components that are root-owned), not just the skill and the manifest.
+    if [[ "$isolation" == "sandboxed" ]]; then
+      agent_owned_dir "$user" "$home" "$home/$install_dir" || true
+      chown -R "${user}:${user}" "$home/$install_dir/$skill" "$home/$install_dir/.skills-manifest.json" 2>/dev/null || true
+    fi
     _skill_read_result "$result_file"
     ok "skill '$skill' installed for agent '$name'." \
        '{name:$n, source:$s, skill:$k, agent:$a, action:"add", strategy:"manual", changed:$ch, content_sha256:$cs, previous_content_sha256:$ps, resolved_sha:$rs}' \
@@ -353,12 +413,26 @@ SKILL_ADD
      --arg ps "$SKILL_RES_PREV" --arg rs "$SKILL_RES_RESOLVED"
 }
 
+# _skill_as_user <user> <cmd...> — run <cmd> as the seat. A seat reading its OWN
+# skills runs it directly (sudo to yourself needs a grant most seats do not have);
+# anyone else goes through `sudo -n`, which fails instead of prompting (DIVE-7860).
+_skill_as_user() {
+  local user="$1"; shift
+  if [[ "$(id -un 2>/dev/null)" == "$user" ]]; then
+    "$@"
+  else
+    sudo -n -u "$user" -H "$@"
+  fi
+}
+
 # _skill_list_json <name> -> prints the installed-skills JSON array for one
 # agent (always valid JSON, "[]" on any failure). Shared by the single-agent
 # `list` and the bulk `--all list` so both paths derive the list identically.
+# DIVE-7860: returns 3 (still printing "[]") when this caller may not read the
+# seat at all, so a refused sudo is never mistaken for "no skills installed".
 _skill_list_json() {
   local name="$1"
-  local user="agent-${name}" home="/home/agent-${name}"
+  local user="agent-${name}" home="${AGENT_HOME_ROOT:-/home}/agent-${name}"
   [[ -d "$home" ]] && id -u "$user" &>/dev/null || { echo "[]"; return; }
 
   local type agent_id install_dir
@@ -366,11 +440,18 @@ _skill_list_json() {
   agent_id="${SKILLS_AGENT_ID[$type]:-claude-code}"
   install_dir=$(skills_install_dir "$type")
 
+  # A probe that only asks "may I run as this seat at all". Both reads below swallow
+  # their own errors (a cold npx cache is normal), so without it a refusal and an
+  # empty skills dir printed the same "[]".
+  if ! _skill_as_user "$user" true >/dev/null 2>&1; then
+    echo "[]"; return 3
+  fi
+
   # `npx skills list --json` prints clean JSON when available. If the
   # skills CLI isn't reachable (no network, npx cache cold) we fall back
   # to a directory scan so the dashboard always has a list to render.
   local out
-  out=$(sudo -u "$user" -H bash -s 2>/dev/null <<'SKILL_LIST' || true
+  out=$(_skill_as_user "$user" bash -s 2>/dev/null <<'SKILL_LIST' || true
 set -uo pipefail
 unset CLAUDE_CONFIG_DIR
 export NVM_DIR="/home/claude/.nvm"
@@ -387,7 +468,7 @@ SKILL_LIST
     # Fallback: enumerate the per-type skills dir in the agent home. Marks
     # each entry with the agent_id we'd pass to `skills add` so callers can
     # tell which CLI a skill is bound to without re-deriving the type.
-    list=$(sudo -u "$user" env INSTALL_DIR="$install_dir" AGENT_ID="$agent_id" bash -c '
+    list=$(_skill_as_user "$user" env INSTALL_DIR="$install_dir" AGENT_ID="$agent_id" bash -c '
       shopt -s nullglob
       out="[]"
       for d in "$HOME"/"$INSTALL_DIR"/*/; do
@@ -403,12 +484,14 @@ SKILL_LIST
 
 cmd_skill_list() {
   local name="$1"; shift
-  local user="agent-${name}" home="/home/agent-${name}"
+  local user="agent-${name}" home="${AGENT_HOME_ROOT:-/home}/agent-${name}"
   [[ -d "$home" ]] || fail "$E_GENERIC" "agent home missing: $home"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
 
-  local list
-  list=$(_skill_list_json "$name")
+  local list rc=0
+  list=$(_skill_list_json "$name") || rc=$?
+  (( rc != 3 )) \
+    || fail "$E_PERMISSION" "needs root to read ${name}'s skills (sudo to $user was refused) — this is not an empty list"
 
   if (( JSON_MODE )); then
     jq -cn --argjson list "$list" --arg n "$name" \
@@ -435,7 +518,7 @@ cmd_skill_list_all() {
   # never discards the others already collected.
   local agents_json="{}" name list
   for name in $names; do
-    list=$(_skill_list_json "$name")
+    list=$(_skill_list_json "$name") || true
     agents_json=$(jq -c --arg n "$name" --argjson l "${list:-[]}" \
       '.[$n] = $l' <<<"$agents_json" 2>/dev/null || printf '%s' "$agents_json")
   done
