@@ -8,7 +8,9 @@
 # the bundle is self-contained on any box; written to /opt/5dive on first use.
 
 COS_ENV_DEFAULT="/etc/5dive/connectors/cos.env"
-COS_RUN_DIR="/opt/5dive"
+# Overridable for the harness only (DIVE-7861); sudo resets the environment, so
+# a root run always writes /opt/5dive.
+COS_RUN_DIR="${COS_RUN_DIR:-/opt/5dive}"
 
 _cos_resolve_bun() {
   local c
@@ -20,11 +22,27 @@ _cos_resolve_bun() {
   printf '/usr/local/bin/bun'
 }
 
+# DIVE-7861: can this caller write the runner dir? A seat without root used to
+# reach `mkdir`/`cat >` under `set -e` and die in the generic "exited 1 without
+# reporting a reason" banner, which tells the caller the effect is UNKNOWN.
+_cos_run_dir_writable() {
+  mkdir -p "$COS_RUN_DIR" 2>/dev/null && [[ -d "$COS_RUN_DIR" && -w "$COS_RUN_DIR" && -x "$COS_RUN_DIR" ]]
+}
+
+# Replace <path> with stdin only when the bytes differ (DIVE-7861: every call,
+# `verify` included, used to rewrite both files). Written beside the target and
+# renamed in, so a concurrent run never imports a half-written module.
+_cos_put() { # <path>  (content on stdin)
+  local t; t=$(mktemp "$1.XXXXXX")
+  cat >"$t"
+  if cmp -s "$t" "$1"; then rm -f "$t"; else chmod 644 "$t"; mv -f "$t" "$1"; fi
+}
+
 # Write the embedded TS modules to /opt/5dive (idempotent). cos-runner imports
 # ./cos-lib.ts so both must sit in the same dir.
 _cos_install_runner() {
   mkdir -p "$COS_RUN_DIR"
-  cat > "$COS_RUN_DIR/cos-lib.ts" <<'COS_LIB_TS'
+  _cos_put "$COS_RUN_DIR/cos-lib.ts" <<'COS_LIB_TS'
 // DIVE-320 — Chief of Staff (CoS) minting core.
 //
 // A CoS bot is a customer-owned Telegram bot with Bot Management Mode ON
@@ -180,7 +198,7 @@ export async function configureChild(
   return failed.length ? { ok: false, failed } : { ok: true };
 }
 COS_LIB_TS
-  cat > "$COS_RUN_DIR/cos-runner.ts" <<'COS_RUNNER_TS'
+  _cos_put "$COS_RUN_DIR/cos-runner.ts" <<'COS_RUNNER_TS'
 // DIVE-320 — thin CLI runner over cos-lib. Invoked by the bash `5dive agent cos`
 // command. Each subcommand prints a single JSON line on stdout (machine-readable
 // for the dashboard) and exits non-zero on failure.
@@ -369,7 +387,6 @@ try {
   out({ ok: false, detail: (e as Error).message });
 }
 COS_RUNNER_TS
-  chmod 644 "$COS_RUN_DIR/cos-lib.ts" "$COS_RUN_DIR/cos-runner.ts"
 }
 
 cmd_agent_cos() {
@@ -378,6 +395,12 @@ cmd_agent_cos() {
     fail "$E_USAGE" "usage: 5dive agent cos set|verify|mint-link|claim|rotate|set-avatar [--token=<tok>] [--suggested=<uname>] [--name=<agent>] [--agent=<name>] [--avatar=<png>] [--bot-id=<id>]" ;;
   esac
   local cos_env="${COS_ENV_FILE:-$COS_ENV_DEFAULT}"
+  # DIVE-7861: refuse BEFORE the runner is touched, with doctor's refusal (rc
+  # E_PERMISSION; a seat whose sudo grant covers this is re-run under it).
+  if ! _cos_run_dir_writable; then
+    (( EUID == 0 )) && fail "$E_PERMISSION" "cannot write the Chief of Staff runner to $COS_RUN_DIR (5dive agent cos $sub)"
+    require_root "agent cos $sub"
+  fi
   _cos_install_runner
   local bun; bun=$(_cos_resolve_bun)
 
