@@ -404,8 +404,9 @@ audit_log() {
   line=$(jq -cn \
     --arg ts "$ts" --arg u "$user" --arg c "$cmd" \
     --arg dv "$derived" --arg cl "$claimed" \
-    --arg r "$result" --argjson code "$code" \
+    --arg r "$result" --argjson code "$code" --arg er "${AUDIT_ERROR:-}" \
     --args '{ts:$ts, user:$u, cmd:$c, result:$r, code:($code|tonumber? // 0), args:$ARGS.positional}
+            + (if $er == "" then {} else {error:$er} end)
             + (if $dv == "" then {} else {derived:$dv} end)
             + (if $cl == "" then {} else {claimed:$cl} end)' \
     -- "${sanitized[@]+"${sanitized[@]}"}" 2>/dev/null) \
@@ -420,6 +421,10 @@ audit_log() {
 # they don't clutter the log.
 AUDIT_CMD=""
 declare -a AUDIT_ARGS=()
+# DIVE-7860: a handler that knows WHY it failed sets this one line before `fail`, and
+# the row then carries it as `error`. Opt-in per handler, never the raw `fail` text:
+# fail messages can echo caller tokens, and this file is readable by every seat.
+AUDIT_ERROR=""
 
 on_exit_audit() {
   local code=$?
