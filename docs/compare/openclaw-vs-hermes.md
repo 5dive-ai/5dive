@@ -35,7 +35,7 @@ curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
 ```
 
-A 1 GB server is enough to start. Link it to the free web app at [5dive.app/self-host](https://5dive.app/self-host). The code is at [github.com/5dive-ai/5dive](https://github.com/5dive-ai/5dive).
+A 1 GB server is enough to start. Link it to the web app at [5dive.ai/self-host](https://5dive.ai/self-host). The code is at [github.com/5dive-ai/5dive](https://github.com/5dive-ai/5dive).
 
 ---
 
@@ -45,3 +45,4 @@ More comparisons:
 
 - [Grok Bot vs OpenAI Dots vs 5dive](grok-bot-vs-openai-dots.md)
 - [Run Claude Code and Codex together](claude-code-and-codex-together.md)
+- [A self-hosted Grok Bot alternative](grok-bot-alternative.md)

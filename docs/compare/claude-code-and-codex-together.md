@@ -36,7 +36,7 @@ Every task lands on one shared list. An agent wakes only when work is waiting fo
 | Teamwork | One task list, handoffs, and a second agent that checks the work |
 | Switching | Move an agent from Claude Code to Codex and back, memory and tasks kept |
 | Usage | `sudo 5dive usage` shows who used your plan's limits |
-| Phone | Free web app at [5dive.app/self-host](https://5dive.app/self-host) |
+| Phone | Web app at [5dive.ai/self-host](https://5dive.ai/self-host) |
 
 The same team can also run Hermes, OpenClaw, OpenCode, Pi and more, or Claude Code on DeepSeek, Kimi or a local model.
 
@@ -46,3 +46,4 @@ More comparisons:
 
 - [Grok Bot vs OpenAI Dots vs 5dive](grok-bot-vs-openai-dots.md)
 - [OpenClaw vs Hermes Agent vs 5dive](openclaw-vs-hermes.md)
+- [A self-hosted Grok Bot alternative](grok-bot-alternative.md)
