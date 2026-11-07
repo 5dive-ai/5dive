@@ -125,6 +125,7 @@ imported() { # <label> <stdin> <args>... — "argv: …" then "mark: true|-"
   (
     cmd_create() {
       printf '%s\n' "$@" > "$rec"
+      printf '%s' "${FIVEDIVE_CREATE_AWAITS_AI:-unset}" > "$rec.awaits"
       local p=""; p=$(printf '%s\n' "$@" | sed -n 's/^--auth-profile=//p' | head -1)
       local r; r=$(registry_read)
       jq --arg n "$1" --arg p "$p" '.agents[$n] = ({type:"claude"} + (if $p == "" then {} else {authProfile:$p} end))' <<<"$r" | registry_write
@@ -186,6 +187,7 @@ box; TTY=0
 eq_t 'no terminal (the lead hires from chat): no prompt, the seat waits' \
   '--auth-profile=marcus defer mark=true' "$(imported notty '1\n2\nsk-ant-api03-x\n' --as=marcus)"
 grep -q 'How should' "$TMP/notty.out" && bad_t 'prompted off a terminal' '' || ok_t 'and nothing is asked'
+eq_t "...and create is told the seat waits for an AI (its self-check's advice reads this)" 1 "$(cat "$TMP/notty.argv.awaits")"
 box; TTY=1; JSON_MODE=1
 eq_t '--json at a terminal: never prompts, the seat waits' \
   '--auth-profile=marcus defer mark=true' "$(imported json '1\n2\nsk-ant-api03-x\n' --as=marcus)"
@@ -193,6 +195,7 @@ JSON_MODE=0
 box "$MP" "$KONST"; TTY=1
 eq_t 'two logins on the box (it has AI, the owner picks): not asked, not marked (NEGATIVE CONTROL)' \
   '--auth-profile=marcus defer mark=-' "$(imported two '1\n2\nsk-ant-api03-x\n' --as=marcus)"
+eq_t '...and create is NOT told it waits (NEGATIVE CONTROL)' 0 "$(cat "$TMP/two.argv.awaits")"
 box "$MP"; TTY=1
 eq_t "one login: its seat, as DIVE-7028 made it (create signs it in there; NEGATIVE CONTROL)" \
   '--auth-profile=mp defer mark=-' "$(imported one '1\n' --as=marcus)"
@@ -202,6 +205,26 @@ eq_t "init's shared login: its seat, as DIVE-7118 made it (NEGATIVE CONTROL)" \
 box; TTY=1
 eq_t 'an explicit --auth-profile is never second-guessed' \
   '--auth-profile=konst defer mark=-' "$(imported explicit '1\n' --as=marcus --auth-profile=konst)"
+
+echo "== 2b. create's self-check gives a waiting seat the right advice =="
+# The real line cmd_create's self-check prints for a deferred-auth seat (it
+# calls selfcheck_deferred_auth_issue; asserted below so the arms grade it).
+aw=$(FIVEDIVE_CREATE_AWAITS_AI=1 selfcheck_deferred_auth_issue claude marcus)
+[[ "$aw" == *'--auth-profile=marcus'* || "$aw" == *'auth login'* ]] \
+  && bad_t 'a waiting seat is told to log in on its own account' "$aw" \
+  || ok_t 'a waiting seat is not told `auth login … --auth-profile=marcus`'
+[[ "$aw" == *'starts by itself'* && "$aw" == *'sudo 5dive init'* ]] \
+  && ok_t '...it is told it starts by itself once an AI is added (sudo 5dive init)' || bad_t 'waiting-seat advice' "$aw"
+pl=$(FIVEDIVE_CREATE_AWAITS_AI=0 selfcheck_deferred_auth_issue claude marcus)
+[[ "$pl" == *'sudo 5dive agent auth login claude --auth-profile=marcus'* ]] \
+  && ok_t 'a plain --defer-auth seat still gets its login line (CONTROL)' || bad_t 'plain --defer-auth advice' "$pl"
+pl=$(unset FIVEDIVE_CREATE_AWAITS_AI; selfcheck_deferred_auth_issue claude marcus)
+[[ "$pl" == *'--auth-profile=marcus'* ]] \
+  && ok_t '...and so does one created with no word from import (CONTROL)' || bad_t 'unset advice' "$pl"
+grep -qF '_hc_issues+=("$(selfcheck_deferred_auth_issue "$type" "$profile")")' src/cmd_agent_create.sh \
+  && ok_t "create's self-check prints that line for a deferred-auth seat" || bad_t "create's self-check no longer calls selfcheck_deferred_auth_issue" ''
+grep -qF '( FIVEDIVE_CREATE_AWAITS_AI="$awaits_ai" cmd_create "${cargs[@]}" )' src/cmd_pack.sh \
+  && ok_t 'import passes its awaits-AI verdict to create' || bad_t 'import no longer tells create' ''
 
 echo '== 3. the first AI added afterwards moves every waiting seat =='
 MOVES="$TMP/moves"

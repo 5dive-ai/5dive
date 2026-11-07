@@ -3921,7 +3921,7 @@ cmd_import() {
   # Recreate via the canonical create path (its ok-envelope suppressed so import
   # emits a single envelope). The registry lock is reentrant, so this is safe.
   step "Recreating agent '$as' from pack (type=$type)"
-  ( cmd_create "${cargs[@]}" ) >/dev/null \
+  ( FIVEDIVE_CREATE_AWAITS_AI="$awaits_ai" cmd_create "${cargs[@]}" ) >/dev/null \
     || { rm -rf "$stage"; fail "$E_GENERIC" "create step failed while importing '$as'"; }
   # DIVE-7848: the seat waits for the box's first AI (see awaits_ai above).
   if (( awaits_ai )); then
