@@ -41,6 +41,36 @@ restart_push_openclaw_state() {
   return 0
 }
 
+# DIVE-7916: the OPERATOR verb. `agent restart X` brings X's unit up, so it
+# records the operator's intent the way `agent start` does (DIVE-857): after
+# `agent stop X; agent restart X` the registry used to keep desiredState=stopped
+# under a RUNNING unit, and every nightly update's restart for X was then held
+# forever (DIVE-4033's park guard, `_agent_is_parked`) while `agent list` said
+# ready. One seat ran an old release through eight nights that way.
+#
+# Only this entry point records intent. cmd_restart itself stays intent-neutral
+# because two INTERNAL callers reuse it and neither may un-park a seat:
+#   - supervisor rung 4 (cmd_supervisor.sh): a watchdog bounce of a hung seat.
+#     A watchdog that flips stopped -> running is exactly the "parked seat comes
+#     back on its own" consent problem DIVE-4033/4399/4409 closed.
+#   - `agent recover` (cmd_account.sh): the LEAD's narrow, sudo-less verb for a
+#     stuck seat. Un-parking a seat the owner stopped is `agent start`, a root
+#     verb, and the lead's grant must not widen into it.
+# main.sh routes `agent restart` here; nothing else calls it.
+cmd_restart_verb() {
+  local _restart_record_intent=1
+  cmd_restart "$@"
+}
+
+# The intent write. Same shape as cmd_start's; the caller already holds the
+# registry lock (main.sh wraps the verb in with_registry_lock).
+restart_record_running_intent() {
+  local name="$1" reg
+  reg=$(registry_read) || return 0
+  reg=$(jq --arg n "$name" '.agents[$n].desiredState = "running"' <<<"$reg") \
+    && echo "$reg" | registry_write
+}
+
 cmd_restart() {
   local name="" defer=0
   while [[ $# -gt 0 ]]; do
@@ -72,12 +102,19 @@ cmd_restart() {
     # restarting itself (e.g. after editing model/effort) doesn't SIGTERM the
     # restart mid-flight. AccuracySec keeps "~1s" from being up to a minute
     # (systemd's default timer slack, DIVE-7353).
+    # The deferred form records intent once the restart is SCHEDULED: the
+    # ~1s unit is what brings it up, and by the time it fires the caller may be
+    # gone (that is the reason --defer exists).
     systemd-run --on-active=1 --timer-property=AccuracySec=100ms --collect \
-      /bin/systemctl restart "5dive-agent@${name}.service" >&2
+      /bin/systemctl restart "5dive-agent@${name}.service" >&2 \
+      || fail "$E_GENERIC" "could not schedule the restart of agent '$name'."
+    (( ${_restart_record_intent:-0} )) && restart_record_running_intent "$name"
     ok "agent '$name' restart scheduled (deferred ~1s)." \
        '{name:$n, action:"restart", deferred:true}' --arg n "$name"
   else
-    systemctl restart "5dive-agent@${name}.service" >&2
+    systemctl restart "5dive-agent@${name}.service" >&2 \
+      || fail "$E_GENERIC" "systemctl could not restart agent '$name'."
+    (( ${_restart_record_intent:-0} )) && restart_record_running_intent "$name"
     ok "agent '$name' restarted." \
        '{name:$n, action:"restart"}' --arg n "$name"
   fi

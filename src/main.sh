@@ -861,7 +861,7 @@ _agent_verb_dispatch() {
           cmd_halt "$@" ;;
         restart)
           AUDIT_CMD="agent restart"; AUDIT_ARGS=("$@")
-          with_registry_lock cmd_restart "$@" ;;
+          with_registry_lock cmd_restart_verb "$@" ;;
         rm|fire)
           AUDIT_CMD="agent rm"; AUDIT_ARGS=("$@")
           with_registry_lock cmd_rm "$@" ;;
