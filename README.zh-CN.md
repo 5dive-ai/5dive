@@ -24,7 +24,7 @@
   <a href="SECURITY.md#signed-releases"><img src="https://img.shields.io/badge/signed%20releases-coming-lightgrey" alt="签名发布：即将推出"></a>
 </p>
 
-<p align="center">🔒 不收集任何遥测数据。你的 AI 密钥直接发送给你的 AI 服务商。<a href="SECURITY.md">安全说明</a></p>
+<p align="center">🔒 不收集任何遥测数据。你的智能体直接与你的 AI 服务商通信。<a href="SECURITY.md">安全说明</a></p>
 
 ```sh
 curl -fsSL https://install.5dive.ai | sudo bash

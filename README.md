@@ -24,7 +24,7 @@
   <a href="SECURITY.md#signed-releases"><img src="https://img.shields.io/badge/signed%20releases-coming-lightgrey" alt="Signed releases: coming"></a>
 </p>
 
-<p align="center">🔒 No telemetry. Your AI keys go straight to your AI provider. <a href="SECURITY.md">Security</a></p>
+<p align="center">🔒 No telemetry. Your agents talk straight to your AI provider. <a href="SECURITY.md">Security</a></p>
 
 ```sh
 curl -fsSL https://install.5dive.ai | sudo bash

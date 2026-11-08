@@ -4,7 +4,7 @@
 
 Use GitHub's private reporting: **[Report a vulnerability →](https://github.com/5dive-ai/5dive/security/advisories/new)**
 
-Please don't open a public issue. We reply within 3 business days.
+Please don't open a public issue.
 
 In scope: the `5dive` CLI, `install.sh`, the systemd units it ships, and the `5dive-ai/*` workflows. Bugs in the coding CLIs (`claude`, `codex`, ...), apt or Node go to their own maintainers.
 
@@ -16,7 +16,7 @@ In scope: the `5dive` CLI, `install.sh`, the systemd units it ships, and the `5d
 - Updates ask `api.5dive.com` for the newest version number and send nothing.
 - `agent import --report-import` sends the pack's name to count imports. It is off unless you add the flag.
 
-## If you link the 5dive phone app
+## If you link the 5dive app
 
 **5dive can:**
 
@@ -28,7 +28,7 @@ In scope: the `5dive` CLI, `install.sh`, the systemd units it ships, and the `5d
 
 - ❌ Read your AI keys, passwords or browser cookies on your server. A key you add in the app waits at 5dive only until your server picks it up (30 minutes at most). ([code](https://install.5dive.ai/link))
 - ❌ Open your files. Only files sent in the chat travel. ([code](https://github.com/5dive-ai/5dive/blob/e9ed52f5/src/cmd_dashboard_relay.sh#L137-L152))
-- ❌ Get in. Nothing listens on your server: it only calls out. ([code](https://install.5dive.ai/link))
+- ❌ Get in. The link opens no port on your server: it only calls out. ([code](https://install.5dive.ai/link))
 
 Leave any time:
 
