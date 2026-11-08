@@ -87,12 +87,18 @@ NPM
   # `_` in x86_64 is what the first regex rejected, so every fixture has it.
   mkdir -p "$CR"/{0.157.1$TT,0.158.0$TT,0.159.0$TT,0.160.0$TT,0.162.1$TT,.tmp-staging}
   for v in 0.157.1$TT 0.158.0$TT 0.159.0$TT 0.160.0$TT 0.162.1$TT .tmp-staging; do head -c 65536 /dev/zero >"$CR/$v/codex"; done
-  cp /bin/sleep "$CR/0.158.0$TT/codex-held"
+  # DIVE-7940: copy BASH, not sleep. On ubuntu-26.04 runners /bin/sleep is a
+  # multi-call coreutils binary that dispatches on its own name, so a copy named
+  # codex-held printed "coreutils: unknown program" and no holder ever ran.
+  # bash runs under any name; it waits on a builtin read of an O_RDWR fifo, so
+  # no child replaces it and exe + map stay on the copied file.
+  cp /bin/bash "$CR/0.158.0$TT/codex-held"
+  mkfifo "$TMP/codex-held.fifo"
   ln -s releases/0.160.0$TT "$TMP/home/.codex/packages/app-server-daemon/current"
   mkdir -p "$TMP/home/.codex/packages/standalone/releases"/{0.1.0,0.2.0}
   echo x >"$TMP/home/.codex/packages/standalone/releases/0.1.0/codex"
   find "$TMP/home/.codex" -mindepth 1 -not -path "$CR/0.159.0$TT*" -exec touch -h -d '3 hours ago' {} +
-  ( exec -a codex-daemon "$CR/0.158.0$TT/codex-held" 300 ) & HOLDERS+=($!)
+  ( exec -a codex-daemon "$CR/0.158.0$TT/codex-held" -c 'read -r -t 300 _ <>"$1"' _ "$TMP/codex-held.fifo" ) & HOLDERS+=($!)
   # DIVE-6329 chrome-cache: what a pre-1.42.1 browser plugin left in ~/.cache.
   CC="$TMP/home/.cache"
   for d in tmp.DEADAAAAAA playwright_chromiumdev_profile-DEADBB tmp.HELDAAAAAA tmp.YOUNGAAAAA tmp.COOKIEAAAA tmp.ROOTFILEAA; do

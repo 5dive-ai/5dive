@@ -109,9 +109,10 @@ spawn_fake() { # spawn_fake <pidfile> <count> [ignore-term]
   : >"$f"
   for ((i=0;i<n;i++)); do
     if [[ -n "$ignore" ]]; then
-      setsid "$bin/chrome" -c 'trap "" TERM; exec "$0" 300' "$bin/agent-browser-linux-x64" >/dev/null 2>&1 &
+      setsid "$bin/chrome" -c 'trap "" TERM; exec "$0" -c "read -r -t 300 _ <>\"\$1\"" _ "$1"' \
+        "$bin/agent-browser-linux-x64" "$dir/hold.fifo" >/dev/null 2>&1 &
     else
-      setsid "$bin/agent-browser-linux-x64" 300 >/dev/null 2>&1 &
+      setsid "$bin/agent-browser-linux-x64" -c 'read -r -t 300 _ <>"$1"' _ "$dir/hold.fifo" >/dev/null 2>&1 &
     fi
     pid=$!
     echo "$pid" >>"$f"
@@ -142,7 +143,11 @@ arm_env() { # arm_env <name> -> prints the case dir, with stubs + dirs ready
   local dir="$TMP/$name" bin
   mkdir -p "$dir/bin" "$dir/home/.claude" "$dir/home/.5dive"
   bin="$(fake_bindir "$dir")"; mkdir -p "$bin"
-  cp /bin/sleep "$bin/agent-browser-linux-x64"; cp /bin/bash "$bin/chrome"
+  # DIVE-7940: the fake browser is a copy of BASH, not sleep -- on ubuntu-26.04
+  # /bin/sleep is multi-call coreutils and refuses to run under another name.
+  # It waits on a builtin read of its own O_RDWR fifo (see spawn_fake).
+  cp /bin/bash "$bin/agent-browser-linux-x64"; cp /bin/bash "$bin/chrome"
+  mkfifo "$dir/hold.fifo"
   mk_stubs "$dir/bin"
   : >"$dir/calls"; : >"$dir/pids"
   echo "$dir"
