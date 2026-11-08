@@ -149,8 +149,9 @@ pin_model() {
       # init already chose OR_MODEL; pinned again the way a person switches models.
       out=$(5dive agent config "$NAME" set "model=$OR_MODEL" 2>&1) || rc=$? ;;
     openclaw)
-      # `agent config set model=` refuses openclaw (init QA defect 6), so
-      # openclaw's own CLI, as the seat user, as a person would.
+      # openclaw's own CLI, as the seat user, as a person would. DIVE-7911: the
+      # restart below used to copy the account's Sonnet back over this pin, and
+      # the seat's turns went out as claude-sonnet-5-5; seat_model_arm grades it.
       out=$(sudo -u "agent-${NAME}" -H env "PATH=/home/claude/.local/bin:/usr/local/bin:/usr/bin:/bin" \
         openclaw models set "anthropic/$haiku" 2>&1) || rc=$?
       (( rc == 0 )) && { systemctl restart "5dive-agent@${NAME}" || rc=$?; } ;;
@@ -199,6 +200,38 @@ PY
 # Codex dispatcher, so it reads the same .env and drains the same inbox. A Codex
 # seat whose ~/.claude is not its own crash-looped that adapter for 14.5 h
 # unseen, because this arm was openclaw only.
+# DIVE-7911: the model the openclaw seat runs on after the pin and its restart,
+# read from the key a turn's model comes from (agents.defaults.model.primary in
+# the seat's own openclaw.json), so a pin the boot overwrites fails here, at pin.
+seat_model_arm() {
+  local home cfg got want
+  home=$(getent passwd "agent-${NAME}" | cut -d: -f6)
+  cfg="$home/.openclaw/openclaw.json"
+  want="anthropic/$(sed -n '/^model_latest()/,/^}/p' "$(command -v 5dive)" \
+    | sed -n 's/^[[:space:]]*haiku)[[:space:]]*printf .%s. "\([^"]*\)".*/\1/p' | head -1)"
+  got=$(jq -r '(.agents.defaults.model) as $m
+    | if ($m|type) == "object" then ($m.primary // "")
+      elif ($m|type) == "string" then $m else "" end' "$cfg" 2>/dev/null)
+  echo "seat model after the pin and restart: ${got:-<none>} (pinned $want)"
+  [[ "$got" == "$want" ]] && return 0
+  DETAIL="the openclaw seat was pinned to $want, but after its restart it runs ${got:-no model} ($cfg)"
+  return 1
+}
+
+# DIVE-7911: the model the turn itself went out on. openclaw names it in a
+# refused turn ("anthropic (claude-sonnet-5-5) returned a billing error") and in
+# the seat's session transcripts; a Sonnet there means the pin did not hold.
+turn_model_arm() {
+  local out="$1" home seen
+  home=$(getent passwd "agent-${NAME}" | cut -d: -f6)
+  seen=$( { printf '%s\n' "$out"; cat "$home"/.openclaw/agents/*/sessions/*.jsonl 2>/dev/null; } \
+    | grep -oE 'claude-(opus|sonnet|haiku|fable)-[0-9]+(-[0-9]+)?' | sort | uniq -c | tr -s ' ' | tr '\n' ';')
+  echo "models named by the turn (reply + session transcripts): ${seen:-none}"
+  [[ "$seen" != *claude-sonnet* && "$seen" != *claude-opus* ]] && return 0
+  STEP=pin DETAIL="the openclaw seat is pinned to Haiku, but its turn went out on another model: $seen"
+  return 1
+}
+
 cell_has_webchat() { case "$(cell_type "$1")" in openclaw|codex|hermes) return 0 ;; *) return 1 ;; esac; }
 
 FAKE_API_PORT=18999
@@ -438,6 +471,7 @@ run_arm() {
   step pin
   pin_model "$type" || { show_seat; finish fail; }
   seat_up || { DETAIL="the seat did not come back up after the model pin"; show_seat; finish fail; }
+  [[ "$type" == openclaw ]] && { seat_model_arm || { show_seat; finish fail; }; }
 
   step reply
   if (( PLACEHOLDER )); then
@@ -453,6 +487,9 @@ run_arm() {
   rc=0
   out=$(timeout 400 5dive agent ask "$NAME" "What is $a + $b? Reply with only the number." --timeout=300 2>&1) || rc=$?
   printf '%s\n' "$out" | tail -15
+  if [[ "$type" == openclaw ]]; then
+    turn_model_arm "$out" || { show_seat; finish fail; }
+  fi
   if grep -qw -- "$want" <<<"$out"; then
     echo "the agent answered $want"
     if cell_has_webchat "$CELL"; then

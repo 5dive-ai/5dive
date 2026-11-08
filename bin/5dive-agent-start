@@ -1487,10 +1487,31 @@ if isinstance(m, dict):
 elif isinstance(m, str):
     print(m)
 ' 2>/dev/null || true)"
-    if [[ -z "${AGENT_MODEL:-}" && -n "$PROFILE_DEFAULTS" && "$LOCAL_PRIMARY" != "$PROFILE_PRIMARY" ]]; then
-      printf '%s' "$PROFILE_DEFAULTS" \
-        | /home/claude/.local/bin/openclaw config patch --stdin >/dev/null 2>&1 \
-        || echo "warn: openclaw config patch (model defaults) failed" >&2
+    # DIVE-7911: copy the account's model only over a model the account put
+    # there. The stamp holds the account model this sync last left in the seat.
+    # A seat model that differs from it was set in the seat itself (`openclaw
+    # models set` as the seat user), and the old unconditional copy put Sonnet
+    # back over that Haiku pin on every restart. No stamp yet (a seat from
+    # before this, or a first boot) copies as before: an empty or built-in
+    # default is the DIVE-1900 failure this sync exists for.
+    OC_ACCOUNT_STAMP="$HOME/.openclaw/.5dive-account-model"
+    OC_STAMPED=""
+    [[ -f "$OC_ACCOUNT_STAMP" ]] && OC_STAMPED="$(head -n1 "$OC_ACCOUNT_STAMP" 2>/dev/null || true)"
+    OC_SEAT_PINNED=0
+    [[ -f "$OC_ACCOUNT_STAMP" && -n "$LOCAL_PRIMARY" && "$LOCAL_PRIMARY" != "$OC_STAMPED" ]] && OC_SEAT_PINNED=1
+    if [[ -z "${AGENT_MODEL:-}" && -n "$PROFILE_DEFAULTS" && "$LOCAL_PRIMARY" != "$PROFILE_PRIMARY" ]] \
+       && (( OC_SEAT_PINNED == 0 )); then
+      if printf '%s' "$PROFILE_DEFAULTS" \
+           | /home/claude/.local/bin/openclaw config patch --stdin >/dev/null 2>&1; then
+        LOCAL_PRIMARY="$PROFILE_PRIMARY"
+      else
+        echo "warn: openclaw config patch (model defaults) failed" >&2
+      fi
+    fi
+    if [[ -n "$PROFILE_PRIMARY" && "$LOCAL_PRIMARY" == "$PROFILE_PRIMARY" ]]; then
+      printf '%s\n' "$PROFILE_PRIMARY" > "$OC_ACCOUNT_STAMP" 2>/dev/null || true
+    elif (( OC_SEAT_PINNED )) && [[ -z "${AGENT_MODEL:-}" ]]; then
+      echo "openclaw: keeping this seat's own model $LOCAL_PRIMARY (its account's is ${PROFILE_PRIMARY:-unset})" >&2
     fi
   fi
   # DIVE-7333: the seat's own pin (`5dive agent config <name> set model=`) wins
