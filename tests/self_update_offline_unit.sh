@@ -127,7 +127,11 @@ declare -F version_lt >/dev/null || { bad_t "version_lt not extractable from src
 warn() { echo "warn: $*" >&2; }
 # shellcheck disable=SC1090
 . "$LIB"
-export OFFLINE_UPDATE_PUBKEY_FILE="$WORK/pub.pem"
+# DIVE-7921: this harness grades the PINNED-key path, so the box under test holds
+# no offline root (neither the compiled-in one nor a root file). The root chain a
+# shipped box takes is graded by offline_update_root_chain_unit.sh.
+OFFLINE_UPDATE_ROOT_PUBKEY_PEM=''
+export OFFLINE_UPDATE_PUBKEY_FILE="$WORK/pub.pem" OFFLINE_UPDATE_ROOT_PUBKEY_FILE="$WORK/no-root.pem"
 
 verify() { # <file> <installed> [allow-down] — prints the reason, rc of _ou_verify
   local st; st="$(mktemp -d "$WORK/st.XXXXXX")"; LAST_STAGE="$st"
@@ -271,7 +275,8 @@ curl -s --max-time 3 -o /dev/null https://github.com 2>/dev/null && { echo "NETN
 eval "\$(sed -n '/^version_lt() {/,/^}/p' "$ROOT/src/cmd_selfupdate.sh")"
 warn() { echo "warn: \$*" >&2; }
 . "$LIB"
-export OFFLINE_UPDATE_PUBKEY_FILE="$WORK/pub.pem"
+OFFLINE_UPDATE_ROOT_PUBKEY_PEM=''
+export OFFLINE_UPDATE_PUBKEY_FILE="$WORK/pub.pem" OFFLINE_UPDATE_ROOT_PUBKEY_FILE="$WORK/no-root.pem"
 st="\$(mktemp -d "$WORK/ns.XXXXXX")"
 _ou_verify "$GOOD" "\$st" 1.0.0 0 || { echo "NETNS: refused: \$_OU_WHY"; exit 1; }
 mkdir -p "$WORK/ns-fake"; mapfile -t ie < <(_ou_installer_env "\$st")
@@ -296,6 +301,7 @@ verb() { # <file> [args…] — runs cmd_self_update in a subshell; output in $W
     # shellcheck disable=SC1090,SC1091
     . "$ROOT/src/lib/error_codes.sh"; . "$ROOT/src/lib/output.sh"
     . "$LIB"; . "$ROOT/src/cmd_selfupdate.sh"
+    OFFLINE_UPDATE_ROOT_PUBKEY_PEM=''
     systemctl() { return 0; }; _team_bot_install_listener() { return 0; }
     local_only_on() { [[ "${VERB_LOCAL_ONLY:-1}" == 1 ]]; }
     export STATE_DIR="$WORK/vstate" HEALTH_GATE_BIN_DIR="$WORK/vbin" HEALTH_GATE_SYSTEMD_DIR="$WORK/vsys"
@@ -358,7 +364,8 @@ grep -q 'if ! offline_update && \[\[ "$_hp_help" == \*"plugin auto-upgrade"\* \]
 # Drop the signature check: the other-key arm must then go through, which is
 # what proves that arm reads the signature and not something incidental.
 mut="$(sed '/openssl pkeyutl -verify/,/^  fi$/c\  :' "$LIB")"
-if ( eval "$mut"; st="$(mktemp -d "$WORK/m.XXXXXX")"; _ou_verify "$OTHER" "$st" 1.0.0 0 ); then
+# shellcheck disable=SC2034  # read by the evaled verifier: the box holds no root
+if ( eval "$mut"; OFFLINE_UPDATE_ROOT_PUBKEY_PEM=''; st="$(mktemp -d "$WORK/m.XXXXXX")"; _ou_verify "$OTHER" "$st" 1.0.0 0 ); then
   ok_t "MUTANT: without the signature check a file signed by another key installs (the OTHER KEY arm would red)"
 else
   bad_t "MUTANT: the other-key file was still refused with no signature check" "the arm is not grading the signature"

@@ -72,7 +72,9 @@ MCowBQYDK2VwAyEAf9KHm4dxpSPYZDHIeDI+mA4yHuPavXzwmsw3+POZW10=
 # key ceremony; then pasted here (`openssl pkey -in root.pem -pubout`). While it
 # is empty and /etc/5dive/update-root.pem is absent, nothing below changes.
 # install.sh writes it to $OFFLINE_UPDATE_ROOT_PUBKEY_FILE (`--write-pubkey`).
-OFFLINE_UPDATE_ROOT_PUBKEY_PEM=''
+OFFLINE_UPDATE_ROOT_PUBKEY_PEM='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA3Wk/8LF4Is9I13/i0qHDp8jtmQ6jsegmBXw0wtmpKls=
+-----END PUBLIC KEY-----'
 
 # >>> DIVE-7577 offline update verifier
 #     (tests/self_update_offline_unit.sh extracts this block VERBATIM between
