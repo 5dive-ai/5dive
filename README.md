@@ -19,11 +19,6 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
-<p align="center">
-  <a href="SECURITY.md"><img src="https://img.shields.io/badge/security-policy-brightgreen" alt="Security policy"></a>
-  <a href="SECURITY.md#signed-releases"><img src="https://img.shields.io/badge/signed%20releases-coming-lightgrey" alt="Signed releases: coming"></a>
-</p>
-
 <p align="center">No telemetry. Your agents talk straight to your AI provider.</p>
 
 ```sh
