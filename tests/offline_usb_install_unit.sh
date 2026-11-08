@@ -58,8 +58,20 @@ S="$WORK/skills"; mkdir -p "$S/5dive-cli"; echo '# s' > "$S/5dive-cli/SKILL.md"
 printf '#!/bin/sh\necho bun-2\n' > "$WORK/bun"; chmod 755 "$WORK/bun"
 openssl genpkey -algorithm ed25519 -out "$WORK/key.pem" 2>/dev/null
 openssl pkey -in "$WORK/key.pem" -pubout -out "$WORK/pub.pem" 2>/dev/null; chmod 644 "$WORK/pub.pem"
+# DIVE-7921: shipped boxes hold 5dive's offline ROOT key, so a file must carry the
+# root's certificate for the key that signed it. A throwaway root certifies the
+# throwaway signing key here; the verb is pointed at that root's file (a root file
+# outranks the compiled-in root), so the U arms take the same chain a new box does.
+openssl genpkey -algorithm ed25519 -out "$WORK/root.key" 2>/dev/null
+openssl pkey -in "$WORK/root.key" -pubout -out "$WORK/root.pub" 2>/dev/null; chmod 644 "$WORK/root.pub"
+TR="$WORK/trust"; mkdir -p "$TR"
+jq -cn --arg pk "$(cat "$WORK/pub.pem")" \
+  --arg id "$(openssl pkey -in "$WORK/key.pem" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')" \
+  --argjson na "$(( $(date +%s) + 86400 ))" '{format:1,kind:"5dive-signing-key",key_id:$id,pubkey:$pk,not_after:$na}' | tr -d '\n' > "$TR/signing-key.json"
+printf '{"format":1,"kind":"5dive-revocations","serial":1,"revoked":[]}' > "$TR/revoked.json"
+for c in signing-key revoked; do openssl pkeyutl -sign -inkey "$WORK/root.key" -rawin -in "$TR/$c.json" -out "$TR/$c.sig" 2>/dev/null; done
 
-UPD="$(bash packaging/offline/build-offline.sh "$t" "$P" "$S" "$WORK/bun" "$WORK/upd" "$WORK/key.pem" 2>/dev/null)" || UPD=""
+UPD="$(OFFLINE_TRUST_DIR="$TR" bash packaging/offline/build-offline.sh "$t" "$P" "$S" "$WORK/bun" "$WORK/upd" "$WORK/key.pem" 2>/dev/null)" || UPD=""
 UNSIGNED="$(bash packaging/offline/build-offline.sh "$t" "$P" "$S" "$WORK/bun" "$WORK/upd-unsigned" 2>/dev/null)" || UNSIGNED=""
 [[ -f "$UPD" && -f "$UNSIGNED" ]] || { bad_t "fixture: build-offline.sh did not build"; finish; }
 
@@ -96,7 +108,7 @@ else bad_t "B6 built a stick from a raw update file"; fi
 
 # A release whose 5dive has no USB verb: refused.
 t2="$WORK/rel-old"; cp -a "$t" "$t2"; sed -i '/^cmd_usb_install/d' "$t2/5dive"
-OLDUPD="$(bash packaging/offline/build-offline.sh "$t2" "$P" "$S" "$WORK/bun" "$WORK/upd-old" "$WORK/key.pem" 2>/dev/null)" || OLDUPD=""
+OLDUPD="$(OFFLINE_TRUST_DIR="$TR" bash packaging/offline/build-offline.sh "$t2" "$P" "$S" "$WORK/bun" "$WORK/upd-old" "$WORK/key.pem" 2>/dev/null)" || OLDUPD=""
 if [[ -f "$OLDUPD" ]] && ! bash "$B" "$OLDUPD" "$WORK/debs" "$PKGS" "$WORK/out-o" >/dev/null 2>"$WORK/e"; then
   grep -q 'predates the USB install' "$WORK/e" && ok_t "B5 an update file whose 5dive predates the USB install is refused" || bad_t "B5 wrong reason" "$(cat "$WORK/e")"
 else bad_t "B5 built a stick from a release with no USB verb"; fi
@@ -216,7 +228,7 @@ E_USAGE=2 E_VALIDATION=3 E_CONFLICT=4 E_GENERIC=1
 . src/lib/offline_update.sh
 eval "$(grep -m1 '^local_only_file()' src/lib/local_only.sh)"
 declare -F cmd_usb_install >/dev/null && declare -F local_only_file >/dev/null || { bad_t "U0 cmd_usb_install / local_only_file not defined"; finish; }
-export OFFLINE_UPDATE_PUBKEY_FILE="$WORK/pub.pem" OFFLINE_UPDATE_ARCH=x86_64
+export OFFLINE_UPDATE_PUBKEY_FILE="$WORK/pub.pem" OFFLINE_UPDATE_ARCH=x86_64 OFFLINE_UPDATE_ROOT_PUBKEY_FILE="$WORK/root.pub"
 export FIVE_LOCAL_ONLY_FILE="$WORK/etc/5dive/local-only" FIVE_USB_STAGE_PARENT="$WORK/stage"
 export FIVE_USB_CLAUDE_HOME="$WORK/home-claude" OFFLINE_UPDATE_BUN_DEST="$WORK/bin-bun"
 export FIVE_USB_CLI="$WORK/cli-installed"

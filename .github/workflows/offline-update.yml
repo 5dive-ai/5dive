@@ -144,6 +144,31 @@ jobs:
             git worktree add -q --detach "$RUNNER_TEMP/tree" HEAD
             (cd "$RUNNER_TEMP/tree" && ./build.sh >/dev/null)
             sed -i 's/^readonly FIVE_VERSION="[^"]*"/readonly FIVE_VERSION="0.0.1"/' "$RUNNER_TEMP/tree/5dive"
+            # DIVE-7921: the tree's 5dive carries 5dive's REAL offline root, which never
+            # certifies a throwaway key. Like the version above, the PR's 5dive gets a
+            # throwaway root that certifies this run's throwaway key: the file then takes
+            # the whole root chain, on the runner and on the USB box.
+            pr_root="$RUNNER_TEMP/pr-root"; mkdir -p "$pr_root/trust"
+            openssl genpkey -algorithm ed25519 -out "$pr_root/root.key"
+            openssl pkey -in "$pr_root/root.key" -pubout -out "$pr_root/root.pub"
+            jq -cjn --arg pk "$(cat "$RUNNER_TEMP/offline-update.pub.pem")" \
+              --arg id "$(openssl pkey -in "$SIGN_KEY" -pubout -outform DER | sha256sum | awk '{print $1}')" \
+              --argjson na "$(( $(date +%s) + 86400 ))" \
+              '{format:1,kind:"5dive-signing-key",key_id:$id,pubkey:$pk,not_after:$na}' > "$pr_root/trust/signing-key.json"
+            printf '{"format":1,"kind":"5dive-revocations","serial":1,"revoked":[]}' > "$pr_root/trust/revoked.json"
+            for c in signing-key revoked; do
+              openssl pkeyutl -sign -inkey "$pr_root/root.key" -rawin -in "$pr_root/trust/$c.json" -out "$pr_root/trust/$c.sig"
+            done
+            python3 - "$RUNNER_TEMP/tree/5dive" "$pr_root/root.pub" <<'PY'
+          import re, sys
+          path, root = sys.argv[1], open(sys.argv[2]).read().rstrip("\n")
+          src = open(path).read()
+          src, n = re.subn(r"^OFFLINE_UPDATE_ROOT_PUBKEY_PEM='[^']*'$",
+                           lambda m: "OFFLINE_UPDATE_ROOT_PUBKEY_PEM='" + root + "'", src, flags=re.M)
+          assert n == 1, f"{n} compiled roots in {path}"
+          open(path, "w").write(src)
+          PY
+            trust="$pr_root/trust"; echo "PR_ROOT=$pr_root/root.pub" >> "$GITHUB_ENV"
             # The version rewrite changes 5dive's bytes: re-hash it, or install.sh
             # refuses the bundle on the box ("checksum mismatch", DIVE-7598).
             sha256sum "$RUNNER_TEMP/tree/5dive" | awk '{print $1}' > "$RUNNER_TEMP/tree/5dive.sha256"
@@ -163,7 +188,12 @@ jobs:
           . src/lib/offline_update.sh
           export OFFLINE_UPDATE_PUBKEY_FILE="$RUNNER_TEMP/offline-update.pub.pem" OFFLINE_UPDATE_STATE_DIR="$RUNNER_TEMP/ou-state"
           # A file built without the root's certificate is checked by the pinned key (DIVE-7888).
-          [[ -n "${TRUST_USED:-}" ]] || { OFFLINE_UPDATE_ROOT_PUBKEY_PEM=''; export OFFLINE_UPDATE_ROOT_PUBKEY_FILE="$RUNNER_TEMP/no-root.pem"; }
+          # A PR's file is certified by the PR's throwaway root (DIVE-7921).
+          if [[ -n "${PR_ROOT:-}" ]]; then
+            OFFLINE_UPDATE_ROOT_PUBKEY_PEM="$(cat "$PR_ROOT")"; export OFFLINE_UPDATE_ROOT_PUBKEY_FILE="$RUNNER_TEMP/no-root.pem"
+          elif [[ -z "${TRUST_USED:-}" ]]; then
+            OFFLINE_UPDATE_ROOT_PUBKEY_PEM=''; export OFFLINE_UPDATE_ROOT_PUBKEY_FILE="$RUNNER_TEMP/no-root.pem"
+          fi
           st="$(mktemp -d)"
           _ou_verify "$OFFLINE_FILE" "$st" 0.0.0 0 || { echo "::error::the built file is refused: $_OU_WHY"; exit 1; }
           echo "accepted: version $_OU_VERSION"
@@ -288,6 +318,16 @@ jobs:
           want="$(sed -n "/^OFFLINE_UPDATE_PUBKEY_PEM='/,/'\$/p" src/lib/offline_update.sh | sed "s/^OFFLINE_UPDATE_PUBKEY_PEM='//; s/'\$//")"
           if [[ "$(box 'cat /etc/5dive/update-pubkey.pem')" == "$want" ]]; then echo "update key pinned: 5dive's release key"
           else echo "::error::the box does not pin 5dive's release key"; fail=1; fi
+          # DIVE-7921: the box pins the offline root its 5dive carries (the PR's throwaway
+          # root on a PR, 5dive's real root on a publish).
+          want_root="$(tar -xOf "$OFFLINE_FILE" payload/cli.tar.gz | tar -xzO ./5dive | awk -v q="'" -v p="OFFLINE_UPDATE_ROOT_PUBKEY_PEM='" '
+            function out(l) { if (substr(l, length(l)) == q) { print substr(l, 1, length(l) - 1); exit } print l }
+            !on && index($0, p) == 1 { on = 1; out(substr($0, length(p) + 1)); next }
+            on { out($0) }')"
+          if [[ -n "${want_root//[[:space:]]/}" ]]; then
+            if [[ "$(box 'cat /etc/5dive/update-root.pem')" == "$want_root" ]]; then echo "update root pinned: the root its 5dive carries"
+            else echo "::error::the box does not pin the offline root its 5dive carries"; fail=1; fi
+          fi
           box '5dive config local-only check --watch=20' || { echo "::error::local-only check is not fully local"; fail=1; }
           addr="${net%/*}"
           page() { box "curl -sk -o /dev/null -w '%{http_code}' https://$addr:8443/" || true; }
