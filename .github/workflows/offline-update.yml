@@ -320,10 +320,14 @@ jobs:
           else echo "::error::the box does not pin 5dive's release key"; fail=1; fi
           # DIVE-7921: the box pins the offline root its 5dive carries (the PR's throwaway
           # root on a PR, 5dive's real root on a publish).
-          want_root="$(tar -xOf "$OFFLINE_FILE" payload/cli.tar.gz | tar -xzO ./5dive | awk -v q="'" -v p="OFFLINE_UPDATE_ROOT_PUBKEY_PEM='" '
+          # Extract ./5dive to files first: an awk that exits early on a pipe cuts tar's
+          # write, and pipefail kills the step on its SIGPIPE.
+          tar -xOf "$OFFLINE_FILE" payload/cli.tar.gz > "$RUNNER_TEMP/usb-cli.tar.gz"
+          tar -xzOf "$RUNNER_TEMP/usb-cli.tar.gz" ./5dive > "$RUNNER_TEMP/usb-5dive"
+          want_root="$(awk -v q="'" -v p="OFFLINE_UPDATE_ROOT_PUBKEY_PEM='" '
             function out(l) { if (substr(l, length(l)) == q) { print substr(l, 1, length(l) - 1); exit } print l }
             !on && index($0, p) == 1 { on = 1; out(substr($0, length(p) + 1)); next }
-            on { out($0) }')"
+            on { out($0) }' "$RUNNER_TEMP/usb-5dive")"
           if [[ -n "${want_root//[[:space:]]/}" ]]; then
             if [[ "$(box 'cat /etc/5dive/update-root.pem')" == "$want_root" ]]; then echo "update root pinned: the root its 5dive carries"
             else echo "::error::the box does not pin the offline root its 5dive carries"; fail=1; fi
