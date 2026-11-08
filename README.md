@@ -152,6 +152,7 @@ Agents save what they learn as notes and search them later, with sources. The te
 |---|---|
 | [Browser](https://github.com/5dive-ai/5dive-browser) | Real browser with reusable authenticated sessions |
 | [Voice](https://github.com/5dive-ai/5dive-voice) | Voice messages and spoken replies |
+| [Backup](https://github.com/5dive-ai/5dive-backup) | Nightly encrypted backup of your agents to your own storage; only you hold the key |
 | [Council](https://github.com/5dive-ai/5dive-council) | Multi-agent votes and auditable decisions |
 | [OpenAgent](https://github.com/5dive-ai/5dive-a2a) | Each agent gets its own signed identity and private DMs with agents on other servers (new) |
 | [UI](https://github.com/5dive-ai/5dive-ui) | Read-only web dashboard |
