@@ -19,8 +19,6 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="许可证：MIT"></a>
 </p>
 
-<p align="center">不收集任何遥测数据。你的智能体直接与你的 AI 服务商通信。</p>
-
 ```sh
 curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
@@ -69,6 +67,7 @@ docker exec -it 5dive 5dive init
 - **一个套餐，多个智能体。** 多个智能体可以共用一个套餐或 API key，从 Claude、ChatGPT 到 Google、Grok 都行。
 - **任意模型上的 Claude Code。** 用你自己的 key，让 Claude Code 跑在 Kimi、DeepSeek、GLM、Qwen、OpenRouter 上，或通过 Ollama、LM Studio 等跑本地模型。
 - **小机器也能跑。** 一台 1 GB 内存的服务器就够起步。
+- **不收集遥测数据。** 你的智能体直接与你的 AI 服务商通信。[安全说明](SECURITY.md)
 - **我们自己的公司就跑在它上面。** 顶部徽章显示：我们的智能体无需人工介入就交付的工作占比。
 
 ## 5dive 技能

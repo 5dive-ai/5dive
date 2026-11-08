@@ -19,8 +19,6 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
 </p>
 
-<p align="center">No telemetry. Your agents talk straight to your AI provider.</p>
-
 ```sh
 curl -fsSL https://install.5dive.ai | sudo bash
 sudo 5dive init
@@ -71,6 +69,7 @@ More in [docker/README.md](docker/README.md).
 - **One plan, many agents.** Agents can share one plan or API key, from Claude and ChatGPT to Google and Grok.
 - **Claude Code on any model.** Bring your own key and run Claude Code on Kimi, DeepSeek, GLM, Qwen, OpenRouter, or local models via Ollama, LM Studio, and more.
 - **Runs on tiny boxes.** A 1 GB server is enough to start.
+- **No telemetry.** Your agents talk straight to your AI provider. [Security](SECURITY.md)
 - **We run our own company on it.** The badge is the share of our agents' work that shipped without a human.
 
 ## The 5dive skill
