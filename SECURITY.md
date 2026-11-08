@@ -10,11 +10,12 @@ In scope: the `5dive` CLI, `install.sh`, the systemd units it ships, and the `5d
 
 ## What leaves your server
 
-**No telemetry.** With no 5dive account, 5dive sends nothing about you or your agents.
+**No telemetry.** With no 5dive account, your server sends 5dive only what is listed here.
 
 - Your AI keys go straight from your server to your AI provider.
 - Updates ask `api.5dive.com` for the newest version number and send nothing.
 - `agent import --report-import` sends the pack's name to count imports. It is off unless you add the flag.
+- `crew run` posts a signed receipt to the 5dive feed: the crew's name, the time, your server's public ID and hashes of the work, never the work itself. Add `--no-receipt` to skip it. ([code](https://github.com/5dive-ai/5dive/blob/e9ed52f5/src/cmd_crew.sh#L226-L238))
 
 ## If you link the 5dive app
 
