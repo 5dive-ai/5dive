@@ -632,6 +632,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _seat_secret"|\
         "/usr/local/bin/5dive browser _connect"|\
         "/usr/local/bin/5dive agent _telegram_open"|\
+        "/usr/local/bin/5dive people knock file *"|"/usr/local/bin/5dive people knock answer *"|\
         "/usr/local/bin/5dive _merge_do"*|\
         "/usr/local/bin/5dive _route_do"|"/usr/local/bin/5dive _pkg_do"|\
         "/usr/local/bin/5dive _dashboard_relay"|\
@@ -845,6 +846,15 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive browser _connect
 # The seat can run it untapped too; all that does is let strangers reach pending,
 # which is what the owner's Invite tap in the Mini App already does.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive agent _telegram_open
+# DIVE-8035: let this seat's Teams channel HOLD a stranger and ask the owner
+# (knock file), and let its Telegram channel apply the owner's Allow / Admin / No
+# tap (knock answer). The wildcard is safe because every argument is validated
+# in the verb: knock file takes the agent from SUDO_UID, never from argv, so a
+# seat files only for itself, capped at 5 waiting per agent; knock answer from a
+# seat refuses without the owner's tap proof, a nonce whose raw value exists only
+# in the button on the owner's card (only its hash is stored).
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive people knock file *
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive people knock answer *
 # DIVE-3474: let a VERIFIER merge the pull request on a row IT ITSELF graded PASS.
 # EXACT path, NO args, NO wildcard: one task ident travels over stdin, the caller
 # is derived from SUDO_UID inside _merge_do, and the merge standing is re-derived
