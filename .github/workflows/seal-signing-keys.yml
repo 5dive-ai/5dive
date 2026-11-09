@@ -44,8 +44,8 @@ on:
 
 env:
   # Step 1 sets both, in a reviewed PR to main. Empty = the job refuses to run.
-  SEAL_TO_KEY: ''
-  SEAL_TO_KEY_ID: ''
+  SEAL_TO_KEY: 'fip2YkDSQ2a9sXlJePgDX3e5VAPj0cPvojJoui75ogg='
+  SEAL_TO_KEY_ID: '3380204578043523366'
 
 permissions:
   contents: read
