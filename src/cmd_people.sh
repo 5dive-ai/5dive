@@ -667,10 +667,14 @@ cmd_people_knock_answer() {
     # their first knock binds to that record instead of making a second one.
     # Only a record with NO id on this channel (an identity is never re-pointed)
     # and never the owner's (an owner tap of Allow must not mint a second owner
-    # identity from an email the knocking server reported).
+    # identity from an email the knocking server reported). An admin record
+    # binds only on an Admin tap: the bind keeps the record's role, so binding
+    # it on Allow ("chat and give work") would grant admin by email alone; on
+    # Allow that knock becomes a fresh member row instead.
     if [[ -z "$hid" && -n "$email" ]]; then
+      local skip="'owner'"; [[ "$choice" == admin ]] || skip="'owner','admin'"
       hid=$(db "SELECT id FROM humans WHERE lower(email)=lower($(sqlq "$email")) AND ${col} IS NULL
-                  AND COALESCE(role,'')<>'owner' ORDER BY (role IS NULL), id LIMIT 1;")
+                  AND COALESCE(role,'') NOT IN (${skip}) ORDER BY (role IS NULL), id LIMIT 1;")
       [[ -z "$hid" ]] || db "UPDATE humans SET ${col}=$(sqlq "$sender"), updated_at=datetime('now') WHERE id=$(sqlq "$hid");"
     fi
     if [[ -z "$hid" ]]; then

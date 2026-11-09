@@ -33,6 +33,8 @@
 #       refused, the knock stays pending, roles.json is unchanged.
 #   E1  a knock answer binds to a person added by email (no twin row);
 #   E2  never by the owner's email, never re-pointing a set Teams id.
+#   E3  an admin record binds only on an Admin tap: Allow on an admin's email
+#       makes a fresh member row and grants no admin key.
 #   G1  the caller seat is read only under root; non-root fails closed to "-".
 #
 # Isolation: source src/ directly, throwaway TASKS_DB and fake homes, stubbed
@@ -299,6 +301,20 @@ E2Q=$( cmd_people_knock_answer "$E2B" allow 2>&1 | jq -r .data.person )
    && -n "$E2Q" && "$E2Q" != eve && "$(db "SELECT teams_id FROM humans WHERE id='eve';")" == "$GE" ]] \
   && ok_t "E2 the owner's email and a person who already has a Teams id are never bound by a knock" \
   || bad_t "E2 bind limits" "owner-knock=$E2P eve-knock=$E2Q"
+
+# E3 — Allow on an admin's email never grants admin; Admin on it binds
+( cmd_people_write add ada --name=Ada --email=user4@example.com --role=admin --agents=vesper ) >/dev/null 2>&1
+GH=abababab-1111-2222-3333-444444444444
+E3A=$(cmd_people_knock_file --agent=otto --channel=teams --sender=$GH --email=user4@example.com 2>&1 | jq -r .data.id)
+E3P=$( cmd_people_knock_answer "$E3A" allow 2>&1 | jq -r .data.person )
+GI=cdcdcdcd-1111-2222-3333-444444444444
+E3B=$(cmd_people_knock_file --agent=vesper --channel=teams --sender=$GI --email=user4@example.com 2>&1 | jq -r .data.id)
+E3Q=$( cmd_people_knock_answer "$E3B" admin 2>&1 | jq -r .data.person )
+[[ -n "$E3P" && "$E3P" != ada && "$(db "SELECT role FROM humans WHERE id=$(sqlq "$E3P");")" == member \
+   && "$(jq -r --arg k "teams:$GH" '(.admins // []) | index($k) // "none"' "$PEOPLE_ROLES_FILE" 2>/dev/null)" == none \
+   && "$E3Q" == ada && "$(db "SELECT role||':'||teams_id FROM humans WHERE id='ada';")" == "admin:$GI" ]] \
+  && ok_t "E3 Allow on an admin's email makes a fresh member (no admin key); Admin on it binds the admin record" \
+  || bad_t "E3 admin bind" "allow=$E3P role=$(db "SELECT role FROM humans WHERE id=$(sqlq "$E3P");") admin=$E3Q ada=$(db "SELECT role||':'||COALESCE(teams_id,'') FROM humans WHERE id='ada';")"
 
 # G1 — the caller seat is read only under a real root euid: below it SUDO_UID is a
 # plain env var, so a non-root caller fails CLOSED to "-" (never "" = root/app).
