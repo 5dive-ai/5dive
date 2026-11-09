@@ -1291,7 +1291,8 @@ _agent_stamp_isolation() {
 
 # DIVE-4557: the write half of `agent grant <name> root`.
 #
-# Root-only to RUN (require_root, in the caller) and loud in the receipt, because
+# Root-only to RUN (require_root, in the caller), refused to a seat caller that
+# is not already root (DIVE-7982, _agent_grant_caller_refusal), and loud in the receipt, because
 # root is a capability an operator confers rather than a default a seat drifts
 # into. `main.sh` already routes this verb through the generic AUDIT_CMD path, so
 # the audit row — who ran it, when, with what arguments — is written for free and
@@ -1336,6 +1337,51 @@ _cmd_agent_grant_root() {
      --arg a "$name" --arg i "$iso" --arg s "$state"
 }
 
+# DIVE-7982: may THIS caller confer <cap>? rc 0 = yes; rc 1 = no, with the
+# refusal text on stdout.
+#
+# `require_root` is not a caller check. An admin seat holds
+# `NOPASSWD: /usr/local/bin/5dive *`, and `sudo 5dive …` IS EUID 0, so before this
+# an admin seat could run `sudo 5dive agent grant <itself> root` and be root one
+# command later. Admin was root-equivalent from DIVE-4557 (2026-09-15) on.
+#
+# The refused set is a seat caller widening a seat to admin or root. Allowed:
+#   - a caller that is not a seat: direct root (no SUDO_UID), `claude` and a
+#     human login under sudo. That is the box owner and the lead, unchanged.
+#   - a seat whose own managed drop-in already grants ALL. It is root now, so
+#     nothing it can confer is wider than what it holds.
+#   - every other capability (standard, merge, push, deploy). Standard is a
+#     downgrade, and the other three re-render the standard template, which
+#     stays inside the 5dive CLI.
+#
+# WHO is asked uid-first through `_gate_authenticated_actor` (lib/actor.sh):
+# EUID, then SUDO_UID only behind a real root check. sudo writes SUDO_UID, and a
+# seat whose sudoers line names only /usr/local/bin/5dive cannot pass env vars
+# through it, so it cannot clear or forge that value. $SUDO_USER is NOT read: it
+# is a plain env var.
+#
+# Inventory of verbs that write sudoers, root units or root cron (2026-11-09):
+# write_root_sudoers has exactly one caller, this verb's root path.
+# write_admin_sudoers is reached from here and from `agent create`, which makes
+# a NEW seat at most as wide as the admin caller (lateral, and the by-role
+# default for every hire, so a lead seat must keep it). Every unit and
+# /etc/cron.d writer (host unit repoint, team bot, local chat and panel,
+# local-only, heartbeat driver) writes a fixed shape no caller argument reaches.
+_agent_grant_caller_refusal() {
+  local cap="$1" name="$2" caller f cls
+  case "$cap" in root|admin) ;; *) return 0 ;; esac
+  caller=$(_gate_authenticated_actor)
+  [[ -n "$caller" ]] || return 0
+  f="${SUDOERS_D:-/etc/sudoers.d}/agent-${caller}"
+  if [[ -r "$f" ]]; then
+    cls=$(classify_sudo_grant < "$f"); cls="${cls%%|*}"
+    [[ "$cls" == "root-all" ]] && return 0
+  fi
+  printf "agent grant %s %s: refused — this command came from the agent '%s', and an agent can't give itself or another agent %s. Ask the box owner to run it from their own login (or as root)." \
+    "$name" "$cap" "$caller" "$cap"
+  return 1
+}
+
 cmd_agent_grant() {
   require_root "agent grant"
   local name="${1:-}" cap="${2:-}"
@@ -1345,6 +1391,9 @@ cmd_agent_grant() {
     merge|push|deploy|admin|root|standard) ;;
     *) fail "$E_USAGE" "unknown capability '${cap}' — one of: merge, push, deploy, admin, root, standard" ;;
   esac
+  # DIVE-7982: before any read or write, so a refused call touches nothing.
+  local refusal
+  refusal=$(_agent_grant_caller_refusal "$cap" "$name") || fail "$E_PERMISSION" "$refusal"
   local user="agent-${name}" reg iso
   reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null 2>&1 \
