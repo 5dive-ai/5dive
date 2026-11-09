@@ -281,6 +281,66 @@ else
 fi
 _pack_leak_roster_raw() { :; }
 
+# ---- 4b. DIVE-7953: a customer's share refused over everyday words -----------
+# The seven false positives from a real refused share (support request 21), as
+# the lines read in that agent's instructions, with the roster that box had:
+# team members named by ROLE. Each must scan clean; then the true hits planted in
+# the SAME file must still refuse, or the clean verdict proves nothing.
+mkdir -p "$TMP/vesper"
+cat > "$TMP/vesper/CLAUDE.md" <<'MD'
+# Vesper
+
+- **Agent-to-agent: two exchanges per topic,** then it goes in the task body.
+When a grade fails, the maker applies it and you re-grade the new head.
+Win-back emails, outreach, replies: all of them go through the owner first.
+## Agent-to-agent: fixed fields, not prose
+Keep this short when answering when you are the verifier on a row.
+Your owner signs in at my.5dive.ai; the public site is 5dive.ai.
+MD
+_pack_leak_roster_raw() { printf 'head\noutreach\nverifier\nvesper\n'; }
+VOUT=$(_pack_memory_leakscan "$TMP/vesper" vesper 2>&1); VRC=$?
+[[ $VRC -eq 0 && -z "$VOUT" ]] \
+  && ok_t "the seven everyday-word lines scan clean with head/outreach/verifier on the roster" \
+  || bad_t "the seven everyday-word lines scan clean" "rc=$VRC out=$VOUT"
+VORIG=$(wc -l < "$TMP/vesper/CLAUDE.md")
+vhit() {  # <category> <literal> — that literal's line must be a <category> hit
+  local ctg="$1" needle="$2" want
+  want=$(grep -nF -- "$needle" "$TMP/vesper/CLAUDE.md" | head -1 | cut -d: -f1)
+  [[ -n "$want" ]] || { bad_t "$ctg still hits ($needle)" "fixture lost '$needle'"; return; }
+  grep -q "^CLAUDE\.md:${want}: ${ctg}: " <<<"$VOUT2" \
+    && ok_t "$ctg still hits: $needle (CLAUDE.md:$want)" \
+    || bad_t "$ctg still hits: $needle" "no ${ctg} at line $want: $VOUT2"
+}
+cat >> "$TMP/vesper/CLAUDE.md" <<'MD'
+If the copy reads off, ask outreach to review it before it ships.
+Ping agent-zephyr when the rail wedges.
+The test box is chill-gorge.5dive.com.
+Standing rule from DIVE-7439: never skip the replay.
+MD
+VOUT2=$(_pack_memory_leakscan "$TMP/vesper" vesper 2>&1); VRC2=$?
+[[ $VRC2 -eq 1 ]] && ok_t "control: the planted true hits refuse the same file" \
+                  || bad_t "control: the planted true hits refuse the same file" "rc=$VRC2"
+vhit identity-name 'ask outreach to review'
+vhit identity-name 'agent-zephyr'
+vhit hostname      'chill-gorge.5dive.com'
+vhit task-id       'DIVE-7439'
+# ...and the original seven lines are STILL clean in that same run.
+VLEAK=$(printf '%s\n' "$VOUT2" | awk -F: -v n="$VORIG" '$2<=n' | grep -c .)
+[[ "$VLEAK" == "0" ]] && ok_t "the everyday-word lines stay clean beside the true hits" \
+                      || bad_t "the everyday-word lines stay clean beside the true hits" "$VOUT2"
+# Only the EXACT public names are exempt: another 5dive.ai subdomain is a host.
+printf 'Staging lives at qa-box.5dive.ai.\n' > "$TMP/vesper/more.md"
+grep -q '^more\.md:1: hostname: qa-box\.5dive\.ai$' <<<"$(_pack_memory_leakscan "$TMP/vesper" vesper 2>&1)" \
+  && ok_t "a non-public 5dive.ai subdomain is still a private host" \
+  || bad_t "a non-public 5dive.ai subdomain is still a private host" "qa-box.5dive.ai was exempted"
+rm -f "$TMP/vesper/more.md"
+# Role words still fire as ACTORS, case-insensitively: a capital A on a real account is not exempt.
+printf 'Hand it to head once the queue drains. Agent-zephyr owns the rail.\n' > "$TMP/vesper/more.md"
+RW=$(_pack_memory_leakscan "$TMP/vesper" vesper 2>&1 | grep -c '^more\.md:1: identity-name: ')
+[[ "$RW" == "2" ]] && ok_t "a role-word name used as an actor, and a capitalised agent-<account>, both fire" \
+                   || bad_t "a role-word name used as an actor, and a capitalised agent-<account>, both fire" "hits=$RW"
+_pack_leak_roster_raw() { :; }
+
 # ---- 5. the gate: publish fails closed, self is unaffected -----------------
 _pack_memory_publish_gate publish "$TMP/raw" >/dev/null 2>&1; G1=$?
 [[ $G1 -eq 1 ]] && ok_t "gate: publish + raw memory REFUSES" \
