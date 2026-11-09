@@ -27,7 +27,7 @@ trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 cd "$(dirname "$0")/.."
 L=src/cmd_agent_teambot.sh
 TMP="$(mktemp -d /tmp/team-sender-gate.XXXXXX)"
-PASS=0 FAIL=0
+PASS=0; FAIL=0
 ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 BUN=$(command -v bun) || { echo "FAIL bun is required" >&2; exit 1; }
@@ -78,7 +78,8 @@ r=$(grep -n 'rateOk(agent, now)' <<<"$loop" | head -1 | cut -d: -f1)
 d=$(grep -n '^    drop($' <<<"$loop" | head -1 | cut -d: -f1)
 [[ -n "$g" && -n "$r" && -n "$d" && $g -lt $r && $g -lt $d ]] \
   && ok_t "e1 the loop runs the gate before the rate limit and the drop" || bad_t "e1 order" "gate=$g rate=$r drop=$d"
-grep -A3 'teamSenderAllowed(lane, msg' <<<"$loop" | grep -q 'continue' \
+after_gate=$(grep -A3 'teamSenderAllowed(lane, msg' <<<"$loop")
+grep -q 'continue' <<<"$after_gate" \
   && ok_t "e2 a refused message is skipped (continue), not delivered" || bad_t "e2" "no continue after the verdict"
 sed -n "/^  cat > \/opt\/5dive\/team-bot-listener.ts <<'LISTENER_TS'$/,/^LISTENER_TS$/p" "$L" | sed '1d;$d' > "$TMP/listener.ts"
 if "$BUN" build --target=bun --no-bundle "$TMP/listener.ts" > /dev/null 2> "$TMP/build.err"; then
@@ -99,4 +100,5 @@ else
 fi
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+printf 'pass=%d fail=%d\n' "$PASS" "$FAIL"
 exit $(( FAIL > 0 ))
