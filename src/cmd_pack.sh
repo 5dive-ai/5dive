@@ -1735,6 +1735,13 @@ _pack_secret_tripwire() {
 # quieter about generic words, never about a specific one, and such a fact almost
 # always carries a path, host or task id on the same line anyway.
 _PACK_LEAK_GENERIC='main|dev|ops|admin|root|test|demo|prod|staging|sandbox|agent|user|team|lead|bot|api|app|web|data|core|base|node|host|code|claude|marketing|creative|design|sales|support|product|research|engineering|finance|legal|security|growth|docs|infra|platform|mobile|council|blog|api'
+# DIVE-7953: TEAM-ROLE words. A team built from a template or a description
+# names its members by role — head, outreach, verifier, scout — and the same
+# words run through every team's own instructions ("re-grade the new head",
+# "Win-back emails, outreach, replies"). A customer's share was refused on
+# exactly those lines. They join the narrow ACTOR rule below, like main and dev:
+# "ask outreach to review" still refuses; "outreach" as a noun does not.
+_PACK_LEAK_GENERIC+='|head|outreach|verifier|scout|publisher|analyst|packager|editor|writer|reviewer|researcher|assistant|manager|planner|builder|tester|qa|coordinator|strategist|designer|developer|engineer|curator|moderator|recruiter|scheduler|monitor|auditor|grader|maker|helper|operator|coach|tutor|copywriter|community|content|social|ads|seo|ceo|cto|cmo|cfo|coo'
 
 _pack_leak_roster_raw() {
   { ls -1 /home 2>/dev/null | sed -n 's/^agent-//p'
@@ -1779,7 +1786,18 @@ _PACK_LEAK_EXEMPT_RE+='|((RFC|SHA|SHA256|ISO|UTF|AES|RSA|SSH|TLS|HTTP|HTTPS|IPV|
 #     which keeps "ask don to review" a hit, where stop-listing the name would not.
 #   - agent-<participle>. "an agent-relayed approval" is a compound adjective, not
 #     an account; the suffix, not a word list, is what tells them apart.
-_PACK_LEAK_NAME_EXEMPT_RE=": identity-name: ([^ ]*'[a-z]{1,3}|agent-[a-z]+(ed|ing|ly|able|ible|less|wide|based|driven|facing))$"
+#   - agent-to-<word> (DIVE-7953). "Agent-to-agent" is English — it heads two
+#     sections of the team template's own CLAUDE.md, so every templated agent
+#     tripped it. The rule matches case-insensitively, so this exemption is
+#     applied case-insensitively too (grep -viE below); "Agent-relayed" at the
+#     start of a sentence was the same miss.
+_PACK_LEAK_NAME_EXEMPT_RE=": identity-name: ([^ ]*'[a-z]{1,3}|agent-[a-z]+(ed|ing|ly|able|ible|less|wide|based|driven|facing)|agent-to-[a-z]+)$"
+
+# Our OWN public web addresses are not a private host (DIVE-7953): an agent that
+# tells people "sign in at my.5dive.ai" leaks nothing. EXACTLY these names, whole
+# match only. Customer boxes live under *.5dive.com and stay private, as does any
+# other subdomain of 5dive.ai.
+_PACK_LEAK_PUBLIC_HOST_RE=": hostname: (((www|my|a2a|blog|install|openagent|docs)\.)?5dive\.ai)$"
 
 # Scan a memory dir for the categories a published pack must not carry.
 # Prints "<file>:<line>: <category>: <match>" per hit to stderr; 0 clean, 1 hits.
@@ -1828,7 +1846,8 @@ _pack_memory_leakscan() {
     # field key would have deduped on <file>:<line> alone and silently dropped the
     # second category on a line that leaks two things — which is the common case
     # (a repo URL is also a hostname), so the report would under-name the work.
-    done | grep -vE "$_PACK_LEAK_EXEMPT_RE" | grep -vE "$_PACK_LEAK_NAME_EXEMPT_RE" \
+    done | grep -vE "$_PACK_LEAK_EXEMPT_RE" | grep -viE "$_PACK_LEAK_NAME_EXEMPT_RE" \
+         | grep -viE "$_PACK_LEAK_PUBLIC_HOST_RE" \
          | awk '!seen[$0]++' | sort -t: -k1,1 -k2,2n -s
   ) || found=""
 

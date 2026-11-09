@@ -351,7 +351,7 @@ cmd_agent_share() {
   if ! hits=$(_share_scan "$work/stage" "$name" 2>&1); then
     rm -rf "$work"
     [[ -n "$hits" ]] && printf '%s\n' "$hits" >&2
-    fail "$E_VALIDATION" "not shared: '$name's instructions, skills or memory carry private detail a public link must not (each line above: file:line: kind: what). Rewrite those lines without the path, name, id or host, then share again. Nothing was published."
+    fail "$E_VALIDATION" "not shared: ${name}'s instructions, skills or memory carry private detail a public link must not (each listed line: file:line: kind: what). Rewrite those lines without the path, name, id or host, then share again. Nothing was published."
   fi
   local mem_n; mem_n=$(_share_memory_count "$work/stage")
 
