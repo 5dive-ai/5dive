@@ -261,10 +261,37 @@ _rn_commit_summary() {
   fi
 }
 
+# _rn_dependabot_headings — DIVE-8034. A Dependabot security PR (`fix(deps): …`)
+# merges with NO changelog.d fragment: Dependabot cannot write one, and
+# lint-changelog-fragments.sh exempts exactly that PR. Without this the CHANGELOG arm
+# below would publish notes that omit a security fix whenever anything else in the
+# range wrote a fragment. So each such commit's subject is fed to _rn_group as a
+# heading-only entry and lands under Fixes like any fragment would. Keyed on the
+# commit AUTHOR GitHub writes on Dependabot's squash merge (measured on main:
+# 26e700a4, `dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>`),
+# so a person's `fix(deps)` — which carries its own fragment — is not printed twice.
+_rn_dependabot_headings() {
+  local range="$to"
+  [[ -n "$from" ]] && range="${from}..${to}"
+  git log --no-merges --format='%ae%x09%s' "$range" 2>/dev/null \
+    | awk -F'\t' '$1 ~ /^([0-9]+\+)?dependabot\[bot\]@users\.noreply\.github\.com$/ && $2 ~ /^fix\(deps\): / {
+        sub(/^[^\t]*\t/, ""); printf "## Unreleased — %s\n", $0 }'
+}
+
 body=""
 source_label=""
 
-added=$(_rn_changelog_added | _rn_group)
+_rn_cl_raw=$(_rn_changelog_added)
+added=$(printf '%s\n' "$_rn_cl_raw" | _rn_group)
+# Only when the CHANGELOG arm already has content: with none, the commit-subject
+# fallback below lists every subject, the Dependabot ones included, and feeding them
+# here would wrongly make a lone Dependabot line the whole body.
+if grep -q '[^[:space:]]' <<<"$added"; then
+  _rn_dep=$(_rn_dependabot_headings)
+  if [[ -n "$_rn_dep" ]]; then
+    added=$(printf '%s\n%s\n' "$_rn_cl_raw" "$_rn_dep" | _rn_group)
+  fi
+fi
 # "Has content" means a non-blank line exists — a range that only added blank lines
 # or a heading-less fragment is not notes, and treating it as notes would publish an
 # empty body while reporting success.

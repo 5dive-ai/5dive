@@ -1603,6 +1603,12 @@ main() {
       # tasks/org; reads unprivileged, writes take root themselves (the table is
       # trusted input to gate delivery). No lock: plain sqlite writes, like org.
       cmd_human "$@" ;;
+    people)
+      # DIVE-8035: who may talk to each agent, across Telegram and Teams — one
+      # list in the tasks DB, written out to each bot's allowFrom, each Teams
+      # config and the roles file. Reads open; writes take root themselves; a
+      # seat reaches only `knock file` / `knock answer` (narrow sudoers lines).
+      cmd_people "$@" ;;
     owner-ask)
       # DIVE-4982: a browser ask the owner answers from Telegram. `browser` sends it
       # (the seat's run re-runs itself as root, where the proof is written); `tap`
