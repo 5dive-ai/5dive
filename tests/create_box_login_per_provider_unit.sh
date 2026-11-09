@@ -142,7 +142,7 @@ eq_t 'a second grok hire: the same login' \
   'profile= defer=0' "$(made scout --type=grok --auth-profile=scout --defer-auth)"
 eq_t 'a team template (defer_auth, no account): box login, not deferred' \
   'profile= defer=0' "$(made pixel --type=codex --defer-auth)"
-eq_t 'claude hires are not touched (DIVE-7028 owns them)' \
+eq_t 'a claude hire on an account that holds a Claude sign-in keeps it' \
   'profile=mp defer=0' "$(made olivia --type=claude --auth-profile=mp --defer-auth)"
 
 box mp:claude gpt:codex
@@ -152,6 +152,39 @@ eq_t 'and a hire naming no account uses it' \
   'profile=gpt defer=0' "$(made ward --type=codex --defer-auth)"
 eq_t 'an account that holds its own Codex sign-in is kept' \
   'profile=gpt defer=0' "$(made ward --type=codex --auth-profile=gpt --defer-auth)"
+
+echo '== 2b. DIVE-7989: a claude hire uses the box Claude login =='
+# lodar's self-hosted box 2026-11-09: the lead on his Claude plan hired "Dude"
+# on a new account named after him and the owner got a second sign-in link.
+box mp:claude
+eq_t 'claude hire on an account named after it: the box Claude account' \
+  'profile=mp defer=0' "$(made dude --type=claude --auth-profile=dude --defer-auth)"
+grep -qF "has no claude sign-in: using this box's claude login" "$TMP/last.log" \
+  && ok_t 'create says it used the box Claude login' || bad_t 'create did not say which login' "$(cat "$TMP/last.log")"
+eq_t 'a second claude hire: the same account, no second link' \
+  'profile=mp defer=0' "$(made scout --type=claude --auth-profile=scout --defer-auth)"
+eq_t 'no account named: the box Claude account (DIVE-7028, unchanged)' \
+  'profile=mp defer=0' "$(made scout --type=claude --defer-auth)"
+box mp:claude demo-ai:demo
+eq_t 'claude hire naming the demo AI on a box with a Claude plan: the plan, not refused' \
+  'profile=mp defer=0' "$(made dude --type=claude --auth-profile=demo-ai)"
+box shared:claude
+mkdir -p "$CONNECTORS_DIR"; echo 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture' > "$CONNECTORS_DIR/anthropic.env"
+eq_t 'the shared Claude login: the hire uses it, not deferred' \
+  'profile= defer=0' "$(made dude --type=claude --auth-profile=dude --defer-auth)"
+box mp:claude other:claude
+eq_t 'two Claude accounts, no default: an account per hire is still asked for' \
+  'profile=dude defer=1' "$(made dude --type=claude --auth-profile=dude --defer-auth)"
+box mp:claude
+eq_t '--own-login: a separate Claude sign-in on the owner ask' \
+  'profile=dude defer=1' "$(made dude --type=claude --auth-profile=dude --defer-auth --own-login)"
+CALLER=owner
+eq_t "the owner's own 'new account' flow keeps the Claude account it named" \
+  'profile=dude defer=1' "$(made dude --type=claude --auth-profile=dude --defer-auth)"
+CALLER=agent
+box demo-ai:demo
+eq_t 'no Claude login on the box, only the demo AI: still refused' \
+  'free demo AI' "$(made dude --type=claude --auth-profile=demo-ai)"
 
 echo '== 3. the overrides =='
 box shared:codex shared:grok mp:claude
