@@ -25,7 +25,9 @@ name: apt-repo
 # ONE-TIME SETUP, by a repo admin, before the first publish (a publish without
 # it goes red naming what is missing):
 #   1. Pages on, source "GitHub Actions" (repo Settings > Pages).
-#   2. Repo secret APT_SIGNING_KEY: an armored, passphrase-less OpenPGP secret
+#   2. Secret APT_SIGNING_KEY in the `release-signing` ENVIRONMENT (DIVE-7973:
+#      never a repo secret, which every branch's workflows can read; the
+#      environment admits deployments from main only): an armored, passphrase-less OpenPGP secret
 #      key (ed25519, signing only). Its public half is what users trust; it is
 #      published as apt/5dive.gpg on every deploy. Losing the secret means a new
 #      key and every user re-running the README's first line.
@@ -109,6 +111,11 @@ jobs:
     needs: plan
     if: needs.plan.outputs.publish == 'true' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
+    # DIVE-7973: APT_SIGNING_KEY lives in the `release-signing` environment,
+    # whose deployment policy admits main only, so a workflow run from any other
+    # branch cannot read it. Pull requests sign with a throwaway key and take no
+    # environment (an empty name is none).
+    environment: ${{ github.event_name != 'pull_request' && 'release-signing' || '' }}
     permissions:
       contents: read
     steps:

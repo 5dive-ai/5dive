@@ -89,6 +89,10 @@ case "\$url" in
   *.release-hold*) printf '# 5dive-release-hold v1\n%s\n' "\${FAKE_HOLD:-}" | emit ;;
   */v0.86.[0-2]/5dive.sha256) t="\${url%/5dive.sha256}"; emit < "$TD/srv/\${t##*/}.sha256" ;;
   */v0.86.[0-2]/5dive) t="\${url%/5dive}"; emit < "$TD/srv/\${t##*/}" ;;
+  # DIVE-7973: install.sh's tag_came_from_main() — every fixture tag came from main.
+  *api.github.com/repos/*/commits/v*) printf '{"sha":"b0","parents":[{"sha":"a0"}],"files":[{"filename":"5dive"},{"filename":"5dive.sha256"}]}\n' | emit ;;
+  *api.github.com/repos/*/commits/a0) printf '{"sha":"a0","parents":[{"sha":"c0"}],"files":[{"filename":"CHANGELOG.md"}]}\n' | emit ;;
+  *api.github.com/repos/*/compare/c0...main) printf '{"status":"ahead"}\n' | emit ;;
   *) exit 22 ;;
 esac
 EOF

@@ -65,16 +65,11 @@ AGENTS_REGISTRY="${AGENTS_REGISTRY:-/var/lib/5dive/agents.json}"
 # persist the marketplace source in THREE places — known_marketplaces.json, the
 # marketplace clone's origin remote, and settings.json extraKnownMarketplaces
 # (the declaration the other two derive from; DIVE-4867). All break once the old
-# org name is parked, so rewrite them as soon as the new org is live. Probe once per
-# run; no-op until the rename happens. GH_ORG env overrides the probe.
-GH_ORG="${GH_ORG:-}"
-if [[ -z "$GH_ORG" ]]; then
-  if curl -fsI --max-time 8 "https://raw.githubusercontent.com/5dive-ai/5dive/main/install.sh" >/dev/null 2>&1; then
-    GH_ORG="5dive-ai"
-  else
-    GH_ORG="5dive-com"
-  fi
-fi
+# org name is parked, so rewrite them to the new org. DIVE-7973: the org is
+# hard-coded — the old probe fell back to 5dive-com on a network blip, which here
+# would have skipped the migration and elsewhere pointed root fetches at the old
+# name. GH_ORG env still overrides (CI, forks, mirrors).
+GH_ORG="${GH_ORG:-5dive-ai}"
 
 migrate_marketplace_org() {
   local user="$1" home="$2"

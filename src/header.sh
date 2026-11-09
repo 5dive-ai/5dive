@@ -57,28 +57,16 @@ devteam_refuse() {  # <verb as the caller typed it>
   fail "$E_USAGE" "$1 is in the devteam plugin: 5dive plugin install devteam"
 }
 
-# GitHub org our repos live under. The org is being renamed
-# 5dive-com -> 5dive-ai (2026-06); fetches must work on either side of the
-# rename, so probe the new org once per process and fall back to the old
-# name. GH_ORG env overrides the probe (CI, forks, air-gapped mirrors).
-# NOTE: install.sh carries a standalone copy of this probe (it runs before
-# the bundle exists) — change the two together.
+# GitHub org our repos live under: 5dive-ai, hard-coded (DIVE-7973). The
+# 2026-06 rename from 5dive-com is long done; the old probe fell back to the
+# OLD org name on any network blip, and self-update then ran that org's
+# install.sh as root. No probe, no fallback. GH_ORG env still overrides (CI,
+# forks, air-gapped mirrors). It also never touches the network, so a
+# local-only box (DIVE-7573) needs no special case.
+# NOTE: install.sh carries a standalone copy (it runs before the bundle
+# exists) — change the two together.
 gh_org() {
-  if [[ -z "${_GH_ORG_RESOLVED:-}" ]]; then
-    if [[ -n "${GH_ORG:-}" ]]; then
-      _GH_ORG_RESOLVED="$GH_ORG"
-    elif declare -F local_only_on >/dev/null && local_only_on; then
-      # DIVE-7573 (D1): a local-only box never probes GitHub (it was 32 SYNs per
-      # `agent create`), and the offline fallback below wrote the OLD org into
-      # the seat. The rename is done: the current org is the answer.
-      _GH_ORG_RESOLVED="5dive-ai"
-    elif curl -fsI --max-time 8 "https://raw.githubusercontent.com/5dive-ai/5dive/main/install.sh" >/dev/null 2>&1; then
-      _GH_ORG_RESOLVED="5dive-ai"
-    else
-      _GH_ORG_RESOLVED="5dive-com"
-    fi
-  fi
-  printf '%s' "$_GH_ORG_RESOLVED"
+  printf '%s' "${GH_ORG:-5dive-ai}"
 }
 
 # DIVE-1475: honor an env-set STATE_DIR instead of unconditionally reopening the

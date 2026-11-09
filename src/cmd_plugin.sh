@@ -85,8 +85,9 @@ readonly PLUGIN_GRANTS="telegram-token audio-io agent-credentials fs-home networ
 readonly PLUGIN_REVIEW_TIERS="official community unreviewed"
 
 # DIVE-4955 — who may publish an `official` plugin. GitHub owners, compared
-# case-insensitively (GitHub logins are). 5dive-com is the org this CLI's own
-# gh_org() falls back to and redirects to 5dive-ai; both are ours. A CONSTANT on
+# case-insensitively (GitHub logins are). 5dive-com is the pre-rename org name;
+# we still hold it (empty, never deleted) so a plugin recorded under it before the
+# rename keeps its tier. gh_org() no longer falls back to it (DIVE-7973). A CONSTANT on
 # purpose: gh_org() honours $GH_ORG, and a trust root that an environment
 # variable can rename is not a root. See _plugin_effective_review.
 readonly PLUGIN_OFFICIAL_OWNERS="5dive-ai 5dive-com"

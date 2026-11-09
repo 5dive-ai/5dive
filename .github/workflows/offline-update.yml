@@ -16,7 +16,9 @@ name: offline-update
 #
 # ONE-TIME SETUP, by a repo admin (main/ops), never on a box and never in chat:
 #   openssl genpkey -algorithm ed25519 -out offline-update.pem
-#   gh secret set OFFLINE_UPDATE_SIGNING_KEY < offline-update.pem
+#   gh secret set OFFLINE_UPDATE_SIGNING_KEY --env release-signing < offline-update.pem
+#   (an ENVIRONMENT secret, DIVE-7973 — never a repo secret, which every branch's
+#   workflows can read; `release-signing` admits deployments from main only)
 #   openssl pkey -in offline-update.pem -pubout   # paste into OFFLINE_UPDATE_PUBKEY_PEM
 #                                                 # in src/lib/offline_update.sh, then shred the file
 # DIVE-7888: once the owner's offline root key exists, its PUBLIC certificate for
@@ -53,6 +55,11 @@ jobs:
   build:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-24.04
+    # DIVE-7973: OFFLINE_UPDATE_SIGNING_KEY lives in the `release-signing`
+    # environment, whose deployment policy admits main only, so a workflow run
+    # from any other branch cannot read it. Pull requests sign with a throwaway
+    # key and take no environment (an empty name is none).
+    environment: ${{ github.event_name != 'pull_request' && 'release-signing' || '' }}
     permissions:
       contents: write   # attach the file to the release
     steps:
@@ -69,7 +76,7 @@ jobs:
           repository: 5dive-ai/skills
           ref: main
           path: _skills
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
 
       - name: Pick the tag
         id: p

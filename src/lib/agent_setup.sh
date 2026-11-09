@@ -199,7 +199,7 @@ install_agent_coauthor_hook() {
 # FORMAT is the refresh script's spec form, `<owner>/<repo>:<skill-id>`, so the
 # two consumers compare byte-for-byte (tests/default_skills_single_list_unit.sh
 # diffs them). `@org` is a placeholder for gh_org() — resolved at use time, not
-# baked in, because the org differs between the 5dive-ai and 5dive-com mirrors
+# baked in, because GH_ORG can name a fork or mirror instead of 5dive-ai
 # and a resolved list could not be a static, diffable constant.
 DEFAULT_AGENT_SKILLS=(
   "@org/skills:5dive-cli"          # spawn sub-agents on this VM via the local 5dive CLI

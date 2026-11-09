@@ -1,0 +1,27 @@
+# DIVE-7973: Dependabot SECURITY updates are on for this repo (main, 11-09).
+# Their PRs used to be titled "Bump x from …", and release-cut refuses a
+# non-conventional title on main, so every entry below gives them a
+# conventional "fix(deps): …" title.
+#
+# open-pull-requests-limit: 0 turns OFF routine version-bump PRs. Security
+# updates are not affected by that limit; they still open, and still take the
+# commit-message prefix from the matching entry here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 0
+    commit-message: { prefix: "fix(deps)" }
+  - package-ecosystem: docker
+    directory: /docker
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 0
+    commit-message: { prefix: "fix(deps)" }
+  - package-ecosystem: pip
+    directories:
+      - /python
+      - /marketplace/linode/apps/linode-marketplace-5dive
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 0
+    commit-message: { prefix: "fix(deps)" }

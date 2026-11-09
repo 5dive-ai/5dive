@@ -311,7 +311,7 @@ jobs:
       # `acp-graded` job below, which asserts the OUTCOME so a dropped step cannot
       # quietly go back to being a skip.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
       - name: Run the FULL corpus (budgeted, shard ${{ matrix.shard }})
         run: |
           # DIVE-4229: an UNGRADED shard (exit 6 -- the calibration clamp, or an
@@ -418,7 +418,7 @@ jobs:
       # `acp-graded` job below, which asserts the OUTCOME so a dropped step cannot
       # quietly go back to being a skip.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
       - name: Run the FULL corpus (installed host, budgeted, shard ${{ matrix.shard }})
         run: |
           # DIVE-4229: an UNGRADED shard (exit 6 -- the calibration clamp, or an
@@ -559,7 +559,7 @@ jobs:
       # `acp-graded` job below, which asserts the OUTCOME so a dropped step cannot
       # quietly go back to being a skip.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
       - name: Every harness must be able to FAIL (shard ${{ matrix.shard }})
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
@@ -682,7 +682,7 @@ jobs:
       # `acp-graded` job below, which asserts the OUTCOME so a dropped step cannot
       # quietly go back to being a skip.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
       - name: Every harness must be able to FAIL (installed host, shard ${{ matrix.shard }})
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
