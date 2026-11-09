@@ -23,6 +23,16 @@
 #      test|ci|chore|docs|refactor|perf: those are the changes a reader of the
 #      release page is not looking for.
 #
+# ONE EXEMPTION TO RULE 2, and it is keyed on WHO opened the PR (DIVE-8034). A
+# Dependabot security PR is titled `fix(deps): …` (.github/dependabot.yml, DIVE-7973)
+# so release-cut accepts its subject, and Dependabot can never add a fragment. Without
+# this, every such PR was red on `title` by construction: 5dive#1622 (a high alert)
+# sat red 3 h until a person retitled it. So a PR whose AUTHOR is Dependabot AND whose
+# title is exactly `fix(deps): …` needs no fragment; release-notes.sh prints that
+# commit's subject under Fixes instead, so the security fix still reaches the notes.
+# The author comes from the PR event (`pull_request.user.login`), which the PR's
+# opener cannot set, so a person's `fix(deps):` PR still has to carry a fragment.
+#
 # SCOPE IS THE PR'S OWN CHANGED FILES, deliberately, not the whole directory. main
 # carries fragments that predate this lint; grading those here would red every
 # unrelated PR with somebody else's defect. The whole-tree grade belongs at cut time,
@@ -30,7 +40,7 @@
 # this is the gate that keeps it from firing.
 #
 # Usage: lint-changelog-fragments.sh --title=<pr title> [--changed-from=<file|->]
-#                                    [--fragdir=<dir>]
+#                                    [--fragdir=<dir>] [--author=<pr author login>]
 #        changed paths are read one per line from --changed-from (default stdin),
 #        repo-relative, as `git diff --name-only` prints them.
 #        Exit 0 clean, 1 on a lint error, 2 on a usage error.
@@ -39,11 +49,13 @@ set -uo pipefail
 title=""
 changed_from="-"
 fragdir="changelog.d"
+author=""
 for arg in "$@"; do
   case "$arg" in
     --title=*)        title="${arg#--title=}" ;;
     --changed-from=*) changed_from="${arg#--changed-from=}" ;;
     --fragdir=*)      fragdir="${arg#--fragdir=}" ;;
+    --author=*)       author="${arg#--author=}" ;;
     *) echo "lint-changelog-fragments: unknown argument '${arg}'" >&2; exit 2 ;;
   esac
 done
@@ -98,7 +110,19 @@ if [[ "$title" =~ ^([a-z]+)(\([^\)]*\))?!?:\  ]]; then
   prtype="${BASH_REMATCH[1]}"
 fi
 
-if [[ "$frag_count" -eq 0 ]]; then
+# DIVE-8034: the Dependabot exemption (header). Both halves must hold: the login is
+# GitHub's own for the app (`dependabot[bot]` on the event, `app/dependabot` as gh
+# prints it), and the title is the exact prefix dependabot.yml gives it — no `!`, no
+# other scope, no other type.
+dependabot_fix=0
+if [[ "$author" == "dependabot[bot]" || "$author" == "app/dependabot" ]] \
+   && [[ "$title" =~ ^fix\(deps\):\  ]]; then
+  dependabot_fix=1
+fi
+
+if [[ "$frag_count" -eq 0 && "$dependabot_fix" -eq 1 ]]; then
+  echo "::notice::Dependabot 'fix(deps)' PR — no changelog.d/ fragment needed; the release notes list this commit's subject under Fixes (DIVE-8034)." >&2
+elif [[ "$frag_count" -eq 0 ]]; then
   case "$prtype" in
     feat|fix)
       {
