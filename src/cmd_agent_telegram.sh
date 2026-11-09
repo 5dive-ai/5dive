@@ -73,10 +73,13 @@ cmd_telegram_discover() {
   # --since, a round that brings only older updates confirms them (offset)
   # and polls again for what is left of the budget.
   local resp count upd="" offset=0 remain
+  # The first round always gets the whole budget: reading the clock a second
+  # time could land past a turnover and hand it timeout 0, and an old-only
+  # answer would then end the poll unasked (DIVE-7998). Later rounds get what
+  # is left of it.
   local deadline=$(( $(date +%s) + poll_secs ))
+  remain=$poll_secs
   while true; do
-    remain=$(( deadline - $(date +%s) ))
-    (( remain < 0 )) && remain=0
     local -a q=(--data-urlencode "timeout=${remain}" --data-urlencode "limit=100"
                 --data-urlencode "allowed_updates=[\"message\"]")
     (( offset > 0 )) && q+=(--data-urlencode "offset=${offset}")
@@ -101,6 +104,8 @@ cmd_telegram_discover() {
       offset=$(jq -r '[.result[].update_id] | max + 1' <<<"$resp")
     fi
     (( remain > 0 )) || break
+    remain=$(( deadline - $(date +%s) ))
+    (( remain < 0 )) && remain=0
   done
   if [[ -z "$upd" ]]; then
     ok "" '{found:false}'
