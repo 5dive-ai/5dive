@@ -133,6 +133,42 @@ rc=$?
 [[ $rc -eq 0 ]] && ok_t 'an untyped title is left to pr-title-lint, not double-reported' \
                 || bad_t 'an untyped title is left to pr-title-lint, not double-reported' "rc=$rc out=$OUT"
 
+# --- DIVE-8034: Dependabot's fix(deps) needs no fragment; nobody else's does ----------
+# run_lint_as <dir> <author> <title> <changed-path>...
+run_lint_as() {
+  local d="$1" who="$2" title="$3"; shift 3
+  local changed="$d/.changed"; : > "$changed"
+  local p; for p in "$@"; do printf '%s\n' "$p" >> "$changed"; done
+  OUT="$(cd "$d" && bash "$LINT" --title="$title" --author="$who" --changed-from=.changed 2>&1)"
+}
+DEPT='fix(deps): Bump x from 1 to 2 in /python'
+for who in 'dependabot[bot]' 'app/dependabot'; do
+  d="$(mk_tree)"; run_lint_as "$d" "$who" "$DEPT" 'python/requirements.txt'; rc=$?
+  if [[ $rc -eq 0 ]] && grep -q '0 error(s)' <<<"$OUT" && ! grep -q '::error' <<<"$OUT"; then
+    ok_t "a Dependabot ($who) fix(deps) PR with no fragment passes with 0 errors"
+  else
+    bad_t "a Dependabot ($who) fix(deps) PR with no fragment passes with 0 errors" "rc=$rc out=$OUT"
+  fi
+done
+d="$(mk_tree)"; run_lint_as "$d" 'some-human' "$DEPT" 'python/requirements.txt'; rc=$?
+[[ $rc -ne 0 ]] && grep -q 'must add a changelog.d/ fragment' <<<"$OUT" \
+  && ok_t 'the same fix(deps) title from a non-Dependabot author is still refused' \
+  || bad_t 'the same fix(deps) title from a non-Dependabot author is still refused' "rc=$rc out=$OUT"
+d="$(mk_tree)"; run_lint "$d" "$DEPT" 'python/requirements.txt'; rc=$?
+[[ $rc -ne 0 ]] && ok_t 'with no --author at all, a fix(deps) PR is still refused (fails closed)' \
+                || bad_t 'with no --author at all, a fix(deps) PR is still refused (fails closed)' "rc=$rc out=$OUT"
+# The exemption is the exact dependabot.yml prefix, not "anything Dependabot opens".
+for t in 'fix(x): Bump x' 'feat(deps): Bump x' 'fix(deps)!: Bump x'; do
+  d="$(mk_tree)"; run_lint_as "$d" 'dependabot[bot]' "$t" 'python/requirements.txt'; rc=$?
+  [[ $rc -ne 0 ]] && ok_t "a Dependabot PR titled '${t%%:*}:' is not exempt" \
+                  || bad_t "a Dependabot PR titled '${t%%:*}:' is not exempt" "rc=$rc out=$OUT"
+done
+# A malformed fragment is still graded on a Dependabot PR — the exemption is rule 2 only.
+d="$(mk_tree)"; printf '## Added\n' > "$d/changelog.d/DEP.md"
+run_lint_as "$d" 'dependabot[bot]' "$DEPT" 'changelog.d/DEP.md'; rc=$?
+[[ $rc -ne 0 ]] && ok_t 'a malformed fragment on a Dependabot PR still reds (rule 1 unchanged)' \
+                || bad_t 'a malformed fragment on a Dependabot PR still reds (rule 1 unchanged)' "rc=$rc out=$OUT"
+
 # --- Scope: README.md, deletions, and other people's fragments ----------------------
 d="$(mk_tree)"
 run_lint "$d" 'docs(changelog): rewrite the README' 'changelog.d/README.md'
@@ -230,6 +266,13 @@ if grep -q 'scripts/lint-changelog-fragments.sh' "$WF"; then
   ok_t 'pr-title-lint.yml invokes the fragment lint'
 else
   bad_t 'pr-title-lint.yml invokes the fragment lint' 'not referenced'
+fi
+# DIVE-8034: the exemption keys on the author, so the workflow must pass the one GitHub
+# sets — the PR's opener cannot write `pull_request.user.login`.
+if grep -q -- '--author="$PR_AUTHOR"' "$WF" && grep -q 'PR_AUTHOR: ${{ github.event.pull_request.user.login }}' "$WF"; then
+  ok_t 'pr-title-lint.yml passes the PR author (pull_request.user.login) to the fragment lint'
+else
+  bad_t 'pr-title-lint.yml passes the PR author (pull_request.user.login) to the fragment lint' 'no --author wiring'
 fi
 # It has to be in the job that reports the REQUIRED `title` context, or it blocks nothing.
 if [[ "$(grep -cE '^  [a-z_-]+:$' <<<"$(sed -n '/^jobs:/,$p' "$WF")")" -eq 1 ]]; then

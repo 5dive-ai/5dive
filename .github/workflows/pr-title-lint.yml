@@ -125,6 +125,9 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
+          # DIVE-8034: who OPENED the PR. Set by GitHub, not by the PR, so it is safe to
+          # key the Dependabot fix(deps) fragment exemption on it.
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           # DIVE-4177: the `if` above already keeps this step off `merge_group`, but
           # tests/merge_queue_triggers_unit.sh arm3 is a TEXT grep over the file and
           # cannot see a step-level condition. Use the branching idiom pii-guard.yml
@@ -140,4 +143,4 @@ jobs:
             echo "::error::could not diff ${BASE_SHA}..${HEAD_SHA} — refusing to report a green fragment lint that graded nothing (DIVE-4177)"
             exit 1
           fi
-          bash scripts/lint-changelog-fragments.sh --title="$PR_TITLE" --changed-from=/tmp/changed.txt
+          bash scripts/lint-changelog-fragments.sh --title="$PR_TITLE" --author="$PR_AUTHOR" --changed-from=/tmp/changed.txt

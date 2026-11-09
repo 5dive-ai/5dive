@@ -530,6 +530,46 @@ run_block "v0.0.9" "$EMPTY" "1.3.1" >/dev/null 2>&1; rc=$?
   && ok_t "block: gh release create is never reached on refusal" \
   || bad_t "block: gh not reached on refusal" "gh was called: $(cat "$TMP/ghargs")"
 
+# --- DIVE-8034: a Dependabot fix(deps) merges with no fragment; the notes still list it
+# Separate repo so the arms above keep their history. The author string is the one
+# GitHub writes on Dependabot's squash merge (main 26e700a4).
+D="$TMP/dep"; mkdir -p "$D"
+git -C "$D" init -q -b main
+git -C "$D" config user.name 'Ada Lovelace'; git -C "$D" config user.email 'ada@example.test'
+DEPBOT='dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>'
+dcommit() { # <file> <content> <subject> [author]
+  printf '%s\n' "$2" > "$D/$1"; git -C "$D" add "$1"
+  if [[ -n "${4-}" ]]; then git -C "$D" commit -q --author="$4" -m "$3"
+  else git -C "$D" commit -q -m "$3"; fi
+}
+printf '# Changelog\n' > "$D/CHANGELOG.md"; git -C "$D" add CHANGELOG.md; git -C "$D" commit -q -m 'chore: seed'
+DEP_FROM=$(git -C "$D" rev-parse HEAD)
+printf '# Changelog\n\n## Unreleased — feat(x): a feature that wrote its fragment\n' > "$D/CHANGELOG.md"
+git -C "$D" add CHANGELOG.md; git -C "$D" commit -q -m 'feat(x): a feature that wrote its fragment'
+dcommit req.txt "dnspython==2.9.0" "fix(deps): Bump dnspython (#1622)" "$DEPBOT"
+dcommit dock.txt "1" "fix(deps): a person's deps fix, listed only via its own fragment"
+DEP_TO=$(git -C "$D" rev-parse HEAD)
+out=$( cd "$D" && bash "$SCRIPTS/release-notes.sh" "$DEP_FROM" "$DEP_TO" "2.0.0" 2>"$TMP/err" ); rc=$?
+fixes_sec=$(sed -n '/^### Fixes/,/^### /p' <<<"$out")
+[[ $rc -eq 0 && "$out" == *"feat(x): a feature that wrote its fragment"* && "$fixes_sec" == *"- fix(deps): Bump dnspython (#1622)"* ]] \
+  && ok_t "dependabot: a fix(deps) with no fragment is listed under Fixes beside the CHANGELOG entries" \
+  || bad_t "dependabot: fix(deps) listed under Fixes" "rc=$rc out=$out err=$(cat "$TMP/err")"
+[[ "$out" != *"a person's deps fix"* ]] \
+  && ok_t "dependabot: a non-Dependabot fix(deps) commit is NOT added (it carries its own fragment)" \
+  || bad_t "dependabot: only Dependabot's author is keyed" "$out"
+[[ "$out" == *"_Notes derived from CHANGELOG.md over"* ]] \
+  && ok_t "dependabot: the body is still the CHANGELOG arm, not the subject fallback" \
+  || bad_t "dependabot: source label" "$out"
+# A range whose CHANGELOG gained nothing keeps the subject fallback exactly — the
+# Dependabot line must not become the whole body and hide every other subject.
+DEP_FROM2=$(git -C "$D" rev-parse HEAD)
+dcommit req.txt "dnspython==2.9.1" "fix(deps): Bump dnspython again" "$DEPBOT"
+dcommit o.txt "1" "chore: an unrelated commit"
+out=$( cd "$D" && bash "$SCRIPTS/release-notes.sh" "$DEP_FROM2" "HEAD" "2.0.1" 2>"$TMP/err" ); rc=$?
+[[ $rc -eq 0 && "$out" == *"chore: an unrelated commit"* && "$out" == *"fix(deps): Bump dnspython again"* && "$out" == *"CHANGELOG.md gained nothing"* ]] \
+  && ok_t "dependabot: with no CHANGELOG change the subject fallback still lists every commit" \
+  || bad_t "dependabot: fallback unchanged" "rc=$rc out=$out"
+
 # --- wiring: the workflow must actually CALL both, and fail the cut on refusal --
 WF=.github/workflows/release-cut.yml
 grep -q 'scripts/release-notes.sh' "$WF" \
