@@ -21,6 +21,10 @@ name: apt-repo
 # tag trigger here would never fire. The newest tag is read with install.sh's
 # rule (strict vX.Y.Z, sort -V), minus the tags .release-hold names, and a tag
 # already in the live pool is skipped. workflow_dispatch republishes by hand.
+# DIVE-8014: release-cut now pushes the tag with a deploy key, and a deploy-key
+# push DOES start workflows. Keep workflow_run anyway: it fires after the release
+# page exists. And nothing may listen on `push: tags: v*` (the tag ruleset is
+# probed with a v* tag on the premise that no workflow fires).
 #
 # ONE-TIME SETUP, by a repo admin, before the first publish (a publish without
 # it goes red naming what is missing):

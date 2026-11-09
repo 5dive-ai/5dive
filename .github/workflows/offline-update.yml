@@ -13,6 +13,10 @@ name: offline-update
 # WHY workflow_run (the same reason as apt-repo.yml): release-cut.yml pushes its
 # tag with github.token, which starts no workflow. A tag whose release already
 # carries the file is skipped; workflow_dispatch rebuilds one by hand.
+# DIVE-8014: release-cut now pushes the tag with a deploy key, and a deploy-key
+# push DOES start workflows. Keep workflow_run anyway: it fires after the release
+# page exists. And nothing may listen on `push: tags: v*` (the tag ruleset is
+# probed with a v* tag on the premise that no workflow fires).
 #
 # ONE-TIME SETUP, by a repo admin (main/ops), never on a box and never in chat:
 #   openssl genpkey -algorithm ed25519 -out offline-update.pem

@@ -11,6 +11,10 @@ name: docker-image
 # instead, reads the newest tag with install.sh's own rule (strict vX.Y.Z,
 # sort -V), and skips when that tag is already published. workflow_dispatch
 # (re)publishes one named tag by hand.
+# DIVE-8014: release-cut now pushes the tag with a deploy key, and a deploy-key
+# push DOES start workflows. Keep workflow_run anyway: it fires after the release
+# page exists. And nothing may listen on `push: tags: v*` (the tag ruleset is
+# probed with a v* tag on the premise that no workflow fires).
 #
 # Pull requests that touch the image build and test it on both arches and
 # push nothing. Not a required check.

@@ -1,0 +1,122 @@
+name: seal-signing-keys
+# DIVE-8014 ONE-SHOT. DELETE THIS FILE once both keys live in the `release-signing`
+# environment and the repo-level copies are gone (step 5 below).
+#
+# WHY IT EXISTS. APT_SIGNING_KEY and OFFLINE_UPDATE_SIGNING_KEY were repo-level
+# secrets, which a workflow on ANY branch can read. DIVE-7973 moved the signing jobs
+# into the `release-signing` environment (deployments from main only), but the keys
+# themselves still have to get there, and no copy of either exists outside GitHub
+# (by design: every box pins the apt key, and lodar's offline root certifies the
+# update key, so rotating is not an option). GitHub secrets are write-only.
+#
+# So this job reads each repo secret inside a run on main and SEALS it to the
+# environment's own public key (a libsodium sealed box, exactly what GitHub's
+# secrets API expects as `encrypted_value`). The artifact holds ciphertext only:
+# GitHub alone holds the private half, so the artifact is safe to download and
+# nobody ever handles a key.
+#
+# THE STEPS (a repo admin runs 1, 3, 4, 5):
+#   1. Create the `release-signing` environment, deployment branches = main only,
+#      then read its public key:
+#        gh api repos/5dive-ai/5dive/environments/release-signing/secrets/public-key
+#   2. Dispatch this workflow ON MAIN with that `key` and `key_id`.
+#   3. Download the artifact and PUT each ciphertext (the job summary prints the
+#      exact commands).
+#   4. PROVE the copies before any delete: dispatch apt-repo and offline-update on
+#      main and check their signatures verify against the pinned public keys. The
+#      job summary below prints each sealed key's PUBLIC fingerprint to compare.
+#      Note offline-update builds UNSIGNED with only a warning when its key is
+#      empty, so a green run is not proof: the attached file must be signed.
+#   5. Only then delete the two repo-level secrets, and delete this file.
+on:
+  workflow_dispatch:
+    inputs:
+      public_key:
+        description: 'release-signing environment public key (the `key` field, base64)'
+        required: true
+        type: string
+      key_id:
+        description: 'its `key_id`'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  seal:
+    # Main only: a branch could edit this file to print the keys instead.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install libsodium bindings (Ubuntu archive)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq python3-nacl
+
+      - name: Seal each repo secret to the environment key
+        env:
+          PUBLIC_KEY: ${{ inputs.public_key }}
+          KEY_ID: ${{ inputs.key_id }}
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          OFFLINE_UPDATE_SIGNING_KEY: ${{ secrets.OFFLINE_UPDATE_SIGNING_KEY }}
+          OUT: ${{ runner.temp }}/sealed
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          python3 - <<'PY'
+          import base64, os, sys
+          from nacl.public import PublicKey, SealedBox
+          pk = base64.b64decode(os.environ["PUBLIC_KEY"].strip(), validate=True)
+          if len(pk) != 32:
+              sys.exit(f"public_key is {len(pk)} bytes, not 32: paste the `key` field of the environment's public-key response")
+          box = SealedBox(PublicKey(pk))
+          out = os.environ["OUT"]
+          for name in ("APT_SIGNING_KEY", "OFFLINE_UPDATE_SIGNING_KEY"):
+              value = os.environ.get(name, "")
+              if not value:
+                  sys.exit(f"{name} is empty in this run: nothing to copy, and a sealed empty value would erase the real key")
+              with open(os.path.join(out, name), "w") as f:
+                  f.write(base64.b64encode(box.encrypt(value.encode())).decode())
+          with open(os.path.join(out, "key_id"), "w") as f:
+              f.write(os.environ["KEY_ID"].strip())
+          print("sealed: APT_SIGNING_KEY, OFFLINE_UPDATE_SIGNING_KEY")
+          PY
+
+      - name: Public fingerprints of what was sealed (compare in step 4)
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          OFFLINE_UPDATE_SIGNING_KEY: ${{ secrets.OFFLINE_UPDATE_SIGNING_KEY }}
+          KEY_ID: ${{ inputs.key_id }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$(mktemp -d)"
+          gpg --batch --quiet --import <<<"$APT_SIGNING_KEY"
+          apt_fpr="$(gpg --batch --list-secret-keys --with-colons | awk -F: '/^fpr/{print $10; exit}')"
+          upd_pub="$(printf '%s\n' "$OFFLINE_UPDATE_SIGNING_KEY" | openssl pkey -pubout)"
+          upd_fpr="$(printf '%s\n' "$upd_pub" | openssl pkey -pubin -outform DER | sha256sum | awk '{print $1}')"
+          rm -rf "$GNUPGHOME"
+          {
+            echo "## Sealed for release-signing (key_id ${KEY_ID})"
+            echo
+            echo "- APT_SIGNING_KEY: OpenPGP fingerprint \`${apt_fpr}\`"
+            echo "- OFFLINE_UPDATE_SIGNING_KEY: public key SHA-256 (DER) \`${upd_fpr}\`"
+            echo
+            echo '```'
+            printf '%s\n' "$upd_pub"
+            echo '```'
+            echo
+            echo "Step 3, from the downloaded artifact's folder:"
+            echo
+            echo '```'
+            echo 'for n in APT_SIGNING_KEY OFFLINE_UPDATE_SIGNING_KEY; do'
+            echo "  gh api -X PUT repos/${GITHUB_REPOSITORY}/environments/release-signing/secrets/\$n \\"
+            echo '    -f encrypted_value="$(cat $n)" -f key_id="$(cat key_id)"'
+            echo 'done'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sealed-signing-keys
+          path: ${{ runner.temp }}/sealed
+          retention-days: 1
+          if-no-files-found: error

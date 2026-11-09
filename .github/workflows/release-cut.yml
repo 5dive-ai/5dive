@@ -119,14 +119,42 @@ concurrency:
 jobs:
   cut:
     runs-on: ubuntu-latest
+    # DIVE-8014: the `v*` tag is pushed with a write DEPLOY KEY, not github.token.
+    # A tag ruleset on refs/tags/v* bypasses that deploy key only, so no other
+    # actor (an agent seat pushing through the 5dive-push app, a workflow on any
+    # branch) can create, move or delete a release tag. GitHub refuses the Actions
+    # integration as a ruleset bypass actor (422, "must be part of the ruleset
+    # source or owner organization"), which is why the token push could not stay.
+    # The key's private half is RELEASE_TAG_DEPLOY_KEY in the `release-signing`
+    # environment, whose deployment policy admits main only.
+    environment: release-signing
     permissions:
-      contents: write   # create the tag and the release
+      contents: write   # create the release page (the tag itself goes over SSH, DIVE-8014)
       checks: read      # read the CI verdict on main's tip
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
+
+      # DIVE-8014: stage the tag deploy key in a file the push below points ssh at.
+      # A separate step so the secret is in the environment of THIS step only, not
+      # of every script the cut step runs (the release grade runs tests/*.sh).
+      - name: Stage the release-tag deploy key
+        env:
+          RELEASE_TAG_DEPLOY_KEY: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/tag-deploy"
+          umask 077; mkdir -p "$d"
+          if [[ -z "$RELEASE_TAG_DEPLOY_KEY" ]]; then
+            echo "::warning::RELEASE_TAG_DEPLOY_KEY is not set in the release-signing environment. The tag will be pushed with github.token, which the v* tag ruleset refuses once it is active (DIVE-8014)."
+            exit 0
+          fi
+          printf '%s\n' "$RELEASE_TAG_DEPLOY_KEY" > "$d/key"
+          # GitHub's published ed25519 host key (api.github.com/meta, SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU).
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$d/known_hosts"
+          echo "TAG_PUSH_KEY_DIR=$d" >> "$GITHUB_ENV"
 
       - name: Cut a release tag if main moved and CI is green on it
         env:
@@ -1120,10 +1148,21 @@ jobs:
           This release commit is not graded by GitHub CI (a GITHUB_TOKEN push does not
           trigger workflows); it was graded IN THIS JOB before publication — tests/*.sh,
           \`5dive selfcheck\`, and --version/--help run against this exact bundle."
-          if ! git push origin "refs/tags/${tag}"; then
+          # DIVE-8014: push over SSH with the release-tag deploy key, the ONE actor the
+          # v* tag ruleset bypasses. With no key staged it falls back to github.token,
+          # which works only until that ruleset is active and is then refused below.
+          if [[ -n "${TAG_PUSH_KEY_DIR:-}" ]]; then
+            _push_remote="git@github.com:${GITHUB_REPOSITORY}.git"
+            export GIT_SSH_COMMAND="ssh -i ${TAG_PUSH_KEY_DIR}/key -o IdentitiesOnly=yes -o UserKnownHostsFile=${TAG_PUSH_KEY_DIR}/known_hosts -o StrictHostKeyChecking=yes"
+          else
+            _push_remote=origin
+          fi
+          if ! git push "$_push_remote" "refs/tags/${tag}"; then
             echo "::error::tag push rejected — ${tag} was NOT published. Nothing changed for any box; they keep installing ${incumbent:-the previous tag}."
+            [[ -n "${TAG_PUSH_KEY_DIR:-}" ]] || echo "::error::no release-tag deploy key was staged, so this push used github.token; the v* tag ruleset admits only the deploy key. Set RELEASE_TAG_DEPLOY_KEY in the release-signing environment (DIVE-8014)."
             exit 1
           fi
+          unset GIT_SSH_COMMAND
 
           # DIVE-2091 — PROVE IT IS SERVABLE, do not assert that it is.
           #
@@ -1248,3 +1287,7 @@ jobs:
           # <<< DIVE-2452 release-notes block
 
           echo "::notice::published ${tag} at ${sha:0:12} (was ${incumbent:-none}) — this is what every box now installs"
+
+      - name: Remove the release-tag deploy key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/tag-deploy"
