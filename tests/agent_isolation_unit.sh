@@ -160,11 +160,8 @@ else
   echo "# visudo not present; skipping sudoers shape asserts"
 fi
 
-# ---- 2b. crew refuses root (invariant: no sudo 5dive subcmd execs as root) ---
-CREW_BODY=$(sed -n '/^cmd_crew()/,/^  case/p' src/cmd_crew.sh)
-grep -q 'id -u.*== *"0"' <<<"$CREW_BODY" && grep -q 'E_PERMISSION' <<<"$CREW_BODY" \
-  && ok_t "cmd_crew refuses to run as root (blocks admin->root via crew exec)" \
-  || bad_t "cmd_crew root guard" "expected an EUID-0 refusal in cmd_crew"
+# ---- 2b. (moved) crew refuses root — DIVE-7950 moved `crew` to crew@5dive-plugins;
+# its EUID-0 refusal is graded there (5dive-plugins test/crew-plugin.test.ts).
 
 # ---- 2c. agent restart --defer runs a FIXED command, not caller-injected -----
 RESTART_BODY=$(sed -n '/^cmd_restart()/,/^}/p' src/cmd_agent_lifecycle.sh)

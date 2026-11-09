@@ -1148,6 +1148,15 @@ _buzz_moved_refusal() {
   fail "$E_USAGE" "Buzz is a plugin now: 5dive plugin install buzz"
 }
 
+# DIVE-7950 — crew (the CrewAI runtime, DIVE-787) left core for `crew@5dive-plugins`
+# (lodar 11-09: optional features are plugins, never core). Same shape as buzz: the
+# name is out of the case table and FIVEDIVE_BUILTIN_VERBS, so the plugin's verb
+# claim resolves, and a box without it gets this one line. No root-grant pin is
+# needed: no seat holds a sudo grant for `crew`, and the verb refuses root anyway.
+_crew_moved_refusal() {
+  fail "$E_USAGE" "crew is a plugin now: sudo 5dive plugin add crew@5dive-plugins"
+}
+
 # DIVE-7117 — browser was never a core verb, so it is not a moved verb either:
 # it is the 5dive-browser plugin, and on a box without it `5dive browser` read
 # "unknown command" with no pointer. An admin head agent asked for a screenshot
@@ -1164,6 +1173,7 @@ _browser_missing_refusal() {
 # that a human is told WHERE it went rather than being told it never existed.
 _moved_verb_notice() {
   [[ "$1" == buzz ]] && _buzz_moved_refusal
+  [[ "$1" == crew ]] && _crew_moved_refusal
   [[ "$1" == browser ]] && _browser_missing_refusal
   local repo; repo="$(_moved_verb_repo "$1")" || return 0
   # DIVE-5247: sysadmin is a partner-box feature, not something to offer every
@@ -1639,12 +1649,6 @@ main() {
       # through the goal materialize path — origination rides ONE count-checkpoint
       # gate, T2 creates gate hard, and it can only touch its own originated tasks.
       cmd_objective "$@" ;;
-    crew)
-      # DIVE-787 (0.5.0 flagship): 5dive as the always-on runtime for CrewAI
-      # crews. install/secret/run/show/list/uninstall. Crew runs in its own venv
-      # with BYO LLM key (owner-600 secret), durable memory on the box disk
-      # (CREWAI_STORAGE_DIR), and a co-signed receipt per run → ZeroHuman feed.
-      cmd_crew "$@" ;;
     heartbeat)
       # Wake-on-work scheduler. on/off mutate the registry (lock taken inside
       # cmd_heartbeat); tick is the root cron driver; ls is read-only. No audit
