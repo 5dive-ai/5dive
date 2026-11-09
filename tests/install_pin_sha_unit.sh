@@ -45,6 +45,7 @@ SHA_OLD="2222222222222222222222222222222222222222"
 SHA_TAGOBJ="9999999999999999999999999999999999999999"   # annotated tag OBJECT — raw/ does not serve it
 SHA_DIRECT="3333333333333333333333333333333333333333"
 
+. "$(dirname "${BASH_SOURCE[0]}")/lib/tag_origin_stub.sh"   # DIVE-7973: fixture tags came from main
 block="$(sed -n '/^# >>> DIVE-1977 pin-resolution block/,/^# <<< DIVE-1977 pin-resolution block/p' install.sh)"
 if [[ -n "$block" ]] && grep -q 'resolve_gh_sha()' <<<"$block" && grep -q 'resolve_gh_tag()' <<<"$block"; then
   ok_t "pin-resolution block is extractable from install.sh"
@@ -61,7 +62,7 @@ fi
 run_block_with() { # $1=block  $2=git stub  $3=curl stub  [$4=REPO] [$5=GH_SHA] [$6=argv1]
   local blk="$1" stubs out rc; stubs="$(mktemp -d)"
   if [[ -n "$2" ]]; then printf '#!/usr/bin/env bash\n%s\n' "$2" > "$stubs/git"; chmod +x "$stubs/git"; fi
-  printf '#!/usr/bin/env bash\n%s\n' "$3" > "$stubs/curl"; chmod +x "$stubs/curl"
+  printf '#!/usr/bin/env bash\n%s\n%s\n' "$(tag_origin_ok_stub)" "$3" > "$stubs/curl"; chmod +x "$stubs/curl"
   # PATH is stubs-first but keeps the real tools the block needs (awk/sed/head/
   # grep/sort). A stub that exits nonzero stands in for "git present but can't
   # resolve" and for "git absent" alike: both leave the ladder empty.

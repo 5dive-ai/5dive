@@ -43,18 +43,12 @@
 # Uninstall: curl -fsSL https://install.5dive.ai | sudo bash -s -- --uninstall
 set -euo pipefail
 
-# GitHub org our repos live under. The org is being renamed
-# 5dive-com -> 5dive-ai (2026-06); installs must work on either side of the
-# rename, so probe the new org once and fall back to the old name. GH_ORG
-# env overrides the probe (CI, forks, air-gapped mirrors). Standalone copy
-# of the bundle's gh_org() — this script runs before the bundle exists.
-if [[ -z "${GH_ORG:-}" ]]; then
-  if curl -fsI --max-time 8 "https://raw.githubusercontent.com/5dive-ai/5dive/main/install.sh" >/dev/null 2>&1; then
-    GH_ORG="5dive-ai"
-  else
-    GH_ORG="5dive-com"
-  fi
-fi
+# GitHub org our repos live under: 5dive-ai, hard-coded (DIVE-7973). The
+# 2026-06 rename from 5dive-com is long done, and the old probe-then-fall-back
+# meant any network blip on the probe sent a root install to the OLD org name.
+# GH_ORG env still overrides (CI, forks, air-gapped mirrors). Standalone copy of
+# the bundle's gh_org() — this script runs before the bundle exists.
+GH_ORG="${GH_ORG:-5dive-ai}"
 
 # DIVE-7577: `5dive self-update --from=<file>` runs this installer from a signed
 # update file, with REPO and every tarball pointed at the unpacked file and
@@ -214,11 +208,56 @@ load_release_hold() {
 }
 # <<< DIVE-4223 release hold
 
+# DIVE-7973: did release tag $1 come from main? A tag can be pushed at ANY
+# commit by anyone with write on the repo, and tags skip main's branch
+# protection, so "newest tag" alone would hand a canary box (as root) whatever
+# was tagged last. release-cut.yml tags a release commit ABOVE main's tip and
+# never pushes main, so the tag itself is not on main; its SHAPE is checked:
+#   tag   = one parent; touches only 5dive, 5dive.sha256 (the bundle)
+#   tag~1 = one parent; touches only src/header.sh (FIVE_VERSION line only),
+#           CHANGELOG.md, changelog.d/*
+#   tag~2 = the source commit; GitHub's compare must say main contains it.
+# The fleet pin enforces the same rule before promoting (5dive-api
+# scripts/control-plane/cli-pin-promote.sh, condition 4); this covers the
+# canary rung, which takes the newest tag without the pin.
+#   0 came from main    1 did not (reason on stdout)    2 could not check (reason on stdout)
+tag_came_from_main() {
+  local tag="$1" api="https://api.github.com/repos/$GH_ORG/5dive" b a np files stray st hp
+  command -v jq >/dev/null 2>&1 || { echo "jq is not installed, so the tag's origin cannot be read"; return 2; }
+  b="$(curl -fsSL --max-time 15 -H 'Accept: application/vnd.github+json' "$api/commits/$tag" 2>/dev/null)" || b=""
+  [[ -n "$(jq -r '.sha // ""' <<<"$b" 2>/dev/null)" ]] || { echo "GitHub did not answer for commits/$tag"; return 2; }
+  np="$(jq -r '.parents | length' <<<"$b")"; files="$(jq -r '.files[]?.filename' <<<"$b")"
+  [[ "$np" == 1 && -n "$files" ]] || { echo "the tagged commit has $np parent(s) or no files listed"; return 1; }
+  stray="$(grep -vE '^(5dive|5dive\.sha256)$' <<<"$files" | head -3 | tr '\n' ' ')" || stray=""
+  [[ -z "$stray" ]] || { echo "the tagged commit touches ${stray}beyond the bundle"; return 1; }
+  a="$(curl -fsSL --max-time 15 -H 'Accept: application/vnd.github+json' "$api/commits/$(jq -r '.parents[0].sha' <<<"$b")" 2>/dev/null)" || a=""
+  [[ -n "$(jq -r '.sha // ""' <<<"$a" 2>/dev/null)" ]] || { echo "GitHub did not answer for the version commit under $tag"; return 2; }
+  np="$(jq -r '.parents | length' <<<"$a")"; files="$(jq -r '.files[]?.filename' <<<"$a")"
+  [[ "$np" == 1 && -n "$files" ]] || { echo "the version commit has $np parent(s) or no files listed"; return 1; }
+  stray="$(grep -vE '^(src/header\.sh|CHANGELOG\.md|changelog\.d/.+)$' <<<"$files" | head -3 | tr '\n' ' ')" || stray=""
+  [[ -z "$stray" ]] || { echo "the version commit touches ${stray}beyond the release files"; return 1; }
+  if grep -qx 'src/header.sh' <<<"$files"; then
+    hp="$(jq -r '.files[] | select(.filename == "src/header.sh") | .patch // ""' <<<"$a")"
+    [[ -n "$hp" ]] || { echo "GitHub returned no diff for src/header.sh in the version commit"; return 2; }
+    stray="$(grep -E '^[-+]' <<<"$hp" | grep -vE '^[-+]readonly FIVE_VERSION="[^"]*"$' | head -1)" || stray=""
+    [[ -z "$stray" ]] || { echo "the version commit changes src/header.sh beyond FIVE_VERSION"; return 1; }
+  fi
+  st="$(curl -fsSL --max-time 15 -H 'Accept: application/vnd.github+json' \
+    "$api/compare/$(jq -r '.parents[0].sha' <<<"$a")...main" 2>/dev/null | jq -r '.status // ""' 2>/dev/null)" || st=""
+  case "$st" in
+    ahead|identical) return 0 ;;
+    behind|diverged) echo "its source commit is '$st' against main"; return 1 ;;
+    *) echo "GitHub's compare against main answered '${st:-nothing}'"; return 2 ;;
+  esac
+}
+
 # Newest release tag name (e.g. v0.15.34) on stdout.
 #   0  resolved            tag on stdout
 #   1  no tag resolved     the release rail is unreachable or empty
 #   2  hold unreadable     we could not establish whether a hold is armed
 #   3  every candidate held
+#   4  the newest candidates did not come from main, or their origin could not
+#      be checked (DIVE-7973)
 resolve_gh_tag() {
   local tags=""
   # git ls-remote is exact and carries no API rate limit. A brand-new box may
@@ -271,7 +310,24 @@ resolve_gh_tag() {
   # deliberate. An operator paged for "no tag resolved" looks at GitHub; one
   # paged for "every tag is held" looks at whoever armed the hold.
   [[ -n "$newest" ]] || return 3
-  printf '%s\n' "$newest"
+  # DIVE-7973: newest-that-CAME-FROM-MAIN. A tag that did not is skipped and the
+  # next one down is offered (at most three), so one bad tag lands the box on the
+  # previous good release rather than on nothing. An origin we could not CHECK
+  # stops here instead: unchecked is not checked.
+  local tries=0 why rc
+  while [[ -n "$newest" && $tries -lt 3 ]]; do
+    tries=$((tries + 1)); rc=0
+    why="$(tag_came_from_main "$newest")" || rc=$?
+    if (( rc == 0 )); then printf '%s\n' "$newest"; return 0; fi
+    if (( rc == 2 )); then
+      printf 'error: 5dive install: cannot confirm release tag %s came from main (%s).\n' "$newest" "$why" >&2
+      return 4
+    fi
+    printf 'warn: 5dive install: skipping release tag %s — it did not come from main (%s).\n' "$newest" "$why" >&2
+    candidates="$(printf '%s\n' "$candidates" | grep -vxF "$newest")" || candidates=""
+    newest="$(printf '%s\n' "$candidates" | tail -1)"
+  done
+  return 4
 }
 
 # >>> DIVE-4140 stable CLI target
@@ -345,7 +401,7 @@ resolve_cli_target() {
     # keep apart.
     local _rgt_rc=0
     target="$(resolve_gh_tag)" || _rgt_rc=$?
-    case "$_rgt_rc" in 2|3) return "$_rgt_rc" ;; esac
+    case "$_rgt_rc" in 2|3|4) return "$_rgt_rc" ;; esac
     source="canary opt-in ($canary_file) — newest released tag, ahead of the fleet pin"; rung=canary
   else
     target="$(curl -fsSL --max-time 5 "$route" 2>/dev/null | tr -d '[:space:]')" || target=""
@@ -490,6 +546,10 @@ elif [[ -z "${REPO:-}" ]]; then
         3)
           printf 'error: 5dive install: RELEASE TARGET IS HELD — refusing to install a held release.\n' >&2
           printf '       A hold is armed on main against the tag this box resolves. This is deliberate; ask whoever armed it.\n' >&2
+          ;;
+        4)
+          printf 'error: 5dive install: RELEASE TAG NOT FROM MAIN — refusing to install a tag whose origin is not main (DIVE-7973).\n' >&2
+          printf '       The newest release tags were not cut from main, or GitHub could not confirm they were. See the line above.\n' >&2
           ;;
         *)
           printf 'error: 5dive install: NO STABLE RELEASE TAG RESOLVED — refusing to install from ungated main.\n' >&2

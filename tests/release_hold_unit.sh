@@ -81,6 +81,7 @@ esac'
 #      meaning the route is unreachable. DIVE-4366: since DIVE-4140 this route is
 #      what a customer box actually follows, so a hold harness that can only
 #      drive the tag-list resolver grades the canary rung and nothing else.
+. "$(dirname "${BASH_SOURCE[0]}")/lib/tag_origin_stub.sh"   # DIVE-7973: fixture tags came from main
 mk_curl() {
   local route_arm=""
   [[ -n "${2:-}" ]] && route_arm="$(printf 'case "$*" in *cli-version*) printf \x27%%s\\n\x27 "%s"; exit 0 ;; esac\n' "$2")"
@@ -110,7 +111,7 @@ run_install() { # $1=hold body  [$2=block override]  [$3=rung: canary(default)|r
     *)      bad_t "unknown rung '$rung'" "run_install takes canary|route"; rm -rf "$stubs"; return ;;
   esac
   printf '#!/usr/bin/env bash\n%s\n' "$git_stub" > "$stubs/git"; chmod +x "$stubs/git"
-  printf '#!/usr/bin/env bash\n%s\n' "$(mk_curl "$1" "$route_tag")" > "$stubs/curl"; chmod +x "$stubs/curl"
+  printf '#!/usr/bin/env bash\n%s\n%s\n' "$(tag_origin_ok_stub)" "$(mk_curl "$1" "$route_tag")" > "$stubs/curl"; chmod +x "$stubs/curl"
   out="$(env -i PATH="$stubs:/usr/bin:/bin" GH_ORG="testorg" \
     CLI_VERSION_OVERRIDE_FILE="$stubs/override-absent" \
     CLI_CANARY_FILE="$canary_file" \

@@ -3,7 +3,7 @@
 # outbound tries in 38 min, `local-only check` red). One arm per defect, each red
 # on the pre-fix tree; the controls prove the online path is unchanged.
 #
-#   D1  G1-G3   gh_org never probes GitHub with local-only on (control: it does off)
+#   D1  G1-G3   gh_org never probes GitHub (DIVE-7973: on or off, no probe, no old-org fallback)
 #   D2  Q1-Q4   every Claude Code run 5dive makes as a seat carries the quiet env
 #               (the create-time plugin install, plugin registration, the mod
 #               probe); nothing extra with the switch off
@@ -85,8 +85,12 @@ on;  : >"$LOG"; org=$(gh_org)
   && ok_ 'G1 local-only on: gh_org = 5dive-ai with no GitHub probe' \
   || bad_ 'G1 gh_org on' "org=$org calls=$(cat "$LOG")"
 off; : >"$LOG"; org=$(gh_org)
-[[ "$org" == 5dive-com ]] && grep -q 'raw.githubusercontent.com' "$LOG" \
-  && ok_ 'G2 control: switch off still probes (offline it falls back to 5dive-com)' \
+# DIVE-7973: the probe and its 5dive-com fallback are gone — offline with the
+# switch off, the answer is still the current org and nothing is probed. (This
+# arm used to assert the fallback; that fallback sent root installs to the old
+# org name on any network blip.)
+[[ "$org" == 5dive-ai ]] && ! grep -q 'raw.githubusercontent.com' "$LOG" \
+  && ok_ 'G2 switch off, offline: still 5dive-ai, no probe, never the old org (DIVE-7973)' \
   || bad_ 'G2 gh_org off' "org=$org calls=$(cat "$LOG")"
 
 # ── the create-time plugin install (real function, heredoc included) ────────
