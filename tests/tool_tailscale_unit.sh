@@ -95,7 +95,7 @@ up=$(grep -m1 '^up ' "$STUB_LOG")
 
 # --- T4: the key never in argv, the answer, or left on disk ----------------------
 grep -q "keyfile=$KEY mode=600" "$STUB_LOG" && ok_t "T4 tailscale read the key from a 0600 file" || bad_t "T4 key file" "$(cat "$STUB_LOG")"
-! grep -v '^keyfile=' "$STUB_LOG" | grep -q "$KEY" && ok_t "T4 the key is in no argv" || bad_t "T4 key in argv" "$(cat "$STUB_LOG")"
+_argv=$(grep -v '^keyfile=' "$STUB_LOG"); ! grep -q "$KEY" <<<"$_argv" && ok_t "T4 the key is in no argv" || bad_t "T4 key in argv" "$(cat "$STUB_LOG")"
 [[ "$out" != *"$KEY"* ]] && ok_t "T4 the answer never prints the key" || bad_t "T4 key in answer" "$out"
 kf=$(cat "$STUB_LOG.kf"); [[ -n "$kf" && ! -e "$kf" && -z "$(ls -A "$TMP/keys")" ]] && ok_t "T4 the key file is gone afterwards" || bad_t "T4 key file left" "$kf $(ls -A "$TMP/keys")"
 [[ ! -s "$TOOLS_ENV_FILE" ]] || ! grep -q tskey "$TOOLS_ENV_FILE" && ok_t "T4 the key is not saved in the agents' key file" || bad_t "T4 in tools.sh"
