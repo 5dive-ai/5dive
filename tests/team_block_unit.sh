@@ -41,6 +41,10 @@ has "a can't is checked twice"                'only after a second, different ch
 has "a blocking 5dive failure is a bug"     'When 5dive itself blocks your work'
 has "...offered, sent only on a yes"        '--file --owner-approved`; never send without it'
 has "...never for cosmetic issues"          'Skip cosmetic issues'
+has "a hire reuses the box's AI sign-in"     'reuses an AI sign-in or key this box already holds'
+has "...else one bare link, no markdown"      'auth start <type>` on its own line, no markdown'
+has "the owner's sign-in code is not a leak"  'it is not a leaked secret'
+has "...it is submitted, never echoed"        'auth submit <session_id> --code=<code>`, never repeat it'
 if grep -nE 'DIVE-[0-9]+|\b20[0-9]{2}-[0-9]{2}-[0-9]{2}\b' "$TEAM" >"$TMP/x"; then bad "a3 no idents or dates in model-facing text" "$(head -2 "$TMP/x")"
 else ok "a3 no idents or dates in model-facing text"; fi
 
