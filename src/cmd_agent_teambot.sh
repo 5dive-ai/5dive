@@ -666,20 +666,69 @@ function saveOffset(o: number): void {
   renameSync(tmp, OFFSET_FILE) // atomic
 }
 
-// thread_id -> agent name, rebuilt each poll from the registry (tiny file, cheap).
-function threadMap(): Map<number, string> {
-  const m = new Map<number, string>()
+// thread_id -> the agent's lane, rebuilt each poll from the registry (tiny file,
+// cheap). DIVE-7972: the lane carries the team group's chat id too, because a
+// thread id alone is a small integer any supergroup can reproduce.
+type Lane = { agent: string; chatId: number | null; stateDir: string | null }
+function threadMap(): Map<number, Lane> {
+  const m = new Map<number, Lane>()
   try {
     const reg = JSON.parse(readFileSync(REGISTRY, 'utf8'))
     for (const [name, a] of Object.entries<any>(reg.agents ?? {})) {
       const t = a?.teamTopic?.threadId
-      if (typeof t === 'number') m.set(t, name)
+      if (typeof t !== 'number') continue
+      const c = a?.teamTopic?.chatId
+      m.set(t, {
+        agent: name,
+        chatId: typeof c === 'number' ? c : (typeof c === 'string' && /^-?\d+$/.test(c) ? Number(c) : null),
+        stateDir: typeof a?.stateDir === 'string' && a.stateDir ? a.stateDir : null,
+      })
     }
   } catch (e) {
     process.stderr.write(`team-bot-listener: registry read failed: ${e}\n`)
   }
   return m
 }
+
+// The agent's access.json, read as root. Missing or unparseable = {} = nobody.
+function readAgentAccess(lane: Lane): any {
+  const dir = lane.stateDir ?? join(HOME_ROOT, `agent-${lane.agent}`, '.claude', 'channels', 'telegram')
+  try {
+    return JSON.parse(readFileSync(join(dir, 'access.json'), 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+// --- team-sender-gate (DIVE-7972) ---
+// Before DIVE-7972 a message reached a sudo agent when it was not from a bot and
+// its thread id was mapped — nothing else. So anyone in the team group, or anyone
+// who added the team bot to THEIR OWN supergroup and posted in a thread with a
+// matching (small integer) id, spoke to the agent as its owner.
+// Now BOTH must hold, or the message is dropped:
+//   1. the chat is the team group this lane was registered in (teamTopic.chatId);
+//   2. the sender is on the agent's list for that group: the group entry's
+//      allowFrom (written as [owner] by `team-bot shared|provision --owner`), or,
+//      when that is empty, the agent's own allowFrom (its paired owner).
+// No list at all = nobody: fail closed. The plugin re-checks in its relay drain.
+function teamSenderAllowed(
+  lane: { chatId: number | null },
+  msg: any,
+  access: any,
+): { ok: true } | { ok: false; why: string } {
+  const chatId = msg?.chat?.id
+  if (lane.chatId == null) return { ok: false, why: 'lane has no registered team group' }
+  if (typeof chatId !== 'number' || chatId !== lane.chatId) return { ok: false, why: `chat ${chatId} is not the team group` }
+  const from = msg?.from?.id
+  if (from == null || !/^\d{1,20}$/.test(String(from))) return { ok: false, why: 'no sender id' }
+  const toList = (v: unknown): string[] => (Array.isArray(v) ? v.map(x => String(x)) : [])
+  const groupList = toList(access?.groups?.[String(chatId)]?.allowFrom)
+  const list = groupList.length > 0 ? groupList : toList(access?.allowFrom)
+  if (list.length === 0) return { ok: false, why: 'agent has no allowFrom for the team group' }
+  if (!list.includes(String(from))) return { ok: false, why: `sender ${from} is not on the agent's allowFrom` }
+  return { ok: true }
+}
+// --- end team-sender-gate ---
 
 // Cache agent-<name> uid/gid so dropped files are owned by the agent (which runs
 // the plugin as agent-<name> and must read + delete them). Listener runs as root.
@@ -1004,8 +1053,15 @@ while (!shuttingDown) {
     if (msg.from?.is_bot) continue
     const threadId = msg.message_thread_id
     if (threadId == null) continue
-    const agent = map.get(threadId)
-    if (!agent) continue
+    const lane = map.get(threadId)
+    if (!lane) continue
+    const agent = lane.agent
+    // DIVE-7972: the team group, and a sender on the agent's list — or nothing.
+    const verdict = teamSenderAllowed(lane, msg, readAgentAccess(lane))
+    if (!verdict.ok) {
+      process.stderr.write(`team-bot-listener: dropped for ${agent} (thread ${threadId}): ${verdict.why}\n`)
+      continue
+    }
     if (!rateOk(agent, now)) {
       process.stderr.write(`team-bot-listener: rate-limited ${agent} (thread ${threadId})\n`)
       continue
