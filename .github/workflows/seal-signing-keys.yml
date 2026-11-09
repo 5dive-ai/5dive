@@ -15,11 +15,22 @@ name: seal-signing-keys
 # GitHub alone holds the private half, so the artifact is safe to download and
 # nobody ever handles a key.
 #
-# THE STEPS (a repo admin runs 1, 3, 4, 5):
+# WHY THE KEY IS A CONSTANT, NOT A DISPATCH INPUT. Whoever chooses the public key
+# can open the artifact. Anyone with write access can dispatch on main (that includes
+# the app every agent seat pushes through), so a `public_key` input would let them
+# pass their OWN key and walk off with both signing keys. The key below can only
+# change through a reviewed merge to main, and the job refuses to run while it is
+# unset. (A required-reviewer environment was the other option; it was not chosen
+# because a reviewer must be a GitHub user and the admin who runs this acts through
+# a token, so every dispatch would wait on a click nobody on the team can make.)
+#
+# THE STEPS (a repo admin runs 1-5):
 #   1. Create the `release-signing` environment, deployment branches = main only,
 #      then read its public key:
 #        gh api repos/5dive-ai/5dive/environments/release-signing/secrets/public-key
-#   2. Dispatch this workflow ON MAIN with that `key` and `key_id`.
+#      and merge a PR that sets SEAL_TO_KEY and SEAL_TO_KEY_ID below to its `key`
+#      and `key_id` (review it against that output: it is public data).
+#   2. Dispatch this workflow ON MAIN (no inputs).
 #   3. Download the artifact and PUT each ciphertext (the job summary prints the
 #      exact commands).
 #   4. PROVE the copies before any delete: dispatch apt-repo and offline-update on
@@ -30,15 +41,11 @@ name: seal-signing-keys
 #   5. Only then delete the two repo-level secrets, and delete this file.
 on:
   workflow_dispatch:
-    inputs:
-      public_key:
-        description: 'release-signing environment public key (the `key` field, base64)'
-        required: true
-        type: string
-      key_id:
-        description: 'its `key_id`'
-        required: true
-        type: string
+
+env:
+  # Step 1 sets both, in a reviewed PR to main. Empty = the job refuses to run.
+  SEAL_TO_KEY: ''
+  SEAL_TO_KEY_ID: ''
 
 permissions:
   contents: read
@@ -54,8 +61,6 @@ jobs:
 
       - name: Seal each repo secret to the environment key
         env:
-          PUBLIC_KEY: ${{ inputs.public_key }}
-          KEY_ID: ${{ inputs.key_id }}
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
           OFFLINE_UPDATE_SIGNING_KEY: ${{ secrets.OFFLINE_UPDATE_SIGNING_KEY }}
           OUT: ${{ runner.temp }}/sealed
@@ -65,9 +70,12 @@ jobs:
           python3 - <<'PY'
           import base64, os, sys
           from nacl.public import PublicKey, SealedBox
-          pk = base64.b64decode(os.environ["PUBLIC_KEY"].strip(), validate=True)
+          raw, key_id = os.environ.get("SEAL_TO_KEY", "").strip(), os.environ.get("SEAL_TO_KEY_ID", "").strip()
+          if not raw or not key_id:
+              sys.exit("SEAL_TO_KEY / SEAL_TO_KEY_ID are unset: step 1 sets them in a reviewed PR to main; this job never takes a key as input")
+          pk = base64.b64decode(raw, validate=True)
           if len(pk) != 32:
-              sys.exit(f"public_key is {len(pk)} bytes, not 32: paste the `key` field of the environment's public-key response")
+              sys.exit(f"SEAL_TO_KEY is {len(pk)} bytes, not 32: it must be the `key` field of the environment's public-key response")
           box = SealedBox(PublicKey(pk))
           out = os.environ["OUT"]
           for name in ("APT_SIGNING_KEY", "OFFLINE_UPDATE_SIGNING_KEY"):
@@ -77,7 +85,7 @@ jobs:
               with open(os.path.join(out, name), "w") as f:
                   f.write(base64.b64encode(box.encrypt(value.encode())).decode())
           with open(os.path.join(out, "key_id"), "w") as f:
-              f.write(os.environ["KEY_ID"].strip())
+              f.write(key_id)
           print("sealed: APT_SIGNING_KEY, OFFLINE_UPDATE_SIGNING_KEY")
           PY
 
@@ -85,7 +93,6 @@ jobs:
         env:
           APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
           OFFLINE_UPDATE_SIGNING_KEY: ${{ secrets.OFFLINE_UPDATE_SIGNING_KEY }}
-          KEY_ID: ${{ inputs.key_id }}
         run: |
           set -euo pipefail
           export GNUPGHOME="$(mktemp -d)"
@@ -95,7 +102,7 @@ jobs:
           upd_fpr="$(printf '%s\n' "$upd_pub" | openssl pkey -pubin -outform DER | sha256sum | awk '{print $1}')"
           rm -rf "$GNUPGHOME"
           {
-            echo "## Sealed for release-signing (key_id ${KEY_ID})"
+            echo "## Sealed for release-signing (key_id ${SEAL_TO_KEY_ID})"
             echo
             echo "- APT_SIGNING_KEY: OpenPGP fingerprint \`${apt_fpr}\`"
             echo "- OFFLINE_UPDATE_SIGNING_KEY: public key SHA-256 (DER) \`${upd_fpr}\`"
