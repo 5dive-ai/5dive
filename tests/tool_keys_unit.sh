@@ -18,6 +18,8 @@ cd "$(dirname "$0")/.."
 TMP="$(mktemp -d /tmp/tool-keys-unit.XXXXXX)"
 export FIVEDIVE_CONNECTOR_DIR="$TMP/connectors"
 mkdir -p "$FIVEDIVE_CONNECTOR_DIR"
+# Never the host's own tailscale (DIVE-7996): its row reads not connected here.
+export FIVEDIVE_TAILSCALE_BIN="$TMP/no-tailscale"
 
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh cmd_tool.sh; do
   # shellcheck source=/dev/null
@@ -52,7 +54,7 @@ gh=$(jq -r '.data.tools[] | select(.id=="github") | .connected' <<<"$out")
 el=$(jq -r '.data.tools[] | select(.id=="elevenlabs") | .connected' <<<"$out")
 n=$(jq -r '.data.tools | length' <<<"$out")
 # 19 catalog keys (aws joined in DIVE-5934) + the google sign-in row.
-[[ "$gh" == true && "$el" == false && "$n" == 20 ]] && ok_t "T2 ls: github connected, elevenlabs not, 19 key tools + google" || bad_t "T2 ls" "$out"
+[[ "$gh" == true && "$el" == false && "$n" == 21 ]] && ok_t "T2 ls: github connected, elevenlabs not, 19 key tools + tailscale + google" || bad_t "T2 ls" "$out"
 [[ "$out" != *ghp_FAKE* ]] && ok_t "T2 ls never prints a key" || bad_t "T2 ls leaks" "$out"
 
 # --- T3: replace is idempotent; another tool's line survives -------------------
@@ -185,7 +187,7 @@ for t in elevenlabs meta; do run rm "$t" >/dev/null; done
 out=$( ( set -euo pipefail; cmd_tool ls ) 2>&1 ); rc=$?
 gh=$(jq -r '.data.tools[] | select(.id=="github") | .connected' <<<"$out" 2>/dev/null)
 n=$(jq -r '.data.tools | length' <<<"$out" 2>/dev/null)
-[[ $rc -eq 0 && "$gh" == false && "$n" == 20 ]] && ok_t "T10 ls with every key removed: rc 0, 20 rows, none connected" || bad_t "T10 ls after last rm" "rc=$rc $out"
+[[ $rc -eq 0 && "$gh" == false && "$n" == 21 ]] && ok_t "T10 ls with every key removed: rc 0, 21 rows, none connected" || bad_t "T10 ls after last rm" "rc=$rc $out"
 
 # --- T11: the business apps (DIVE-5513) -----------------------------------------
 # The ten ids, each with its vars in stdin order, after the first nine (aws is
@@ -222,12 +224,12 @@ out=$(printf 'stockFAKEtoken\n' | run set acme-stock --env=ACME_STOCK_TOKEN); rc
 [[ $rc -eq 0 && "$(seen ACME_STOCK_TOKEN)" == stockFAKEtoken ]] && ok_t "T12 a one-variable custom tool" || bad_t "T12 one var" "rc=$rc $out"
 out=$(run ls --tool=acme-cal:ACME_LOGIN,ACME_CALDAV_PASSWORD --tool=acme-stock:ACME_STOCK_TOKEN --tool=acme-crm:ACME_CRM_TOKEN)
 got=$(jq -r '[.data.tools[19:][] | "\(.id)=\(.env | join(","))=\(.connected)"] | join(" ")' <<<"$out")
-[[ "$got" == "acme-cal=ACME_LOGIN,ACME_CALDAV_PASSWORD=true acme-stock=ACME_STOCK_TOKEN=true acme-crm=ACME_CRM_TOKEN=false google==false" ]] \
-  && ok_t "T12 ls --tool lists custom ids after the catalog, connected from the keys, google last" || bad_t "T12 ls --tool" "got: $got"
+[[ "$got" == "acme-cal=ACME_LOGIN,ACME_CALDAV_PASSWORD=true acme-stock=ACME_STOCK_TOKEN=true acme-crm=ACME_CRM_TOKEN=false tailscale==false google==false" ]] \
+  && ok_t "T12 ls --tool lists custom ids after the catalog, connected from the keys, then tailscale, google last" || bad_t "T12 ls --tool" "got: $got"
 n=$(run ls | jq -r '.data.tools | length')
-[[ "$n" == 20 ]] && ok_t "T12 a plain ls lists the catalog only" || bad_t "T12 plain ls" "$n"
+[[ "$n" == 21 ]] && ok_t "T12 a plain ls lists the catalog only" || bad_t "T12 plain ls" "$n"
 n=$(run ls --tool=github:GH_TOKEN | jq -r '.data.tools | length')
-[[ "$n" == 20 ]] && ok_t "T12 --tool on a catalog id adds no second row" || bad_t "T12 catalog --tool" "$n"
+[[ "$n" == 21 ]] && ok_t "T12 --tool on a catalog id adds no second row" || bad_t "T12 catalog --tool" "$n"
 out=$(printf 'x\n' | run set acme-x); rc=$?
 [[ $rc -ne 0 && "$out" == *"unknown tool"* && "$out" == *"--env"* ]] && ok_t "T12 an unknown id without --env: refused, names --env" || bad_t "T12 no --env" "rc=$rc $out"
 before=$(cat "$F")

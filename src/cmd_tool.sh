@@ -117,6 +117,11 @@ _tool_usage() {
     5dive tool google cancel <session>
     5dive tool rm google               sign out
   Every google verb, and rm google, is root-only.
+
+  Tailscale puts this server on your own private network:
+    5dive tool set tailscale     an auth key (tskey-auth-...) on STDIN; joins with
+                                 shields up, so nothing on the network can reach in
+    5dive tool rm tailscale      leave the network (tailscale logout)
 EOF
 }
 
@@ -161,6 +166,8 @@ _tool_custom_var_ok() {
 # catalog id, else the caller's own list (validated). Fails with a usage error.
 _tool_resolve() {
   local id="${1:-}" given="${3:-0}" v seen=" " n=0 list
+  [[ "$id" == "$TOOL_TAILSCALE_ID" ]] \
+    && fail "$E_USAGE" "tailscale joins the server to your network rather than saving a key: 5dive tool set tailscale (and tool rm tailscale to leave)"
   local -a words=()
   read -ra words <<<"${2:-}"
   list="${words[*]}"
@@ -214,6 +221,10 @@ _tool_ls() {
     out=$(jq -c --arg id "${ids[$i]}" --arg env "${envs[$i]}" --argjson c "$connected" \
       '. + [{id: $id, kind: "key", env: ($env | split(" ")), connected: $c}]' <<<"$out")
   done
+  # Tailscale (DIVE-7996): the box itself on the owner's private network, not a
+  # key in the file. Always listed, so the Mini App knows this CLI can join it.
+  out=$(jq -c --argjson c "$(_tool_tailscale_running && echo true || echo false)" \
+    '. + [{id: "tailscale", kind: "network", env: [], connected: $c}]' <<<"$out")
   # The sign-ins after every key tool (DIVE-5934). Read from gcloud's own files,
   # never by running gcloud: ls must answer on a box that has not installed it.
   local account
@@ -266,6 +277,11 @@ _tool_put_var() {
 _tool_set() {
   local id="${1:-}"
   require_root tool set
+  if [[ "$id" == "$TOOL_TAILSCALE_ID" ]]; then
+    (( ! _TOOL_ENV_GIVEN )) || fail "$E_USAGE" "tailscale joins the server to your network; it takes no --env"
+    _tool_tailscale_up
+    return 0
+  fi
   _tool_resolve "$id" "$_TOOL_ENV_ARG" "$_TOOL_ENV_GIVEN"
   local env="$_TOOL_VARS"
   [[ -t 0 ]] && fail "$E_USAGE" "the key goes on stdin, one line per field: $env"
@@ -292,6 +308,10 @@ _tool_rm() {
   require_root tool rm
   if [[ "$id" == "$TOOL_GOOGLE_ID" ]] && (( ! _TOOL_ENV_GIVEN )); then
     _tool_google_rm
+    return 0
+  fi
+  if [[ "$id" == "$TOOL_TAILSCALE_ID" ]] && (( ! _TOOL_ENV_GIVEN )); then
+    _tool_tailscale_down
     return 0
   fi
   _tool_resolve "$id" "$_TOOL_ENV_ARG" "$_TOOL_ENV_GIVEN"
@@ -670,4 +690,84 @@ _tool_google_rm() {
   fi
   [[ -z "$(_tool_google_account)" ]] || fail "$E_GENERIC" "could not sign Google out: the account is still set in $(_tool_google_config_file)"
   ok "Google signed out" '{tool: $t, connected: false}' --arg t "$TOOL_GOOGLE_ID"
+}
+
+# ── Tailscale: the server on the owner's network (DIVE-7996) ─────────────────
+# Not a key agents read: `tool set tailscale` joins THIS server to the owner's
+# tailnet with an auth key they made at login.tailscale.com/admin/settings/keys,
+# pasted in the Mini App's Tools. The key is used once and kept nowhere: it goes
+# stdin -> a 0600 file in a root-only dir -> `tailscale up --auth-key=file:...`,
+# never argv (argv is audited and visible in ps), never a log, and the file is
+# gone when the verb returns. Joined with:
+#   --shields-up            nothing on the tailnet can open a connection in
+#   --accept-dns=false      the box keeps its own DNS
+#   --accept-routes=false   and its own routes
+#   --reset                 a re-join with a new key never trips over old flags
+# The exit-node route stays a guide step (it needs the admin console).
+TOOL_TAILSCALE_ID="tailscale"
+TOOL_TAILSCALE_BIN="${FIVEDIVE_TAILSCALE_BIN:-tailscale}"
+TOOL_TAILSCALE_KEY_RE='^tskey-auth-[A-Za-z0-9_-]{8,}$'
+TOOL_TAILSCALE_KEY_DIR="${FIVEDIVE_TAILSCALE_KEY_DIR:-/run/5dive-tailscale}"
+
+# 0 when tailscaled says Running. Never fails, never waits long: ls must answer
+# on a box with no tailscale at all.
+_tool_tailscale_running() {
+  command -v "$TOOL_TAILSCALE_BIN" >/dev/null 2>&1 || return 1
+  [[ "$(timeout 5 "$TOOL_TAILSCALE_BIN" status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null)" == Running ]]
+}
+
+# The name the box takes on the tailnet: its short hostname as a DNS label.
+_tool_tailscale_hostname() {
+  local h
+  h=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo 5dive)
+  h=$(tr 'A-Z' 'a-z' <<<"$h" | tr -c 'a-z0-9-\n' '-' | sed -E 's/^-+//; s/-+$//')
+  h="${h:0:63}"
+  printf '%s' "${h:-5dive}"
+}
+
+_tool_tailscale_up() {
+  [[ -t 0 ]] && fail "$E_USAGE" "the auth key goes on stdin, one line: tskey-auth-..."
+  local line vals=() key
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    vals+=("$line")
+  done
+  (( ${#vals[@]} == 1 )) || fail "$E_VALIDATION" "tailscale takes 1 value (an auth key), got ${#vals[@]}. Nothing was changed"
+  key="${vals[0]}"
+  [[ "$key" =~ $TOOL_TAILSCALE_KEY_RE ]] \
+    || fail "$E_VALIDATION" "that is not a Tailscale auth key (it starts with tskey-auth-). Nothing was changed"
+  if ! command -v "$TOOL_TAILSCALE_BIN" >/dev/null 2>&1; then
+    [[ -x "$TOOL_ENSURE_CLI" ]] \
+      || fail "$E_NOT_INSTALLED" "Tailscale is not installed and this server has no installer for it ($TOOL_ENSURE_CLI is missing). Update the server, then try again"
+    "$TOOL_ENSURE_CLI" tailscale </dev/null >/dev/null 2>&1 \
+      || fail "$E_GENERIC" "could not install Tailscale on this server. Try again in a minute"
+    command -v "$TOOL_TAILSCALE_BIN" >/dev/null 2>&1 \
+      || fail "$E_GENERIC" "Tailscale installed but its command is missing. Try again in a minute"
+  fi
+  local kf rc err
+  install -d -m 700 "$TOOL_TAILSCALE_KEY_DIR" 2>/dev/null || mkdir -p -m 700 "$TOOL_TAILSCALE_KEY_DIR"
+  kf=$(umask 077; mktemp "$TOOL_TAILSCALE_KEY_DIR/key.XXXXXX") || fail "$E_GENERIC" "could not stage the auth key"
+  printf '%s' "$key" > "$kf"
+  key=""; vals=()
+  err=$(timeout 120 "$TOOL_TAILSCALE_BIN" up --reset --auth-key="file:$kf" \
+    --shields-up --accept-dns=false --accept-routes=false \
+    --hostname="$(_tool_tailscale_hostname)" --timeout=90s </dev/null 2>&1 >/dev/null)
+  rc=$?
+  rm -f "$kf"
+  if (( rc != 0 )); then
+    # Tailscale's own words, minus anything key-shaped, so a bad key reads as one.
+    err=$(sed -E 's/tskey-[A-Za-z0-9_-]+/tskey-…/g' <<<"$err" | tail -n 3 | tr '\n' ' ')
+    fail "$E_GENERIC" "Tailscale did not connect: ${err:-it stopped with code $rc}"
+  fi
+  _tool_tailscale_running || fail "$E_GENERIC" "Tailscale took the key but is not connected yet. Try again in a minute"
+  ok "this server is on your Tailscale network, with shields up" \
+     '{tool: $t, connected: true}' --arg t "$TOOL_TAILSCALE_ID"
+}
+
+_tool_tailscale_down() {
+  if command -v "$TOOL_TAILSCALE_BIN" >/dev/null 2>&1; then
+    timeout 30 "$TOOL_TAILSCALE_BIN" logout </dev/null >/dev/null 2>&1 || true
+    _tool_tailscale_running && fail "$E_GENERIC" "could not take this server off Tailscale: it still reads connected"
+  fi
+  ok "this server left your Tailscale network" '{tool: $t, connected: false}' --arg t "$TOOL_TAILSCALE_ID"
 }
