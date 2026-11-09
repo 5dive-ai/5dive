@@ -200,7 +200,7 @@ require_sqlite() {
 # block, and a store stamped '3932-1' has never seen the triggers block, so
 # either literal skips one population's migration entirely. A THIRD value that
 # no store carries is the only resolution that re-migrates both.
-_TASKS_SCHEMA_EPOCH='5769-1'  # DIVE-5769: +team_members (on top of 4911-1: +tasks.gate_renag_failed_at/_via)
+_TASKS_SCHEMA_EPOCH='8035-1'  # DIVE-8035: +humans.role/teams_id/email, +human_access, +knocks (on top of 5769-1: +team_members, 4911-1: +tasks.gate_renag_failed_at/_via)
 
 # DIVE-3931: Event -> Task ingress lives in the task store because ingress ends
 # at the queue. One SQL emitter serves fresh stores and migrations so the two
@@ -1127,7 +1127,10 @@ CREATE TABLE IF NOT EXISTS humans (
   buzz_npub    TEXT,
   discord_id   TEXT,
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  role         TEXT,
+  teams_id     TEXT,
+  email        TEXT
 );
 CREATE TABLE IF NOT EXISTS human_agents (
   human_id TEXT NOT NULL REFERENCES humans(id) ON DELETE CASCADE,
@@ -1135,6 +1138,35 @@ CREATE TABLE IF NOT EXISTS human_agents (
   PRIMARY KEY (human_id, agent)
 );
 CREATE INDEX IF NOT EXISTS human_agents_agent_idx ON human_agents(agent);
+-- DIVE-8035 People: WHO MAY TALK TO WHICH AGENT (agent='*' = every agent).
+-- NOT human_agents, which means "owns that agent's gates" and feeds gate routing.
+-- humans.role NOT NULL marks a People-managed record (src/cmd_people.sh); a
+-- pairing-era row keeps role NULL and `people sync` never adds or removes it.
+CREATE TABLE IF NOT EXISTS human_access (
+  human_id TEXT NOT NULL REFERENCES humans(id) ON DELETE CASCADE,
+  agent    TEXT NOT NULL,
+  PRIMARY KEY (human_id, agent)
+);
+CREATE INDEX IF NOT EXISTS human_access_agent_idx ON human_access(agent);
+-- DIVE-8035: a stranger asking to talk to an agent, held until the owner taps.
+-- nonce_hash is the owner card's tap proof: {"allow":h,"admin":h,"no":h}, one
+-- SHA-256 per button (raw nonces only ride the buttons; a proof answers its own choice).
+CREATE TABLE IF NOT EXISTS knocks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent       TEXT NOT NULL,
+  channel     TEXT NOT NULL,
+  sender_id   TEXT NOT NULL,
+  name        TEXT,
+  email       TEXT,
+  status      TEXT NOT NULL DEFAULT 'pending',
+  nonce_hash  TEXT,
+  human_id    TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  answered_at TEXT,
+  answered_by TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS knocks_one_pending ON knocks(agent, channel, sender_id) WHERE status='pending';
+CREATE UNIQUE INDEX IF NOT EXISTS humans_teams_id_uq ON humans(teams_id) WHERE teams_id IS NOT NULL;
 
 -- DIVE-5769: TEAM MEMBERSHIP, many-to-many. One character is one agent per box,
 -- and a team that needs a persona already here ADDS that agent instead of
@@ -3341,7 +3373,10 @@ CREATE TABLE IF NOT EXISTS humans (
   buzz_npub    TEXT,
   discord_id   TEXT,
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  role         TEXT,
+  teams_id     TEXT,
+  email        TEXT
 );
 CREATE TABLE IF NOT EXISTS human_agents (
   human_id TEXT NOT NULL REFERENCES humans(id) ON DELETE CASCADE,
@@ -3351,6 +3386,49 @@ CREATE TABLE IF NOT EXISTS human_agents (
 CREATE INDEX IF NOT EXISTS human_agents_agent_idx ON human_agents(agent);
 MIG
   fi
+  # DIVE-8035 People, for EXISTING stores (the DIVE-2512 lesson: a fresh-DB
+  # harness never runs this path, so tests/people_unit.sh builds a pre-8035
+  # store and migrates it). Guarded per piece, not on one table's absence, so a
+  # store that lost one ALTER to a lock converges on the next epoch-stale run.
+  # The humans columns go in BEFORE the teams_id unique index that needs them.
+  # All three are additive and the new tables arrive EMPTY: zero People rows is
+  # today's behaviour, byte for byte. Keep the CREATEs byte-identical to the
+  # copies in _tasks_schema above (tests/schema_sync_unit.sh).
+  local _hcols _hc
+  _hcols=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+    "SELECT name FROM pragma_table_info('humans');" 2>/dev/null)
+  for _hc in role teams_id email; do
+    grep -qx "$_hc" <<<"$_hcols" && continue
+    sqlite3 -cmd ".timeout 5000" "$TASKS_DB" \
+      "ALTER TABLE humans ADD COLUMN $_hc TEXT;" >/dev/null 2>&1 || true
+  done
+  sqlite3 -cmd ".timeout 5000" "$TASKS_DB" <<'MIG' >/dev/null 2>&1 || true
+CREATE TABLE IF NOT EXISTS human_access (
+  human_id TEXT NOT NULL REFERENCES humans(id) ON DELETE CASCADE,
+  agent    TEXT NOT NULL,
+  PRIMARY KEY (human_id, agent)
+);
+CREATE INDEX IF NOT EXISTS human_access_agent_idx ON human_access(agent);
+-- DIVE-8035: a stranger asking to talk to an agent, held until the owner taps.
+-- nonce_hash is the owner card's tap proof: {"allow":h,"admin":h,"no":h}, one
+-- SHA-256 per button (raw nonces only ride the buttons; a proof answers its own choice).
+CREATE TABLE IF NOT EXISTS knocks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent       TEXT NOT NULL,
+  channel     TEXT NOT NULL,
+  sender_id   TEXT NOT NULL,
+  name        TEXT,
+  email       TEXT,
+  status      TEXT NOT NULL DEFAULT 'pending',
+  nonce_hash  TEXT,
+  human_id    TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  answered_at TEXT,
+  answered_by TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS knocks_one_pending ON knocks(agent, channel, sender_id) WHERE status='pending';
+CREATE UNIQUE INDEX IF NOT EXISTS humans_teams_id_uq ON humans(teams_id) WHERE teams_id IS NOT NULL;
+MIG
   # DIVE-5769: team membership (see _tasks_schema). A brand-new table, never
   # referenced by tasks/projects, and EMPTY on arrival — which is the signal every
   # surface reads as "derive this team from the org tree, as before".
