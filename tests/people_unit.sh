@@ -31,6 +31,7 @@
 #   K8  a seat files a knock for itself only (agent from SUDO_UID, never argv).
 #   K9  a proof answers only its own button: the No/Allow nonce as admin is
 #       refused, the knock stays pending, roles.json is unchanged.
+#   G1  the caller seat is read only under root; non-root fails closed to "-".
 #
 # Isolation: source src/ directly, throwaway TASKS_DB and fake homes, stubbed
 # registry/send/audit, no root, no network.
@@ -271,6 +272,14 @@ K8B=$( SUDO_UID=4321 cmd_people_knock_file --channel=telegram --sender=123456787
 [[ "$K8A" == "$E_PERMISSION" && "$(db "SELECT agent FROM knocks WHERE id=$(jq -r .data.id <<<"$K8B");")" == otto ]] \
   && ok_t "K8 a seat cannot knock in another agent's name; its own agent comes from SUDO_UID" \
   || bad_t "K8 seat scope" "other=$K8A own=$K8B"
+
+# G1 — the caller seat is read only under a real root euid: below it SUDO_UID is a
+# plain env var, so a non-root caller fails CLOSED to "-" (never "" = root/app).
+G1=$( _gate_is_root() { return 1; }; SUDO_UID=4321 _people_caller_seat )
+G1R=$( SUDO_UID=4321 _people_caller_seat )
+[[ "$G1" == "-" && "$G1R" == otto ]] \
+  && ok_t "G1 caller seat: non-root fails closed to '-', root reads the sudo-stamped seat" \
+  || bad_t "G1 caller seat" "nonroot='$G1' root='$G1R'"
 
 echo "-----"
 echo "people_unit: $PASS passed, $FAIL failed"

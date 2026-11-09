@@ -115,8 +115,14 @@ _people_agent_exists() {
 _people_in_use() {
   [[ "$(db "SELECT 1 FROM humans WHERE role IS NOT NULL LIMIT 1;" 2>/dev/null)" == "1" ]]
 }
-# The seat a sudo caller is, or empty for root / a non-seat.
+# The seat a sudo caller is: empty for root itself (the app), "-" for a caller
+# that is not a seat. SUDO_UID is only sound under a REAL root euid (DIVE-1413:
+# below EUID 0 it is a plain env var), and sudo stamps it on the transition, so
+# a non-root caller fails CLOSED to "-" — never to empty, which means "root, no
+# proof needed". Both callers already refuse non-root; this keeps the read sound
+# on its own.
 _people_caller_seat() {
+  _gate_is_root || { printf '%s' "-"; return 0; }
   local ruid="${SUDO_UID:-}" who=""
   [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 ]] || return 0
   who=$(actor_uid_to_name "$ruid" 2>/dev/null)
@@ -132,7 +138,8 @@ _people_home_of() {  # <agent>
 }
 # Replace a person's access set. <id> <agents csv|*|"">
 _people_set_access() {
-  local id="$1" list="$2" a sql="DELETE FROM human_access WHERE human_id=$(sqlq "$id");"
+  local id="$1" list="$2" a
+  local sql="DELETE FROM human_access WHERE human_id=$(sqlq "$id");"
   if [[ "$list" == "*" ]]; then
     sql+="INSERT INTO human_access(human_id,agent) VALUES ($(sqlq "$id"),'*');"
   else
