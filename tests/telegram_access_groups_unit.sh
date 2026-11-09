@@ -59,7 +59,9 @@ out=$(run olivia --answer=every) && [[ "$(field answer)" == every && "$(field gr
   && okk 'every group now has requireMention false' || bad "groups after every: $(jq -c .groups "$STATE/access.json")"
 [[ "$(jq '.groupsRequireMention' "$STATE/access.json")" == false ]] \
   && okk 'groupsRequireMention false, for a group added later' || bad 'groupsRequireMention not written'
-[[ "$(jq -c 'del(.groups, .groupsRequireMention)' "$STATE/access.json")" == "$before" ]] \
+[[ "$(jq '.groupsOwnerOnly' "$STATE/access.json")" == false ]] \
+  && okk 'groupsOwnerOnly false: groups opened on purpose, for a group added later (DIVE-7972)' || bad 'groupsOwnerOnly false not written'
+[[ "$(jq -c 'del(.groups, .groupsRequireMention, .groupsOwnerOnly)' "$STATE/access.json")" == "$before" ]] \
   && okk 'every other key is kept as it was' || bad "other keys changed: $(jq -c . "$STATE/access.json")"
 [[ "$(jq '.groups["-200"].message_thread_id' "$STATE/access.json")" == 7 ]] \
   && okk "a group's own fields survive" || bad 'message_thread_id lost'
@@ -183,8 +185,15 @@ out=$(run olivia) && [[ "$(field answer)" == owner && "$(field mixed)" == true ]
   && okk 'a group open to everyone under owner reads mixed' || bad "owner mixed: $out"
 out=$(run olivia --answer=name) && [[ "$(field answer)" == name ]] \
   && [[ "$(jq -c '[.groups[] | [.requireMention, .allowFrom]]' "$STATE/access.json")" == '[[true,[]],[true,[]]]' ]] \
-  && [[ "$(jq 'has("groupsOwnerOnly")' "$STATE/access.json")" == false ]] \
-  && okk 'leaving owner opens the groups it closed and drops the key' || bad "owner->name: $(jq -c . "$STATE/access.json")"
+  && [[ "$(jq -c '.groupsOwnerOnly' "$STATE/access.json")" == false ]] \
+  && okk 'leaving owner opens the groups it closed and stores groupsOwnerOnly:false (opened on purpose, DIVE-7972)' || bad "owner->name: $(jq -c . "$STATE/access.json")"
+# DIVE-7972: no key = never chose; telegram 0.5.138+ then admits a new group with
+# its owners alone. Choosing by name/every opens such a group and stores false.
+printf '%s' "$OWNER_ACCESS" >"$STATE/access.json"
+jq '.groups["-100"].allowFrom=["1"] | del(.groupsOwnerOnly)' "$STATE/access.json" >"$TMP/a" && cp "$TMP/a" "$STATE/access.json"
+run olivia --answer=every >/dev/null \
+  && [[ "$(jq -c '[.groups[].allowFrom]' "$STATE/access.json")" == '[[],["5"]]' && "$(jq -c '.groupsOwnerOnly' "$STATE/access.json")" == false ]] \
+  && okk 'no key: every opens a group the default closed, keeps one it did not, stores false' || bad "absent->every: $(jq -c . "$STATE/access.json")"
 printf '%s' "$OWNER_ACCESS" >"$STATE/access.json"
 jq '.groups["-100"].allowFrom=["1"] | .groupsOwnerOnly=true | .groups["-200"].allowFrom=["5"]' "$STATE/access.json" >"$TMP/a" && cp "$TMP/a" "$STATE/access.json"
 run olivia --answer=every >/dev/null && [[ "$(jq -c '[.groups[].allowFrom]' "$STATE/access.json")" == '[[],["5"]]' ]] \

@@ -286,7 +286,11 @@ cfgs = [g for g in groups.values() if isinstance(g, dict)]
 allow = access.get('allowFrom') if isinstance(access.get('allowFrom'), list) else []
 owners_rec = access.get('owners') if isinstance(access.get('owners'), list) else []
 owners = [o for o in owners_rec if isinstance(o, str) and o.isdigit() and o in allow]
-was_owner = access.get('groupsOwnerOnly') is True
+# DIVE-7972: with the key absent, telegram 0.5.138+ admits a new group with its
+# owners alone (the safe default), so a group whose allowFrom is exactly the
+# owners was closed by that default and leaving for name/every opens it too.
+# Only `false` (written below) means groups were opened on purpose.
+was_owner = access.get('groupsOwnerOnly') is not False
 if want == 'owner':
     if not owner_ok:
         print("owner: this agent's Telegram plugin is too old for it; it updates on its own", file=sys.stderr); sys.exit(2)
@@ -319,10 +323,10 @@ if want or names_set:
                 g['allowFrom'] = []
         access['groups'] = groups
         access['groupsRequireMention'] = on
-        if want == 'owner':
-            access['groupsOwnerOnly'] = True
-        else:
-            access.pop('groupsOwnerOnly', None)
+        # DIVE-7972: name/every is the owner opening groups ON PURPOSE, so it is
+        # stored as `false`; an absent key now means "never chose" and the plugin
+        # lets a new group in with its owners only.
+        access['groupsOwnerOnly'] = want == 'owner'
     if replace:
         access['groupsCallNames'] = names
         access['groupsCallNamesComplete'] = True
