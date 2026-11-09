@@ -138,8 +138,12 @@ jobs:
           fetch-depth: 0
 
       # DIVE-8014: stage the tag deploy key in a file the push below points ssh at.
-      # A separate step so the secret is in the environment of THIS step only, not
-      # of every script the cut step runs (the release grade runs tests/*.sh).
+      # A separate step keeps the secret VALUE out of the cut step's environment, so
+      # it is not inherited by every script that step runs. It is NOT confined to
+      # this step: the key FILE stays in RUNNER_TEMP, with its path in GITHUB_ENV,
+      # for the whole cut step (the release grade runs tests/*.sh), until the
+      # always() step at the end removes it. That is acceptable because the deploy
+      # key can only push to this repo and the cut step already runs main's code.
       - name: Stage the release-tag deploy key
         env:
           RELEASE_TAG_DEPLOY_KEY: ${{ secrets.RELEASE_TAG_DEPLOY_KEY }}
