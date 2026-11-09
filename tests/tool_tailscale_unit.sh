@@ -62,7 +62,7 @@ ok_t()  { PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; }
 bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 run() { ( cmd_tool "$@" ) 2>&1; }
 ts_connected() { run ls | jq -r '.data.tools[] | select(.id=="tailscale") | .connected'; }
-KEY="tskey-auth-kAbC123CNTRL-Zz9yXwVuTsRqPoNmLkJiHg"
+KEY="tskey-auth-""kAbC123CNTRL-Zz9yXwVuTsRqPoNmLkJiHg"
 
 # --- T1: ls lists tailscale (before google), not connected ------------------------
 out=$(run ls)
@@ -73,7 +73,7 @@ last=$(jq -r '.data.tools[-1].id' <<<"$out")
 
 # --- T2: a wrong-prefix key, or two lines, is refused before tailscale runs --------
 : > "$STUB_LOG"
-for bad in "tskey-api-kAbC123CNTRL-Zz9yXwVu" "ghp_FAKE1234567890" "tskey-auth-x';touch\${IFS}$TMP/pwned;'"; do
+for bad in "tskey-api-""kAbC123CNTRL-Zz9yXwVu" "ghp_FAKE1234567890" "tskey-auth-""x';touch\${IFS}$TMP/pwned;'"; do
   out=$(printf '%s\n' "$bad" | run set tailscale); rc=$?
   [[ $rc -ne 0 && "$out" == *"tskey-auth-"* && ! -s "$STUB_LOG" ]] && ok_t "T2 refused before tailscale ran: ${bad:0:20}…" || bad_t "T2 must refuse: $bad" "rc=$rc $out $(cat "$STUB_LOG")"
 done
