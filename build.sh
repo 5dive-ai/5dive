@@ -179,7 +179,6 @@ LAZY_FILES=(
   src/cmd_constitution.sh
   src/cmd_loop.sh
   src/cmd_loop_pack.sh
-  src/cmd_crew.sh
   src/cmd_heartbeat.sh
   src/cmd_supervisor.sh
   src/cmd_a2a.sh
