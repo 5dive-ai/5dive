@@ -1149,7 +1149,8 @@ CREATE TABLE IF NOT EXISTS human_access (
 );
 CREATE INDEX IF NOT EXISTS human_access_agent_idx ON human_access(agent);
 -- DIVE-8035: a stranger asking to talk to an agent, held until the owner taps.
--- nonce_hash is the owner card's tap proof (raw nonce only rides the button).
+-- nonce_hash is the owner card's tap proof: {"allow":h,"admin":h,"no":h}, one
+-- SHA-256 per button (raw nonces only ride the buttons; a proof answers its own choice).
 CREATE TABLE IF NOT EXISTS knocks (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   agent       TEXT NOT NULL,
@@ -3409,7 +3410,8 @@ CREATE TABLE IF NOT EXISTS human_access (
 );
 CREATE INDEX IF NOT EXISTS human_access_agent_idx ON human_access(agent);
 -- DIVE-8035: a stranger asking to talk to an agent, held until the owner taps.
--- nonce_hash is the owner card's tap proof (raw nonce only rides the button).
+-- nonce_hash is the owner card's tap proof: {"allow":h,"admin":h,"no":h}, one
+-- SHA-256 per button (raw nonces only ride the buttons; a proof answers its own choice).
 CREATE TABLE IF NOT EXISTS knocks (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   agent       TEXT NOT NULL,

@@ -19,7 +19,8 @@
 #   R1  roles.json: admin keys added under `managed`, a hand-added admin
 #       survives a demote that removes the managed key;
 #   O1  the owner cannot be removed or demoted;
-#   K1  knock file: id printed, card sent with kn:<id>:<choice>:<nonce>;
+#   K1  knock file: id printed, card sent with kn:<id>:<choice>:<nonce>, one
+#       nonce per button;
 #   K2  same sender again: same id, no second card;
 #   K3  cap: the 6th pending knock on one agent is refused;
 #   K4  answer allow: member created with access, synced into Teams, the answer
@@ -28,6 +29,8 @@
 #   K6  answer no: denied, no person; a re-knock stays denied and is not re-carded;
 #   K7  a seat answers only with the owner's tap proof; re-answer is a conflict;
 #   K8  a seat files a knock for itself only (agent from SUDO_UID, never argv).
+#   K9  a proof answers only its own button: the No/Allow nonce as admin is
+#       refused, the knock stays pending, roles.json is unchanged.
 #
 # Isolation: source src/ directly, throwaway TASKS_DB and fake homes, stubbed
 # registry/send/audit, no root, no network.
@@ -181,10 +184,15 @@ K1=$( cmd_people_knock_file --agent=vesper --channel=teams --sender=$GK --name="
 KID=$(jq -r '.data.id' <<<"$K1")
 CB=$(jq -r '.inline_keyboard[0][0].callback_data' "$CARDS" 2>/dev/null)
 NONCE="${CB##*:}"
+CB_AD=$(jq -r '.inline_keyboard[0][1].callback_data' "$CARDS" 2>/dev/null); NONCE_AD="${CB_AD##*:}"
+CB_NO=$(jq -r '.inline_keyboard[0][2].callback_data' "$CARDS" 2>/dev/null); NONCE_NO="${CB_NO##*:}"
 [[ "$KID" =~ ^[0-9]+$ && "$(jq -r .data.status <<<"$K1")" == pending && "$CB" =~ ^kn:${KID}:allow:[0-9a-f]{32}$ \
+   && "$CB_AD" =~ ^kn:${KID}:admin:[0-9a-f]{32}$ && "$CB_NO" =~ ^kn:${KID}:no:[0-9a-f]{32}$ \
+   && "$NONCE" != "$NONCE_AD" && "$NONCE" != "$NONCE_NO" && "$NONCE_AD" != "$NONCE_NO" \
    && "$(jq -r '[.inline_keyboard[0][].text]|join("/")' "$CARDS")" == "Allow/Admin/No" \
-   && -z "$(db "SELECT 1 FROM knocks WHERE nonce_hash=$(sqlq "$NONCE");")" ]] \
-  && ok_t "K1 knock file: id $KID, owner card Allow/Admin/No with kn:<id>:<choice>:<nonce>, only the hash stored" \
+   && -z "$(db "SELECT 1 FROM knocks WHERE instr(nonce_hash, $(sqlq "$NONCE"))
+                OR instr(nonce_hash, $(sqlq "$NONCE_AD")) OR instr(nonce_hash, $(sqlq "$NONCE_NO"));")" ]] \
+  && ok_t "K1 knock file: id $KID, owner card Allow/Admin/No, each button its own kn:<id>:<choice>:<nonce>, only hashes stored" \
   || bad_t "K1 knock file" "out=$K1 cb=$CB"
 
 K2=$( cmd_people_knock_file --agent=vesper --channel=teams --sender=${GK^^} 2>&1 )
@@ -206,6 +214,18 @@ actor_uid_to_name() { printf 'agent-vesper'; }
 ( SUDO_UID=4321 cmd_people_knock_answer "$KID" admin ) >/dev/null 2>&1; K7A=$?
 ( SUDO_UID=4321 cmd_people_knock_answer "$KID" admin --proof=00000000000000000000000000000000 ) >/dev/null 2>&1; K7B=$?
 
+# K9 — a proof answers only its own button: the owner's No (or Allow) nonce
+# replayed as admin is refused, the knock stays pending, roles.json untouched.
+R9=$(cat "$PEOPLE_ROLES_FILE" 2>/dev/null)
+( SUDO_UID=4321 cmd_people_knock_answer "$KID" admin --proof="$NONCE_NO" ) >/dev/null 2>&1; K9A=$?
+( SUDO_UID=4321 cmd_people_knock_answer "$KID" admin --proof="$NONCE" ) >/dev/null 2>&1; K9B=$?
+( SUDO_UID=4321 cmd_people_knock_answer "$KID" allow --proof="$NONCE_NO" ) >/dev/null 2>&1; K9C=$?
+[[ "$K9A" == "$E_PERMISSION" && "$K9B" == "$E_PERMISSION" && "$K9C" == "$E_PERMISSION" \
+   && "$(db "SELECT status FROM knocks WHERE id=$KID;")" == pending \
+   && "$(cat "$PEOPLE_ROLES_FILE" 2>/dev/null)" == "$R9" ]] \
+  && ok_t "K9 a seat cannot replay the No or Allow button's nonce as admin (or No's as allow); knock stays pending, roles.json unchanged" \
+  || bad_t "K9 proof bound to choice" "no-as-admin=$K9A allow-as-admin=$K9B no-as-allow=$K9C status=$(db "SELECT status FROM knocks WHERE id=$KID;")"
+
 K4=$( SUDO_UID=4321 cmd_people_knock_answer "$KID" allow --proof="$NONCE" --by=telegram:1234567898 2>&1 )
 K4P=$(jq -r .data.person <<<"$K4")
 DROP="$AGENT_HOME_ROOT/agent-vesper/.claude/channels/teams/knocks/$KID.json"
@@ -217,7 +237,7 @@ DROP="$AGENT_HOME_ROOT/agent-vesper/.claude/channels/teams/knocks/$KID.json"
   && ok_t "K4 answer allow: member created with access, synced into Teams, knocks/$KID.json dropped for the server" \
   || bad_t "K4 answer allow" "out=$K4 drop=$(cat "$DROP" 2>/dev/null)"
 
-( SUDO_UID=4321 cmd_people_knock_answer "$KID" admin --proof="$NONCE" ) >/dev/null 2>&1; K7C=$?
+( SUDO_UID=4321 cmd_people_knock_answer "$KID" allow --proof="$NONCE" ) >/dev/null 2>&1; K7C=$?
 [[ "$K7A" == "$E_PERMISSION" && "$K7B" == "$E_PERMISSION" && "$K7C" == "$E_CONFLICT" ]] \
   && ok_t "K7 a seat needs the owner's tap proof (none/wrong refused); an answered knock cannot be re-answered" \
   || bad_t "K7 seat proof" "none=$K7A wrong=$K7B again=$K7C"

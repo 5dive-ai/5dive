@@ -38,12 +38,13 @@
 # THE KNOCK. A Teams sender not on the list is held by the plugin, which runs
 # `sudo -n 5dive people knock file …` (the narrow per-seat grant in
 # render_standard_sudoers). The owner gets a Telegram card with Allow / Admin /
-# No; the button carries `kn:<kid>:<choice>:<nonce>` and the plugin that
-# receives the tap runs `sudo -n 5dive people knock answer <kid> <choice>
-# --proof=<nonce> --by=telegram:<uid>`. Only the hash of the nonce is stored, and
-# the raw nonce exists only in the button the owner taps (the Bot API has no
-# history a seat could read it back from), so a seat cannot answer its own
-# knock. Root (the app's exec) answers without a proof. The answer is handed to
+# No; each button carries `kn:<kid>:<choice>:<nonce>` with ITS OWN nonce, and the
+# plugin that receives the tap runs `sudo -n 5dive people knock answer <kid>
+# <choice> --proof=<nonce> --by=telegram:<uid>`. Only the three hashes are stored
+# (knocks.nonce_hash = {"allow":h,"admin":h,"no":h}), and a raw nonce exists only
+# in the button the owner taps (the Bot API has no history a seat could read it
+# back from), so a seat cannot answer its own knock. A nonce proves only the
+# choice its button names: the owner's No cannot be replayed as Admin. Root (the app's exec) answers without a proof. The answer is handed to
 # the agent's Teams server as knocks/<kid>.json in its state dir (DIVE-8036).
 
 _PEOPLE_ID_RX='^[a-z0-9][a-z0-9_-]{0,31}$'
@@ -543,16 +544,21 @@ cmd_people_knock_file() {
   (( n < PEOPLE_KNOCK_CAP )) \
     || fail "$E_CONFLICT" "$agent already has $n people waiting for the owner (cap $PEOPLE_KNOCK_CAP) — this one is not filed"
 
-  local nonce kid
-  nonce=$(_human_nonce_mint) || fail "$E_GENERIC" "could not mint a knock proof"
+  # One nonce PER CHOICE: a proof answers only the button it rode on.
+  local n_allow n_admin n_no hashes kid
+  n_allow=$(_human_nonce_mint) && n_admin=$(_human_nonce_mint) && n_no=$(_human_nonce_mint) \
+    || fail "$E_GENERIC" "could not mint a knock proof"
+  hashes=$(jq -cn --arg a "$(_human_nonce_sha "$n_allow")" --arg d "$(_human_nonce_sha "$n_admin")" \
+             --arg n "$(_human_nonce_sha "$n_no")" '{allow:$a, admin:$d, no:$n}') \
+    || fail "$E_GENERIC" "could not record a knock proof"
   kid=$(db "INSERT INTO knocks (agent, channel, sender_id, name, email, nonce_hash)
             VALUES ($(sqlq "$agent"), $(sqlq "$channel"), $(sqlq "$sender"), $(sqlq_or_null "$name"),
-                    $(sqlq_or_null "$email"), $(sqlq "$(_human_nonce_sha "$nonce")"));
+                    $(sqlq_or_null "$email"), $(sqlq "$hashes"));
             SELECT last_insert_rowid();")
   [[ "$kid" =~ ^[0-9]+$ ]] || fail "$E_GENERIC" "knock was not recorded"
   audit_log "people knock file" ok 0 -- "knock=$kid" "agent=$agent" "channel=$channel" "by_claimed=${SUDO_USER:-root}"
   local carded=0
-  _people_knock_card "$kid" "$agent" "$channel" "$name" "$email" "$nonce" && carded=1
+  _people_knock_card "$kid" "$agent" "$channel" "$name" "$email" "$n_allow" "$n_admin" "$n_no" && carded=1
   _people_knock_out "$kid" pending "$carded" ""
 }
 
@@ -573,8 +579,9 @@ _people_html() { local s="$1"; s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&g
 # else the box's gate notifier — the path gate alerts take (_task_send_owner).
 # rc 0 = delivered. Never fails the knock: an undelivered card still shows in
 # the app's Team tab.
-_people_knock_card() {  # <kid> <agent> <channel> <name> <email> <nonce>
-  local kid="$1" agent="$2" channel="$3" who="${4:-Someone}" email="$5" nonce="$6"
+_people_knock_card() {  # <kid> <agent> <channel> <name> <email> <nonce allow> <nonce admin> <nonce no>
+  local kid="$1" agent="$2" channel="$3" who="${4:-Someone}" email="$5"
+  local n_allow="$6" n_admin="$7" n_no="$8"
   _task_agent_channel "$agent" 2>/dev/null \
     || { local nt; nt=$(_task_resolve_gate_notifier 2>/dev/null) && [[ -n "$nt" ]] && _task_agent_channel "$nt" 2>/dev/null; } \
     || return 1
@@ -584,9 +591,9 @@ _people_knock_card() {  # <kid> <agent> <channel> <name> <email> <nonce>
   local text
   text="<b>$(_people_html "$who")</b> wants to talk to ${ag}${email:+ · $(_people_html "$email")} · in ${where}"$'\n\n'"Allow = chat and give work. Admin = also pay, delete, change settings."
   local markup
-  markup=$(jq -cn --arg k "$kid" --arg n "$nonce" '{inline_keyboard:[[
-      {text:"Allow", callback_data:("kn:"+$k+":allow:"+$n)},
-      {text:"Admin", callback_data:("kn:"+$k+":admin:"+$n)},
+  markup=$(jq -cn --arg k "$kid" --arg a "$n_allow" --arg d "$n_admin" --arg n "$n_no" '{inline_keyboard:[[
+      {text:"Allow", callback_data:("kn:"+$k+":allow:"+$a)},
+      {text:"Admin", callback_data:("kn:"+$k+":admin:"+$d)},
       {text:"No",    callback_data:("kn:"+$k+":no:"+$n)}]]}')
   _task_send_owner "$text" "$markup" "" "$plain" >/dev/null 2>&1 || true
   [[ "${TASK_SEND_DELIVERED:-0}" == 1 ]]
@@ -631,12 +638,15 @@ cmd_people_knock_answer() {
   [[ -n "$row" ]] || fail "$E_NOT_FOUND" "no knock #$kid"
   local agent channel sender name email status nhash
   IFS=$'\x1f' read -r agent channel sender name email status nhash <<<"$row"
-  # A seat answers only with the owner's tap proof: the raw nonce exists only in
-  # the button on the owner's card. Root (the app) needs none.
+  # A seat answers only with the owner's tap proof FOR THE CHOICE GIVEN: each
+  # button carries its own nonce, so the No (or Allow) button's nonce never
+  # proves Admin. A stored hash that is not the per-choice object matches
+  # nothing. Root (the app) needs none.
   local seat; seat=$(_people_caller_seat)
   if [[ -n "$seat" ]]; then
-    [[ "$proof" =~ ^[0-9a-f]{32}$ && -n "$nhash" && "$(_human_nonce_sha "$proof")" == "$nhash" ]] \
-      || fail "$E_PERMISSION" "a seat answers a knock only with the owner's tap proof"
+    local want; want=$(jq -r --arg c "$choice" 'if type=="object" then (.[$c] // "") else "" end' <<<"$nhash" 2>/dev/null)
+    [[ "$proof" =~ ^[0-9a-f]{32}$ && "$want" =~ ^[0-9a-f]{64}$ && "$(_human_nonce_sha "$proof")" == "$want" ]] \
+      || fail "$E_PERMISSION" "a seat answers a knock only with the owner's tap proof for that answer"
   fi
   [[ "$status" == pending ]] || fail "$E_CONFLICT" "knock #$kid is already answered ($status)"
 
