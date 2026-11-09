@@ -136,6 +136,8 @@ Agents:
                                                      # stops disagreeing with the grant, and audits it. Wider
                                                      # than admin, which is the 5dive CLI as root only.
                                                      # Narrow it back with \`agent grant <name> admin\`.
+                                                     # admin and root refuse an agent caller (DIVE-7982):
+                                                     # run them as root or from the owner's login.
   5dive agent config <name> set workdir=<path>       # tmux cwd; "default" clears override
   5dive agent config <name> set auth-profile=<name>  # swap profile; "default" clears override
   5dive agent rotation get <agent>                   # DIVE-4416: the seat's login pool — which accounts it
