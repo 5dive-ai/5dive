@@ -5,6 +5,9 @@
 # DIVE-5993: and `orgChannelsOff` for a Team/Enterprise login whose effective
 # managed policy lacks `channelsEnabled: true` (the org's settings replace the
 # box file whenever they hold any key; no merge).
+# DIVE-8033: the file is org policy only while the seat logs in with a
+# Team/Enterprise subscription; a stale one left after the seat moved to a key,
+# a custom endpoint or a pro/max login flags nothing.
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -29,11 +32,11 @@ BZ='{"marketplace":"5dive-plugins","plugin":"buzz"}'
 UP='{"marketplace":"claude-plugins-official","plugin":"telegram"}'
 mkdir -p "$H/agent-nofile/.claude"
 remote personal '{}'
-remote allowed "{\"allowedChannelPlugins\":[$TG,$DB]}"
+remote allowed "{\"channelsEnabled\":true,\"allowedChannelPlugins\":[$TG,$DB]}"
 remote mp "{\"allowedChannelPlugins\":[$TG,{\"marketplace\":\"claude-plugins-official\",\"plugin\":\"discord\"}],\"channelsEnabled\":true}"
 remote off '{"channelsEnabled":false}'
-remote tgonly "{\"allowedChannelPlugins\":[$TG]}"
-remote upstream "{\"allowedChannelPlugins\":[$TG]}"
+remote tgonly "{\"channelsEnabled\":true,\"allowedChannelPlugins\":[$TG]}"
+remote upstream "{\"channelsEnabled\":true,\"allowedChannelPlugins\":[$TG]}"
 remote nochan "{\"allowedChannelPlugins\":[$TG]}"
 remote codex "{\"allowedChannelPlugins\":[]}"
 remote garbled '{"allowedChannelPlugins": ['
@@ -49,11 +52,25 @@ remote teamon "{\"channelsEnabled\":true,\"allowedChannelPlugins\":[$TG,$DB]}"; 
 remote entprof '{"permissions":{"deny":["WebFetch"]}}'
 mkdir -p "$TMP/profiles/corp/claude"; printf '{"claudeAiOauth":{"subscriptionType":"enterprise"}}\n' >"$TMP/profiles/corp/claude/.credentials.json"
 remote propol "{\"allowedChannelPlugins\":[$TG,$DB]}"; plan propol pro
+# The org's allowlist and switch apply to a Team/Enterprise login only.
+for n in allowed mp off tgonly upstream garbled; do plan "$n" team; done
+# DIVE-8033: stale org files left after the seat left its Team org.
+STALE="{\"allowedChannelPlugins\":[$TG]}"
+remote stalekey "$STALE"                                   # API key / custom model: no claudeAiOauth
+remote stalekeyoff '{"channelsEnabled":false}'
+remote stalepro "$STALE"; plan stalepro pro
+remote stalemaxoff '{"channelsEnabled":false}'; plan stalemaxoff max
+remote staleincl "$STALE"; plan staleincl team              # old team creds, profile now on the included AI
+remote staleincloff '{"channelsEnabled":false}'; plan staleincloff team
+mkdir -p "$TMP/profiles/incl"; printf 'ANTHROPIC_BASE_URL=https://llm.example.com/anthropic\nANTHROPIC_AUTH_TOKEN=x\n' >"$TMP/profiles/incl/combined.env"
+remote teamenv "{\"allowedChannelPlugins\":[$TG],\"channelsEnabled\":true}"
+mkdir -p "$TMP/profiles/subtok/claude"; printf 'CLAUDE_CODE_OAUTH_TOKEN=x\nANTHROPIC_API_KEY=\n' >"$TMP/profiles/subtok/combined.env"
+printf '{"claudeAiOauth":{"subscriptionType":"team"}}\n' >"$TMP/profiles/subtok/claude/.credentials.json"
 printf 'AGENT_CHANNEL_MARKETPLACE=5dive-plugins\n' >"$E/mp.env"
 printf 'AGENT_CHANNEL_MARKETPLACE=5dive-plugins\n' >"$E/tgonly.env"
 printf 'AGENT_CHANNEL_MARKETPLACE=5dive-plugins\n' >"$E/off.env"
 row() { printf '"%s":{"type":"%s","channels":"%s","authProfile":"%s","heartbeat":{"enabled":false}}' "$1" "$2" "$3" "${4:-}"; }
-for n in teamnone teampol teamon entprof propol; do printf 'AGENT_CHANNEL_MARKETPLACE=5dive-plugins\n' >"$E/$n.env"; done
+for n in teamnone teampol teamon entprof propol stalekey stalekeyoff stalepro stalemaxoff staleincl staleincloff teamenv; do printf 'AGENT_CHANNEL_MARKETPLACE=5dive-plugins\n' >"$E/$n.env"; done
 {
   printf '{"agents":{'
   row nofile claude dashboard; printf ,
@@ -71,7 +88,14 @@ for n in teamnone teampol teamon entprof propol; do printf 'AGENT_CHANNEL_MARKET
   row teampol claude telegram,dashboard; printf ,
   row teamon claude telegram,dashboard; printf ,
   row entprof claude dashboard corp; printf ,
-  row propol claude telegram,dashboard
+  row propol claude telegram,dashboard; printf ,
+  row stalekey claude telegram,dashboard; printf ,
+  row stalekeyoff claude telegram,dashboard; printf ,
+  row stalepro claude telegram,dashboard; printf ,
+  row stalemaxoff claude telegram,dashboard; printf ,
+  row staleincl claude telegram,dashboard incl; printf ,
+  row staleincloff claude telegram,dashboard incl; printf ,
+  row teamenv claude telegram,dashboard subtok
   printf '}}\n'
 } >"$TMP/agents.json"
 snap() { CLAUDE_MANAGED_SETTINGS="$1" AGENT_ENV_DIR="$E" python3 "$PY" "$TMP/agents.json" "$TMP/profiles" "$TMP/connectors" "$H" "$TMP/sudoers" /default 2>"$TMP/err"; }
@@ -106,6 +130,12 @@ OUT3=$(snap "$TMP/absent.json")
 remote teampol "{\"channelsEnabled\":true,\"allowedChannelPlugins\":[$TG,$DB]}"
 OUT4=$(snap "$BOX")
 [[ "$(off teampol "$OUT4")" == null && "$(jq -c '.[] | select(.name=="teampol") | .orgBlocksChannels' <<<"$OUT4")" == null ]] && okk 'the org flips channelsEnabled on (Claude Code re-fetches on restart): the same seat clears' || bad "teampol after flip: $(off teampol "$OUT4")"
+
+# DIVE-8033: a stale org file on a seat that is no longer a Team/Enterprise login
+for n in stalekey stalekeyoff stalepro stalemaxoff staleincl staleincloff; do
+  [[ "$(flag "$n")" == null && "$(off "$n" "$OUT")" == null ]] && okk "$n: a stale org file on a non-team login flags nothing" || bad "$n: $(flag "$n") $(off "$n" "$OUT")"
+done
+[[ "$(flag teamenv)" == "[$DB]" ]] && okk 'a team profile with an empty API key line is still a team login: its allowlist still applies' || bad "teamenv: $(flag teamenv)"
 
 echo "pass=$pass fail=$fail"
 (( fail == 0 ))
