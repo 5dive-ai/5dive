@@ -1076,23 +1076,12 @@ r=$( (_secret_reveal --agent=kostya --host=github.com github.password) 2>"$TMP/r
 cp -p "$TMP/vk.bak" "$VK"
 # DIVE-7274: L17n was a 1-in-256 flake because CBC under a wrong key passes its
 # padding check that often and v1 then answered garbage. A v2 value carries a
-# known prefix, so EVERY wrong key is refused: 400 fresh keys, 0 accepted (the
-# pre-fix tree accepts ~1.5 of them). v1 lines are judged by their text.
-v2line=$(sed -n 's/^GITHUB__PASSWORD=//p' "$SAVED" | head -n 1)
+# known prefix, so EVERY wrong key is refused. The 400-key statistical sweep (L17s,
+# ~31s of pbkdf2) lives in tests/secret_vault_wrong_key_sweep_unit.sh, nightly
+# (DIVE-8028); core keeps L17n's single wrong key and L17t's deterministic forgery.
+# v1 lines are judged by their text; v1line feeds L17u's migration arm below.
 v1line="v1:$(printf '%s' "$PP" | openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -salt -a -A -pass "file:$VK" 2>/dev/null)"
 [[ "$(_vault_dec "$v1line")" == "$PP" ]] || bad_t "L17s1 a v1 value reads under its own key" "[$(_vault_dec "$v1line")]"
-cp -p "$VK" "$TMP/vk.bak"; chmod 600 "$VK"
-acc2=0 acc1=0 pad=0
-for _ in $(seq 400); do
-  openssl rand -hex 32 > "$VK"
-  _vault_dec "$v2line" >/dev/null 2>&1 && acc2=$((acc2 + 1))
-  _vault_open "${v1line#v1:}" >/dev/null 2>&1 && pad=$((pad + 1))
-  _vault_dec "$v1line" >/dev/null 2>&1 && acc1=$((acc1 + 1))
-done
-cp -p "$TMP/vk.bak" "$VK"
-[[ "$v2line" == v2:* && $acc2 -eq 0 && $acc1 -eq 0 ]] \
-  && ok_t "L17s NEGATIVE CONTROL: 400 fresh wrong keys: every v2 and every v1 value refused ($pad v1 decrypts passed the padding check and were still refused)" \
-  || bad_t "L17s wrong keys accepted" "v2=$acc2 v1=$acc1 pad=$pad line=${v2line:0:3}"
 # A garbage decrypt that passed its padding, as v2 sees it: the right key, no check prefix.
 forged="v2:$(printf 'Pa55-no-prefix' | openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -salt -a -A -pass "file:$VK" 2>/dev/null)"
 r=$(_vault_dec "$forged"); rc=$?
