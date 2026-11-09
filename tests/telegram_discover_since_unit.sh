@@ -72,6 +72,19 @@ out=$(cmd_telegram_discover --token="$TOKEN" --poll-secs=1 --since=1000)
 t "2 old message alone: next round finds the new one" "222" "$(jq -r '.data.userId' <<<"$out")"
 t "2 the old message was confirmed (offset 11)" "- 11" "$(tr '\n' ' ' <"$TMP/offsets" | sed 's/ $//')"
 
+# 2b DIVE-7998: arm 2 on a clock that ticks between reads. Main went red when
+# the second turned over between the deadline and the first round's budget:
+# that round got timeout 0, and an old-only answer ended the poll. The first
+# round must always get the whole --poll-secs; the clock below steps 1s per
+# read, so that turnover happens on every run, not one in fifty.
+date() { local c; c=$(cat "$TMP/clock" 2>/dev/null || echo 5000); echo $((c+1)) >"$TMP/clock"; echo "$c"; }
+rm -f "$TMP/clock"
+rounds "$OLD" "$NEW"
+out=$(cmd_telegram_discover --token="$TOKEN" --poll-secs=1 --since=1000)
+unset -f date
+t "2b clock ticks before the first round: the next round still runs" "222" "$(jq -r '.data.userId' <<<"$out")"
+t "2b the old message was confirmed (offset 11)" "- 11" "$(tr '\n' ' ' <"$TMP/offsets" | sed 's/ $//')"
+
 # 3
 rounds "$OLD"
 out=$(cmd_telegram_discover --token="$TOKEN" --poll-secs=1 --since=1000)
