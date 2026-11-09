@@ -65,7 +65,7 @@ Agents:
                             [--with-skills=<spec>[,<spec>...]] [--no-skills]
                             [--no-team-bot] [--defer-auth] [--can-push]
                             [--human=<id>] [--own-login]
-                            # --own-login: a codex/grok hire by an agent uses the
+                            # --own-login: a claude/codex/grok hire by an agent uses the
                             # box's existing sign-in for that provider; this keeps
                             # the named --auth-profile as a separate sign-in.
                             # --human=<id> names the PERSON this agent belongs to

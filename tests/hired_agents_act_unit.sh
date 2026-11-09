@@ -436,7 +436,7 @@ BLOCK=$(sed -n '/<!-- 5dive:hired-agents:begin/,/<!-- 5dive:hired-agents:end/p' 
 for want in 'Standard-tier never creates agents' 'Standard-tier: send `5dive hire-link <slug>`' \
             '5dive pkg install' '5dive route add <name> --port=<port>' 'Standard-tier: ask your lead, `5dive agent send <lead>' 'npm i -g' \
             '**Blank teammates**, admin: `sudo 5dive agent create' '--type=claude|codex|grok|antigravity' \
-            '5dive agent auth start <type>' '**`5dive market` hires**, admin:' \
+            "(uses the box's sign-in)" '**`5dive market` hires**, admin:' \
             "its Telegram bot: your human's Connect tap (Mini App, Team)" \
             '**None fits:** `5dive hire-link --create --name=<Name> --description=<need>`'; do
   [[ "$BLOCK" == *"$want"* ]] && ok "hired-agents block says: $want" || bad "hired-agents block says: $want"

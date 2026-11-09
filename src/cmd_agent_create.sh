@@ -3486,7 +3486,7 @@ cmd_create() {
   local cos_owner_id=""
   local byo_provider="" byo_api_key="" byo_model="" byo_effort="" byo_base_url=""
   local skills_arg="" skills_set=0 no_skills=0 defer_auth=0
-  local own_login=0           # DIVE-7084: a separate codex/grok sign-in, on the owner's ask
+  local own_login=0           # DIVE-7084/7989: a separate claude/codex/grok sign-in, on the owner's ask
   local isolation="" isolation_explicit=0 no_team_bot=0
   # DIVE-4269: a created seat is ENROLLED in the heartbeat by default. See the
   # enrolment block near the self-check for why the default flipped.
@@ -3661,11 +3661,21 @@ cmd_create() {
   # --own-login keeps a separate sign-in when the owner asked for one.
   (( own_login )) && [[ -z "$profile" ]] \
     && fail "$E_USAGE" "--own-login needs --auth-profile=<new account> to hold that sign-in"
-  if [[ "$type" == "codex" || "$type" == "grok" ]] && (( ! own_login )) \
+  # DIVE-7989: Claude too. On lodar's self-hosted box (2026-11-09) the lead,
+  # signed in with his Claude plan, hired "Dude" on a new account named after
+  # him, so the owner got a second Claude sign-in link for a plan the box
+  # already held, and the hire stalled on the code he pasted back. The box's
+  # Claude login is the shared one, else the owner's default (pinned or added
+  # last), else the one signed-in account; never the demo AI.
+  if [[ "$type" == "claude" || "$type" == "codex" || "$type" == "grok" ]] && (( ! own_login )) \
      && [[ -z "$byo_provider" && -z "$byo_api_key" && -z "$byo_base_url" ]]; then
     local _box_login=""
+    lazy_need account_default_v
     if _create_has_login "$type"; then
       _box_login="(shared)"
+    elif [[ "$type" == "claude" ]] && account_default_v claude \
+         && ! _create_uses_demo_ai "$ACCOUNT_DEFAULT_ACCOUNT" ""; then
+      _box_login="$ACCOUNT_DEFAULT_ACCOUNT"
     elif _box_login=$(_create_sole_account "$type"); then
       :
     else
@@ -3674,6 +3684,13 @@ cmd_create() {
     if [[ -n "$_box_login" && -n "$profile" ]] && _create_caller_is_agent \
        && ! _create_has_login "$type" "$profile"; then
       step "Account '$profile' has no $type sign-in: using this box's $type login instead of a new one (--own-login keeps a separate sign-in)"
+      profile=""
+      [[ "$_box_login" == "(shared)" ]] || profile="$_box_login"
+    elif [[ -n "$_box_login" && -n "$profile" ]] && _create_caller_is_agent \
+         && _create_uses_demo_ai "$profile" ""; then
+      # DIVE-7989: the demo AI holds a Claude-shaped key, so it reads as signed
+      # in; an agent may never hire on it (DIVE-6843), and the box has a real one.
+      step "Account '$profile' is the owner's free trial: using this box's $type login instead"
       profile=""
       [[ "$_box_login" == "(shared)" ]] || profile="$_box_login"
     fi
