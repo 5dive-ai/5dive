@@ -31,6 +31,8 @@
 #   K8  a seat files a knock for itself only (agent from SUDO_UID, never argv).
 #   K9  a proof answers only its own button: the No/Allow nonce as admin is
 #       refused, the knock stays pending, roles.json is unchanged.
+#   E1  a knock answer binds to a person added by email (no twin row);
+#   E2  never by the owner's email, never re-pointing a set Teams id.
 #   G1  the caller seat is read only under root; non-root fails closed to "-".
 #
 # Isolation: source src/ directly, throwaway TASKS_DB and fake homes, stubbed
@@ -272,6 +274,31 @@ K8B=$( SUDO_UID=4321 cmd_people_knock_file --channel=telegram --sender=123456787
 [[ "$K8A" == "$E_PERMISSION" && "$(db "SELECT agent FROM knocks WHERE id=$(jq -r .data.id <<<"$K8B");")" == otto ]] \
   && ok_t "K8 a seat cannot knock in another agent's name; its own agent comes from SUDO_UID" \
   || bad_t "K8 seat scope" "other=$K8A own=$K8B"
+
+# E1 — a person added in the app by email binds on their first knock (no twin)
+( cmd_people_write add eve --name=Eve --email=user2@example.com --agents=vesper ) >/dev/null 2>&1
+GE=eeeeeeee-1111-2222-3333-444444444444
+NE=$(db "SELECT COUNT(*) FROM humans;")
+E1K=$(cmd_people_knock_file --agent=otto --channel=teams --sender=$GE --name="Eve E" --email=user2@example.com 2>&1 | jq -r .data.id)
+E1=$( cmd_people_knock_answer "$E1K" allow 2>&1 )
+[[ "$(jq -r .data.person <<<"$E1")" == eve && "$(db "SELECT COUNT(*) FROM humans;")" == "$NE" \
+   && "$(db "SELECT role||':'||teams_id||':'||display_name FROM humans WHERE id='eve';")" == "member:$GE:Eve" \
+   && "$(db "SELECT group_concat(agent, ',') FROM (SELECT agent FROM human_access WHERE human_id='eve' ORDER BY agent);")" == "otto,vesper" ]] \
+  && ok_t "E1 knock answer binds to the person added by email: no second row, Teams id set, access added" \
+  || bad_t "E1 email bind" "out=$E1 rows=$(db "SELECT COUNT(*) FROM humans;") vs $NE"
+
+# E2 — never re-point an identity, never bind to the owner by email
+( cmd_people_write set lodar --email=user3@example.com ) >/dev/null 2>&1
+GF=ffffffff-1111-2222-3333-444444444444
+E2A=$(cmd_people_knock_file --agent=otto --channel=teams --sender=$GF --email=user3@example.com 2>&1 | jq -r .data.id)
+E2P=$( cmd_people_knock_answer "$E2A" allow 2>&1 | jq -r .data.person )
+GG=99999999-1111-2222-3333-444444444444
+E2B=$(cmd_people_knock_file --agent=otto --channel=teams --sender=$GG --email=user2@example.com 2>&1 | jq -r .data.id)
+E2Q=$( cmd_people_knock_answer "$E2B" allow 2>&1 | jq -r .data.person )
+[[ -n "$E2P" && "$E2P" != lodar && "$(db "SELECT COALESCE(teams_id,'')||':'||role FROM humans WHERE id='lodar';")" == ":owner" \
+   && -n "$E2Q" && "$E2Q" != eve && "$(db "SELECT teams_id FROM humans WHERE id='eve';")" == "$GE" ]] \
+  && ok_t "E2 the owner's email and a person who already has a Teams id are never bound by a knock" \
+  || bad_t "E2 bind limits" "owner-knock=$E2P eve-knock=$E2Q"
 
 # G1 — the caller seat is read only under a real root euid: below it SUDO_UID is a
 # plain env var, so a non-root caller fails CLOSED to "-" (never "" = root/app).

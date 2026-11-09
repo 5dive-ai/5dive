@@ -663,6 +663,16 @@ cmd_people_knock_answer() {
     new_status=allowed
     local col=teams_id; [[ "$channel" == telegram ]] && col=telegram_id
     hid=$(db "SELECT id FROM humans WHERE ${col}=$(sqlq "$sender") LIMIT 1;")
+    # Someone added in the app by name + email has no id on this channel yet:
+    # their first knock binds to that record instead of making a second one.
+    # Only a record with NO id on this channel (an identity is never re-pointed)
+    # and never the owner's (an owner tap of Allow must not mint a second owner
+    # identity from an email the knocking server reported).
+    if [[ -z "$hid" && -n "$email" ]]; then
+      hid=$(db "SELECT id FROM humans WHERE lower(email)=lower($(sqlq "$email")) AND ${col} IS NULL
+                  AND COALESCE(role,'')<>'owner' ORDER BY (role IS NULL), id LIMIT 1;")
+      [[ -z "$hid" ]] || db "UPDATE humans SET ${col}=$(sqlq "$sender"), updated_at=datetime('now') WHERE id=$(sqlq "$hid");"
+    fi
     if [[ -z "$hid" ]]; then
       hid=$(_people_new_id "$email" "$name" "$channel" "$sender")
       db "INSERT INTO humans (id, display_name, ${col}, email, role)
