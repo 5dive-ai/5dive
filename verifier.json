@@ -1,0 +1,247 @@
+{
+  "date": "2026-11-09",
+  "generatedAtUtc": "2026-11-09T02:01:21Z",
+  "window": {
+    "days": 30,
+    "from": "2026-10-10",
+    "to": "2026-11-08",
+    "basis": "each task counts once, on the UTC day of its last task.done; the window is the whole days before the publish date"
+  },
+  "totals": {
+    "shipped": 1893,
+    "reviewed": 1023,
+    "firstTry": 595,
+    "sentBack": 428,
+    "sendBacks": 596
+  },
+  "days": [
+    {
+      "date": "2026-10-10",
+      "reviewed": 30,
+      "firstTry": 26,
+      "sentBack": 4
+    },
+    {
+      "date": "2026-10-11",
+      "reviewed": 19,
+      "firstTry": 13,
+      "sentBack": 6
+    },
+    {
+      "date": "2026-10-12",
+      "reviewed": 28,
+      "firstTry": 19,
+      "sentBack": 9
+    },
+    {
+      "date": "2026-10-13",
+      "reviewed": 37,
+      "firstTry": 18,
+      "sentBack": 19
+    },
+    {
+      "date": "2026-10-14",
+      "reviewed": 47,
+      "firstTry": 19,
+      "sentBack": 28
+    },
+    {
+      "date": "2026-10-15",
+      "reviewed": 52,
+      "firstTry": 34,
+      "sentBack": 18
+    },
+    {
+      "date": "2026-10-16",
+      "reviewed": 27,
+      "firstTry": 13,
+      "sentBack": 14
+    },
+    {
+      "date": "2026-10-17",
+      "reviewed": 19,
+      "firstTry": 14,
+      "sentBack": 5
+    },
+    {
+      "date": "2026-10-18",
+      "reviewed": 27,
+      "firstTry": 20,
+      "sentBack": 7
+    },
+    {
+      "date": "2026-10-19",
+      "reviewed": 18,
+      "firstTry": 11,
+      "sentBack": 7
+    },
+    {
+      "date": "2026-10-20",
+      "reviewed": 41,
+      "firstTry": 19,
+      "sentBack": 22
+    },
+    {
+      "date": "2026-10-21",
+      "reviewed": 37,
+      "firstTry": 27,
+      "sentBack": 10
+    },
+    {
+      "date": "2026-10-22",
+      "reviewed": 21,
+      "firstTry": 9,
+      "sentBack": 12
+    },
+    {
+      "date": "2026-10-23",
+      "reviewed": 27,
+      "firstTry": 18,
+      "sentBack": 9
+    },
+    {
+      "date": "2026-10-24",
+      "reviewed": 40,
+      "firstTry": 26,
+      "sentBack": 14
+    },
+    {
+      "date": "2026-10-25",
+      "reviewed": 26,
+      "firstTry": 14,
+      "sentBack": 12
+    },
+    {
+      "date": "2026-10-26",
+      "reviewed": 49,
+      "firstTry": 33,
+      "sentBack": 16
+    },
+    {
+      "date": "2026-10-27",
+      "reviewed": 47,
+      "firstTry": 26,
+      "sentBack": 21
+    },
+    {
+      "date": "2026-10-28",
+      "reviewed": 19,
+      "firstTry": 5,
+      "sentBack": 14
+    },
+    {
+      "date": "2026-10-29",
+      "reviewed": 50,
+      "firstTry": 24,
+      "sentBack": 26
+    },
+    {
+      "date": "2026-10-30",
+      "reviewed": 37,
+      "firstTry": 17,
+      "sentBack": 20
+    },
+    {
+      "date": "2026-10-31",
+      "reviewed": 60,
+      "firstTry": 32,
+      "sentBack": 28
+    },
+    {
+      "date": "2026-11-01",
+      "reviewed": 25,
+      "firstTry": 16,
+      "sentBack": 9
+    },
+    {
+      "date": "2026-11-02",
+      "reviewed": 43,
+      "firstTry": 25,
+      "sentBack": 18
+    },
+    {
+      "date": "2026-11-03",
+      "reviewed": 45,
+      "firstTry": 26,
+      "sentBack": 19
+    },
+    {
+      "date": "2026-11-04",
+      "reviewed": 42,
+      "firstTry": 27,
+      "sentBack": 15
+    },
+    {
+      "date": "2026-11-05",
+      "reviewed": 28,
+      "firstTry": 15,
+      "sentBack": 13
+    },
+    {
+      "date": "2026-11-06",
+      "reviewed": 23,
+      "firstTry": 15,
+      "sentBack": 8
+    },
+    {
+      "date": "2026-11-07",
+      "reviewed": 41,
+      "firstTry": 25,
+      "sentBack": 16
+    },
+    {
+      "date": "2026-11-08",
+      "reviewed": 18,
+      "firstTry": 9,
+      "sentBack": 9
+    }
+  ],
+  "reasons": {
+    "basis": "one fixed category per send-back, by rule from the reviewer's finding; no match or no preserved finding = other. Sums to totals.sendBacks.",
+    "total": 596,
+    "categories": [
+      {
+        "key": "conflict",
+        "label": "Clashes with newer work",
+        "count": 40
+      },
+      {
+        "key": "safety",
+        "label": "Safety or privacy",
+        "count": 30
+      },
+      {
+        "key": "writing",
+        "label": "Unclear writing",
+        "count": 138
+      },
+      {
+        "key": "tests",
+        "label": "Failing tests",
+        "count": 237
+      },
+      {
+        "key": "proof",
+        "label": "No proof it works",
+        "count": 40
+      },
+      {
+        "key": "ask",
+        "label": "Not what was asked",
+        "count": 30
+      },
+      {
+        "key": "other",
+        "label": "Other",
+        "count": 81
+      }
+    ]
+  },
+  "definitions": {
+    "reviewed": "a second agent graded or sent back the task before it shipped",
+    "firstTry": "reviewed, never sent back",
+    "sentBack": "sent back to its builder at least once (a merge conflict after a pass does not count)",
+    "shipped": "every task shipped in the window, reviewed or not; small routine tasks skip review"
+  },
+  "methodology": "https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md"
+}
