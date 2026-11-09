@@ -66,15 +66,20 @@ out=$(cmd_telegram_discover --token="$TOKEN" --poll-secs=1 --since=1000)
 t "1 --since returns the message sent after setup" "222" "$(jq -r '.data.userId' <<<"$out")"
 t "1 sentAt is the message's send time" "1100" "$(jq -r '.data.sentAt' <<<"$out")"
 
+# Arms 2 and 3 need a SECOND poll round, which the loop only takes while the
+# budget has whole seconds left. With --poll-secs=1 a `date +%s` tick between the
+# deadline and the first round leaves remain=0 and the loop stops after one round
+# (DIVE-7999: main red at 0fd26e02, arm 2 ran 07:17:13.99 -> 14.02). 2 s keeps
+# remain >= 1 on round one.
 # 2
 rounds "$OLD" "$NEW"
-out=$(cmd_telegram_discover --token="$TOKEN" --poll-secs=1 --since=1000)
+out=$(cmd_telegram_discover --token="$TOKEN" --poll-secs=2 --since=1000)
 t "2 old message alone: next round finds the new one" "222" "$(jq -r '.data.userId' <<<"$out")"
 t "2 the old message was confirmed (offset 11)" "- 11" "$(tr '\n' ' ' <"$TMP/offsets" | sed 's/ $//')"
 
 # 3
 rounds "$OLD"
-out=$(cmd_telegram_discover --token="$TOKEN" --poll-secs=1 --since=1000)
+out=$(cmd_telegram_discover --token="$TOKEN" --poll-secs=2 --since=1000)
 t "3 only an old message: found:false" "false" "$(jq -r '.data.found' <<<"$out")"
 t "3 the old message was confirmed" "11" "$(sed -n 2p "$TMP/offsets")"
 
