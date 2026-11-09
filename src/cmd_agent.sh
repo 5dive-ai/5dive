@@ -1324,7 +1324,9 @@ def avatar_info(name):
 # leaves out, each as {"marketplace","plugin"} (the exact entry the admin must
 # add: a pre-fork telegram seat runs the upstream plugin), or None. A personal account caches {} and a missing or garbled
 # file is no evidence, so neither is ever flagged: that is the "never shown to
-# normal accounts" rule. Plugin names mirror 5dive-agent-start's --channels.
+# normal accounts" rule. A seat whose current login is not Team/Enterprise is
+# never flagged either: the file stays on disk after it leaves the org
+# (DIVE-8033). Plugin names mirror 5dive-agent-start's --channels.
 AGENT_ENV_DIR = os.environ.get("AGENT_ENV_DIR") or "/var/lib/5dive/agents.d"
 
 def channel_plugins(name, channels):
@@ -1353,7 +1355,17 @@ def channel_plugins(name, channels):
 # the box file, which turns channels on.
 BOX_MANAGED_SETTINGS = os.environ.get("CLAUDE_MANAGED_SETTINGS") or "/etc/claude-code/managed-settings.json"
 
+# DIVE-8033: a profile that hands Claude Code a key or a custom endpoint (the
+# included AI, an API key) logs in with that, whatever .credentials.json still
+# holds from an earlier subscription login.
+KEY_AUTH_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
 def claude_plan(name, profile):
+    if profile:
+        for line in (read_text(os.path.join(profiles_dir, profile, "combined.env")) or "").splitlines():
+            key, sep, value = line.partition("=")
+            if sep and key.strip() in KEY_AUTH_VARS and value.strip().strip("'\"") != "":
+                return None
     paths = [os.path.join(profiles_dir, profile, "claude", ".credentials.json")] if profile else []
     paths.append(os.path.join(home_root, f"agent-{name}", ".claude", ".credentials.json"))
     for path in paths:
@@ -1370,11 +1382,18 @@ def org_channel_policy(name, agent_type, channels, profile=""):
     plugins = channel_plugins(name, channels)
     if not plugins:
         return None, None
+    # DIVE-8033: remote-settings.json is org policy only while the seat logs in
+    # with a Team/Enterprise subscription. A seat that left its org for an API
+    # key, a custom model or a pro/max login keeps the old file on disk, and
+    # Claude Code no longer applies it: reading it would report a chat the org
+    # blocks when nothing blocks it.
+    if claude_plan(name, profile) not in ("team", "enterprise"):
+        return None, None
     remote = read_json(os.path.join(home_root, f"agent-{name}", ".claude", "remote-settings.json"))
     if not isinstance(remote, dict):
         remote = None
     off = remote is not None and remote.get("channelsEnabled") is False
-    if not off and claude_plan(name, profile) in ("team", "enterprise"):
+    if not off:
         policy = remote if remote else read_json(BOX_MANAGED_SETTINGS)
         # An unreadable box file is no evidence: never flag on a guess.
         off = isinstance(policy, dict) and policy.get("channelsEnabled") is not True
