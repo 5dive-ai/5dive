@@ -56,9 +56,10 @@ else bad_t "R1 mirror 404 once" "rc=$rc runs=$(runs r1) out=$out"; fi
 # R2 — negative control
 mkstub r2 99 100 "$MIRROR"
 out="$("$RETRY" "$TMP/r2" 2>&1)"; rc=$?
-if (( rc == 100 )) && [[ "$(runs r2)" == 3 ]] && tail -3 <<<"$out" | grep -qF '404  Not Found'; then
+last3="$(tail -3 <<<"$out")"
+if (( rc == 100 )) && [[ "$(runs r2)" == 3 ]] && grep -qF '404  Not Found' <<<"$last3"; then
   ok_t "R2 mirror 404 every time: still fails (rc 100) after 3 attempts, mirror error in the last lines"
-else bad_t "R2 negative control" "rc=$rc runs=$(runs r2) tail=$(tail -3 <<<"$out")"; fi
+else bad_t "R2 negative control" "rc=$rc runs=$(runs r2) tail=$last3"; fi
 
 # R3 — not a download error
 mkstub r3 99 100 'E: Unable to locate package shellchek'
