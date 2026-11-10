@@ -33,8 +33,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # sqlite3 (the task board) and cron (heartbeat, digest and disk drivers, which
 # install.sh only writes when /etc/cron.d exists) are on every real host; a box
 # someone hosts on needs them too (DIVE-6802).
-RUN apt-get update -qq \
- && apt-get install -y -qq --no-install-recommends \
+# DIVE-8088: Acquire::Retries re-tries a dropped connection or a 5xx in place. A
+# mirror 404 is not retried by apt; CI re-runs the whole build on that
+# (scripts/net-retry.sh), and this layer's fresh `apt-get update` is what clears it.
+RUN apt-get -o Acquire::Retries=5 update -qq \
+ && apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends \
       systemd systemd-sysv \
       sudo ca-certificates curl \
       jq tmux git python3-yaml \

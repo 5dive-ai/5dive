@@ -127,7 +127,8 @@ jobs:
         with:
           fetch-depth: 0
       - name: Tools
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq apt-utils dpkg-dev gnupg >/dev/null
+        # DIVE-8088: retried only on a download error (scripts/net-retry.sh).
+        run: scripts/net-retry.sh sudo sh -c 'apt-get update -qq && apt-get install -y -qq apt-utils dpkg-dev gnupg' >/dev/null
 
       - name: Signing key
         env:
@@ -176,10 +177,12 @@ jobs:
           set -euo pipefail
           (cd site/apt && exec python3 -m http.server 8765 --bind 127.0.0.1) >/dev/null 2>&1 &
           for _ in $(seq 30); do curl -fsS -o /dev/null http://127.0.0.1:8765/5dive.gpg && break; sleep 1; done
-          docker run --rm --network host -v "$PWD:/src:ro" ubuntu:24.04 \
+          # DIVE-8088: each arm is a fresh container; net-retry runs it again only when it
+          # failed on an Ubuntu mirror download, never on one of the arm's own checks.
+          scripts/net-retry.sh docker run --rm --network host -v "$PWD:/src:ro" ubuntu:24.04 \
             bash /src/packaging/deb/test-apt.sh fresh http://127.0.0.1:8765
           if [[ -n "$OLD" ]]; then
-            docker run --rm --network host -v "$PWD:/src:ro" ubuntu:24.04 \
+            scripts/net-retry.sh docker run --rm --network host -v "$PWD:/src:ro" ubuntu:24.04 \
               bash /src/packaging/deb/test-apt.sh upgrade http://127.0.0.1:8765 "${OLD#v}" "${NEWEST#v}"
           else
             echo "::warning::only one packageable tag — the upgrade arm did not run"

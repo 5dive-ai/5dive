@@ -113,7 +113,11 @@ jobs:
         run: |
           # A release tag carries its built bundle; a PR tree does not (DIVE-2091).
           [[ -f 5dive ]] || ./build.sh
-          docker build -f docker/Dockerfile -t "$IMAGE:$TAG" .
+          # DIVE-8088: net-retry runs it again only when it failed on a download (a mirror 404,
+          # a dropped connection, a 429); any other failure fails at once, as before.
+          # This job checks out a release TAG; a tag cut before DIVE-8088 has no wrapper.
+          retry=(); [[ -x scripts/net-retry.sh ]] && retry=(scripts/net-retry.sh)
+          "${retry[@]}" docker build -f docker/Dockerfile -t "$IMAGE:$TAG" .
           docker run --rm --entrypoint /usr/local/bin/5dive "$IMAGE:$TAG" --version
       - name: Saved state survives recreate, Docker restart and update
         run: docker/persistence-test.sh "$TAG"
