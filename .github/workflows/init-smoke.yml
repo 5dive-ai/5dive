@@ -122,7 +122,7 @@ jobs:
     needs: plan
     name: image / ubuntu-${{ matrix.os }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -134,7 +134,9 @@ jobs:
           OS: ${{ matrix.os }}
         run: |
           mkdir -p /tmp/ctx
-          docker build -f docker/harness-smoke.Dockerfile --build-arg "UBUNTU=$OS" -t "is:$OS" /tmp/ctx
+          # DIVE-8088: net-retry runs it again only when it failed on a download (a mirror 404,
+          # a dropped connection, a 429); any other failure fails at once, as before.
+          scripts/net-retry.sh docker build -f docker/harness-smoke.Dockerfile --build-arg "UBUNTU=$OS" -t "is:$OS" /tmp/ctx
           docker save "is:$OS" | gzip -1 > "/tmp/is-$OS.tar.gz"
           ls -lh "/tmp/is-$OS.tar.gz"
       - uses: actions/upload-artifact@v4

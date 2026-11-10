@@ -52,7 +52,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install shellcheck
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+        # DIVE-8088: retried only on a download error (scripts/net-retry.sh).
+        run: scripts/net-retry.sh sudo sh -c 'apt-get update -qq && apt-get install -y -qq shellcheck'
       - name: Lint install + sources + agent-start
         # DIVE-2125 (verifier): scripts/ was linted by NOTHING, so every helper the
         # CLI shells out to shipped unchecked. Widened rather than adding one file:
@@ -191,7 +192,9 @@ jobs:
           # `"/5dive": not found` at image build — before the two version
           # assertions below could run at all.
           ./build.sh
-          docker build -f docker/Dockerfile -t 5dive-smoke .
+          # DIVE-8088: net-retry runs it again only when it failed on a download (a mirror 404,
+          # a dropped connection, a 429); any other failure fails at once, as before.
+          scripts/net-retry.sh docker build -f docker/Dockerfile -t 5dive-smoke .
       - name: Verify CLI is on PATH and reports the expected version
         run: |
           docker run --rm --entrypoint /usr/local/bin/5dive 5dive-smoke --version
@@ -321,7 +324,9 @@ jobs:
       - name: Build image (runs install.sh against fresh ubuntu:22.04)
         run: |
           ./build.sh
-          docker build -f docker/Dockerfile -t 5dive-contract .
+          # DIVE-8088: net-retry runs it again only when it failed on a download (a mirror 404,
+          # a dropped connection, a 429); any other failure fails at once, as before.
+          scripts/net-retry.sh docker build -f docker/Dockerfile -t 5dive-contract .
       # Everything docker-install asserts is that the bundle lays down and
       # reports a version. Nothing there ever installed a published plugin,
       # resolved a team template, or asked a verb for its usage — so v0.28.0

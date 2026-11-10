@@ -25,10 +25,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # The docker image is minimized (man pages and docs stripped by dpkg excludes).
 # A cloud image is not, but that changes no binary, so it is left as it is.
+# DIVE-8088: Acquire::Retries re-tries a dropped connection in place (the package
+# install below is a ~8-minute layer, too long to redo for one reset). A mirror 404
+# is re-run from the top by scripts/net-retry.sh in the workflow, with a fresh update.
 RUN set -eu; \
     codename=$(. /etc/os-release && echo "$VERSION_CODENAME"); \
-    apt-get update -qq; \
-    apt-get install -y -qq --no-install-recommends ca-certificates curl >/dev/null; \
+    apt-get -o Acquire::Retries=5 update -qq; \
+    apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends ca-certificates curl >/dev/null; \
     curl -fsSL --retry 3 \
       "https://cloud-images.ubuntu.com/${codename}/current/${codename}-server-cloudimg-amd64.manifest" \
       -o /tmp/cloud.manifest; \
@@ -39,7 +42,7 @@ RUN set -eu; \
     apt-cache pkgnames | sort -u > /tmp/available; \
     comm -12 /tmp/wanted /tmp/available > /tmp/install; \
     echo "cloud image ${codename}: $(wc -l < /tmp/cloud.manifest) packages, installing $(wc -l < /tmp/install)"; \
-    xargs -a /tmp/install apt-get install -y -qq --no-install-recommends >/dev/null; \
+    xargs -a /tmp/install apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends >/dev/null; \
     if dpkg -s libatomic1 >/dev/null 2>&1; then echo "libatomic1: present"; else echo "libatomic1: absent (as on a fresh cloud server)"; fi; \
     rm -rf /var/lib/apt/lists/* /tmp/cloud.manifest /tmp/wanted /tmp/available /tmp/install
 

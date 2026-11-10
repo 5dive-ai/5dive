@@ -570,7 +570,10 @@ declare -A TYPE_INSTALL=(
   # required". Idempotent: a no-op once it is there, so a box already on Hermes
   # gets it on its next install too. A failure is a warning, not a dead install:
   # other providers do not need it.
-  [hermes]="{ [[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_PIN_COMMIT}/scripts/install.sh | setsid -w bash -s -- --skip-setup --branch ${HERMES_PIN_TAG} --commit ${HERMES_PIN_COMMIT} && chmod 0775 /home/claude/.hermes; }; } && ${HERMES_SDK_STEP}"
+  # DIVE-8088: --retry 5. raw.githubusercontent.com answers 429 to a shared IP (a CI
+  # runner, a busy NAT); curl counts 429/5xx/timeouts as transient and backs off
+  # 1-2-4-8-16s, honouring Retry-After. A 404 is not retried. Same on a customer box.
+  [hermes]="{ [[ -x /home/claude/.local/bin/hermes ]] || { curl -fsSL --retry 5 https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_PIN_COMMIT}/scripts/install.sh | setsid -w bash -s -- --skip-setup --branch ${HERMES_PIN_TAG} --commit ${HERMES_PIN_COMMIT} && chmod 0775 /home/claude/.hermes; }; } && ${HERMES_SDK_STEP}"
   # openclaw's launcher is `#!/usr/bin/env node`, so symlinking only the CLI
   # into ~/.local/bin leaves it unexecutable in systemd/create-time envs where
   # nvm's per-version bin directory is absent from PATH. Install a supported
