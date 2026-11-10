@@ -90,7 +90,9 @@ out="$(_memory_search '???' --roots="$STORE" 2>/dev/null)"
 # ── router topic words see Cyrillic ───────────────────────────────────────
 r="$(_memory_router --root="$STORE" --recent=0 2>&1)"
 line="$(grep -F -- '**reference** — 5 atoms' <<<"$r")"
-grep -q -- '[а-яё]' <<<"$line" \
+# A literal fixture word, never a bracket range: CI's grep rejects '[а-яё]'
+# with "Invalid collation character" in its locale (DIVE-8108 merge hold).
+grep -qF -- 'где·' <<<"$line" \
   && ok_t "router: Cyrillic words appear among the topic words ($line)" \
   || bad_t 'router: no Cyrillic topic words' "$r"
 
