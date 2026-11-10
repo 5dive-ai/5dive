@@ -208,6 +208,77 @@ has_t 'other-file refusal names it' "$out" "notes.txt:1:"
 fixture gamma "I am agent-gamma on this box."
 (cmd_agent_share gamma) >/dev/null 2>&1 && ok_t "the agent's own account name is not a leak" || bad_t "own account name refused"
 
+echo '== DIVE-8149: our own skill, unchanged, is not refused; an edited copy is =='
+# The lock `skills add` writes in the agent's home, with the skills CLI's OWN
+# hash (copied from its computeSkillFolderHash: path then bytes per file, files
+# in JavaScript localeCompare order), computed by node so the CLI's python
+# re-implementation is graded against the real algorithm, not against itself.
+gh_org() { printf '%s' "${GH_ORG:-5dive-ai}"; }
+AGENT_HOME_ROOT="$TMP/homes"
+skills_hash() { # <skill dir>
+  node -e '
+const fs=require("fs"),path=require("path"),crypto=require("crypto");
+const root=process.argv[1],files=[];
+(function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){const p=path.join(d,e.name);
+  if(e.isDirectory()){if(e.name===".git"||e.name==="node_modules")continue;walk(p);}
+  else if(e.isFile())files.push({rel:path.relative(root,p).split("\\").join("/"),p});}})(root);
+files.sort((a,b)=>a.rel.localeCompare(b.rel));
+const h=crypto.createHash("sha256");for(const f of files){h.update(f.rel);h.update(fs.readFileSync(f.p));}
+console.log(h.digest("hex"));' "$1"
+}
+cli_skill_fixture() { # <agent>: the default 5dive-cli skill, as public as ours is
+  local s="$TMP/fixture/$1/skills/5dive-cli"; mkdir -p "$s/references"
+  printf -- '---\nname: 5dive-cli\n---\nRun the local CLI.\n' > "$s/SKILL.md"
+  printf '# Commands\nsudo 5dive agent list\n5dive task show DIVE-1234\nsudo 5dive agent share <name>\n' > "$s/references/commands.md"
+}
+lock_for() { # <agent> <source> [hash]
+  mkdir -p "$AGENT_HOME_ROOT/agent-$1"
+  jq -n --arg s "$2" --arg h "${3-$(skills_hash "$TMP/fixture/$1/skills/5dive-cli")}" \
+    '{version:1, skills:{"5dive-cli":{source:$s, sourceType:"github", skillPath:"5dive-cli/SKILL.md", computedHash:$h}}}' \
+    > "$AGENT_HOME_ROOT/agent-$1/skills-lock.json"
+}
+if ! command -v node >/dev/null 2>&1; then
+  bad_t '8149: node is needed to compute the skills CLI hash' "no node on PATH"
+else
+  fixture vesper ""; cli_skill_fixture vesper
+  # Control: the fixture skill really does trip the scan, with no lock.
+  out=$( (cmd_agent_share vesper) 2>&1 ); rc=$?
+  eq_t '8149/control no lock: our skill is scanned and refused' "$E_VALIDATION" "$rc"
+  has_t '8149/control names its sudo line' "$out" "skills/5dive-cli/references/commands.md:2: sudo-posture: sudo"
+  has_t '8149/control leads with one plain sentence' "$(head -1 <<<"$out")" "Not shared: 3 line(s) in vesper's own instructions, skills or memory look private"
+  # Arm: the lock names our repo and the bytes match it -> shared, body travels.
+  lock_for vesper 5dive-ai/skills
+  out=$( (JSON_MODE=1; cmd_agent_share vesper) 2>&1 ); rc=$?
+  eq_t '8149/arm default skills + clean instructions shares (rc 0)' 0 "$rc"
+  vd=$(_share_dir_of_agent vesper)
+  has_t '8149/arm our skill still travels in the pack' "$(packlist "$vd/pack.tar.gz")" "skills/5dive-cli/references/commands.md"
+  # A URL-form source is the same repo.
+  lock_for vesper https://github.com/5dive-ai/skills.git
+  (cmd_agent_share vesper) >/dev/null 2>&1 && ok_t '8149/arm a github URL source is our repo too' || bad_t '8149/arm URL source refused'
+  # Mutant: one edited line in our file -> scanned again, and the line is named.
+  lock_for vesper 5dive-ai/skills
+  sed -i '3s#.*#5dive task show DIVE-1234 (notes in /home/owner/x)#' "$TMP/fixture/vesper/skills/5dive-cli/references/commands.md"
+  out=$( (cmd_agent_share vesper) 2>&1 ); rc=$?
+  eq_t '8149/mutant an edited line is refused' "$E_VALIDATION" "$rc"
+  has_t '8149/mutant names the edited line' "$out" "skills/5dive-cli/references/commands.md:3: host-path: /home/owner"
+  has_t '8149/mutant the unedited lines are scanned again too' "$out" "skills/5dive-cli/references/commands.md:2: sudo-posture: sudo"
+  # Not ours: the same bytes from another repo stay scanned.
+  fixture vesper ""; cli_skill_fixture vesper; lock_for vesper acme/skills
+  (cmd_agent_share vesper) >/dev/null 2>&1 && bad_t '8149/third-party source is scanned' "shared" || ok_t '8149/third-party source is scanned'
+  # A lock with a hash that does not match (or none) proves nothing.
+  lock_for vesper 5dive-ai/skills "$(printf '0%.0s' {1..64})"
+  (cmd_agent_share vesper) >/dev/null 2>&1 && bad_t '8149/wrong hash is scanned' "shared" || ok_t '8149/wrong hash is scanned'
+  lock_for vesper 5dive-ai/skills ""
+  (cmd_agent_share vesper) >/dev/null 2>&1 && bad_t '8149/empty hash is scanned' "shared" || ok_t '8149/empty hash is scanned'
+  # The exemption is per skill: the agent's own leaky skill next to ours still refuses.
+  lock_for vesper 5dive-ai/skills
+  printf 'notes in /home/owner/y\n' >> "$TMP/fixture/vesper/skills/research/SKILL.md"
+  out=$( (cmd_agent_share vesper) 2>&1 ); rc=$?
+  eq_t '8149/own skill next to ours is still scanned' "$E_VALIDATION" "$rc"
+  not_t '8149/... and ours is not in the list' "$out" "skills/5dive-cli/"
+fi
+unset AGENT_HOME_ROOT
+
 echo '== the page server serves shares =='
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 _secret_drop_server_py > "$TMP/server.py"
