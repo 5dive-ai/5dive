@@ -436,7 +436,27 @@ const TODAY = new Date().toISOString().slice(0, 10);   // DIVE-1024: expiry comp
 const TRUTH = String(opt("truth", "0")) === "1";   // DIVE-5816 pilot seat: say "may be outdated"
 const estTokens = (s) => Math.ceil(s.length / 4);
 const STOP = new Set("a an and are as at be but by for from has have if in into is it its of on or that the their then there these this to was were will with you your our we".split(" "));
-const tokenize = (s) => s.toLowerCase().replace(/`[^`]*`/g, " ").replace(/[^a-z0-9]+/g, " ").split(" ").filter((t) => t.length > 1 && !STOP.has(t));
+// DIVE-8108: words are Unicode letters/marks/digits, not a-z0-9 — an
+// ASCII-only class turned every Cyrillic or Chinese word into a space, so a
+// query in the owner's language scored nothing and read as "no such fact".
+// Han/Kana/Hangul are written without spaces, so a run of them becomes
+// overlapping character bigrams ("发布清单" → 发布 布清 清单) on both sides; a
+// lone CJK character stays a one-character token (it is a word on its own).
+const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/u;
+const PIECES = /([\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+)|([^\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+)/gu;
+const tokenize = (s) => {
+  const out = [];
+  for (const w of s.toLowerCase().replace(/`[^`]*`/g, " ").split(/[^\p{L}\p{M}\p{N}]+/u)) {
+    if (!w) continue;
+    if (!CJK_RUN.test(w)) { if ([...w].length > 1 && !STOP.has(w)) out.push(w); continue; }
+    for (const m of w.matchAll(PIECES)) {
+      if (m[1]) { const cs = [...m[1]]; if (cs.length === 1) out.push(cs[0]); else for (let i = 0; i + 1 < cs.length; i++) out.push(cs[i] + cs[i + 1]); }
+      else if ([...m[2]].length > 1 && !STOP.has(m[2])) out.push(m[2]);
+    }
+  }
+  return out;
+};
+const isCJK = (t) => CJK_RUN.test(t);
 function mdFiles(root) {
   const out = [];
   const walk = (d) => {
@@ -500,6 +520,11 @@ function lifecycle(m) {
   return { mult, flags };
 }
 if (!query) { console.error('usage: memory search "<query>"'); process.exit(2); }
+// DIVE-8108: a query with nothing to match on is a usage error, never a
+// well-formed empty result — the router teaches that an empty result means
+// the fact does not exist, so a silent zero here is a false negative.
+const qToks = [...new Set(tokenize(query))];
+if (qToks.length === 0) process.exit(3);   // the shell side reports it through fail (E_USAGE)
 if (docs.length === 0) { console.log("(no markdown found in the given roots)"); process.exit(0); }
 const k1 = 1.5, b = 0.75;
 const docTokens = docs.map((d) => tokenize(`${d.heading} ${d.text}`));
@@ -508,15 +533,26 @@ const df = new Map();
 for (const toks of docTokens) for (const t of new Set(toks)) df.set(t, (df.get(t) ?? 0) + 1);
 const N = docs.length;
 const idf = (t) => Math.log(1 + (N - (df.get(t) ?? 0) + 0.5) / ((df.get(t) ?? 0) + 0.5));
-const qToks = [...new Set(tokenize(query))];
-const scored = docs.map((d, i) => {
-  const toks = docTokens[i]; const tf = new Map();
-  for (const t of toks) tf.set(t, (tf.get(t) ?? 0) + 1);
+const docTf = docTokens.map((toks) => { const tf = new Map(); for (const t of toks) tf.set(t, (tf.get(t) ?? 0) + 1); return tf; });
+const rank = (terms) => docs.map((d, i) => {
+  const toks = docTokens[i]; const tf = docTf[i];
   let score = 0;
-  for (const qt of qToks) { const f = tf.get(qt) ?? 0; if (!f) continue; score += idf(qt) * (f * (k1 + 1)) / (f + k1 * (1 - b + b * (toks.length / avgdl))); }
+  for (const qt of terms) { const f = tf.get(qt) ?? 0; if (!f) continue; score += idf(qt) * (f * (k1 + 1)) / (f + k1 * (1 - b + b * (toks.length / avgdl))); }
   const lc = lifecycle(d.m);
   return { ...d, score: score * lc.mult, flags: lc.flags };
 }).filter((d) => d.score > 0).sort((a, b) => b.score - a.score);
+let scored = rank(qToks);
+// DIVE-8108: inflected languages. "стоянк" is a stem; the facts say
+// "стоянка"/"стоянки". Only when the exact terms score NOTHING, retry once with
+// every indexed word that starts with a query word of 4+ characters (or a lone
+// CJK character). An exact hit always wins, so Latin ranking never moves.
+let PREFIX = false;
+if (scored.length === 0) {
+  const stems = qToks.filter((t) => [...t].length >= 4 || ([...t].length === 1 && isCJK(t)));
+  const expanded = stems.length ? [...df.keys()].filter((v) => stems.some((s) => v !== s && v.startsWith(s))) : [];
+  if (expanded.length) { scored = rank(expanded); PREFIX = scored.length > 0; }
+}
+const how = PREFIX ? "BM25, words starting with the query" : "BM25";
 const home = process.env.HOME || "";
 // DIVE-3821: the description is what stage 1 shows, so carry it per-file. The
 // chunker folds it into chunk 0's text; re-read it here rather than parse the
@@ -550,7 +586,7 @@ if (INDEX) {
     if (!prev || d.score > prev.score) best.set(k, d);
   }
   const rows = [...best.values()].sort((a, b) => b.score - a.score);
-  console.log(`\n🔎 "${query}"  —  ${rows.length} file(s) across ${N} chunks (BM25 index rows, ≤${MAX_TOKENS} tok)\n`);
+  console.log(`\n🔎 "${query}"  —  ${rows.length} file(s) across ${N} chunks (${how} index rows, ≤${MAX_TOKENS} tok)\n`);
   for (const d of rows) {
     if (shown >= LIMIT) break;
     const slug = slugOf(d);
@@ -571,7 +607,7 @@ if (INDEX) {
   console.log(`\n— ${shown}/${rows.length} rows, ~${used} tokens. Fetch the ones you want:\n    5dive memory get <slug> [<slug>...]\n`);
   process.exit(0);
 }
-console.log(`\n🔎 "${query}"  —  ${scored.length} hits across ${N} chunks / ${new Set(docs.map((d) => d.file)).size} files (BM25, ≤${MAX_TOKENS} tok)\n`);
+console.log(`\n🔎 "${query}"  —  ${scored.length} hits across ${N} chunks / ${new Set(docs.map((d) => d.file)).size} files (${how}, ≤${MAX_TOKENS} tok)\n`);
 for (const d of scored) {
   if (shown >= LIMIT) break;
   const snippet = d.text.length > 500 ? d.text.slice(0, 500) + " …" : d.text;
@@ -585,7 +621,12 @@ for (const d of scored) {
 console.log(`— shown ${shown}/${scored.length} hits, ~${used} tokens —`);
 MEMJS
   local truth=0; _memory_truth_on && truth=1
-  node "$js" "$query" --limit="$limit" --max-tokens="$maxtok" --roots="$roots" --index="$index" --truth="$truth"
+  local rc=0
+  node "$js" "$query" --limit="$limit" --max-tokens="$maxtok" --roots="$roots" --index="$index" --truth="$truth" || rc=$?
+  # DIVE-8108: exit 3 = the query has no searchable words. Said through fail
+  # so the CLI names it, never as a silent empty result.
+  [ "$rc" -eq 3 ] && fail "$E_USAGE" "memory search: no searchable words in the query \"$query\" (only punctuation, symbols or very common words) — search with a word the fact itself would use"
+  return "$rc"
 }
 
 # memory add — the write/compile path (DIVE-897, DIVE-726 Phase 1b).
@@ -628,7 +669,7 @@ try:
     body = open(bodyfile, encoding="utf-8", errors="replace").read()
 except OSError:
     sys.exit(0)
-WORD = re.compile(r"[a-z0-9_./-]{3,}")
+WORD = re.compile(r"[\w./-]{3,}")   # DIVE-8108: \w is Unicode — a Cyrillic atom has words too
 def words(t):
     t = re.sub(r"\A---\n.*?\n---\n", "", t, flags=re.S)   # drop frontmatter
     return set(WORD.findall(t.lower()))
@@ -1155,7 +1196,7 @@ PATH_RE = re.compile(
     r'(?<![\w./@-])((?:[\w.-]+/)*[\w.-]+\.'
     r'(?:tsx|ts|jsx|mjs|cjs|json|js|yaml|yml|sh|py|go|rs|sql|toml|conf|env))'
     r'(?![A-Za-z0-9])(?::(\d+))?')
-WORD_RE = re.compile(r'[a-z0-9]+')
+WORD_RE = re.compile(r'[^\W_]+')   # DIVE-8108: Unicode letters/digits (was a-z0-9)
 PRUNE = {"node_modules", ".git", "dist", "build", ".next", "vendor",
          "coverage", ".venv", "__pycache__", ".turbo"}
 
@@ -2330,7 +2371,10 @@ const TODAY = new Date().toISOString().slice(0, 10);
 const INDEX = path.join(ROOT, "MEMORY.md");
 
 const STOP = new Set("a an and are as at be but by for from has have if in into is it its of on or that the than then there these this to was were will with you your our we not no never only own one two md the its it's about after against all also any because been before being both can cannot did do does doing done down during each few first for further had having here how i if into itself just more most must my nor now off once other out over own same should so some such take that's their them themselves they this those through too under until up very what when where which while who whom why will would".split(/\s+/));
-const tokenize = (s) => String(s).toLowerCase().replace(/`[^`]*`/g, " ").replace(/[^a-z0-9]+/g, " ").split(" ").filter((t) => t.length > 2 && !STOP.has(t) && !/^\d+$/.test(t));
+// DIVE-8108: Unicode words (a-z0-9 dropped every Cyrillic/CJK topic word);
+// a CJK run counts as its character bigrams, as in memory search.
+const CJK_RUN = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
+const tokenize = (s) => String(s).toLowerCase().replace(/`[^`]*`/g, " ").replace(CJK_RUN, (r) => { const cs = [...r]; return " " + (cs.length < 2 ? "" : cs.slice(0, -1).map((c, i) => c + cs[i + 1]).join(" ")) + " "; }).split(/[^\p{L}\p{M}\p{N}]+/u).filter((t) => ([...t].length > 2 || (t && /^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]{2}$/u.test(t))) && !STOP.has(t) && !/^\d+$/.test(t));
 
 let entries;
 try { entries = fs.readdirSync(ROOT, { withFileTypes: true }); } catch (e) { console.error(`memory router: cannot read ${ROOT}`); process.exit(5); }
