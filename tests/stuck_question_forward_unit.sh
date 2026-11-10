@@ -70,6 +70,16 @@
 #      `Ship it as "v2"?`, still forward. MUTANT: the base tier that reads the
 #      raw paragraph (the pre-6515 tree) forwards the clicker text (O1 red)
 #
+# DIVE-8084 arms.
+#   J  a turn that ran a `5dive task need` tool call (that did not error) is
+#      terminal: `.last` written, a pending `.retry` dropped, one log line naming
+#      the gate, nothing sent to a lead or a person, also when the gate was
+#      withdrawn before the tick (vesper, DIVE-1137 on chill-gorge). CONTROL: the
+#      same closing question after a non-gate tool call, with `5dive task need`
+#      only quoted in the reply, after a `task need` that errored, or after one in
+#      an EARLIER turn, still reaches the lead. MUTANT: the sweep without the gate
+#      exit forwards vesper's turn (J1 red)
+#
 # Stubs: systemctl (per unit), cmd_send (the a2a rail), _tg_access_state_dir (channel dirs into the temp tree),
 # _gate_channel_api (the Bot API seam), _reflex_endpoint_decide (the model),
 # _hb_log. No root, no network, no box path written.
@@ -643,6 +653,89 @@ _hb_stuck_fenced_reply "a stray </5dive-r:e78392d6> closer only?" && Y5_BAD+=" c
   && ok_t "Y5: complete fence and echo-then-real-fence are the caller's; empty echoed pair, mismatched ids and a bare closer are not" \
   || bad_t "Y5: fence shape rule" "$Y5_BAD"
 
+# --- J) DIVE-8084: a turn that filed a task gate is the gate's, not a stuck question ----------------------
+# vesper on chill-gorge, 2026-11-09 09:36:02Z: `task need DIVE-1137 --type=decision`,
+# then the turn ended "Which way do you want it?". The gate's ping was held and
+# the gate withdrawn at 09:36:34Z; the sweep still retried the ask 5 times.
+# tx_calls writes one PRIOR turn and then the ENDED turn, each a real prompt
+# followed by Bash tool calls (each with its tool_result) and the final text.
+tx_calls() { # <seat> <final text> <ended-turn calls json> [prior-turn calls json]
+  local d="$TMP/home/agent-$1/.claude/projects/-home-claude-projects" f
+  mkdir -p "$d"; f="$d/session.jsonl"
+  jq -cn --arg t "$2" --argjson calls "$3" --argjson prior "${4:-[]}" '
+    def turn($cs; $k): {type: "user", entrypoint: "cli", message: {role: "user", content: "go on"}},
+      ($cs | to_entries[] | ("toolu_\($k)\(.key)") as $id
+        | {type: "assistant", entrypoint: "cli", message: {role: "assistant", stop_reason: "tool_use",
+             content: [{type: "tool_use", id: $id, name: "Bash", input: {command: .value.cmd, description: "x"}}]}},
+          {type: "user", entrypoint: "cli", message: {role: "user",
+             content: [{type: "tool_result", tool_use_id: $id, content: "ok", is_error: (.value.err // false)}]}});
+    turn($prior; "p"),
+    {type: "assistant", entrypoint: "cli", message: {role: "assistant", stop_reason: "end_turn", content: [{type: "text", text: "Earlier turn done."}]}},
+    turn($calls; "e"),
+    {type: "assistant", entrypoint: "cli", message: {role: "assistant", stop_reason: "end_turn", content: [{type: "text", text: $t}]}},
+    {type: "system", subtype: "stop_hook_summary"}' > "$f"
+  touch -d "@$((NOW - 60))" "$f"
+}
+VESPER_Q="DIVE-1137 needs your call before I touch the pricing page: keep the yearly toggle, or drop it and show monthly only.
+
+Which way do you want it?"
+NEED_CALL='[{"cmd":"cd /home/claude/projects/shop && sudo 5dive task need DIVE-1137 --type=decision --ask=\"Keep the yearly toggle?\" --options=\"keep it|drop it\" --recommend=\"keep it\""}]'
+SHOW_CALL='[{"cmd":"5dive task show DIVE-1137"}]'
+db "INSERT INTO tasks(ident, title, status, assignee) VALUES ('DIVE-1137', 'pricing toggle', 'done', 'quiet');" >/dev/null   # gate withdrawn, row closed
+J_LAST="$STATE_DIR/stuck-question/quiet.last" J_RETRY="$STATE_DIR/stuck-question/quiet.retry"
+J0_BAD=""
+tx_calls quiet "$VESPER_Q" "$NEED_CALL"
+[[ "$(_hb_seat_ended_turn_text quiet)" == "${_HB_STUCK_Q_GATE_MARK-}${VESPER_Q}" ]] || J0_BAD+=" gated-turn:$(_hb_seat_ended_turn_text quiet | head -c 40 | od -c | head -1)"
+tx_calls quiet "$VESPER_Q" "$SHOW_CALL"
+[[ "$(_hb_seat_ended_turn_text quiet)" == "$VESPER_Q" ]] || J0_BAD+=" plain-turn"
+[[ -z "$J0_BAD" ]] \
+  && ok_t "J0: (precondition) the reader marks the turn whose tool calls filed a task gate, and only that turn" \
+  || bad_t "J0: gate mark" "$J0_BAD"
+opt_out; fresh; DOWN="boss"; tx_calls quiet "$VESPER_Q" "$NEED_CALL"; tick
+J1_A2A=$(a2as) J1_LOG=$(cat "$TMP/hb.log"); DOWN="lead boss"
+fresh; tx_calls quiet "$VESPER_Q" "$NEED_CALL"; tick
+[[ "$J1_A2A" == 0 && "$(a2as)" == 0 && "$(sends)" == 0 && -s "$J_LAST" && ! -e "$J_RETRY" ]] \
+  && has "$J1_LOG" "[stuck-question] quiet: its last turn filed a task gate (5dive task need); the gate owns this ask, nothing forwarded" \
+  && [[ "$(grep -c . <<<"$J1_LOG")" == 1 ]] \
+  && ok_t "J1: vesper's turn (task need filed, gate since withdrawn): no lead, no person, marked judged, one log line" \
+  || bad_t "J1: gate-owned ask forwarded" "a2a(lead up)=$J1_A2A a2a=$(a2as) api=$(sends) last=$(cat "$J_LAST" 2>/dev/null) log=$J1_LOG"
+# The incident's state: an undeliverable retry already pending for that text.
+fresh; mkdir -p "$STATE_DIR/stuck-question"
+printf '%s 3 0\n' "$(printf '%s' "$VESPER_Q" | sha256sum | cut -c1-32)" > "$J_RETRY"
+unchannel lead; unchannel boss; tx_calls quiet "$VESPER_Q" "$NEED_CALL"; tick
+channel lead '["501"]'; channel boss '["701"]'
+[[ ! -e "$J_RETRY" && -s "$J_LAST" && "$(sends)" == 0 ]] && ! has "$(cat "$TMP/hb.log")" "no paired channel resolves" \
+  && ok_t "J2: a retry already pending for the gated text is dropped, not tried again (the 'try 1..5' log of the incident)" \
+  || bad_t "J2: pending retry survived" "retry=$(cat "$J_RETRY" 2>/dev/null) log=$(cat "$TMP/hb.log")"
+J3_BAD=""
+DOWN="boss"
+fresh; tx_calls quiet "$VESPER_Q" "$SHOW_CALL"; tick
+[[ "$(a2as)" == 1 && "$(sends)" == 0 ]] && has "$(cat "$TMP/a2a.last")" "Which way do you want it?" || J3_BAD+=" no-gate-call:a2a=$(a2as)"
+fresh; tx_calls quiet "$VESPER_Q" '[]'; tick
+[[ "$(a2as)" == 1 ]] || J3_BAD+=" no-tool-call:a2a=$(a2as)"
+[[ -z "$J3_BAD" ]] \
+  && ok_t "J3: CONTROL: the same closing question in a turn with no task need call still goes to the lead first (DIVE-5113)" \
+  || bad_t "J3: plain question silenced" "$J3_BAD"
+J4_BAD=""
+fresh; tx_calls quiet "I would file \`5dive task need DIVE-1137 --type=decision\` for this.
+
+5dive task need DIVE-1137 is what I'd run. Which way do you want it?" "$SHOW_CALL"; tick
+[[ "$(a2as)" == 1 ]] || J4_BAD+=" quoted-in-reply:a2a=$(a2as)"
+fresh; tx_calls quiet "$VESPER_Q" '[{"cmd":"grep -rn \"5dive task need\" docs/ | head"}]'; tick
+[[ "$(a2as)" == 1 ]] || J4_BAD+=" grep-for-the-words:a2a=$(a2as)"
+[[ -z "$J4_BAD" ]] \
+  && ok_t "J4: 'task need' only in the reply text, or only as a grep pattern, files nothing: still forwarded" \
+  || bad_t "J4: quoted task need suppressed the forward" "$J4_BAD"
+J5_BAD=""
+fresh; tx_calls quiet "$VESPER_Q" '[{"cmd":"sudo 5dive task need DIVE-1137 --type=decision","err":true}]'; tick
+[[ "$(a2as)" == 1 ]] || J5_BAD+=" errored-need:a2a=$(a2as)"
+fresh; tx_calls quiet "$VESPER_Q" "$SHOW_CALL" "$NEED_CALL"; tick
+[[ "$(a2as)" == 1 ]] || J5_BAD+=" earlier-turn-need:a2a=$(a2as)"
+DOWN="lead boss"
+[[ -z "$J5_BAD" ]] \
+  && ok_t "J5: a task need that errored, or one filed in an EARLIER turn, owns nothing: the question still goes to the lead" \
+  || bad_t "J5: gate scope" "$J5_BAD"
+
 # --- O) DIVE-6515: a '?' the seat only QUOTED is not an ask ------------------------------------------
 # clicker's finished report on chill-gorge (relayed to head 2026-10-18 08:35Z,
 # 11:06Z and 10-19 02:05Z, box with reflex_model null): its only '?' is in
@@ -786,6 +879,16 @@ opt_out; fresh; DOWN="boss"; tx quiet "$FENCED_Q"; tick; DOWN="lead boss"
 [[ "$(a2as)" == 1 ]] && has "$(cat "$TMP/a2a.last")" "e78392d6" \
   && ok_t "Y3: MUTANT (no fence check): the fenced reply is sent to the lead as a stuck question — Y1 goes red" \
   || bad_t "Y3: mutant must forward the fenced reply" "a2a=$(a2as)"
+eval "$SWEEP_SRC"
+# J6: the pre-8084 sweep, which has no exit for a turn that filed a task gate.
+eval "$(sed 's/if (( gated )); then/if false; then/' <<<"$SWEEP_SRC")"
+has "$(declare -f _hb_stuck_question_sweep)" 'if false; then' \
+  && ok_t "J6a: (anchor) the no-gate-exit mutation landed" \
+  || bad_t "J6a: gate mutation anchor" "the sed pattern no longer matches src/cmd_heartbeat.sh"
+opt_out; fresh; DOWN="boss"; tx_calls quiet "$VESPER_Q" "$NEED_CALL"; tick; DOWN="lead boss"
+[[ "$(a2as)" == 1 ]] && has "$(cat "$TMP/a2a.last")" "Which way do you want it?" \
+  && ok_t "J6: MUTANT (no gate exit): vesper's gate-owned question reaches the lead — J1 goes red" \
+  || bad_t "J6: mutant must forward the gated turn" "a2a=$(a2as)"
 eval "$SWEEP_SRC"
 # O3: the pre-6515 base tier, which reads the raw final paragraph.
 BASE_SRC=$(declare -f _hb_stuck_base_asks)

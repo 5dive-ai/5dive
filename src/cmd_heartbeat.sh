@@ -9035,6 +9035,15 @@ _HB_STUCK_Q_SENDER=stuck-question   # relayed agent words: never the droppable t
 # in the seat's home, and its transcript (entrypoint sdk-cli) is then the newest
 # file — at 01:15:20Z it was, 84s before marcus asked. A headless run has nobody
 # waiting on it. Newlines are kept: the base reads the final PARAGRAPH.
+#
+# DIVE-8084: when the turn (every record since the last prompt that is not a
+# tool result) ran a `5dive task need` tool call that did not error, the text is
+# prefixed with $_HB_STUCK_Q_GATE_MARK. A task gate owns that ask and its own
+# rail pages for it, hold and withdrawal included, so the sweep must not. Read
+# from the tool CALLS, never the text: a reply that quotes `5dive task need` filed
+# nothing, and a gate withdrawn before the tick still owned the ask.
+_HB_STUCK_Q_GATE_MARK=$'\002gate\n'
+_HB_STUCK_Q_GATE_RE='(^|[;&|(`\n])[ \t]*(sudo[ \t]+)?([A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+)*([^ \t;&|]*/)?5dive[ \t]+task[ \t]+need([ \t]|$)'
 _hb_seat_ended_turn_text() { # <agent>
   local name="$1" home tx out now mt n=0
   home="${_HB_SEAT_HOME_ROOT}/agent-${name}"
@@ -9045,14 +9054,20 @@ _hb_seat_ended_turn_text() { # <agent>
     [[ -r "$tx" ]] || continue
     mt=$(stat -c %Y "$tx" 2>/dev/null) || continue
     (( now - mt <= _HB_STUCK_Q_MAX_AGE_MIN * 60 )) || return 1
-    out=$(tail -n "$_HB_CARRYOVER_TAIL_LINES" "$tx" 2>/dev/null | jq -rRn '
+    out=$(tail -n "$_HB_CARRYOVER_TAIL_LINES" "$tx" 2>/dev/null | jq -rRn --arg re "$_HB_STUCK_Q_GATE_RE" --arg mark "$_HB_STUCK_Q_GATE_MARK" '
+      def blocks: (.message.content // []) | if type == "array" then .[] | select(type == "object") else empty end;
       [ inputs | fromjson? | select(type == "object" and (.type == "user" or .type == "assistant")) ] as $r
       | if ($r | length) == 0 then "\u0001none"
         elif ($r[-1].entrypoint // "") == "sdk-cli" then "\u0001headless"
         elif $r[-1].type != "assistant" or ($r[-1].message.stop_reason // "") != "end_turn" then "\u0001busy"
         else ([ $r | to_entries[] | select(.value.type == "user") | .key ] | max // -1) as $u
-          | [ $r[($u + 1):][] | (.message.content // [])[]? | select(type == "object" and .type == "text") | .text ]
-          | join("\n\n")
+          | ([ $r | to_entries[] | select(.value.type == "user" and ([.value | blocks | select(.type == "tool_result")] | length) == 0) | .key ] | max // -1) as $p
+          | [ $r[($p + 1):][] | blocks | select(.type == "tool_result" and .is_error == true) | .tool_use_id ] as $failed
+          | ([ $r[($p + 1):][] | select(.type == "assistant") | blocks
+               | select(.type == "tool_use" and ((.input.command? // null) | type) == "string" and (.input.command | test($re)))
+               | .id | select(. as $i | $failed | index([$i]) | not) ] | length > 0) as $gated
+          | (if $gated then $mark else "" end)
+            + ([ $r[($u + 1):][] | blocks | select(.type == "text") | .text ] | join("\n\n"))
         end' 2>/dev/null) || continue
     case "$out" in
       $'\001headless') continue ;;
@@ -9281,7 +9296,7 @@ _hb_stuck_question_sweep() {
   _task_deployment_has_channels || return 0
   local reg; reg=$(registry_read 2>/dev/null) || return 0
   local dir="${STATE_DIR}/stuck-question" model="" name key text hash chat sent now
-  local r_hash r_n r_due retrying full lead ask
+  local r_hash r_n r_due retrying full lead ask gated
   mkdir -p "$dir" 2>/dev/null || return 0
   model=$(reflex_shadow_model 2>/dev/null) || model=""
   now=$(_hb_stuck_q_now)
@@ -9302,6 +9317,8 @@ _hb_stuck_question_sweep() {
     fi
     printf '%s\n' "$key" > "$dir/${name}.tx" 2>/dev/null || true
     text=$(_hb_seat_ended_turn_text "$name") || continue
+    gated=0
+    [[ "$text" == "$_HB_STUCK_Q_GATE_MARK"* ]] && { gated=1; text=${text#"$_HB_STUCK_Q_GATE_MARK"}; }
     hash=$(printf '%s' "$text" | sha256sum | cut -c1-32)
     [[ "$hash" == "$(cat "$dir/${name}.last" 2>/dev/null)" ]] && continue
     retrying=0
@@ -9319,6 +9336,12 @@ _hb_stuck_question_sweep() {
       printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true
       rm -f "$dir/${name}.retry"
       _hb_log "[stuck-question] ${name}: its last turn is a fenced agent-ask reply; the asking caller reads it, nothing forwarded"
+      continue
+    fi
+    if (( gated )); then                             # terminal: a task gate owns it (DIVE-8084)
+      printf '%s\n' "$hash" > "$dir/${name}.last" 2>/dev/null || true
+      rm -f "$dir/${name}.retry"
+      _hb_log "[stuck-question] ${name}: its last turn filed a task gate (5dive task need); the gate owns this ask, nothing forwarded"
       continue
     fi
     full="$text"
