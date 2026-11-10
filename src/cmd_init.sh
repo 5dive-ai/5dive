@@ -63,12 +63,26 @@ cmd_app_hint() {
   if [[ -s "$tok" ]] && grep -q '^CONNECTORD_TOKEN=.' "$tok" 2>/dev/null; then
     return 0
   fi
+  # DIVE-8065: «Optional:» read as skippable, under «Next step: sudo 5dive init»;
+  # «Then» makes it the step after, as the README's line does (DIVE-6842).
   cat <<'HINT'
 
-Optional: chat with your agents from your phone, free:
+Then chat with your agents from your phone, free:
   https://5dive.ai/self-host
 
 HINT
+}
+
+# DIVE-8065: rc 0 when the agent init makes chats in 5dive.app with no more
+# steps: this box is linked (self-host-link.sh's marker), the type has app chat
+# (Claude Code, Codex), and no channel was named, so `agent create` turns the
+# app's chat on (DIVE-7028). On 2026-11-10's fresh-box walk the last screen
+# listed eleven terminal commands and never said to open the app.
+_init_app_chat() {
+  local type="$1" channels="$2"
+  [[ -f "${FIVEDIVE_CHAT_ONLY_MARK:-/etc/5dive/chat-only}" ]] || return 1
+  [[ "$type" == claude || "$type" == codex ]] || return 1
+  [[ "$channels" == none ]]
 }
 
 _init_warn() {
@@ -604,9 +618,13 @@ USAGE
   esac
 
   if (( supports_telegram == 1 )); then
-    local ch_choice
+    local ch_choice ch_first="cli|Terminal only|Use the 5dive CLI or attach to its TUI"
+    # DIVE-8065: on a box linked to 5dive.app the first choice already gets the
+    # app's chat (see _init_app_chat), so it says so instead of «Terminal only».
+    _init_app_chat "$type" none \
+      && ch_first="cli|5dive.app and terminal|Chat in 5dive.app on your phone: this server is linked"
     _init_pick ch_choice "Where do you want to talk to $name?" 1 \
-      "cli|Terminal only|Use the 5dive CLI or attach to its TUI" \
+      "$ch_first" \
       "telegram|Telegram|Message your agent from your phone"
     case "$ch_choice" in
       telegram) channels="telegram" ;;
@@ -798,7 +816,12 @@ USAGE
   # --- Step 8: next steps ---
   echo >&2
   _init_ok "$name is ready"
-  _init_note "Your first teammate is running. Start with one of these:"
+  if _init_app_chat "$type" "$channels"; then
+    _init_note "Open 5dive.app and say hi to $name. It shows up in My team within a minute."
+    _init_note "Or from this terminal:"
+  else
+    _init_note "Your first teammate is running. Start with one of these:"
+  fi
   cat >&2 <<NEXT
 
     5dive agent send '$name' 'hello, who are you?'
