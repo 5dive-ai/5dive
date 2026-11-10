@@ -9,6 +9,8 @@
 #       survives, the epoch moves. (DIVE-2512: a fresh-DB harness never runs
 #       _tasks_db_migrate, so this arm builds the old shape by hand.)
 #   L1  `people ls --json` shape: {people:[], knocks:[]} on an empty box;
+#   L2  (DIVE-8111) the empty list's line names Teams knocking, not "keeps access";
+#   L3  (DIVE-8111) a waiting knock is listed with its answer command;
 #   Z1  zero managed rows: sync writes NOTHING (files byte-identical);
 #   W1  non-root write refused (E_PERMISSION) and writes nothing;
 #   S1  add: the person's telegram id joins the allowed agent's allowFrom, Teams
@@ -204,6 +206,20 @@ K2=$( cmd_people_knock_file --agent=vesper --channel=teams --sender=${GK^^} 2>&1
 [[ "$(jq -r .data.id <<<"$K2")" == "$KID" && "$(wc -l <"$CARDS")" == 1 ]] \
   && ok_t "K2 dedupe: the same sender (any case) gets the same knock, no second card" \
   || bad_t "K2 dedupe" "out=$K2 cards=$(wc -l <"$CARDS")"
+
+# L2/L3 (DIVE-8111) — the words a self-hoster with no Telegram reads. The empty
+# list no longer claims every agent keeps its Teams access while a new Teams
+# connection holds a stranger; a waiting knock names the answer command.
+L2=$( TASKS_DB="$TMP/empty-l2.db"; JSON_MODE=0; cmd_people_ls 2>&1 )
+[[ "$L2" == *"nobody on the list yet"* && "$L2" == *"A new Teams connection lets in only people you add"* \
+   && "$L2" != *"keeps its current Telegram and Teams access"* ]] \
+  && ok_t "L2 empty list: says a new Teams connection holds anyone not added (not 'keeps its Teams access')" \
+  || bad_t "L2 empty words" "$L2"
+L3=$( JSON_MODE=0; cmd_people_ls 2>&1 )
+[[ "$L3" == *"#$KID Kim Stranger → vesper (teams, user@example.com)"* \
+   && "$L3" == *"Answer: sudo 5dive people knock answer <number> allow"* ]] \
+  && ok_t "L3 a waiting knock is listed with the command that answers it" \
+  || bad_t "L3 knock words" "$L3"
 
 for i in 1 2 3 4; do
   cmd_people_knock_file --agent=vesper --channel=teams --sender="cccccccc-1111-2222-3333-00000000000$i" >/dev/null 2>&1
