@@ -189,7 +189,9 @@ cmd_people_ls() {
     return 0
   fi
   if [[ "$people" == "[]" ]]; then
-    echo "(nobody on the list — every agent keeps its current Telegram and Teams access; add someone with: sudo 5dive people add <id> --name=<name> --agents=<agent>)"
+    # DIVE-8111: this used to say every agent keeps its "Teams access" while a
+    # new Teams connection (access: knock) was holding someone's first message.
+    echo "(nobody on the list yet. Telegram keeps the people each bot already lets in. A new Teams connection lets in only people you add: anyone else waits below until you answer. Add someone: sudo 5dive people add <id> --name=<name> --agents=<agent>)"
   else
     jq -r '.[] | [.id, (.name // ""), .role,
                   (if .telegram then "telegram" else "" end) + (if .teams then (if .telegram then "+" else "" end) + "teams" else "" end),
@@ -199,6 +201,7 @@ cmd_people_ls() {
   if [[ "$knocks" != "[]" ]]; then
     echo; echo "Wants to talk to your agents:"
     jq -r '.[] | "  #\(.id) \(.name // "someone") → \(.agent) (\(.channel)\(if .email then ", " + .email else "" end))"' <<<"$knocks"
+    echo "Answer: sudo 5dive people knock answer <number> allow   (or admin, or no)"
   fi
 }
 
