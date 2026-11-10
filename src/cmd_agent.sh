@@ -259,6 +259,41 @@ _agent_list_table() {
   fi
 }
 
+# DIVE-8137: Claude Code switches its channels feature OFF whenever
+# ANTHROPIC_BASE_URL is a custom (non-Anthropic) endpoint: OpenRouter or any
+# gateway. Upstream design, see community wiki
+# cc-channels-are-blocked-on-any-custom-anthropic-base-url. The seat starts,
+# authenticates and answers `agent send`, and never hears app chat (the dashboard
+# channel), telegram or any other channel, while deaf/auth/startup all read green.
+# `_agent_claude_chat_health <name> <channels> <profile>` prints the
+# `health.chat` JSON: {"ok":false,"reason":"openrouter"|"custom-base-url"} or
+# null. The base URL is the one the unit RUNS with: its EnvironmentFile chain
+# (shared anthropic.env, then agents.d/<name>.env, then the auth overlay, the
+# profile's combined.env or agents.d/<name>-auth.env), last definition wins.
+# Hand-parsed rather than profile_env_value, which cannot tell an explicit
+# empty override from an absent line. Only a POSITIVE read flags: a file in the
+# chain that exists but cannot be read makes the answer unknown, so null. The
+# python fast path (claude_chat_health) mirrors this.
+_agent_claude_chat_health() {
+  local name="$1" channels="$2" profile="$3" overlay f line url=""
+  case ",${channels}," in
+    *,telegram,*|*,discord,*|*,dashboard,*|*,buzz,*|*,teams,*) ;;
+    *) printf 'null'; return 0 ;;
+  esac
+  if [[ -n "$profile" ]]; then overlay="${AUTH_PROFILES_DIR}/${profile}/combined.env"
+  else overlay="${ENV_DIR}/${name}-auth.env"; fi
+  for f in "${CONNECTORS_DIR}/anthropic.env" "${ENV_DIR}/${name}.env" "$overlay"; do
+    [[ -e "$f" ]] || continue
+    [[ -r "$f" ]] || { printf 'null'; return 0; }
+    line=$(grep -E '^ANTHROPIC_BASE_URL=' "$f" 2>/dev/null | tail -1) || line=""
+    [[ -n "$line" ]] || continue
+    url="${line#*=}"; url="${url%\"}"; url="${url#\"}"; url="${url%\'}"; url="${url#\'}"
+  done
+  if [[ -z "$url" || "$url" =~ ^https://api\.anthropic\.com(/|$) ]]; then printf 'null'
+  elif [[ "$url" =~ ^https://openrouter\.ai(/|$) ]]; then printf '{"ok":false,"reason":"openrouter"}'
+  else printf '{"ok":false,"reason":"custom-base-url"}'; fi
+}
+
 _cmd_list_legacy() {
   # DIVE-1074: rootless read (mirrors account list / DIVE-1035). `agent list` is
   # pure-read, and a standard-isolation agent (group claude, so it can read the
@@ -369,6 +404,11 @@ _cmd_list_legacy() {
       _hc_nallow=$(jq -r '(.allowFrom // []) | length' <<<"$_hc_json" 2>/dev/null || echo -1)
       (( _hc_nallow == 0 )) && hdeaf="true"      # -1 (parse fail) -> unknown, don't flag
     done
+    # DIVE-8137: a Claude Code seat on a custom base URL hears no channel at all.
+    local hchat="null"
+    [[ "$ltype" == "claude" ]] && hchat=$(_agent_claude_chat_health "$name" "$lchan" "$lprof" || true)
+    [[ -n "$hchat" ]] || hchat="null"
+    [[ "$hchat" == null ]] || hdeaf="true"
     _hc_hb=$(jq -r --arg n "$name" '.agents[$n].heartbeat.enabled // false' <<<"$reg" 2>/dev/null || echo false)
     [[ "$_hc_hb" == "true" ]] || hasleep="true"
     # DIVE-1953: the third badge in this set. deaf/asleep answer "can anything
@@ -426,7 +466,7 @@ _cmd_list_legacy() {
       --arg model "$amodel" --arg effort "$aeffort" \
       --arg approval "$aapproval" --arg sandbox "$asandbox" --arg configSource "$aconfig_source" \
       --arg live "$alive" \
-      --argjson hdeaf "$hdeaf" --argjson hasleep "$hasleep" \
+      --argjson hdeaf "$hdeaf" --argjson hasleep "$hasleep" --argjson hchat "$hchat" \
       --arg haState "$_ha_state" --arg haExp "$_ha_exp" --arg haRefresh "$_ha_refresh" \
       --arg hsState "$_hs_state" --arg hsReason "$_hs_reason" --arg opState "$_op_state" \
       --arg qState "$_q_state" \
@@ -445,7 +485,7 @@ _cmd_list_legacy() {
                        measured: ($sgClass != "unknown"),
                        extraEntries: ($sgExtra == "1")},
                 operationalState: $opState,
-                health: {deaf: $hdeaf, asleep: $hasleep,
+                health: {deaf: $hdeaf, asleep: $hasleep, chat: $hchat,
                          auth: {state: $haState,
                                 expiresAt: (if $haExp == "-" then null
                                             else ($haExp | tonumber | todate) end),
@@ -1410,6 +1450,37 @@ def org_channel_policy(name, agent_type, channels, profile=""):
 def org_blocked_channels(name, agent_type, channels, profile=""):
     return org_channel_policy(name, agent_type, channels, profile)[0]
 
+# DIVE-8137: Claude Code switches channels OFF whenever ANTHROPIC_BASE_URL is a
+# custom (non-Anthropic) endpoint, OpenRouter or any gateway (community wiki
+# cc-channels-are-blocked-on-any-custom-anthropic-base-url). The seat starts and
+# authenticates, and never hears app chat, telegram or any other channel. Twin
+# of the shell's _agent_claude_chat_health: the URL the unit RUNS with, from its
+# EnvironmentFile chain (shared anthropic.env, agents.d/<name>.env, then the
+# auth overlay), last definition wins. A file in the chain that exists but
+# cannot be read is no evidence, so None: only a positive read flags.
+ANTHROPIC_URL_RE = re.compile(r"^https://api\.anthropic\.com(/|$)")
+OPENROUTER_URL_RE = re.compile(r"^https://openrouter\.ai(/|$)")
+
+def claude_chat_health(name, agent_type, channels, profile=""):
+    if agent_type != "claude" or not channel_plugins(name, channels):
+        return None
+    overlay = (os.path.join(profiles_dir, profile, "combined.env") if profile
+               else os.path.join(AGENT_ENV_DIR, f"{name}-auth.env"))
+    url = ""
+    for path in (os.path.join(connectors_dir, "anthropic.env"),
+                 os.path.join(AGENT_ENV_DIR, f"{name}.env"), overlay):
+        if not os.path.lexists(path):
+            continue
+        text = read_text(path)
+        if text is None:
+            return None
+        for line in text.splitlines():
+            if line.startswith("ANTHROPIC_BASE_URL="):
+                url = line.split("=", 1)[1].strip().strip("'\"")
+    if not url or ANTHROPIC_URL_RE.match(url):
+        return None
+    return {"ok": False, "reason": "openrouter" if OPENROUTER_URL_RE.match(url) else "custom-base-url"}
+
 # DIVE-7307: a2a messages waiting in the seat's spool. The spool itself sits in
 # the seat's home; its root writers keep this count beside the registry, so the
 # rootless fallback and the root helper read the same number. Absent = 0.
@@ -1454,6 +1525,9 @@ for name, value in agents.items():
             allow = access.get("allowFrom", [])
             if isinstance(allow, list) and len(allow) == 0:
                 deaf = True
+    chat = claude_chat_health(name, agent_type, channels, profile)
+    if chat is not None:
+        deaf = True
     asleep = value.get("heartbeat", {}).get("enabled", False) is not True if isinstance(value.get("heartbeat"), dict) else True
     auth_state, auth_exp, auth_refresh = auth_health(agent_type, profile)
     trouble, refusal = seat_refusal(name, unit_started_epoch(started.get(name, "")))
@@ -1511,7 +1585,7 @@ for name, value in agents.items():
         "avatar": avatar_info(name),
         "orgBlocksChannels": org_blocks,
         "orgChannelsOff": org_off,
-        "health": {"deaf": deaf, "asleep": asleep,
+        "health": {"deaf": deaf, "asleep": asleep, "chat": chat,
                    "auth": {"state": auth_state, "expiresAt": iso_time(auth_exp), "refreshable": auth_refresh,
                             "refusal": refusal},
                    "quota": quota,
