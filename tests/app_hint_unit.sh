@@ -26,7 +26,7 @@ export APP_HINT_CONNECTOR_TOKEN="$tmp/connectord.env"
 
 # 1. A self-hosted, unlinked box gets the block: one line and the full link.
 out="$(cmd_app_hint)"
-for needle in "Optional: chat with your agents from your phone, free:" "https://5dive.ai/self-host"; do
+for needle in "Then chat with your agents from your phone, free:" "https://5dive.ai/self-host"; do
   [[ "$out" == *"$needle"* ]] && ok "block names: $needle" || bad "block is missing: $needle"
 done
 # The old pairing-code steps are gone: one way in, not two.
@@ -54,6 +54,26 @@ rm -f "$APP_HINT_CONNECTOR_TOKEN"
 grep -q '^5dive _app_hint 2>/dev/null || true$' install.sh && ok "install.sh prints it" || bad "install.sh does not call 5dive _app_hint"
 [[ "$(declare -f cmd_init)" == *"cmd_app_hint"* ]] && ok "init prints it" || bad "cmd_init does not call cmd_app_hint"
 grep -qE '^\s+_app_hint\)$' src/main.sh && ok "main dispatches _app_hint" || bad "main.sh has no _app_hint verb"
+
+# 5b. DIVE-8065: the block is the next step, not an aside («Optional:» read as skippable).
+[[ "$(cmd_app_hint)" != *"Optional"* ]] && ok "block no longer says Optional" || bad "block still says Optional"
+
+# 5c. DIVE-8065: on a linked box, init's channel pick and last screen send a Claude
+# Code or Codex agent to the app. _init_app_chat is the one test both read.
+export FIVEDIVE_CHAT_ONLY_MARK="$tmp/chat-only"
+! _init_app_chat claude none && ok "unlinked box: no app chat" || bad "unlinked box read as app chat"
+: > "$FIVEDIVE_CHAT_ONLY_MARK"
+_init_app_chat claude none && ok "linked box, claude: app chat" || bad "linked claude not app chat"
+_init_app_chat codex none && ok "linked box, codex: app chat" || bad "linked codex not app chat"
+! _init_app_chat hermes none && ok "linked box, hermes: no app chat" || bad "hermes read as app chat"
+! _init_app_chat claude telegram && ok "linked box, Telegram picked: no app chat" || bad "a Telegram pick read as app chat"
+unset FIVEDIVE_CHAT_ONLY_MARK
+init_body="$(declare -f cmd_init)"
+# shellcheck disable=SC2016
+for needle in '_init_app_chat "$type" "$channels"' 'Open 5dive.app and say hi to $name' \
+              '_init_app_chat "$type" none' '5dive.app and terminal'; do
+  [[ "$init_body" == *"$needle"* ]] && ok "init has: $needle" || bad "init is missing: $needle"
+done
 
 # 6. Both READMEs carry the same one link and the app, above the first section,
 # and none of the retired connector steps (lodar 10-24: «link is wrong»).
