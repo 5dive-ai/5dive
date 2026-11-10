@@ -116,12 +116,25 @@ _share_sanitize_stage() {
 # pack.tar.gz, so a scan of CLAUDE.md alone published them unread). Hits on
 # stderr as "<path>:<line>: <category>: <match>", path relative to the stage
 # (skills/research/SKILL.md:3: ...). rc 1 = refuse.
+#
+# DIVE-8149: a skill of OURS, unchanged, is not scanned. Our default skills
+# (5dive-cli: ~142 lines of DIVE-NNNN ids and `sudo` in its command reference)
+# made every default agent unshareable, and the owner can neither reword our
+# file nor keep a rewording past the next skill refresh. Such a skill is public
+# already, in our own skills repo. "Ours and unchanged" is checked, never
+# assumed: the agent's skills-lock.json (written by `skills add` in its home)
+# names our repo as the source AND the staged copy, the bytes the page will
+# serve, still hashes to the lock's computedHash. One edited byte and the skill
+# is scanned like any other. A third-party skill is always scanned.
 _share_scan() {
-  local stage="$1" name="$2" d
+  local stage="$1" name="$2" d id ex=(--exclude=./manifest.json)
   d=$(mktemp -d) || return 1
+  while IFS= read -r id; do
+    valid_skill_id "$id" && ex+=("--exclude=./skills/$id")
+  done < <(_share_public_skill_ids "$stage" "$name")
   # Copy the stage minus manifest.json, keeping relative paths so a hit names
   # the file the reader will find in the pack. Symlinks are not followed.
-  (cd "$stage" && tar -cf - --exclude=./manifest.json .) | (cd "$d" && tar -xf -) \
+  (cd "$stage" && tar -cf - "${ex[@]}" .) | (cd "$d" && tar -xf -) \
     || { rm -rf "$d"; return 1; }
   # The agent's own account name (agent-<name>) is not a leak in its own share:
   # the page is published under that name. Every other hit stands.
@@ -131,6 +144,69 @@ _share_scan() {
   [[ -z "$hits" ]] && return 0
   printf '%s\n' "$hits" >&2
   return 1
+}
+
+# DIVE-8149: the staged skills that are ours and unchanged, one id per line.
+# <stage> <agent>. Prints nothing when the agent has no lock, a lock it cannot
+# read, or a skill that does not match: the safe answer is "scan it".
+# computedHash is the `skills` CLI's own: sha256 over each file's relative path
+# then its bytes, files in JavaScript localeCompare order (.git and
+# node_modules skipped). localeCompare is ICU collation, which python cannot
+# reproduce exactly, so three orders are tried. That is no weaker: a match means
+# the staged bytes ARE the public bytes in some order, so nothing private is in
+# them.
+_share_public_skill_ids() {
+  local stage="$1" name="$2" lock
+  lock="${AGENT_HOME_ROOT:-/home}/agent-${name}/skills-lock.json"
+  [[ -f "$lock" && ! -L "$lock" && -d "$stage/skills" ]] || return 0
+  python3 - "$lock" "$stage/skills" "$(gh_org)/skills" <<'PY' 2>/dev/null || true
+import hashlib, json, os, re, sys
+lock_path, skills_dir, ours = sys.argv[1], sys.argv[2], sys.argv[3].lower()
+try:
+    with open(lock_path, encoding="utf-8") as fh:
+        skills = json.load(fh).get("skills") or {}
+except Exception:
+    sys.exit(0)
+def norm(src):
+    s = str(src or "").strip().lower()
+    s = re.sub(r"^(https?://)?(www\.)?github\.com/", "", s)
+    return re.sub(r"(\.git)?/*$", "", s)
+def files_of(root):
+    out = []
+    for cur, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = [x for x in dirs if x not in (".git", "node_modules")]
+        for n in names:
+            p = os.path.join(cur, n)
+            if os.path.isfile(p) and not os.path.islink(p):
+                out.append((os.path.relpath(p, root).replace(os.sep, "/"), p))
+    return out
+def icu_key(s):  # ICU root order: punctuation < digits < letters, case second
+    k = []
+    for c in s:
+        if c.isalpha(): k.append((2, c.lower()))
+        elif c.isdigit(): k.append((1, c))
+        else: k.append((0, c))
+    return (k, s)
+orders = (icu_key, lambda s: (s.lower(), s), lambda s: s)
+def digest(files, key):
+    h = hashlib.sha256()
+    for rel, p in sorted(files, key=lambda f: key(f[0])):
+        h.update(rel.encode("utf-8"))
+        with open(p, "rb") as fh:
+            h.update(fh.read())
+    return h.hexdigest()
+for sid in sorted(os.listdir(skills_dir)):
+    entry = skills.get(sid)
+    root = os.path.join(skills_dir, sid)
+    if not isinstance(entry, dict) or not os.path.isdir(root) or os.path.islink(root):
+        continue
+    want = str(entry.get("computedHash") or "").lower()
+    if norm(entry.get("source")) != ours or not re.fullmatch(r"[0-9a-f]{64}", want):
+        continue
+    files = files_of(root)
+    if files and any(digest(files, k) == want for k in orders):
+        print(sid)
+PY
 }
 
 # The facts a share carries: memory/*.md minus the index. <stage>
@@ -350,6 +426,9 @@ cmd_agent_share() {
   local hits=""
   if ! hits=$(_share_scan "$work/stage" "$name" 2>&1); then
     rm -rf "$work"
+    # DIVE-8149: one plain sentence first; the raw list is for whoever rewrites.
+    local nhit; nhit=$(printf '%s\n' "$hits" | grep -E '^[^:]+:[0-9]+: ' | cut -d: -f1,2 | sort -u | wc -l) || nhit=0
+    printf '%s\n' "Not shared: ${nhit:-0} line(s) in ${name}'s own instructions, skills or memory look private (a path, name, id, host, login detail or the word sudo). Reword those lines, then share again. Nothing was published. The lines:" >&2
     [[ -n "$hits" ]] && printf '%s\n' "$hits" >&2
     fail "$E_VALIDATION" "not shared: ${name}'s instructions, skills or memory carry private detail a public link must not (each listed line: file:line: kind: what). Rewrite those lines without the path, name, id or host, then share again. Nothing was published."
   fi
