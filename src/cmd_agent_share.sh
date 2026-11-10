@@ -427,7 +427,7 @@ cmd_agent_share() {
   if ! hits=$(_share_scan "$work/stage" "$name" 2>&1); then
     rm -rf "$work"
     # DIVE-8149: one plain sentence first; the raw list is for whoever rewrites.
-    local nhit; nhit=$(printf '%s\n' "$hits" | grep -E '^[^:]+:[0-9]+: ' | cut -d: -f1,2 | sort -u | wc -l)
+    local nhit; nhit=$(printf '%s\n' "$hits" | grep -E '^[^:]+:[0-9]+: ' | cut -d: -f1,2 | sort -u | wc -l) || nhit=0
     printf '%s\n' "Not shared: ${nhit:-0} line(s) in ${name}'s own instructions, skills or memory look private (a path, name, id, host, login detail or the word sudo). Reword those lines, then share again. Nothing was published. The lines:" >&2
     [[ -n "$hits" ]] && printf '%s\n' "$hits" >&2
     fail "$E_VALIDATION" "not shared: ${name}'s instructions, skills or memory carry private detail a public link must not (each listed line: file:line: kind: what). Rewrite those lines without the path, name, id or host, then share again. Nothing was published."
