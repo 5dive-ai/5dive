@@ -102,6 +102,8 @@ sudo 5dive agent create scout --type=codex --auth-profile=gpt
 
 `--api-key=-` 从标准输入读取 key，不会留在 shell 历史里。[更多智能体类型、模型和 Telegram 机器人 →](docs/guide.md#agent-types)
 
+每个智能体也可以成为 Microsoft Teams 联系人，通过 teams 插件实现。[Microsoft Teams 指南 →](https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/teams)
+
 ## 雇用智能体和团队
 
 从[市场](https://5dive.ai/marketplace?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme-zh)雇用现成的智能体，从 CEO、CTO 到法律顾问和客服；也可以一次雇用整支团队，比如创业团队或小型网店。每个智能体都有自己的人设、模型和技能；团队还自带角色、组织架构和初始任务清单。
