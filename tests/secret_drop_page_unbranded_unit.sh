@@ -9,6 +9,7 @@
 #
 # Run: bash tests/secret_drop_page_unbranded_unit.sh   (no root, no network)
 set -uo pipefail
+tmp=""; trap 'rc=$?; rm -f "${tmp:-}"; echo "HARNESS-RC=$rc"' EXIT   # one EXIT trap: the marker first, the tempfile cleanup folded in
 # DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
@@ -22,12 +23,12 @@ gone_texts() { awk '/^GONE = \{/,/^\}/' "$1" | grep -oE '"[^"]+"'; }
 
 texts=$(gone_texts src/cmd_secret_drop.sh)
 [[ $(printf '%s\n' "$texts" | wc -l) -ge 6 ]] || bad "U0 GONE table not found (got: $texts)"
-if printf '%s\n' "$texts" | grep -qi '5dive'; then bad "U1 a page text names the platform: $(printf '%s\n' "$texts" | grep -i 5dive)"; else ok "U1 page texts are unbranded"; fi
+if grep -qi '5dive' <<<"$texts"; then bad "U1 a page text names the platform: $(grep -i 5dive <<<"$texts")"; else ok "U1 page texts are unbranded"; fi
 
-tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
+tmp=$(mktemp)
 sed 's|"Ask for a new link where you opened this one."|"Open the task again in the 5dive app for a new link."|' src/cmd_secret_drop.sh > "$tmp"
 if cmp -s "$tmp" src/cmd_secret_drop.sh; then bad "U2 mutation did not apply"
-elif gone_texts "$tmp" | grep -qi '5dive'; then ok "U2 the old line is caught"
+elif grep -qi '5dive' <<<"$(gone_texts "$tmp")"; then ok "U2 the old line is caught"
 else bad "U2 the old line was not caught"; fi
 
 printf '%d pass, %d fail\n' "$pass" "$failn"
