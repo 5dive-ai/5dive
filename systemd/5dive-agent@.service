@@ -53,6 +53,13 @@ EnvironmentFile=-/var/lib/5dive/agents.d/%i-auth.env
 # group claude, so it cannot traverse /etc/5dive) printed "Permission denied"
 # on every command, with or without a key saved.
 Environment=BASH_ENV=/usr/local/lib/5dive/tool-env.sh
+# DIVE-8195: before every start — the nightly update's restart, a reboot, a
+# crash re-start, not only `5dive agent restart` — re-normalize the perms of the
+# login this seat seeds from, as root (`+`). 5dive-agent-start runs as the seat
+# and cannot chmod, so without this an admin antigravity seat booted on a 0600
+# token with no seat ACL and stayed DEGRADED until a hand restart. `-` so a fault
+# here never blocks the start; `timeout` so it never stalls one either.
+ExecStartPre=-+/usr/bin/timeout 30 /usr/local/bin/5dive agent _seed_perms %i
 ExecStart=/usr/local/bin/5dive-agent-start %i
 # Stop: tear down the tmux session, then SIGHUP the antigravity CLI binary
 # specifically. agy (the Go `agy` binary) IGNORES SIGTERM but dies on SIGHUP —

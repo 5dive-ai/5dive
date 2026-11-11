@@ -354,6 +354,65 @@ if [[ $EUID -ne 0 ]]; then
   chmod 0644 "$P7101/.openclaw/state/openclaw.sqlite"
 fi
 
+# ---------- DIVE-8195: a clean start clears the stale breadcrumb ----------
+# teal-fox 2026-11-11: the nightly booted an antigravity seat on an unreadable
+# token (breadcrumb: STALE), a root restart fixed the perms, and doctor/`auth
+# status` still said STALE, because the start that fixed it re-copied nothing
+# (chmod moves no mtime) and only a re-copy cleared the file. B is that exact
+# sequence driven through the shipped block; C1/C2 are the negative controls:
+# a token that is still NEWER than the seat's copy keeps the breadcrumb.
+if [[ $EUID -ne 0 ]]; then
+  for t in antigravity openclaw; do
+    case "$t" in
+      antigravity) BLK="$AGY_BLOCK"; P8="$TMP/profile-8195-agy"; SH8="$P8/.gemini/antigravity-cli/antigravity-oauth-token"
+                   LOC_REL=".gemini/antigravity-cli/antigravity-oauth-token" ;;
+      openclaw)    BLK="$OC_BLOCK";  P8="$TMP/profile-8195-oc";  SH8="$P8/.openclaw/agents/main/agent/openclaw-agent.sqlite"
+                   LOC_REL=".openclaw/agents/main/agent/openclaw-agent.sqlite" ;;
+    esac
+    H8="$TMP/home-8195-$t"; BC8="$H8/.5dive-cred-seed-failed"
+    mkdir -p "$(dirname "$SH8")" "$H8"
+    printf 'tok-8195-%s\n' "$t" > "$SH8"
+    run8() { run_block "$BLK" TYPE="$t" HOME="$H8" NAME="s8195" PROFILE_STATE_DIR="$P8" WORKDIR="$TMP" "$@"; }
+    run8 >/dev/null                                   # first boot: seeds the seat's copy
+    check "$t 8195 precondition: the seat holds a current copy, no breadcrumb" \
+          "$( [[ -s "$H8/$LOC_REL" && ! -e "$BC8" ]] && echo yes )" yes
+    chmod 0000 "$SH8"                                 # the nightly's 0600, no seat ACL
+    run8 >/dev/null
+    check "$t 8195 precondition: the unreadable boot leaves the STALE breadcrumb" \
+          "$(grep -c 'may be STALE' "$BC8" 2>/dev/null)" 1
+    chmod 0644 "$SH8"                                 # root restart fixed perms; mtime unchanged
+    out=$(run8)
+    check "$t 8195 B: perms fixed + local copy current -> the next start clears the breadcrumb" \
+          "$( [[ -e "$BC8" ]] && echo present || echo absent )" absent
+    check "$t 8195 B: and that start prints no ERROR line" "$(grep -c '^ERROR' <<<"$out")" 0
+
+    # C1: the shared token is NEWER than the seat's copy and unreadable.
+    sleep 1; printf 'tok-8195-%s-rotated\n' "$t" > "$SH8"; chmod 0000 "$SH8"
+    run8 >/dev/null
+    check "$t 8195 C1: newer + unreadable shared token keeps the STALE breadcrumb" \
+          "$(grep -c 'may be STALE' "$BC8" 2>/dev/null)" 1
+    # C2: the shared token is NEWER and READABLE, but this start's copy fails.
+    # The readable branch must not wipe the copy failure's breadcrumb.
+    chmod 0644 "$SH8"; rm -f "$BC8"
+    mkdir -p "$TMP/bin-mktemp-fails"; printf '#!/bin/sh\nexit 1\n' > "$TMP/bin-mktemp-fails/mktemp"
+    cp "$TMP/bin/sudo" "$TMP/bin-mktemp-fails/sudo"; chmod +x "$TMP/bin-mktemp-fails/"*
+    env PATH="$TMP/bin-mktemp-fails:$TMP/bin:$PATH" TYPE="$t" HOME="$H8" NAME=s8195 \
+        PROFILE_STATE_DIR="$P8" WORKDIR="$TMP" bash -c "set -uo pipefail
+$HELPER
+$BLK" >/dev/null 2>&1
+    check "$t 8195 C2: newer + readable but the copy failed -> breadcrumb kept" \
+          "$( [[ -s "$BC8" ]] && echo present || echo absent )" present
+    check "$t 8195 C2: the seat still holds its OLD copy (the copy really failed)" \
+          "$(cat "$H8/$LOC_REL")" "tok-8195-$t"
+    # ...and once a start does copy it, the breadcrumb goes (no permanent red).
+    run8 >/dev/null
+    check "$t 8195: the next good copy clears it" \
+          "$( [[ -e "$BC8" ]] && echo present || echo absent )" absent
+  done
+else
+  echo "SKIP: DIVE-8195 B/C arms need a non-root uid (root reads a 0000 file)"
+fi
+
 # ---------- guard: no seed block may be sudo-ONLY again ----------
 # Every credential seed must attempt a plain read before falling back to sudo.
 # Catches a future block (or a revert) that reintroduces the DIVE-1900 shape.
