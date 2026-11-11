@@ -1,26 +1,20 @@
 {
-  "date": "2026-11-10",
-  "generatedAtUtc": "2026-11-10T02:01:30Z",
+  "date": "2026-11-11",
+  "generatedAtUtc": "2026-11-11T02:01:38Z",
   "window": {
     "days": 30,
-    "from": "2026-10-11",
-    "to": "2026-11-09",
+    "from": "2026-10-12",
+    "to": "2026-11-10",
     "basis": "each task counts once, on the UTC day of its last task.done; the window is the whole days before the publish date"
   },
   "totals": {
-    "shipped": 1954,
-    "reviewed": 1044,
+    "shipped": 2014,
+    "reviewed": 1070,
     "firstTry": 598,
-    "sentBack": 446,
-    "sendBacks": 626
+    "sentBack": 472,
+    "sendBacks": 656
   },
   "days": [
-    {
-      "date": "2026-10-11",
-      "reviewed": 19,
-      "firstTry": 13,
-      "sentBack": 6
-    },
     {
       "date": "2026-10-12",
       "reviewed": 28,
@@ -194,36 +188,42 @@
       "reviewed": 52,
       "firstTry": 29,
       "sentBack": 23
+    },
+    {
+      "date": "2026-11-10",
+      "reviewed": 45,
+      "firstTry": 13,
+      "sentBack": 32
     }
   ],
   "reasons": {
     "basis": "one fixed category per send-back, by rule from the reviewer's finding; no match or no preserved finding = other. Sums to totals.sendBacks.",
-    "total": 626,
+    "total": 656,
     "categories": [
       {
         "key": "conflict",
         "label": "Clashes with newer work",
-        "count": 41
+        "count": 43
       },
       {
         "key": "safety",
         "label": "Safety or privacy",
-        "count": 32
+        "count": 34
       },
       {
         "key": "writing",
         "label": "Unclear writing",
-        "count": 143
+        "count": 147
       },
       {
         "key": "tests",
         "label": "Failing tests",
-        "count": 251
+        "count": 267
       },
       {
         "key": "proof",
         "label": "No proof it works",
-        "count": 44
+        "count": 51
       },
       {
         "key": "ask",
@@ -233,7 +233,7 @@
       {
         "key": "other",
         "label": "Other",
-        "count": 82
+        "count": 81
       }
     ]
   },
