@@ -1131,7 +1131,7 @@ def page(title, body):
 
 GONE = {
     4: (404, "This link does not work", "It may have been mistyped, or it was already used."),
-    11: (410, "This link has expired", "Open the task again in the 5dive app for a new link."),
+    11: (410, "This link has expired", "Ask for a new link where you opened this one."),
     5: (410, "This request is closed", "The agent no longer needs this, or it was already provided."),
 }
 
