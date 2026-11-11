@@ -283,6 +283,37 @@ JSON_MODE=0
 _h=$( ( cmd_account_default mp ) 2>/dev/null)
 grep -q '^New agents use mp (claude), set as the default ' <<<"$_h" && ok_t 'the human line says it was set, not added' || bad_t 'human line' "$_h"
 
+echo '== 7. DIVE-8207: Undo of «Your own AI» over a Claude the ledger never marked =='
+# even-branch, 2026-11-11: client-claude predates the ledger (seen); «Your own AI»
+# is a Claude login: combined.env as _apply_byo_claude writes it, the OAuth and
+# API-key lines blanked (their keys are what marks the account a Claude one).
+# After Undo the box marks no login, and the partner API's own fallback (the
+# client's newest Claude) must be told which one was undone, or it picks it again.
+custom_login() {
+  mkdir -p "$AUTH_PROFILES_DIR/$1"
+  printf 'ANTHROPIC_BASE_URL=https://ai.example.com\nANTHROPIC_AUTH_TOKEN=sk-fixture\nCLAUDE_CODE_OAUTH_TOKEN=\nANTHROPIC_API_KEY=\nFIVEDIVE_CUSTOM_HARNESS=claude\n' > "$AUTH_PROFILES_DIR/$1/combined.env"
+}
+registry_read() { printf '%s\n' '{"agents":{}}'; }
+fresh_box; claude_login mp; claude_login client-claude; pick >/dev/null
+custom_login client-custom
+eq_t '«Your own AI» added: new hires go to it' client-custom:claude "$(pick)"
+JSON_MODE=1
+_d=$( ( cmd_account_default --undo=client-custom:claude ) 2>/dev/null)
+eq_t 'Undo: the box marks no login (the one before it predates the ledger)' null "$(jq -c '.data' <<<"$_d")"
+eq_t '...and records it undone under its Claude key' undone "$(line client-custom claude | cut -d' ' -f2)"
+_l=$( ( cmd_account_list ) 2>/dev/null)
+eq_t 'account list --json says which login was undone, and only it' 'client-custom=["claude"]' \
+  "$(jq -r '.data[] | select(.undone) | "\(.name)=\(.undone | tojson)"' <<<"$_l")"
+eq_t '...and marks no row default' '' "$(jq -r '.data[] | select(.default) | .name' <<<"$_l")"
+custom_login client-custom-2
+_l=$( ( cmd_account_list ) 2>/dev/null)
+eq_t 'a login added after it is the default, and the undone mark stays on the old one only' 'client-custom-2=claude client-custom=["claude"]' \
+  "$(jq -r '[(.data[] | select(.default) | "\(.name)=\(.default)"), (.data[] | select(.undone) | "\(.name)=\(.undone | tojson)")] | join(" ")' <<<"$_l")"
+rm -rf "${AUTH_PROFILES_DIR:?}/client-custom"
+_l=$( ( cmd_account_list ) 2>/dev/null)
+eq_t 'a removed account takes its undone mark with it' 0 "$(jq '[.data[] | select(.undone)] | length' <<<"$_l")"
+JSON_MODE=0
+
 echo
 printf 'DIVE-7152 new hires go to the login added last (+ DIVE-7415 the pinned default): %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 )) || exit 1
