@@ -148,23 +148,36 @@ cmd_agent_tg_connect_greet() {
 
   local started_s started_ms
   started_s=$(date +%s); started_ms=$(_tgcg_now_ms)
-  local me bot_name about persona p_name p_welcome_en p_welcome_ru
+  local me bot_name name_ru about about_ru persona p_name p_welcome_en p_welcome_ru
   # Every call is `|| …`: the binary runs under set -e, and a network blip must
   # cost one send, never the run.
   me=$(_tgcg_call "$token" getMe) || me=""
   bot_name=$(jq -r '.result.first_name // empty' <<<"$me" 2>/dev/null) || bot_name=""
   about=$(jq -r '.result.short_description // empty' <<<"$(_tgcg_call "$token" getMyShortDescription)" 2>/dev/null) || about=""
+  # A Russian greeting reads the line set under language_code=ru
+  # (5dive-api profileTexts sets English as the default, Russian under ru),
+  # else the default, as the plugin's liteAboutText reads it.
+  about_ru=$(jq -r '.result.short_description // empty' \
+    <<<"$(_tgcg_call "$token" getMyShortDescription '{"language_code":"ru"}')" 2>/dev/null) || about_ru=""
+  [[ -n "$about_ru" ]] || about_ru="$about"
   persona=$(_tgcg_persona "$home" "$type" en); p_name="${persona%%$'\t'*}"; p_welcome_en="${persona#*$'\t'}"
   [[ "$persona" == *$'\t'* ]] || { p_name=""; p_welcome_en=""; }
   persona=$(_tgcg_persona "$home" "$type" ru); p_welcome_ru="${persona#*$'\t'}"
   [[ "$persona" == *$'\t'* ]] || p_welcome_ru=""
+  # A bot whose own name is Cyrillic was named in Russian when its owner
+  # created it (a partner's client whose Telegram is in Russian confirms «Джейн»,
+  # not «Jane»):
+  # a Russian greeting says that name. Otherwise the persona's name, as before.
+  name_ru="$bot_name"
   [[ -n "$p_name" ]] && bot_name="$p_name"
+  [[ "$(jq -rn --arg n "$name_ru" '$n | test("\\p{Cyrillic}")' 2>/dev/null)" == true ]] || name_ru="$bot_name"
 
   local -A greeted=() pending=()
   local o resp text lang
   _tgcg_greet() { # <chat> <lang> — 0 sent, 1 not
-    local w="$p_welcome_en"; [[ "$2" == ru ]] && w="$p_welcome_ru"
-    text=$(_tgcg_text "$2" "$bot_name" "$about" "$w") || return 1
+    local w="$p_welcome_en" n="$bot_name" a="$about"
+    [[ "$2" == ru ]] && { w="$p_welcome_ru"; n="$name_ru"; a="$about_ru"; }
+    text=$(_tgcg_text "$2" "$n" "$a" "$w") || return 1
     resp=$(_tgcg_call "$token" sendMessage "$(jq -cn --arg c "$1" --arg t "$text" '{chat_id: ($c|tonumber), text: $t}')") || return 1
     [[ "$(jq -r '.ok // false' <<<"$resp" 2>/dev/null)" == true ]]
   }
