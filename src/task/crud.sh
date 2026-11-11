@@ -1102,6 +1102,14 @@ cmd_task_ls() {
       # column surgery) so the SELECT and its MAX_ARG_STRLEN stdin-feed stay
       # untouched, and the only behaviour change is what reaches the caller.
       --no-body)    no_body=1 ;;
+      # DIVE-8209: the app's board read. `--no-body` also strips `result`, which
+      # the Mini App's list shows on rows done today, so the app could not use
+      # it and read every body instead: on chill-gorge that was 4.25 MB for
+      # 1,178 rows (bodies 77%), over the box exec service's 4 MiB output cap,
+      # and the Tasks tab could not load. `--brief` drops `body` only. The app's
+      # detail sheet re-reads one row with `task show`, so nothing it shows is
+      # lost. Same jq post-pass as --no-body; --no-body wins if both are given.
+      --brief)      no_body=$(( no_body == 1 ? 1 : 2 )) ;;
       -*)           fail "$E_USAGE" "unknown flag: $1" ;;
       *)            fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
@@ -1282,8 +1290,10 @@ cmd_task_ls() {
     local _dispatch_jq='map(.dispatch_reason = (.dispatch_reason // null)
                             | .dispatch_fix = (if .dispatch_reason == null then null
                                                else ($fix[.dispatch_reason] // "undispatchable") end))'
-    if (( no_body )); then
+    if (( no_body == 1 )); then
       printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(map(del(.body, .result)) | ${_dispatch_jq})}}"
+    elif (( no_body == 2 )); then
+      printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(map(del(.body)) | ${_dispatch_jq})}}"
     else
       printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(. | ${_dispatch_jq})}}"
     fi
