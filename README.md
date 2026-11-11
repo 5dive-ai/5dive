@@ -17,6 +17,7 @@
   <a href="https://5dive.ai/team"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F5dive-ai%2F5dive%2Fstatus%2Fbadge.json" alt="Autonomous task metric"></a>
   <a href="https://github.com/5dive-ai/5dive/releases"><img src="https://img.shields.io/github/v/release/5dive-ai/5dive" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
+  <a href="https://play.google.com/store/apps/details?id=ai.fivedive.app&amp;referrer=utm_source%3Dgithub%26utm_medium%3Downed%26utm_campaign%3D5dive-readme"><img src="https://img.shields.io/badge/Android-Google_Play-3DDC84?logo=android&amp;logoColor=white" alt="Android app on Google Play"></a>
 </p>
 
 ```sh
