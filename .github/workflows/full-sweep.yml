@@ -312,6 +312,12 @@ jobs:
       # quietly go back to being a skip.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
+      # DIVE-8192: the server also runs on node (>= 22.18) where there is no bun —
+      # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
+      # what that runner installs, so this job grades the same node the listing meets.
+      - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
+        uses: actions/setup-node@v4
+        with: { node-version: 'lts/*' }
       - name: Run the FULL corpus (budgeted, shard ${{ matrix.shard }})
         run: |
           # DIVE-4229: an UNGRADED shard (exit 6 -- the calibration clamp, or an
@@ -419,6 +425,12 @@ jobs:
       # quietly go back to being a skip.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
+      # DIVE-8192: the server also runs on node (>= 22.18) where there is no bun —
+      # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
+      # what that runner installs, so this job grades the same node the listing meets.
+      - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
+        uses: actions/setup-node@v4
+        with: { node-version: 'lts/*' }
       - name: Run the FULL corpus (installed host, budgeted, shard ${{ matrix.shard }})
         run: |
           # DIVE-4229: an UNGRADED shard (exit 6 -- the calibration clamp, or an
@@ -560,6 +572,12 @@ jobs:
       # quietly go back to being a skip.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
+      # DIVE-8192: the server also runs on node (>= 22.18) where there is no bun —
+      # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
+      # what that runner installs, so this job grades the same node the listing meets.
+      - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
+        uses: actions/setup-node@v4
+        with: { node-version: 'lts/*' }
       - name: Every harness must be able to FAIL (shard ${{ matrix.shard }})
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
@@ -683,6 +701,12 @@ jobs:
       # quietly go back to being a skip.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
+      # DIVE-8192: the server also runs on node (>= 22.18) where there is no bun —
+      # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
+      # what that runner installs, so this job grades the same node the listing meets.
+      - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
+        uses: actions/setup-node@v4
+        with: { node-version: 'lts/*' }
       - name: Every harness must be able to FAIL (installed host, shard ${{ matrix.shard }})
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \

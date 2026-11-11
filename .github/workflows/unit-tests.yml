@@ -250,6 +250,12 @@ jobs:
       # absence of coverage loud.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
+      # DIVE-8192: the server also runs on node (>= 22.18) where there is no bun —
+      # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
+      # what that runner installs, so this job grades the same node the listing meets.
+      - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
+        uses: actions/setup-node@v4
+        with: { node-version: 'lts/*' }
       # DIVE-2525: the budget is NOT passed here. It lives in tests/lib/tier.sh next
       # to the tier definition, because a budget spelled in the caller is raised by
       # a one-line YAML edit that nobody reviews as the policy change it is.
@@ -535,6 +541,12 @@ jobs:
       # meaningful if the harness can also pass.
       - name: Install bun (harness precondition — a touched harness may need it)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
+      # DIVE-8192: the server also runs on node (>= 22.18) where there is no bun —
+      # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
+      # what that runner installs, so this job grades the same node the listing meets.
+      - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
+        uses: actions/setup-node@v4
+        with: { node-version: 'lts/*' }
       - name: Run them (any tier)
         if: steps.changed.outputs.files != ''
         run: |
@@ -778,6 +790,12 @@ jobs:
       # harness now FAILS without bun, so a job missing this step goes red.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
+      # DIVE-8192: the server also runs on node (>= 22.18) where there is no bun —
+      # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
+      # what that runner installs, so this job grades the same node the listing meets.
+      - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
+        uses: actions/setup-node@v4
+        with: { node-version: 'lts/*' }
       # DIVE-2829: see the pristine job. This is the job the 2026-08-05 pair was
       # measured on, and the one whose red froze release-cut.yml.
       - name: Run core harnesses (installed host, budgeted, shard ${{ matrix.shard }})
@@ -943,6 +961,12 @@ jobs:
       # without bun, so every job that runs the corpus needs this step.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
+      # DIVE-8192: the server also runs on node (>= 22.18) where there is no bun —
+      # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
+      # what that runner installs, so this job grades the same node the listing meets.
+      - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
+        uses: actions/setup-node@v4
+        with: { node-version: 'lts/*' }
       # DIVE-3580: the second box's verdict is only independent of the first while the
       # fleet's draw is — and on #708 it was not: both runners confirmed a red that
       # main's own next run of the SAME corpus refuted at 77% of cap. So the confirm
@@ -1047,6 +1071,12 @@ jobs:
       # without bun, so every job that runs the corpus needs this step.
       - name: Install bun (harness precondition — acp_stdio_unit grades the ACP server)
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0, pinned to a sha: a third-party tag can be moved (DIVE-7973)
+      # DIVE-8192: the server also runs on node (>= 22.18) where there is no bun —
+      # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
+      # what that runner installs, so this job grades the same node the listing meets.
+      - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
+        uses: actions/setup-node@v4
+        with: { node-version: 'lts/*' }
       # DIVE-3580: same baseline, same hand-off discipline — see the pristine confirm job.
       - name: Fetch the last green main run's per-harness baseline (DIVE-3580)
         env:

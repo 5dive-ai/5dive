@@ -35,8 +35,9 @@ source src/cmd_acp.sh
 WORK=$(mktemp -d)
 FAILED=0
 CHECKS=0
-ok()   { CHECKS=$((CHECKS+1)); printf 'ok   - %s\n' "$1"; }
-bad()  { CHECKS=$((CHECKS+1)); FAILED=$((FAILED+1)); printf 'FAIL - %s\n' "$1"; }
+PFX=""   # "[node] " / "[bun] " while the stdio scenarios run once per runtime
+ok()   { CHECKS=$((CHECKS+1)); printf 'ok   - %s%s\n' "$PFX" "$1"; }
+bad()  { CHECKS=$((CHECKS+1)); FAILED=$((FAILED+1)); printf 'FAIL - %s%s\n' "$PFX" "$1"; }
 want() { if [[ "$1" == "true" ]]; then ok "$2"; else bad "$2"; fi; }
 
 # --- the stub CLI the server talks to -------------------------------------------
@@ -72,6 +73,58 @@ rc=0
 out=$(ACP_BUN_BIN="$WORK/no-such-bun" cmd_acp 2>&1 >/dev/null) || rc=$?
 want "$([[ $rc -eq 7 ]] && echo true)" "bun missing exits E_NOT_INSTALLED (7), got $rc"
 want "$(grep -qi 'bun' <<<"$out" && echo true)" "bun-missing message names bun: ${out:0:90}"
+# An EXPLICIT ACP_BUN_BIN is never silently swapped for node (DIVE-8192): the caller
+# named a binary. Graded with a node that certainly qualifies, so the arm cannot pass
+# merely because no node was found.
+cat > "$WORK/node-24" <<'FN'
+#!/bin/bash
+[[ "$1" == "-p" ]] && { echo 24.11.0; exit 0; }
+exit 0
+FN
+chmod +x "$WORK/node-24"
+rc=0
+out=$(ACP_BUN_BIN="$WORK/no-such-bun" ACP_NODE_BIN="$WORK/node-24" cmd_acp 2>&1 >/dev/null) || rc=$?
+want "$([[ $rc -eq 7 ]] && grep -q 'ACP_BUN_BIN' <<<"$out" && echo true)" \
+  "an explicit ACP_BUN_BIN that is missing fails naming it, even with a usable node (rc=$rc): ${out:0:80}"
+
+# --- 1a. WHICH RUNTIME (DIVE-8192) ---------------------------------------------
+# The ACP registry's verify-auth runner has Node LTS and no bun: that box must pick
+# node, a bun box must keep bun, and a box with neither must say so naming BOTH.
+# The mask: ACP_BUN_PROBES="" empties the fixed-path and sudo probes, and PATH is a
+# dir holding only what the arm names. Real-environment proof (their own
+# verify_agents.py as an unprivileged user, PATH without bun) is in the PR, not here.
+mkdir -p "$WORK/rt-node" "$WORK/rt-bun" "$WORK/rt-both" "$WORK/rt-none" "$WORK/rt-oldnode"
+mkver() { printf '#!/bin/bash\n[[ "$1" == "-p" ]] && { echo %s; exit 0; }\nexit 0\n' "$2" > "$1"; chmod +x "$1"; }
+mkver "$WORK/rt-node/node" 22.18.0
+mkver "$WORK/rt-both/node" 24.11.0
+mkver "$WORK/rt-oldnode/node" 22.17.1
+for d in rt-bun rt-both; do printf '#!/bin/bash\nexit 0\n' > "$WORK/$d/bun"; chmod +x "$WORK/$d/bun"; done
+rt_in() { ( unset ACP_BUN_BIN ACP_NODE_BIN ACP_RUNTIME; export ACP_BUN_PROBES="" PATH="$WORK/$1"; _acp_resolve_runtime ) || echo "NONE"; }
+want "$([[ "$(rt_in rt-node)" == "node $WORK/rt-node/node" ]] && echo true)" \
+  "node only (the registry runner): runs on node (got: $(rt_in rt-node))"
+want "$([[ "$(rt_in rt-bun)" == "bun $WORK/rt-bun/bun" ]] && echo true)" \
+  "bun only: runs on bun (got: $(rt_in rt-bun))"
+want "$([[ "$(rt_in rt-both)" == "bun $WORK/rt-both/bun" ]] && echo true)" \
+  "both: bun stays first, so a managed box is unchanged (got: $(rt_in rt-both))"
+want "$([[ "$(rt_in rt-none)" == "NONE" ]] && echo true)" \
+  "neither: no runtime (got: $(rt_in rt-none))"
+want "$([[ "$(rt_in rt-oldnode)" == "NONE" ]] && echo true)" \
+  "node 22.17 does not count: it cannot run .mts without a flag (got: $(rt_in rt-oldnode))"
+# The version gate at its edges, read straight off the predicate.
+vg=""
+for v in 20.19.0 22.17.9 22.18.0 23.5.0 23.6.0 24.0.0 25.1.0 garbage; do
+  mkver "$WORK/vnode" "$v"; _acp_node_supports_ts "$WORK/vnode" && vg+="$v+ " || vg+="$v- "
+done
+want "$([[ "$vg" == "20.19.0- 22.17.9- 22.18.0+ 23.5.0- 23.6.0+ 24.0.0+ 25.1.0+ garbage- " ]] && echo true)" \
+  "node version gate: >=22.18 on 22, >=23.6 on 23, any 24+ (got: $vg)"
+rc=0
+out=$( ( unset ACP_BUN_BIN ACP_NODE_BIN ACP_RUNTIME; export ACP_BUN_PROBES="" PATH="$WORK/rt-none"; cmd_acp ) 2>&1 >/dev/null ) || rc=$?
+want "$([[ $rc -eq 7 ]] && grep -qi 'bun' <<<"$out" && grep -qi 'node 22.18' <<<"$out" && echo true)" \
+  "neither: exits E_NOT_INSTALLED (7) naming BOTH bun and node 22.18 (rc=$rc): ${out:0:100}"
+rc=0
+out=$( ( unset ACP_BUN_BIN ACP_NODE_BIN; export ACP_RUNTIME=node ACP_BUN_PROBES="" PATH="$WORK/rt-bun"; cmd_acp ) 2>&1 >/dev/null ) || rc=$?
+want "$([[ $rc -eq 7 ]] && grep -q 'ACP_RUNTIME=node' <<<"$out" && echo true)" \
+  "ACP_RUNTIME=node with only bun present fails rather than quietly running bun (rc=$rc)"
 rc=0
 out=$(cmd_acp --nonsense 2>&1 >/dev/null) || rc=$?
 want "$([[ $rc -eq 2 ]] && echo true)" "an argument is a usage error (2), got $rc"
@@ -79,7 +132,7 @@ want "$([[ $rc -eq 2 ]] && echo true)" "an argument is a usage error (2), got $r
 # --- 1b. WHERE the server stages (DIVE-3361) -----------------------------------
 # The ACP registry's required verify-auth job spawns this verb as an unprivileged
 # sandbox user, so a root-only staging default is not cosmetic: `cat >
-# /opt/5dive/acp-server.ts` is Permission denied and the listing fails with no ACP
+# /opt/5dive/acp-server.mts` is Permission denied and the listing fails with no ACP
 # frame on the wire at all. Graded here, ABOVE the bun gate, because a stub bin
 # answers the preflight — so these arms still run on a box with no bun.
 #
@@ -99,7 +152,7 @@ rc=0
 ( export ACP_RUN_DIR_DEFAULT="$WORK/notadir/5dive" ACP_BUN_BIN="$WORK/fake-bun" HOME="$WORK/h1"
   unset ACP_RUN_DIR XDG_CACHE_HOME
   cmd_acp ) >/dev/null 2>"$WORK/stage-a.err" || rc=$?
-want "$([[ $rc -eq 0 && -f "$WORK/h1/.cache/5dive/acp-server.ts" ]] && echo true)" \
+want "$([[ $rc -eq 0 && -f "$WORK/h1/.cache/5dive/acp-server.mts" ]] && echo true)" \
   "an unwritable default stages under \$HOME/.cache/5dive instead (rc=$rc)"
 
 # (b) XDG_CACHE_HOME wins over \$HOME/.cache when it is set — that variable is one
@@ -108,7 +161,7 @@ rc=0
 ( export ACP_RUN_DIR_DEFAULT="$WORK/notadir/5dive" ACP_BUN_BIN="$WORK/fake-bun" HOME="$WORK/h2" XDG_CACHE_HOME="$WORK/xdg"
   unset ACP_RUN_DIR
   cmd_acp ) >/dev/null 2>"$WORK/stage-b.err" || rc=$?
-want "$([[ $rc -eq 0 && -f "$WORK/xdg/5dive/acp-server.ts" && ! -e "$WORK/h2/.cache/5dive/acp-server.ts" ]] && echo true)" \
+want "$([[ $rc -eq 0 && -f "$WORK/xdg/5dive/acp-server.mts" && ! -e "$WORK/h2/.cache/5dive/acp-server.mts" ]] && echo true)" \
   "XDG_CACHE_HOME takes the fallback ahead of \$HOME/.cache (rc=$rc)"
 
 # (c) A WRITABLE default is still used first: a managed box does not move.
@@ -116,7 +169,7 @@ rc=0
 ( export ACP_RUN_DIR_DEFAULT="$WORK/optlike" ACP_BUN_BIN="$WORK/fake-bun" HOME="$WORK/h3"
   unset ACP_RUN_DIR XDG_CACHE_HOME
   cmd_acp ) >/dev/null 2>"$WORK/stage-c.err" || rc=$?
-want "$([[ $rc -eq 0 && -f "$WORK/optlike/acp-server.ts" && ! -e "$WORK/h3/.cache/5dive/acp-server.ts" ]] && echo true)" \
+want "$([[ $rc -eq 0 && -f "$WORK/optlike/acp-server.mts" && ! -e "$WORK/h3/.cache/5dive/acp-server.mts" ]] && echo true)" \
   "a writable default still wins — the VM's /opt/5dive layout is unchanged (rc=$rc)"
 
 # (d) An EXPLICIT ACP_RUN_DIR is the only candidate. Falling back past a directory
@@ -125,7 +178,7 @@ rc=0
 out=$( ( export ACP_RUN_DIR="$WORK/notadir/mine" ACP_BUN_BIN="$WORK/fake-bun" HOME="$WORK/h4"
          unset XDG_CACHE_HOME
          cmd_acp ) 2>&1 >/dev/null ) || rc=$?
-want "$([[ $rc -ne 0 && ! -e "$WORK/h4/.cache/5dive/acp-server.ts" ]] && echo true)" \
+want "$([[ $rc -ne 0 && ! -e "$WORK/h4/.cache/5dive/acp-server.mts" ]] && echo true)" \
   "an explicit ACP_RUN_DIR does NOT silently fall back to \$HOME (rc=$rc)"
 # DIVE-3635: the negative half greps the FULL fallback path, not the bare word
 # `h4`. $WORK is an mktemp -d, and on main@035db79 mktemp handed out
@@ -166,8 +219,16 @@ want "$([[ $rc -ne 0 ]] && echo true)" "no writable candidate is a clean failure
 want "$(grep -q 'ACP_RUN_DIR' <<<"$out" && echo true)" \
   "and it names ACP_RUN_DIR, the thing the reader can act on: ${out:0:80}"
 
+# --- which runtimes grade the server (DIVE-8192: once per runtime) -------------
+# The server ships for TWO runtimes now — bun where it exists, node >= 22.18 where it
+# does not (the ACP registry's runner) — so every stdio scenario below runs under
+# EACH, and a runtime this box lacks is a FAIL, not a quiet subset.
 BUN=$(ACP_BUN_BIN="" _acp_resolve_bun)
-if [[ ! -x "$BUN" ]]; then
+NODE=$(ACP_NODE_BIN="" _acp_resolve_node)
+RTS=(); MISSING=()
+if [[ -x "$BUN" ]]; then RTS+=(bun); else MISSING+=("bun ($BUN)"); fi
+if [[ -n "$NODE" ]]; then RTS+=(node); else MISSING+=("node >= 22.18 ($(command -v node || echo none) $(node --version 2>/dev/null))"); fi
+if [[ ${#MISSING[@]} -gt 0 ]]; then
   # DIVE-3059: THIS DEFAULTS TO FAIL, and the reason is that the previous version
   # of this block was honest in the log and invisible in the verdict. It printed
   # `SKIP - stdio scenarios` and then `PASS - N checks` and exited 0, so a run
@@ -192,21 +253,17 @@ if [[ ! -x "$BUN" ]]; then
   # nothing catches, because the line still LOOKS precise. So report what is
   # known for certain — how many ran, how many failed, and that the stdio
   # scenarios were not among them.
-  if [[ -n "${ACP_ALLOW_SKIP:-}" ]]; then
-    printf 'SKIP - stdio scenarios: no bun on this box (%s); ACP_ALLOW_SKIP set\n' "$BUN"
-    # The count is in the summary line ON PURPOSE: a reader must be able to tell
-    # this run from a full one WITHOUT opening the log.
-    printf 'PARTIAL - %d preflight checks ran, %d failed; the stdio scenarios did NOT run\n' \
-      "$CHECKS" "$FAILED"
-    [[ $FAILED -eq 0 ]] || exit 1
-    exit 0
+  if [[ -z "${ACP_ALLOW_SKIP:-}" ]]; then
+    printf 'FAIL - stdio scenarios cannot run on: %s\n' "${MISSING[*]}"
+    printf 'FAIL - only %d preflight checks ran; the ACP server was NOT graded on that runtime.\n' "$CHECKS"
+    printf 'FAIL - install it, or set ACP_ALLOW_SKIP=1 to accept an ungraded ACP server.\n'
+    exit 1
   fi
-  printf 'FAIL - stdio scenarios cannot run: no bun on this box (%s)\n' "$BUN"
-  printf 'FAIL - only %d preflight checks ran; the ACP server itself was NOT graded.\n' "$CHECKS"
-  printf 'FAIL - install bun, or set ACP_ALLOW_SKIP=1 to accept an ungraded ACP server.\n'
-  exit 1
+  printf 'SKIP - stdio scenarios on: %s; ACP_ALLOW_SKIP set\n' "${MISSING[*]}"
 fi
 
+scenarios() {   # once per runtime: $RT, $RUNNER (argv up to and including the server)
+: > "$ASK_LOG"
 # --- 2. handshake, roster, refuse-to-open-blank, attach, turn, fall-through -----
 req() { printf '%s\n' "$1"; }
 # Runs the REAL verb (so the staging, the preflight and the exec are all in the
@@ -220,7 +277,7 @@ VERB='source src/header.sh; source src/lib/error_codes.sh; source src/lib/output
   req '{"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":"5dive-1","prompt":[{"type":"text","text":"now do the thing"}]}}'
   req '{"jsonrpc":"2.0","id":6,"method":"session/prompt","params":{"sessionId":"5dive-1","prompt":[{"type":"text","text":"/nope still send me"}]}}'
   req '{"jsonrpc":"2.0","id":7,"method":"nonsense/method","params":{}}'
-} | timeout 60 bash -c "$VERB" 2>"$WORK/err.log" >"$WORK/out.jsonl" || true
+} | ACP_RUNTIME="$RT" ACP_BUN_BIN="${RT_BUN:-}" ACP_NODE_BIN="${RT_NODE:-}" timeout 60 bash -c "$VERB" 2>>"$WORK/err.log" >"$WORK/out.jsonl" || true
 
 j() { jq -r "$1" "$WORK/out.jsonl" 2>/dev/null | grep -v '^null$' | head -1; }
 
@@ -301,7 +358,7 @@ want "$(grep -q 'agent ask alpha /nope still send me' "$ASK_LOG" && echo true)" 
   sleep 2
   req '{"jsonrpc":"2.0","id":null,"method":"session/cancel","params":{"sessionId":"5dive-1"}}'
   sleep 2
-} | ( ASK_SLOW=1 timeout 60 "$BUN" "$ACP_RUN_DIR/acp-server.ts" ) 2>>"$WORK/err.log" >"$WORK/cancel.jsonl" || true
+} | ( ASK_SLOW=1 timeout 60 "${RUNNER[@]}" ) 2>>"$WORK/err.log" >"$WORK/cancel.jsonl" || true
 
 want "$(jq -e 'select(.id==4)|.result.stopReason=="cancelled"' "$WORK/cancel.jsonl" >/dev/null 2>&1 && echo true)" \
   "session/cancel lands WHILE the prompt is open and the turn answers stopReason cancelled"
@@ -344,7 +401,7 @@ STUBX
     req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}'
     req '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}'
     req '{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"5dive-1","prompt":[{"type":"text","text":"do the thing"}]}}'
-  } | ( ACP_CLI_BIN="$WORK/stub-nofleet" timeout 60 "$BUN" "$ACP_RUN_DIR/acp-server.ts" ) \
+  } | ( ACP_CLI_BIN="$WORK/stub-nofleet" timeout 60 "${RUNNER[@]}" ) \
       2>>"$WORK/err.log" >"$2" || true
 }
 chunks_of() { jq -r 'select(.method=="session/update")|.params.update|select(.sessionUpdate=="agent_message_chunk")|.content.text' "$1" 2>/dev/null | tr '\n' ' '; }
@@ -389,7 +446,7 @@ rm -f "$WORK/stub-nofleet"
   req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}'
   req '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}'
   req '{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"5dive-1","prompt":[{"type":"text","text":"do the thing"}]}}'
-} | ( ACP_CLI_BIN="$WORK/stub-nofleet" timeout 60 "$BUN" "$ACP_RUN_DIR/acp-server.ts" ) \
+} | ( ACP_CLI_BIN="$WORK/stub-nofleet" timeout 60 "${RUNNER[@]}" ) \
     2>>"$WORK/err.log" >"$WORK/nocli.jsonl" || true
 c=$(chunks_of "$WORK/nocli.jsonl"); d=$(descs_of "$WORK/nocli.jsonl")
 want "$(grep -q 'CLI is not reachable' <<<"$c" && echo true)" \
@@ -422,7 +479,7 @@ chmod +x "$WORK/pathbin/5dive" "$WORK/pathbin/sudo"
   req '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2}}'
   req '{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}'
   req '{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"5dive-1","prompt":[{"type":"text","text":"do the thing"}]}}'
-} | ( unset ACP_CLI_BIN; PATH="$WORK/pathbin:$PATH" timeout 60 "$BUN" "$ACP_RUN_DIR/acp-server.ts" ) \
+} | ( unset ACP_CLI_BIN; PATH="$WORK/pathbin:$PATH" timeout 60 "${RUNNER[@]}" ) \
     2>>"$WORK/err.log" >"$WORK/direct.jsonl" || true
 c=$(chunks_of "$WORK/direct.jsonl")
 want "$(grep -q 'DIRECT-ANSWER' <<<"$c" && echo true)" \
@@ -458,7 +515,7 @@ chmod +x "$WORK/nfbin/sudo"
 # `env` sets the stripped PATH on the SERVER only. Writing `PATH=... timeout` would
 # resolve `timeout` itself against the stripped PATH, find nothing, and run no
 # server at all — whereupon the `5dive init` assertion below passes on empty output.
-} | ( unset ACP_CLI_BIN; timeout 60 env PATH="$WORK/nfbin" "$BUN" "$ACP_RUN_DIR/acp-server.ts" ) \
+} | ( unset ACP_CLI_BIN; timeout 60 env PATH="$WORK/nfbin" "${RUNNER[@]}" ) \
     2>>"$WORK/err.log" >"$WORK/nosudocli.jsonl" || true
 c=$(chunks_of "$WORK/nosudocli.jsonl")
 want "$([[ -n "$c" ]] && echo true)" \
@@ -478,8 +535,23 @@ want "$([[ "$(chunks_of "$WORK/nofleet.jsonl")" != "$(chunks_of "$WORK/emptyflee
   "control: the three causes produce three DIFFERENT replies — one generic sentence would pass each arm alone"
 want "$([[ -n "$(chunks_of "$WORK/nocli.jsonl")" ]] && echo true)" \
   "control: and the no-CLI run spoke at all — an empty stdout would satisfy the distinctness arm"
+}
+
+for RT in "${RTS[@]}"; do
+  PFX="[$RT] "; RT_BUN=""; RT_NODE=""
+  if [[ $RT == bun ]]; then RT_BUN=$BUN; RUNNER=("$BUN" "$ACP_RUN_DIR/acp-server.mts")
+  else RT_NODE=$NODE; RUNNER=("$NODE" --disable-warning=ExperimentalWarning "$ACP_RUN_DIR/acp-server.mts"); fi
+  scenarios
+done
+PFX=""
 
 printf '%s\n' "--- server stderr (diagnostics belong here):"
 head -5 "$WORK/err.log" || true
 if [[ $FAILED -ne 0 ]]; then printf 'FAILED %d of %d checks\n' "$FAILED" "$CHECKS"; exit 1; fi
-printf 'PASS - %d checks\n' "$CHECKS"
+if [[ ${#MISSING[@]} -gt 0 ]]; then
+  # The count is in the summary line ON PURPOSE: a reader must be able to tell this
+  # run from a full one WITHOUT opening the log.
+  printf 'PARTIAL - %d checks, graded on: %s; NOT on: %s\n' "$CHECKS" "${RTS[*]:-nothing}" "${MISSING[*]}"
+  exit 0
+fi
+printf 'PASS - %d checks (bun and node)\n' "$CHECKS"
