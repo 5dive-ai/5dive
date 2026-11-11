@@ -728,8 +728,20 @@ cmd_account_list() {
   ACCOUNT_LOGINS_PRESCANNED=1
   account_default_v || true
   ACCOUNT_LOGINS_PRESCANNED=0
+  # DIVE-8207: and `undone: [<type>]` on a row whose login the owner took the
+  # default off with Undo. A caller with its own fallback (the partner API picks
+  # the client's newest Claude when no login is marked) must skip it, or Undo
+  # hands the default straight back to the login it was undoing.
+  local undone="" key
+  for key in "${!ACCOUNT_LOGINS[@]}"; do
+    [[ "${ACCOUNT_LOGINS[$key]#*$'\t'}" == undone ]] && undone+="$key"$'\n'
+  done
   rows=$(printf '%s\n' ${recs[@]+"${recs[@]}"} | jq -Rsc --argjson reg "$(registry_read)" \
-    --arg da "$ACCOUNT_DEFAULT_ACCOUNT" --arg dt "$ACCOUNT_DEFAULT_TYPE" --arg dp "$ACCOUNT_DEFAULT_PINNED" '
+    --arg da "$ACCOUNT_DEFAULT_ACCOUNT" --arg dt "$ACCOUNT_DEFAULT_TYPE" --arg dp "$ACCOUNT_DEFAULT_PINNED" \
+    --arg ud "$undone" '
+    ( $ud | split("\n") | map(select(length > 0) | split("\t"))
+      | reduce .[] as $p ({}; .[$p[0]] = ((.[$p[0]] // []) + [$p[1]] | sort)) ) as $undone
+    |
     # bound-agent index: profile -> [agent], from ONE registry read. Mirrors
     # account_agents_bound s select(.value.authProfile == $p), per profile.
     ( ($reg.agents // {}) | to_entries
@@ -749,7 +761,8 @@ cmd_account_list() {
                           ({}; .[$sig[$i]] = ($sig[$i + 1] | fromjson))) }
             + (if ($custom // "") != "" then {custom: ($custom | fromjson)} else {} end)
             + (if $da != "" and $n == $da then {default: $dt} else {} end)
-            + (if $da != "" and $n == $da and $dp == "1" then {pinned: true} else {} end))')
+            + (if $da != "" and $n == $da and $dp == "1" then {pinned: true} else {} end)
+            + (if $undone[$n] then {undone: $undone[$n]} else {} end))')
   if (( JSON_MODE )); then
     echo "$rows" | jq -c '{ok:true, data: .}'
   else
