@@ -2123,6 +2123,8 @@ HELP
   # child `agent create` output — that output is a clack render and parsing it would
   # break the moment the renderer changes.
   local -a _brought_up_names=()
+  local _hire_lead=""   # DIVE-8181
+  [[ -n "${COMPOSE_TEAM_KEY:-}" ]] && { _hire_lead=$(_compose_spec_root "$spec" 2>/dev/null) || _hire_lead=""; }
   local -a _adopted_names=() _shared_names=()
   mapfile -t names < <(jq -r '.agents | keys[]' <<<"$spec")
   if (( ${#names[@]} == 0 )); then
@@ -2204,6 +2206,22 @@ HELP
     local agent_spec pack_slug
     agent_spec=$(jq -c --arg n "$name" '.agents[$n]' <<<"$spec")
     pack_slug=$(jq -r '.pack // empty' <<<"$agent_spec")
+    # DIVE-8181: a team import's lead starts with the app's chat on (people talk
+    # to the team through the lead); members stay as they were. A pack seat's
+    # type is the pack's, so the import decides it there (FIVEDIVE_HIRE_CHAT).
+    local hire_chat=0
+    if [[ -n "${COMPOSE_TEAM_KEY:-}" && -n "$_hire_lead" && "$name" == "$_hire_lead" ]]; then
+      hire_chat=lead
+      if [[ -z "$pack_slug" ]]; then
+        # The channels create would get: the spec's, else the one its token implies.
+        local _lead_ch
+        _lead_ch=$(jq -r 'if (.channels // "") != "" then .channels
+          elif (.telegram_token // "") != "" then "telegram"
+          elif (.discord_token // "") != "" then "discord" else "" end' <<<"$agent_spec")
+        _lead_ch=$(hire_app_chat "$(jq -r '.type // "claude"' <<<"$agent_spec")" "$_lead_ch")
+        [[ -z "$_lead_ch" ]] || agent_spec=$(jq -c --arg c "$_lead_ch" '.channels = $c' <<<"$agent_spec")
+      fi
+    fi
     local -a args=(); local brought_up=1 verb=create
     if [[ "$(jq -r '.prefer_applied // false' <<<"$agent_spec")" == "true" ]]; then
       step "[$name] on $(jq -r '.type' <<<"$agent_spec") with account '$(jq -r '.auth_profile' <<<"$agent_spec")': the team asks for it there, and this box is signed in to it"
@@ -2214,7 +2232,7 @@ HELP
       verb=import
       step "[$name] importing character pack '$pack_slug'"
       mapfile -t args < <(_compose_import_args "$agent_spec" "$name" "$pack_slug" "$spec_dir" "$type_override")
-      bash "$self" agent import "${args[@]}" || brought_up=0
+      FIVEDIVE_HIRE_CHAT="$hire_chat" bash "$self" agent import "${args[@]}" || brought_up=0
       (( brought_up )) && _compose_pack_extra_skills "$agent_spec" "$name" "$self"
       # DIVE-5498: the pack's own CLAUDE.md names teammates by their bare names.
       if (( brought_up )) && [[ -n "$COMPOSE_NAME_MAP" ]]; then

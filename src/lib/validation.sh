@@ -638,6 +638,32 @@ SECRETS_GROUP="${FIVEDIVE_SECRETS_GROUP:-claude-keys}"
 # The workspace group the keys are moving OFF (create_agent_user's seam).
 _sp_shared_group()   { printf '%s' "${AGENT_SHARED_GROUP:-claude}"; }
 _sp_connectord_env() { printf '%s' "${FIVEDIVE_CONNECTORD_ENV:-/etc/5dive/connectord.env}"; }
+
+# DIVE-8181: the channels a HIRE starts with. lodar, 2026-11-11: "should we
+# install dashboard chat on default for single agents and teams leads? so human
+# dont wait". The app's "Chat here" turned chat on at the first tap, and that
+# restarts the agent (~1 min of "Getting X ready"). Set at create, the first
+# start already has it. Scope is the hire only (`agent import`, and a team
+# import's lead): DIVE-5406 took app chat off EVERY create because it put a
+# plugin nobody used on every seat, and members stay as they were.
+#
+# box_has_app_chat — rc 0 when the app's chat reaches this box: a box 5dive runs
+# (its connectord token, which the dashboard plugin reads) or a self-hosted box
+# linked for chat (box_is_chat_only, header.sh).
+box_has_app_chat() { box_is_chat_only || [[ -e "$(_sp_connectord_env)" ]]; }
+# hire_app_chat <type> <channels> — <channels> with "dashboard" added after the
+# rest (Telegram stays first) when the box has app chat and <type> has web chat;
+# else <channels> unchanged. "" and "none" become "dashboard".
+hire_app_chat() {
+  local type="$1" ch="${2:-}"
+  if ! type_has_web_chat "$type" || ! box_has_app_chat; then
+    printf '%s' "$ch"; return 0
+  fi
+  case "$ch" in
+    ""|none) printf 'dashboard' ;;
+    *) if channel_in_list dashboard "$ch"; then printf '%s' "$ch"; else printf '%s,dashboard' "$ch"; fi ;;
+  esac
+}
 _sp_connectors_dir() { printf '%s' "${CONNECTORS_DIR:-${FIVEDIVE_CONNECTOR_DIR:-/etc/5dive/connectors}}"; }
 _sp_profiles_dir()   { printf '%s' "${AUTH_PROFILES_DIR:-/var/lib/5dive/auth-profiles}"; }
 _sp_env_dir()        { printf '%s' "${ENV_DIR:-/var/lib/5dive/agents.d}"; }
