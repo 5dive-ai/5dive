@@ -134,6 +134,16 @@ cmd_org_set() {
   if (( mgr_set )); then (( mgr_clear )) && _aud_mgr="(cleared)" || _aud_mgr="$mgr_name"; fi
   audit_log "org set" ok 0 -- "agent=$name" "reports_to=$_aud_mgr" "by_claimed=${SUDO_USER:-root}"
 
+  # DIVE-8189: a seat whose heartbeat mode came from the org-chart default
+  # (freshSource=default) follows its new place in the chart — a worker moved
+  # under a lead starts each task fresh. An explicit --fresh/--no-fresh, a team
+  # import's choice, or an enrolment from before DIVE-8189 is never touched.
+  # Never fails the chart write: the edge is already in.
+  if (( mgr_set )) && declare -F _hb_fresh_rederive >/dev/null \
+     && [[ "$(jq -r --arg n "$name" '.agents[$n].heartbeat != null' <<<"$(registry_read)" 2>/dev/null)" == "true" ]]; then
+    ( with_registry_lock _hb_fresh_rederive "$name" ) || true
+  fi
+
   # DIVE-4555 — THE CHART IS BUILT HERE, so this is where "and it still routes
   # nowhere" has to be said. There is no onboarding wizard that writes
   # `agents_org` (checked: neither `5dive init` nor `5dive company` touches the

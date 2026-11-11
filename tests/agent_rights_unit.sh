@@ -263,7 +263,7 @@ check 'S18 org edge: dave gives to his manager alice (and still cannot clobber h
 # ── H: heartbeat _self ─────────────────────────────────────────────────────────
 hbf() { jq -c --arg n "$1" '.agents[$n].heartbeat' "$REGISTRY"; }
 CAROL_BEFORE=$(hbf carol)
-arm_H1() { SUDO_UID=1001 hb on; [[ $RC == 0 && "$(hbf alice)" == '{"enabled":true,"everyMin":30,"fresh":false,"lastRunAt":0}' ]] \
+arm_H1() { SUDO_UID=1001 hb on; [[ $RC == 0 && "$(hbf alice)" == '{"enabled":true,"everyMin":30,"fresh":false,"lastRunAt":0,"freshSource":"default","freshWhy":"reports to no agent"}' ]] \
   && grep -q 'heartbeat _self on ok 0 -- by=alice' "$TMP/audit"; }
 check 'H1 alice: _self on enrols alice (defaults), audited' arm_H1
 arm_H2() { SUDO_UID=1002 hb on; [[ $RC == 0 && "$(hbf bob)" == '{"enabled":true,"everyMin":45,"fresh":true,"lastRunAt":123}' ]]; }

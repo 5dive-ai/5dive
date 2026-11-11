@@ -446,7 +446,7 @@ Real browser (screenshots, clicks, signed-in pages) — a PLUGIN, 5dive-browser:
   5dive market show browser                          # what it does, before you add it
 
 Heartbeat (wake an agent only when it has queued tasks, one per tick):
-  5dive heartbeat on  <name> [--every=<dur>] [--fresh]      # enrol (default 30m, fresh off: no /clear between tasks)
+  5dive heartbeat on  <name> [--every=<dur>] [--fresh|--no-fresh]  # enrol (default 30m; fresh on for a no-chat seat reporting to an agent, or a pinned reviewer)
   5dive heartbeat off <name>
   5dive heartbeat self on|off                               # enrol or pause YOUR OWN seat (works from a standard seat)
   5dive heartbeat ls                                        # enrolled agents + next-wake + queued count
