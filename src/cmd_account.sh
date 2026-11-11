@@ -165,6 +165,39 @@ _acct_env_load() {
   done <"$1"
 }
 
+# account_url_host <url> — the host of an address, nothing else: no scheme, no
+# user:password@, no port, no path, query or fragment. Lowercased.
+account_url_host() {
+  local h="${1#*://}"
+  h="${h%%/*}"; h="${h%%\?*}"; h="${h%%#*}"
+  h="${h##*@}"
+  if [[ "$h" == \[*\]* ]]; then h="${h%%\]*}]"; else h="${h%:*}"; fi
+  printf '%s' "${h,,}"
+}
+
+# account_custom_v <name> — «Your own AI» on this account (DIVE-7568), left in
+# ACCOUNT_CUSTOM as {harness, model, host}, or "" when the account is not one.
+# DIVE-8170: the partner API lists a client's own model as «<model> · <host>».
+# Only the HOST of the address: a path or a user:password@ in it can carry a
+# secret, and the key itself is never read here. Shell builtins only (one read
+# of combined.env, no spawn): `account list` is on a 3s budget (DIVE-3088).
+ACCOUNT_CUSTOM=""
+account_custom_v() {
+  ACCOUNT_CUSTOM=""
+  local env_file="${AUTH_PROFILES_DIR}/${1}/combined.env" v h m
+  [[ -s "$env_file" ]] || return 0
+  _acct_env_load "$env_file"
+  v="${ACCT_ENV[FIVEDIVE_CUSTOM_BASE_URL]:-}"; v="${v%\"}"; v="${v#\"}"
+  h="${ACCT_ENV[FIVEDIVE_CUSTOM_HARNESS]:-}"; h="${h%\"}"; h="${h#\"}"
+  m="${ACCT_ENV[FIVEDIVE_CUSTOM_MODEL]:-}"; m="${m%\"}"; m="${m#\"}"
+  [[ -n "$v" && -n "$h" ]] || return 0
+  local jh jm jo
+  _acct_json_str "$h"; jh=$ACCT_JSON_STR
+  if [[ -n "$m" ]]; then _acct_json_str "$m"; jm=$ACCT_JSON_STR; else jm=null; fi
+  _acct_json_str "$(account_url_host "$v")"; jo=$ACCT_JSON_STR
+  printf -v ACCOUNT_CUSTOM '{"harness":%s,"model":%s,"host":%s}' "$jh" "$jm" "$jo"
+}
+
 # account_signin_detail_v <name> <type> — account_signin_detail's object, left in
 # ACCOUNT_SIGNIN_DETAIL, so `account list` gets it without a `$( )` fork per
 # (account, type) (DIVE-6985).
@@ -670,7 +703,9 @@ cmd_account_list() {
     account_types_authed_arr "$name"
     atypes=(${ACCOUNT_TYPES_AUTHED[@]+"${ACCOUNT_TYPES_AUTHED[@]}"})
     printf -v csv '%s,' ${atypes[@]+"${atypes[@]}"}
-    fields=("$name" "${csv%,}")
+    # DIVE-8170: field 3 is the account's «Your own AI» record, or empty.
+    account_custom_v "$name"
+    fields=("$name" "${csv%,}" "$ACCOUNT_CUSTOM")
     if [[ "$name" != demo-ai && "$name" != default ]]; then
       for t in ${atypes[@]+"${atypes[@]}"}; do
         [[ " ${ACCOUNT_DEFAULT_TYPES[*]} " == *" $t "* ]] && ACCOUNT_LOGINS_NOW+=("$name"$'\t'"$t")
@@ -705,12 +740,14 @@ cmd_account_list() {
     | split("\n") | map(select(length > 0))
     | map(split("\t")
           | .[0] as $n
-          | .[2:] as $sig
+          | .[2] as $custom
+          | .[3:] as $sig
           | { name:  $n,
               types: (if .[1] == "" then [] else (.[1] | split(",")) end),
               agents: ($bound[$n] // []),
               signins: (reduce range(0; ($sig | length); 2) as $i
                           ({}; .[$sig[$i]] = ($sig[$i + 1] | fromjson))) }
+            + (if ($custom // "") != "" then {custom: ($custom | fromjson)} else {} end)
             + (if $da != "" and $n == $da then {default: $dt} else {} end)
             + (if $da != "" and $n == $da and $dp == "1" then {pinned: true} else {} end))')
   if (( JSON_MODE )); then
