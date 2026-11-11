@@ -8,7 +8,7 @@
 # our CLI, so we belong in the first tier: command "5dive", args ["acp"]. An adapter
 # would put us in amp's tier and add a dependency we do not need.
 #
-# TRANSPORT is an embedded bun/TS server, NOT hand-rolled JSON-RPC in bash: ACP
+# TRANSPORT is an embedded TS server (bun, or node when there is none — DIVE-8192), NOT hand-rolled JSON-RPC in bash: ACP
 # interleaves server-initiated `session/update` notifications with a still-open
 # `session/prompt`, which is concurrent framing in a language with no JSON parser.
 # Same embedding pattern as cmd_cos.sh — and the heredoc below is the ONLY copy of
@@ -59,7 +59,10 @@ _acp_resolve_bun() {
   local c
   # ACP_BUN_BIN: harness seam, and the escape hatch on a box with bun elsewhere.
   if [[ -n "${ACP_BUN_BIN:-}" ]]; then printf '%s' "$ACP_BUN_BIN"; return 0; fi
-  for c in /usr/local/bin/bun /home/claude/.bun/bin/bun; do
+  # ACP_BUN_PROBES: harness seam ONLY (DIVE-8192) — the node-fallback arms must be able
+  # to run on a box whose /usr/local/bin/bun exists. Unset means this box's layout; SET
+  # (even empty) it is the whole probe list, so the sudo probe below is skipped too.
+  for c in ${ACP_BUN_PROBES-/usr/local/bin/bun /home/claude/.bun/bin/bun}; do
     [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
   done
   # THE CALLER'S OWN PATH — required for the verb to work anywhere but our VM, not a CI
@@ -74,9 +77,58 @@ _acp_resolve_bun() {
   # its cases and one fewer login shell.
   c=$(command -v bun 2>/dev/null)
   [[ -n "$c" && -x "$c" ]] && { printf '%s' "$c"; return 0; }
-  c=$(sudo -u claude -i bash -lc 'command -v bun' 2>/dev/null | tail -1)
-  [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
-  printf '/usr/local/bin/bun'
+  # -n: never a password prompt. Off our VM (a laptop, the registry's sandbox user)
+  # this probe cannot succeed, and a prompt on the client's terminal is worse than a miss.
+  if [[ -z "${ACP_BUN_PROBES+x}" ]]; then
+    c=$(sudo -n -u claude -i bash -lc 'command -v bun' 2>/dev/null | tail -1)
+    [[ -x "$c" ]] && { printf '%s' "$c"; return 0; }
+  fi
+  # A MISS PRINTS NOTHING (DIVE-8192). This used to print the literal /usr/local/bin/bun
+  # for the error message to name; once node became a fallback, that literal read as a
+  # FOUND bun on any box where the path exists but every real probe had been ruled out.
+  return 0
+}
+
+# NODE IS THE FALLBACK, not a peer (DIVE-8192). The ACP registry's required verify-auth
+# job runs us on a GitHub ubuntu runner that installs uv and Node `lts/*` and has NO
+# bun: measured at v0.127.0 with their own verify_agents.py --auth-check as an
+# unprivileged user, no bun on PATH = 0/1 (exit 7; their log only says "timeout waiting
+# for initialize"), bun on PATH = 1/1. The same gap hits any laptop without bun. The
+# server is strip-only TS, and node runs .mts by erasing types with no flag from 22.18
+# (23.6 on the odd line) — older node would need a flag it may not have, so it is a
+# miss, not a guess. Bun stays FIRST: a managed box behaves exactly as before.
+#
+# Prints the node path, or nothing. ACP_NODE_BIN: the seam, and the escape hatch.
+_acp_node_supports_ts() { # $1 = node binary; 0 when it type-strips by default
+  local v maj min
+  v=$("$1" -p 'process.versions.node' 2>/dev/null) || return 1
+  maj=${v%%.*}; min=${v#*.}; min=${min%%.*}
+  [[ "$maj" =~ ^[0-9]+$ && "$min" =~ ^[0-9]+$ ]] || return 1
+  (( maj >= 24 || (maj == 23 && min >= 6) || (maj == 22 && min >= 18) ))
+}
+_acp_resolve_node() {
+  local c
+  if [[ -n "${ACP_NODE_BIN:-}" ]]; then c=$ACP_NODE_BIN; else c=$(command -v node 2>/dev/null) || c=""; fi
+  [[ -n "$c" && -x "$c" ]] && _acp_node_supports_ts "$c" && printf '%s' "$c"
+  return 0
+}
+
+# Which runtime runs the server: prints "bun <path>" or "node <path>", or returns 1.
+# An EXPLICIT ACP_BUN_BIN is the only bun candidate and is never silently swapped for
+# node: the caller named a binary, and running a different one hides their mistake.
+# ACP_RUNTIME=bun|node forces one (the node round-trip arm, and a user's own choice).
+_acp_resolve_runtime() {
+  local b n
+  case "${ACP_RUNTIME:-}" in
+    node) n=$(_acp_resolve_node); [[ -n "$n" ]] || return 1; printf 'node %s' "$n"; return 0 ;;
+    bun)  b=$(_acp_resolve_bun); [[ -x "$b" ]] || return 1; printf 'bun %s' "$b"; return 0 ;;
+  esac
+  b=$(_acp_resolve_bun)
+  if [[ -x "$b" ]]; then printf 'bun %s' "$b"; return 0; fi
+  [[ -n "${ACP_BUN_BIN:-}" ]] && return 1
+  n=$(_acp_resolve_node)
+  [[ -n "$n" ]] && { printf 'node %s' "$n"; return 0; }
+  return 1
 }
 
 # Stage the embedded server into $1 (idempotent). Returns non-zero if $1 cannot take
@@ -84,8 +136,11 @@ _acp_resolve_bun() {
 # existing directory that is not ours to write (DIVE-3361).
 _acp_install_runner() {
   mkdir -p "$1" || return 1
-  cat > "$1/acp-server.ts" <<'ACP_SERVER_TS' || return 1
-// DIVE-3017 — ACP over stdio for `5dive acp`. Staged by cmd_acp.sh; run on bun.
+  cat > "$1/acp-server.mts" <<'ACP_SERVER_TS' || return 1
+// DIVE-3017 — ACP over stdio for `5dive acp`. Staged by cmd_acp.sh; run on bun, or on
+// node >= 22.18 when there is no bun (DIVE-8192). `.mts`, not `.ts`: node decides a .ts
+// file's module type from the nearest package.json, so one with "type":"commonjs" above
+// the staging dir would turn the top-level await below into a syntax error.
 //
 // stdout carries the PROTOCOL and nothing else. Every diagnostic goes to stderr —
 // one stray println here is a parse error in the client, not a log line.
@@ -116,12 +171,55 @@ const PROTOCOL_VERSION = 1; // Buzz's client sends 2 (crates/buzz-acp/src/acp.rs
 // its own agent fixtures answer 1, so negotiating down is the shape it expects. We
 // answer with what we actually speak rather than claiming a version we have not read.
 
+// RUNS ON BUN OR NODE (DIVE-8192). The ACP registry's required verify-auth job spawns
+// us on a GitHub runner that has Node LTS and NO bun, so every Bun.* call here was a
+// 0/1 on their gate. Only APIs both runtimes implement are used below — node:child_process,
+// process.stdin/stdout — and the TS stays STRIP-ONLY (no enum, namespace, parameter
+// property or `<T>x` cast), because node runs this file by erasing types, not compiling.
+import { spawn as nodeSpawn } from "node:child_process";
+
 const RESERVED = new Set(["attach", "agents"]);
-const sink = Bun.stdout.writer();
 
 function send(msg: unknown): void {
-  sink.write(JSON.stringify(msg) + "\n");
-  sink.flush();
+  process.stdout.write(JSON.stringify(msg) + "\n");
+}
+
+// One child process, the shape both call sites need. node REPORTS a missing binary as
+// an async 'error' event where Bun.spawn threw; `exited` resolves either way, and
+// `spawnError` carries the ENOENT so the callers keep their "not found" handling.
+type Child = {
+  kill: (sig?: number | string) => void;
+  stdout: AsyncIterable<Uint8Array>;
+  stderrText: Promise<string>;
+  exited: Promise<number>;
+  spawnError: () => Error | null;
+};
+function start(cmd: string[]): Child {
+  const p = nodeSpawn(cmd[0], cmd.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
+  let spawnErr: Error | null = null;
+  // stderr is drained CONCURRENTLY: left unread, a chatty child fills the pipe and
+  // blocks on write while we wait for it to exit.
+  let errTxt = "";
+  p.stderr.on("data", (c: Uint8Array) => { errTxt += Buffer.from(c).toString("utf8"); });
+  const stderrDone = new Promise<void>((res) => { p.stderr.on("close", () => res()); p.stderr.on("error", () => res()); });
+  const exited = new Promise<number>((res) => {
+    p.on("error", (e: Error) => { spawnErr = e; res(127); });
+    // A signal-killed child (our own cancel) has code null; report it as non-zero.
+    p.on("close", (code: number | null) => res(code ?? 1));
+  });
+  return {
+    kill: (sig) => { p.kill(sig as any); },
+    stdout: p.stdout as unknown as AsyncIterable<Uint8Array>,
+    stderrText: exited.then(() => stderrDone).then(() => errTxt),
+    exited,
+    spawnError: () => spawnErr,
+  };
+}
+async function readAll(it: AsyncIterable<Uint8Array>): Promise<string> {
+  const dec = new TextDecoder();
+  let s = "";
+  for await (const c of it) s += dec.decode(c, { stream: true });
+  return s + dec.decode();
 }
 function log(s: string): void {
   try { process.stderr.write(`[5dive acp] ${s}\n`); } catch { /* stderr may be closed */ }
@@ -192,12 +290,16 @@ async function roster(): Promise<Roster> {
     const cmd = [...argv, "agent", "list", "--json"];
     let out = "", errTxt = "", code = -1;
     try {
-      const p = Bun.spawn({ cmd, stdout: "pipe", stderr: "pipe" });
-      out = await new Response(p.stdout).text();
-      errTxt = (await new Response(p.stderr).text()).trim();
+      const p = start(cmd);
+      // A failed spawn tears the stream down ("Premature close" on bun); the spawn
+      // error below is the real reason, so the read failure is not the one reported.
+      try { out = await readAll(p.stdout); } catch { /* reported via spawnError */ }
       code = await p.exited;
+      errTxt = (await p.stderrText).trim();
+      // An absent binary is a spawn ERROR, not an exit 127 — keep it on the throw path.
+      const se = p.spawnError();
+      if (se) throw se;
     } catch (e) {
-      // Bun throws rather than exiting 127 when the binary is absent.
       if (!detail) detail = (e as Error).message;
       log(`${cmd[0]}: ${(e as Error).message}`);
       continue;
@@ -369,25 +471,26 @@ async function runTurn(id: unknown, s: Session, body: string): Promise<void> {
   if (!body) { chunk(s, "(empty prompt — nothing sent)"); return ok(id, { stopReason: "end_turn" }); }
   const timeout = process.env.ACP_ASK_TIMEOUT || "180";
   const cmd = [...cliArgv(), "agent", "ask", s.attached as string, body, `--timeout=${timeout}`];
-  let p;
-  try {
-    p = Bun.spawn({ cmd, stdout: "pipe", stderr: "pipe" });
-  } catch (e) {
-    chunk(s, `[5dive] could not run \`agent ask\`: ${(e as Error).message}`);
-    return ok(id, { stopReason: "end_turn" });
-  }
+  const p = start(cmd);
   s.proc = p;
   let saw = false;
   const dec = new TextDecoder();
-  for await (const c of p.stdout as any) {
-    const t = dec.decode(c as Uint8Array, { stream: true });
-    if (t) { saw = true; chunk(s, t); }
-  }
+  try {
+    for await (const c of p.stdout) {
+      const t = dec.decode(c, { stream: true });
+      if (t) { saw = true; chunk(s, t); }
+    }
+  } catch { /* a stream torn down by a failed spawn: the exit below says why */ }
   const code = await p.exited;
   s.proc = null;
+  const se = p.spawnError();
+  if (se) {
+    chunk(s, `[5dive] could not run \`agent ask\`: ${se.message}`);
+    return ok(id, { stopReason: "end_turn" });
+  }
   if (s.cancelled) { s.cancelled = false; return ok(id, { stopReason: "cancelled" }); }
   if (code !== 0) {
-    const tail = (await new Response(p.stderr).text()).trim().split("\n").slice(-3).join("\n");
+    const tail = (await p.stderrText).trim().split("\n").slice(-3).join("\n");
     chunk(s, `\n[5dive] agent ask ${s.attached} exited ${code}${tail ? `: ${tail}` : ""}`);
   } else if (!saw) {
     chunk(s, `[5dive] ${s.attached} produced no reply within ${timeout}s.`);
@@ -531,7 +634,7 @@ async function dispatch(line: string): Promise<void> {
 const inflight = new Set<Promise<void>>();
 const dec = new TextDecoder();
 let buf = "";
-for await (const c of Bun.stdin.stream()) {
+for await (const c of process.stdin) {
   buf += dec.decode(c as Uint8Array, { stream: true });
   let i: number;
   while ((i = buf.indexOf("\n")) >= 0) {
@@ -546,7 +649,7 @@ for await (const c of Bun.stdin.stream()) {
 // stdin closed: finish what is open rather than dropping a turn on the floor.
 while (inflight.size) await Promise.allSettled([...inflight]);
 ACP_SERVER_TS
-  chmod 644 "$1/acp-server.ts" || return 1
+  chmod 644 "$1/acp-server.mts" || return 1
 }
 
 cmd_acp() {
@@ -557,11 +660,17 @@ cmd_acp() {
       *) fail "$E_USAGE" "5dive acp takes no arguments (got: $a)" ;;
     esac
   done
-  local bun; bun=$(_acp_resolve_bun)
+  local rt rt_kind rt_bin
   # PREFLIGHT, and it is load-bearing. presets.rs renders NotInstalled only when the
-  # COMMAND is absent, so with `5dive` on PATH and bun missing the client spawns us
+  # COMMAND is absent, so with `5dive` on PATH and no runtime the client spawns us
   # and gets a process that dies with no reason attached. Say why, on stderr, once.
-  [[ -x "$bun" ]] || fail "$E_NOT_INSTALLED" "bun not found at $bun — 5dive acp runs its ACP server on bun. Install it (curl -fsSL https://bun.sh/install | bash) or point ACP_BUN_BIN at an existing binary."
+  if ! rt=$(_acp_resolve_runtime); then
+    if [[ -n "${ACP_BUN_BIN:-}" && -z "${ACP_RUNTIME:-}" ]]; then
+      fail "$E_NOT_INSTALLED" "bun not found at $ACP_BUN_BIN (ACP_BUN_BIN) — point it at an existing bun, or unset it to let 5dive acp use bun or node from PATH."
+    fi
+    fail "$E_NOT_INSTALLED" "no runtime for the ACP server: 5dive acp needs bun, or node 22.18 or newer, and found neither${ACP_RUNTIME:+ (ACP_RUNTIME=$ACP_RUNTIME)}. Install one (https://bun.sh or https://nodejs.org), or point ACP_BUN_BIN / ACP_NODE_BIN at an existing binary."
+  fi
+  rt_kind=${rt%% *}; rt_bin=${rt#* }
   # First candidate that actually TAKES the file wins; the per-attempt stderr is
   # dropped because a Permission denied on /opt is expected off our VM, not news.
   # A total failure names every directory tried, which is the message that used to
@@ -574,11 +683,14 @@ cmd_acp() {
   done < <(_acp_run_dir_candidates)
   [[ -n "$dir" ]] || fail "$E_GENERIC" "could not stage the ACP server in any of: ${tried:-<none: HOME and XDG_CACHE_HOME are both unset>} — point ACP_RUN_DIR at a writable directory."
   [[ -t 0 ]] && printf '%s\n' "5dive acp speaks JSON-RPC on stdin/stdout; you are on a TTY. This verb is meant to be spawned by an ACP client." >&2
-  # `exec` hands the pipes straight to bun. Note for whoever reads the audit log:
+  # `exec` hands the pipes straight to the runtime. Note for whoever reads the audit log:
   # this replaces the process, so the dispatcher's EXIT-trap row never fires
   # (DIVE-2797). The row is emitted below, before the exec, for that reason.
   if declare -F audit_log >/dev/null 2>&1 && [[ -n "${AUDIT_LOG:-}" ]]; then
-    audit_log "acp" "start" 0 -- "runner=$dir" || true
+    audit_log "acp" "start" 0 -- "runner=$dir" "runtime=$rt_kind" || true
   fi
-  exec "$bun" "$dir/acp-server.ts"
+  # node: type stripping still prints an ExperimentalWarning on 22.x. stderr is not the
+  # wire, but a client may surface it as an error line, so it is silenced by name.
+  [[ "$rt_kind" == node ]] && exec "$rt_bin" --disable-warning=ExperimentalWarning "$dir/acp-server.mts"
+  exec "$rt_bin" "$dir/acp-server.mts"
 }
