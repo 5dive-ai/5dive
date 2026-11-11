@@ -14,7 +14,8 @@ tmp=""; trap 'rc=$?; rm -f "${tmp:-}"; echo "HARNESS-RC=$rc"' EXIT   # one EXIT 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.." || exit 1
-pass=0 failn=0
+pass=0
+failn=0
 ok() { pass=$((pass + 1)); printf 'ok   %s\n' "$1"; }
 bad() { failn=$((failn + 1)); printf 'FAIL %s\n' "$1"; }
 
