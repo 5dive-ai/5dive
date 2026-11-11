@@ -26,6 +26,23 @@ normalize_restart_profile_perms() {
   return 0
 }
 
+# DIVE-8195: the unit's root pre-start step (`ExecStartPre=-+` in
+# systemd/5dive-agent@.service). normalize_restart_profile_perms had one caller,
+# `agent restart`, but most starts never pass through it: the nightly update's
+# plain `systemctl restart`, a reboot, a crash re-start. Those booted an admin
+# antigravity seat on a 0600 token with no seat ACL — DEGRADED until someone ran
+# `agent restart` by hand. Every start now gets the same normalize as root.
+# Takes NO registry lock: `agent restart` holds it across its synchronous
+# `systemctl restart`, which runs this step. Never fails (the unit ignores rc too).
+cmd_agent_seed_perms() {
+  local name="${1:-}" reg
+  [[ -n "$name" ]] || return 0   # root is checked in the normalize itself
+  reg=$(registry_read 2>/dev/null) || return 0
+  jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null 2>&1 || return 0
+  normalize_restart_profile_perms "$name"
+  return 0
+}
+
 # DIVE-7101: restart is the documented heal, and on openclaw 2026.10.x the key
 # lives in the account's state db, which a standard seat cannot read. The boot
 # seed then leaves the seat with no key, so push it in as root before the unit

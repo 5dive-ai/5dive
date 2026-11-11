@@ -761,6 +761,10 @@ _agent_verb_dispatch() {
         # restarts every seat after a Claude Code upgrade, defers a seat that is
         # mid-turn instead of killing it. Decides and records; never restarts.
         _restart_decide) cmd_agent_restart_decide "$@" ;;
+        # DIVE-8195: hidden root primitive, the seat unit's ExecStartPre. Every
+        # start re-normalizes the bound account's seed perms (cmd_agent_lifecycle.sh).
+        # No audit row and no lock: it runs on every start, crash re-starts included.
+        _seed_perms) cmd_agent_seed_perms "$@" ;;
         # DIVE-4203: hidden read-only primitive — prints THE default-skills list
         # (DEFAULT_AGENT_SKILLS in lib/agent_setup.sh), one `<owner>/<repo>:<skill>`
         # per line. Exists so 5dive-refresh-skills.sh, installed standalone beside

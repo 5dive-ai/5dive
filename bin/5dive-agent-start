@@ -743,6 +743,19 @@ assert_cred_seeded() {
   fi
 
   if (( readable )); then
+    # DIVE-8195: a readable credential whose local copy is CURRENT is the clean
+    # verdict, so it clears an earlier start's breadcrumb. The seed above only
+    # calls cred_seed_ok when it re-copies (shared NEWER than local), and the
+    # start that fixes the perms re-copies nothing — chmod/setfacl move no mtime
+    # — so `auth status`/doctor kept saying STALE after the fault was gone.
+    # NOT unconditional: shared still newer here means this start's copy failed,
+    # and that breadcrumb must stand. `sudo -n test` is the fallback for a parent
+    # chain only an admin seat can traverse ([[ -nt ]] then reads false).
+    if [[ -s "$local_path" ]] \
+       && ! { [[ "$shared" -nt "$local_path" ]] \
+              || sudo -n test "$shared" -nt "$local_path" 2>/dev/null; }; then
+      cred_seed_ok
+    fi
     return 0                      # we could read it; the seed above had its shot
   fi
   if (( ! present )); then
