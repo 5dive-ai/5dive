@@ -1263,10 +1263,10 @@ _compose_team_heartbeat_fresh() {
   for n in "$@"; do
     [[ "$(jq -r --arg n "$n" '.agents[$n].heartbeat != null' <<<"$reg" 2>/dev/null)" == "true" ]] || continue
     if [[ "$n" == "$lead" ]]; then
-      reg=$(jq --arg n "$n" '.agents[$n].heartbeat.fresh = false' <<<"$reg") || return 0
+      reg=$(jq --arg n "$n" '.agents[$n].heartbeat += {fresh: false, freshSource: "team-import", freshWhy: "team lead"}' <<<"$reg") || return 0
       kept_names+=("$n")
     else
-      reg=$(jq --arg n "$n" '.agents[$n].heartbeat.fresh = true' <<<"$reg") || return 0
+      reg=$(jq --arg n "$n" '.agents[$n].heartbeat += {fresh: true, freshSource: "team-import", freshWhy: "team import: not the lead"}' <<<"$reg") || return 0
       fresh_names+=("$n")
     fi
   done

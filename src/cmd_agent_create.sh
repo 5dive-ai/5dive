@@ -3489,6 +3489,22 @@ _create_caller_account() {
   registry_read 2>/dev/null | jq -r --arg n "$who" '.agents[$n].authProfile // empty' 2>/dev/null || true
 }
 
+# DIVE-8189: the line `agent create` prints after enrolment — which heartbeat
+# mode the seat got and why (the org-chart default from _hb_fresh_default, or
+# the --fresh/--no-fresh the caller passed), plus the one command that flips it.
+# The owner should never have to know `heartbeat on --fresh` exists to get a
+# clean worker. Silent when the seat has no heartbeat record.
+_create_heartbeat_fresh_line() { # <name>
+  local name="$1" reg fr fw
+  reg=$(registry_read)
+  fr=$(jq -r --arg n "$name" 'if .agents[$n].heartbeat == null then "" elif .agents[$n].heartbeat.fresh == true then "on" else "off" end' <<<"$reg" 2>/dev/null) || fr=""
+  fw=$(jq -r --arg n "$name" '.agents[$n].heartbeat.freshWhy // ""' <<<"$reg" 2>/dev/null) || fw=""
+  case "$fr" in
+    on)  step "heartbeat fresh=on${fw:+ ($fw)} — each task starts in a clean context (keep its context instead: sudo 5dive heartbeat on $name --no-fresh)" ;;
+    off) step "heartbeat fresh=off${fw:+ ($fw)} — it keeps its context between tasks (start each task clean instead: sudo 5dive heartbeat on $name --fresh)" ;;
+  esac
+}
+
 cmd_create() {
   local name="" type="" channels="none" channels_set=0 telegram_token="" discord_token="" workdir="" profile=""
   local telegram_home_channel="" telegram_allowed_users="" telegram_cos="" telegram_cos_avatar=""
@@ -3501,6 +3517,7 @@ cmd_create() {
   # DIVE-4269: a created seat is ENROLLED in the heartbeat by default. See the
   # enrolment block near the self-check for why the default flipped.
   local no_heartbeat=0 heartbeat_every="" _hb_driver=""
+  local heartbeat_fresh=""   # DIVE-8189: --fresh / --no-fresh; "" = org-chart default
   local autonomy="standard"   # DIVE-499
   local can_push=0            # DIVE-1462/STEER-4: delegated-push (builder) capability
   local can_deploy=0          # INST-5: delegated-deploy (production ship) capability
@@ -3531,6 +3548,8 @@ cmd_create() {
       --no-team-bot)               no_team_bot=1 ;;
       --no-heartbeat)              no_heartbeat=1 ;;
       --heartbeat-every=*)         heartbeat_every="${1#--heartbeat-every=}" ;;
+      --fresh)                     heartbeat_fresh="--fresh" ;;
+      --no-fresh)                  heartbeat_fresh="--no-fresh" ;;
       --defer-auth)                defer_auth=1 ;;
       --own-login)                 own_login=1 ;;
       --isolation=*)               isolation="${1#--isolation=}"; isolation_explicit=1 ;;
@@ -3543,7 +3562,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz|teams[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--defer-auth] [--own-login] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz|teams[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--fresh|--no-fresh] [--defer-auth] [--own-login] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -4809,6 +4828,7 @@ cmd_create() {
   else
     local -a _hb_args=( "$name" )
     [[ -n "$heartbeat_every" ]] && _hb_args+=( "--every=$heartbeat_every" )
+    [[ -n "$heartbeat_fresh" ]] && _hb_args+=( "$heartbeat_fresh" )
     # SUBSHELL, deliberately. `cmd_heartbeat_on` ends in `ok` and guards itself
     # with `require_root`/`require_agent`, all three of which EXIT. Called inline
     # that would end `create` at the last step of a successful provision — either
@@ -4828,6 +4848,8 @@ cmd_create() {
         *)
           warn "heartbeat enrolled for '$name', but there is no heartbeat driver on this box (${_hb_driver#*:}): board work will not start by itself; run: sudo 5dive heartbeat install" ;;
       esac
+      # DIVE-8189: say which mode enrolment picked, and why.
+      _create_heartbeat_fresh_line "$name"
     else
       warn "heartbeat enrolment FAILED for '$name' — the agent is up but nothing will wake it. Enrol it by hand: sudo 5dive heartbeat on $name"
     fi

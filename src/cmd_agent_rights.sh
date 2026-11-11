@@ -313,13 +313,13 @@ cmd_agent_skill_give() {
 _hb_self_apply() {
   local op="$1" name="$2"
   if [[ "$op" == off ]]; then cmd_heartbeat_off "$name"; return; fi
-  local reg every fresh
+  local reg every
   reg=$(registry_read)
   every=$(jq -r --arg n "$name" '.agents[$n].heartbeat.everyMin // empty' <<<"$reg" 2>/dev/null) || every=""
-  fresh=$(jq -r --arg n "$name" '.agents[$n].heartbeat.fresh // false' <<<"$reg" 2>/dev/null) || fresh=false
   local -a args=("$name")
   [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) && args+=("--every=$every")
-  [[ "$fresh" == true ]] && args+=(--fresh) || args+=(--no-fresh)
+  # DIVE-8189: no fresh flag — `heartbeat on` keeps an existing enrolment's mode
+  # (and where it came from), so a resume no longer stamps it "explicit".
   cmd_heartbeat_on "${args[@]}"
 }
 

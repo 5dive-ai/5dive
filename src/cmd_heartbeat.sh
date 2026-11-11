@@ -953,8 +953,9 @@ _hb_usage() {
   cat <<USAGE
 5dive heartbeat — wake agents only when they have queued tasks
 
-  5dive heartbeat on  <name> [--every=<dur>] [--fresh]
-                                          # enrol agent; default every=${_HB_DEFAULT_EVERY}m, fresh off
+  5dive heartbeat on  <name> [--every=<dur>] [--fresh|--no-fresh]
+                                          # enrol agent; default every=${_HB_DEFAULT_EVERY}m; fresh ON for a seat that
+                                          # reports to an agent with no human chat, or a pinned reviewer
   5dive heartbeat off <name>              # stop waking the agent (keeps its settings)
   5dive heartbeat self on|off             # enrol or pause YOUR OWN seat (works from a standard seat)
   5dive heartbeat ls                      # show enrolled agents + next-wake + queued count
@@ -981,7 +982,10 @@ _hb_usage() {
         (systemctl stop) after --sleep-after minutes (default ${_HB_SLEEP_AFTER_MIN}m) and is
         woken again by the next trigger. 'always_on' (default) is unchanged;
         main + marketing are pinned always-on and refuse 'cold'.
-  fresh (default off,): --fresh sends /clear before each task so
+  fresh (DIVE-8189: ON by default for a seat that reports to an agent and
+        holds no human chat, and for a pinned reviewer; off otherwise, and
+        always off on codex; an existing enrolment keeps its mode; --fresh /
+        --no-fresh always win): --fresh sends /clear before each task so
         context starts clean, at the cost of a full CLAUDE.md/project re-prime
         on every wake (up to ~48x/day on the default 30m cadence). Off keeps
         the running conversation across tasks — cheaper, and what main/
@@ -1354,37 +1358,131 @@ _hb_parse_every() {
   printf '%s' "$total"
 }
 
+# -------- DIVE-8189: a worker with no human chat starts each task fresh ------
+#
+# lodar, 2026-11-11 (forwarded from his other box, where he was the owner
+# surprised that his worker and reviewer seats were not fresh): the owner had to
+# KNOW to run `heartbeat on <seat> --fresh` by hand. So enrolment now picks the
+# mode from the org chart, and says which and why:
+#
+#   on  — the seat reports to an AGENT and holds no human channel (channels=none):
+#         it only works rows a lead hands it, so nothing is lost by a clean window
+#         and one verdict no longer carries the last row's reasoning;
+#   on  — the seat is a PINNED REVIEWER (a row names it with --review=<seat>, so
+#         tasks.review_mode = 'seat:<name>');
+#   off — everything else: an org root, a seat reporting to a human or to nobody,
+#         and any seat that holds a human chat (telegram, discord, dashboard…) —
+#         a fresh wake would wipe that live conversation;
+#   off — a codex seat, whatever the chart says, until a fresh wake on a codex
+#         pane works (the proposal cites 13495edd3576).
+#
+# REJECTED: fresh for every subordinate (on the proposer's box 7 of 8 such seats
+# hold a human chat) and a print-only hint (the hint was the status quo).
+#
+# Output is "on|<why>" or "off|<why>". Read-only: never writes the registry.
+_hb_fresh_default() { # <name> [<registry-json>]
+  local name="$1" reg="${2:-}"
+  [[ -n "$reg" ]] || reg=$(registry_read)
+  local type channels
+  type=$(jq -r --arg n "$name" '.agents[$n].type // ""' <<<"$reg" 2>/dev/null) || type=""
+  channels=$(jq -r --arg n "$name" '.agents[$n].channels // "none" | if . == "" then "none" else . end' <<<"$reg" 2>/dev/null) || channels="none"
+  if [[ "$type" == codex ]]; then
+    printf 'off|codex seat: a fresh wake does not work on a codex pane yet'
+    return 0
+  fi
+  local pinned="0" mgr=""
+  if [[ -n "${TASKS_DB:-}" && -f "$TASKS_DB" ]]; then
+    pinned=$(db "SELECT COUNT(*) FROM tasks WHERE review_mode=$(sqlq "seat:$name");" 2>/dev/null) || pinned="0"
+    mgr=$(db "SELECT COALESCE(reports_to,'') FROM agents_org WHERE name=$(sqlq "$name") LIMIT 1;" 2>/dev/null) || mgr=""
+  fi
+  if [[ "$pinned" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'on|pinned reviewer on %s row(s)' "$pinned"
+    return 0
+  fi
+  # "reports to an agent" = the manager is a seat in THIS registry. A chart edge
+  # to a name that is not a seat (a human, a removed agent) is not a lead that
+  # hands it rows.
+  if [[ -z "$mgr" || "$(jq -r --arg m "$mgr" '(.agents // {}) | has($m)' <<<"$reg" 2>/dev/null)" != "true" ]]; then
+    printf 'off|reports to no agent'
+    return 0
+  fi
+  if [[ "$channels" == none ]]; then
+    printf 'on|reports to %s, no human channel' "$mgr"
+  else
+    printf 'off|reports to %s but holds a human chat (%s)' "$mgr" "$channels"
+  fi
+}
+
+# DIVE-8189: re-derive the default for a seat whose CURRENT mode came from that
+# default (heartbeat.freshSource == "default") — the `org set` hook. An explicit
+# --fresh/--no-fresh, a team import's choice, or an enrolment made before
+# DIVE-8189 (no freshSource) is never touched. Prints the change, if any.
+# Must run under with_registry_lock.
+_hb_fresh_rederive() { # <name>
+  local name="$1" reg src cur pick want why
+  reg=$(registry_read)
+  src=$(jq -r --arg n "$name" '.agents[$n].heartbeat.freshSource // ""' <<<"$reg" 2>/dev/null) || return 0
+  [[ "$src" == default ]] || return 0
+  cur=$(jq -r --arg n "$name" '.agents[$n].heartbeat.fresh // false' <<<"$reg" 2>/dev/null) || return 0
+  pick=$(_hb_fresh_default "$name" "$reg"); why="${pick#*|}"
+  [[ "${pick%%|*}" == on ]] && want=true || want=false
+  [[ "$want" == "$cur" ]] && return 0
+  jq --arg n "$name" --argjson f "$want" --arg w "$why" \
+    '.agents[$n].heartbeat += {fresh: $f, freshWhy: $w}' <<<"$reg" | registry_write
+  step "heartbeat for '$name': fresh=${pick%%|*} (${why})"
+}
+
 cmd_heartbeat_on() {
   require_root "heartbeat on"
-  local name="" every="" fresh="false"
+  # fresh_flag: "" = not given. DIVE-8189: no flag is no longer "off" — a NEW
+  # enrolment takes the org-chart default (_hb_fresh_default), an EXISTING one
+  # keeps the mode it has. An explicit flag always wins.
+  local name="" every="" fresh_flag=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --every=*)  every="${1#*=}" ;;
-      --fresh)    fresh="true" ;;
-      --no-fresh) fresh="false" ;;
+      --fresh)    fresh_flag="true" ;;
+      --no-fresh) fresh_flag="false" ;;
       -*)         fail "$E_USAGE" "unknown flag: $1" ;;
       *)          [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "unexpected arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive heartbeat on <name> [--every=<dur>] [--fresh]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive heartbeat on <name> [--every=<dur>] [--fresh|--no-fresh]"
   require_agent "$name"
   local everyMin="$_HB_DEFAULT_EVERY"
   if [[ -n "$every" ]]; then
     everyMin=$(_hb_parse_every "$every") || fail "$E_VALIDATION" "bad --every '$every' (use minutes, or 45m / 2h / 1h30m)"
   fi
   local reg; reg=$(registry_read)
+  local fresh src why
+  if [[ -n "$fresh_flag" ]]; then
+    fresh="$fresh_flag"; src="explicit"
+    [[ "$fresh" == true ]] && why="--fresh" || why="--no-fresh"
+  elif [[ "$(jq -r --arg n "$name" '(.agents[$n].heartbeat // {}) | has("fresh")' <<<"$reg" 2>/dev/null)" == "true" ]]; then
+    # Never change an existing enrolment: re-running `heartbeat on` (or a resume
+    # after `heartbeat off`) used to reset a fresh seat to warm.
+    fresh=$(jq -r --arg n "$name" '.agents[$n].heartbeat.fresh == true' <<<"$reg")
+    src=$(jq -r --arg n "$name" '.agents[$n].heartbeat.freshSource // ""' <<<"$reg")
+    why="kept from the existing enrolment"
+  else
+    local pick; pick=$(_hb_fresh_default "$name" "$reg")
+    [[ "${pick%%|*}" == on ]] && fresh=true || fresh=false
+    src="default"; why="${pick#*|}"
+  fi
+  local fresh_word; [[ "$fresh" == true ]] && fresh_word=on || fresh_word=off
   # Preserve any existing lastRunAt so toggling on/off doesn't reset the throttle.
   echo "$reg" | jq --arg n "$name" --argjson e "$everyMin" --argjson f "$fresh" \
-    '.agents[$n].heartbeat = {
+      --arg s "$src" --arg w "$why" \
+    '.agents[$n].heartbeat = ((.agents[$n].heartbeat // {}) + {
         enabled: true,
         everyMin: $e,
         fresh: $f,
         lastRunAt: (.agents[$n].heartbeat.lastRunAt // 0)
-     }' | registry_write
-  ok "heartbeat on for '$name' (every ${everyMin}m, fresh=${fresh})" \
-     '{name:$n, enabled:true, everyMin:($e|tonumber), fresh:($f=="true")}' \
-     --arg n "$name" --arg e "$everyMin" --arg f "$fresh"
+     } + (if $s == "" then {} else {freshSource: $s, freshWhy: $w} end))' | registry_write
+  ok "heartbeat on for '$name' (every ${everyMin}m, fresh=${fresh_word} (${why}))" \
+     '{name:$n, enabled:true, everyMin:($e|tonumber), fresh:($f=="true"), freshWhy:$w}' \
+     --arg n "$name" --arg e "$everyMin" --arg f "$fresh" --arg w "$why"
 }
 
 cmd_heartbeat_off() {
