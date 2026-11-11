@@ -19,6 +19,11 @@
 #   G9   owners: `owners` wins over allowFrom but only allowlisted, positive ids.
 #   G10  no owner id: nothing is sent.
 #   G11  the persona's name and welcome replace the bot's (bun only; skipped without).
+#   G12  OINOA-43: a Russian greeting carries the bot's Russian short description
+#        (language_code=ru), else the default one; the English greeting keeps English.
+#   G13  OINOA-43: a bot whose own name is Cyrillic (a Russian client confirmed
+#        «Джейн») is greeted in Russian under that name, even over the persona's
+#        Latin «Jane»; the English greeting and a Latin bot name keep the persona's.
 #   E1-E2 under the binary's set -e, a dead network (every call, or only the peek)
 #        costs the sends, never the run: it still ends with its JSON line, rc 0.
 #   P1-P2 the markers are written as the seat (runuser -u agent-<name> when root),
@@ -80,8 +85,11 @@ body=""; prev=""; for a in "$@"; do [[ "$prev" == "--data-binary" ]] && body="$a
 printf '%s %s\n' "$method" "$body" >>"$STUB_DIR/calls.log"
 [[ "${STUB_CURL_FAIL:-}" == all || "${STUB_CURL_FAIL:-}" == "$method" ]] && exit 7
 case "$method" in
-  getMe) printf '{"ok":true,"result":{"id":7000000001,"first_name":"Ada","username":"ada_bot"}}' ;;
-  getMyShortDescription) printf '{"ok":true,"result":{"short_description":"keeps the books"}}' ;;
+  getMe) jq -cn --arg n "${STUB_BOT_NAME:-Ada}" '{ok: true, result: {id: 7000000001, first_name: $n, username: "ada_bot"}}' ;;
+  getMyShortDescription)
+    # OINOA-43: the Russian line lives under language_code=ru; none set = "" (Telegram's answer).
+    if [[ "$body" == *'"language_code":"ru"'* ]]; then jq -cn --arg d "${STUB_ABOUT_RU:-}" '{ok: true, result: {short_description: $d}}'
+    else printf '{"ok":true,"result":{"short_description":"keeps the books"}}'; fi ;;
   sendMessage)
     chat=$(jq -r .chat_id <<<"$body")
     # 403 until the owner's own message has been seen (they pressed Start).
@@ -207,6 +215,53 @@ if command -v bun >/dev/null 2>&1; then
   check "G11 the persona's name replaces the bot's" '[[ "$t" == "Hi, I'"'"'m Olivia."$'"'"'\n'"'"'"Olivia keeps the books."* ]]' "$t"
 else
   printf 'skip - G11 (no bun on PATH)\n'
+fi
+
+# ── G12-G13: a Russian client's tagline and name (OINOA-43) ──────────────────
+# ru_greeting — the greeting a 403 owner reads after their first message, in ru.
+ru_greeting() {
+  printf '[{"update_id":20,"message":{"chat":{"id":%s,"type":"private"},"from":{"id":%s,"language_code":"ru"},"text":"/start"}}]\n' \
+    "$OWNER" "$OWNER" >"$TMP/updates-ru.json"
+  STUB_403="$OWNER" STUB_UPDATES="$TMP/updates-ru.json" run ada
+  grep '^sendMessage ' "$TMP/calls.log" | cut -d' ' -f2- | jq -s -r 'last | .text'
+}
+RU_TAG="Держит всё вокруг вас в порядке."
+seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+t=$(STUB_ABOUT_RU="$RU_TAG" ru_greeting)
+check "G12 the Russian greeting carries the Russian short description, no English line" \
+  '[[ "$t" == "Здравствуйте, я Ada."$'"'"'\n'"'"'"$RU_TAG"$'"'"'\n\n'"'"'"Напишите, что нужно сделать"* && "$t" != *"keeps the books"* ]]' "$t"
+check "G12 it asked getMyShortDescription with language_code ru" 'grep -q "^getMyShortDescription .*\"language_code\":\"ru\"" "$TMP/calls.log"'
+seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+t=$(ru_greeting)
+check "G12 no Russian line on the bot: the default one, as before" '[[ "$t" == "Здравствуйте, я Ada."$'"'"'\n'"'"'"Ada keeps the books."* ]]' "$t"
+seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+STUB_ABOUT_RU="$RU_TAG" run ada
+t=$(grep -m1 '^sendMessage ' "$TMP/calls.log" | cut -d' ' -f2- | jq -r .text)
+check "G12 the English greeting keeps the English line" '[[ "$t" == "Hi, I'"'"'m Ada."$'"'"'\n'"'"'"Ada keeps the books."* ]]' "$t"
+
+seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+t=$(STUB_BOT_NAME="Джейн" STUB_ABOUT_RU="$RU_TAG" ru_greeting)
+check "G13 a bot named in Russian greets a Russian owner under that name" \
+  '[[ "$t" == "Здравствуйте, я Джейн."$'"'"'\n'"'"'"$RU_TAG"* ]]' "$t"
+if command -v bun >/dev/null 2>&1; then
+  seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+  mkdir -p "$AGENT_HOME_ROOT/agent-ada/.claude"
+  printf 'name: Jane\n' >"$AGENT_HOME_ROOT/agent-ada/.claude/persona.yaml"
+  t=$(STUB_BOT_NAME="Джейн" STUB_ABOUT_RU="$RU_TAG" ru_greeting)
+  check "G13 the bot's Russian name wins over the persona's Latin one in Russian" '[[ "$t" == "Здравствуйте, я Джейн."* ]]' "$t"
+  seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+  mkdir -p "$AGENT_HOME_ROOT/agent-ada/.claude"
+  printf 'name: Jane\n' >"$AGENT_HOME_ROOT/agent-ada/.claude/persona.yaml"
+  STUB_BOT_NAME="Джейн" run ada
+  t=$(grep -m1 '^sendMessage ' "$TMP/calls.log" | cut -d' ' -f2- | jq -r .text)
+  check "G13 the English greeting keeps the persona's name" '[[ "$t" == "Hi, I'"'"'m Jane."* ]]' "$t"
+  seat ada claude "{\"allowFrom\":[\"$OWNER\"]}"
+  mkdir -p "$AGENT_HOME_ROOT/agent-ada/.claude"
+  printf 'name: Jane\n' >"$AGENT_HOME_ROOT/agent-ada/.claude/persona.yaml"
+  t=$(ru_greeting)
+  check "G13 a Latin bot name: the persona's name in Russian too, as before" '[[ "$t" == "Здравствуйте, я Jane."* ]]' "$t"
+else
+  printf 'skip - G13 persona arms (no bun on PATH)\n'
 fi
 
 # ── E1-E2: set -e and a dead network ─────────────────────────────────────────
