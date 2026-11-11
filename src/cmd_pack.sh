@@ -3908,13 +3908,21 @@ cmd_import() {
   elif (( ! shared_login )); then
     cargs+=("--defer-auth")
   fi
-  if [[ -n "$channels" ]]; then
-    cargs+=("--channels=$channels")
-  elif [[ -n "$tg_token" ]]; then
-    cargs+=("--channels=telegram")
-  elif [[ -n "$dc_token" ]]; then
-    cargs+=("--channels=discord")
+  # DIVE-8181: an import is a hire, so its seat starts with the app's chat on
+  # (hire_app_chat, validation.sh) and the owner's first "Chat here" opens at
+  # once. FIVEDIVE_HIRE_CHAT, set by `team import` per seat: 0 for a member (as
+  # before), lead for its lead (added to the template's own channels too).
+  # Unset is a single hire: an explicit --channels is kept as given.
+  local hire_ch="$channels" hire_mode="${FIVEDIVE_HIRE_CHAT:-1}"
+  if [[ -z "$hire_ch" ]]; then
+    if [[ -n "$tg_token" ]]; then hire_ch=telegram
+    elif [[ -n "$dc_token" ]]; then hire_ch=discord
+    fi
+    [[ "$hire_mode" == 0 ]] || hire_ch=$(hire_app_chat "$type" "$hire_ch")
+  elif [[ "$hire_mode" == lead ]]; then
+    hire_ch=$(hire_app_chat "$type" "$hire_ch")
   fi
+  [[ -n "$hire_ch" ]] && cargs+=("--channels=$hire_ch")
   # DIVE-7028: no channel named -> none, chosen by cmd_create (which gives a seat
   # on a box linked to 5dive.app chat that chat).
   [[ -n "$tg_token" ]] && cargs+=("--telegram-token=$tg_token")
