@@ -362,6 +362,7 @@ Auth (lower-level; the dashboard uses these — prefer 'account' for human-drive
   5dive agent auth start <type> [--auth-profile=<name>]      # non-TTY device-code: returns session id
   5dive agent auth poll <session_id>                         # {state, url, error}
   5dive agent auth submit <session_id> --code=<callback>     # paste the claude callback code
+  5dive agent auth submit <session_id> --code=-              # the same, the code read from stdin
   5dive agent auth cancel <session_id>
   5dive agent auth reap [--ttl=<secs>] [--max-age=<secs>] [--dry-run]
                                                        # kill abandoned login processes + drop old session dirs
