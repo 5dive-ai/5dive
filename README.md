@@ -105,7 +105,7 @@ sudo 5dive agent create scout --type=codex --auth-profile=gpt
 
 `--api-key=-` reads the key from stdin, so it never lands in your shell history. [More agent types, models and Telegram bots →](docs/guide.md#agent-types)
 
-Each agent can also be a Microsoft Teams contact, through the teams plugin. [Microsoft Teams guide →](https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/teams)
+Each agent can also be a Microsoft Teams contact, through the teams plugin. [Microsoft Teams guide →](https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/teams#readme)
 
 ## Hire agents and teams
 
