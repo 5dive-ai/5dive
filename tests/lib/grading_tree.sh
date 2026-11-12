@@ -110,6 +110,15 @@ fi
 . "$(dirname -- "${BASH_SOURCE[0]}")/env_isolation.sh" \
   || printf 'env isolation: UNRESOLVED (tests/lib/env_isolation.sh not reachable; caller FIVE_* knobs NOT cleared)\n' >&2
 
+# DIVE-8295: a board created today numbers its default project TASK-N; ~800
+# harnesses here were written against DIVE-<n> on a fresh fixture board. Pin the
+# old prefix for them so a product default does not silently move their fixture —
+# the DIVE-4402 pattern below. FIVEDIVE_, not FIVE_, for the reason given at
+# live_arm_ok below: env_isolation.sh clears and REPORTS every FIVE_* knob, and its
+# own harnesses pin that report silent. A harness that grades the real default
+# unsets it, as tests/task_prefix_default_unit.sh does.
+export FIVEDIVE_TASK_PREFIX=DIVE
+
 # DIVE-4402: harnesses that grade an always-on verifier box opt in explicitly
 # after creating their disposable STATE_DIR. Default-policy harnesses omit the
 # call, so a production default change cannot silently move their fixture.

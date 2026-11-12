@@ -2245,11 +2245,18 @@ _sup_goal_drift() {  # <type> <home> <name> <now> <act_epoch>
   set_ts=$(grep -oE '"timestamp":"[^"]+"' <<<"$setline" | head -1 | cut -d'"' -f4) || set_ts=""
   [[ -n "$set_ts" ]] && set_epoch=$(date -d "$set_ts" +%s 2>/dev/null) || set_epoch=""
   [[ "$set_epoch" =~ ^[0-9]+$ ]] && (( now - set_epoch < _SUP_T_SLOW_MIN * 60 )) && return 0
-  local task
-  task=$(grep -oE 'DIVE-[0-9]+' <<<"$setline" | head -1 | grep -oE '[0-9]+') || task=""
-  [[ -n "$task" ]] || return 0
-  local st
-  st=$(db "SELECT status FROM tasks WHERE id=${task};" 2>/dev/null || echo "")
+  # DIVE-8295: the goal names an IDENT (TASK-N on a new box, DIVE-N on ours), and an
+  # ident's number is not the row id once a second project mints rows — so resolve
+  # the ident to its row and echo that id (goalDriftTask stays the numeric row id).
+  # `| head -1`, not `grep -m1`: -m1 caps LINES, and the goal line names the ident
+  # twice ("Task X … task start X").
+  local ident task
+  ident=$(grep -oE "$(task_ident_ere)" <<<"$setline" | head -1) || ident=""
+  [[ -n "$ident" ]] || return 0
+  local st row
+  row=$(db "SELECT id||'|'||status FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
+  task="${row%%|*}"; st="${row#*|}"
+  [[ "$task" =~ ^[0-9]+$ ]] || return 0
   # Only a still-untouched (todo) target is drift; in_progress (by anyone) or
   # any terminal/blocked state means the goal is being served or is satisfied.
   [[ "$st" == "todo" ]] || return 0
@@ -2650,7 +2657,7 @@ _sup_classify() {
     # Observe-only: the P2 act loop is gated on class=="stuck", so this never
     # nudges/resumes/rotates — surfaced for the audit trail and board only.
     class="drift"; cause="goal-drift"
-    detail="active /goal targets DIVE-${goal_drift_task} (still todo); agent progressing elsewhere"
+    detail="active /goal targets $(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks WHERE id=${goal_drift_task};" 2>/dev/null || echo "row ${goal_drift_task}") (still todo); agent progressing elsewhere"
   elif (( has_work )); then
     detail="active"
   elif (( stranded > 0 )); then

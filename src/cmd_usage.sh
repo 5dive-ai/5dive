@@ -2354,7 +2354,7 @@ cmd_activity() {
       *)               args+=("$a") ;;
     esac
   done
-  [[ ${#args[@]} -eq 1 ]] || fail "$E_USAGE" "usage: 5dive activity <agent> [--7d] [--task=DIVE-N] [--limit=N] [--json]"
+  [[ ${#args[@]} -eq 1 ]] || fail "$E_USAGE" "usage: 5dive activity <agent> [--7d] [--task=TASK-N] [--limit=N] [--json]"
   agent="${args[0]}"
   [[ "$limit" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--limit must be an integer"
   require_root

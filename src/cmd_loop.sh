@@ -969,7 +969,7 @@ cmd_loop_verify() {
     esac
     shift
   done
-  [[ -n "$target" ]]   || fail "$E_USAGE" "loop verify: --target=<id|DIVE-N> required"
+  [[ -n "$target" ]]   || fail "$E_USAGE" "loop verify: --target=<id|TASK-N> required"
   [[ -n "$verifier" ]] || fail "$E_USAGE" "loop verify: --verifier=<agent> required"
   [[ -z "$max_iters" || "$max_iters" =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--max-iters must be a positive integer"
   [[ -z "$ceiling"   || "$ceiling"   =~ ^[1-9][0-9]*$ ]] || fail "$E_VALIDATION" "--ceiling must be a positive integer (tokens)"
@@ -1096,7 +1096,7 @@ cmd_loop_grade() {
     esac
     shift
   done
-  [[ -n "$target" ]]   || fail "$E_USAGE" "loop grade: --target=<id|DIVE-N> required"
+  [[ -n "$target" ]]   || fail "$E_USAGE" "loop grade: --target=<id|TASK-N> required"
   [[ -n "$verifier" ]] || fail "$E_USAGE" "loop grade: --verifier=<agent> required"
   [[ -z "$threshold" || "$threshold" =~ ^[0-9]+$ ]] && [[ -z "$threshold" || "$threshold" -le 100 ]] \
     || fail "$E_VALIDATION" "--threshold must be an integer 0-100"

@@ -297,7 +297,9 @@ SITES=(
   # DIVE-6985: was "src/cmd_account.sh:base_url". That grep is gone (combined.env
   # is read with builtins now), so the arm follows the same file's remaining
   # grep-probe guard, the hermes `default:` line in account_signin_detail_v.
-  "src/cmd_supervisor.sh:task"  "src/cmd_pack.sh:found"      "src/cmd_account.sh:default_line"
+  # DIVE-8295: the goal-drift probe now extracts the IDENT (any board prefix) and
+  # resolves it to a row, so its guarded variable is `ident`, no longer `task`.
+  "src/cmd_supervisor.sh:ident" "src/cmd_pack.sh:found"      "src/cmd_account.sh:default_line"
   "src/cmd_agent_telegram.sh:token" "src/cmd_cos.sh:atok"    "src/cmd_selfupdate.sh:start_line"
   "src/cmd_doctor.sh:last_event" "src/cmd_loop_pack.sh:ident" "src/cmd_agent_config.sh:token_for_install"
   # DIVE-3572's whois site ("src/cmd_agent_buzz_whois.sh:n") left with the buzz

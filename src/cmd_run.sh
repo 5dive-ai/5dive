@@ -8,7 +8,7 @@
 _run_usage() {
   cat >&2 <<'USAGE'
 usage:
-  5dive run ls [--task=DIVE-N] [--agent=<name>] [--role=maker|verifier]
+  5dive run ls [--task=TASK-N] [--agent=<name>] [--role=maker|verifier]
                [--status=running|completed|failed|abandoned|parked]
                [--outcome=<s>] [--since=<24h|7d|YYYY-MM-DD>] [--limit=N] [--json]
   5dive run show <RUN-ID> [--json]

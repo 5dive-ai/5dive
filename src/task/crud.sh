@@ -1404,7 +1404,7 @@ cmd_task_show() {
     esac
     shift
   done
-  [[ ${#pos[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task show <id|DIVE-N> [--no-body]"
+  [[ ${#pos[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task show <id|TASK-N> [--no-body]"
   resolve_task_id "${pos[0]}"; local id="$RESOLVED_TASK_ID"
   if (( JSON_MODE )); then
     local task subs deps previous_gates
@@ -1764,7 +1764,7 @@ _gate_history_show_summary() {
 
 cmd_task_gate_history() {
   tasks_db_init
-  [[ $# -eq 1 ]] || fail "$E_USAGE" "usage: 5dive task gate-history <id|DIVE-N>"
+  [[ $# -eq 1 ]] || fail "$E_USAGE" "usage: 5dive task gate-history <id|TASK-N>"
   resolve_task_id "$1"
   local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local summary rows count coverage state basis
@@ -1831,7 +1831,7 @@ cmd_task_gate_history() {
 
 cmd_task_assign() {
   tasks_db_init
-  [[ $# -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task assign <id|DIVE-N> <agent>"
+  [[ $# -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task assign <id|TASK-N> <agent>"
   resolve_task_id "$1"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local who="$2"
   # DIVE-3344: the raw reassignment verb, and the one that can move a live row
@@ -1953,7 +1953,7 @@ cmd_task_verifier() {
     shift
   done
   [[ -n "$task" && -n "$who" ]] \
-    || fail "$E_USAGE" "usage: 5dive task verifier <id|DIVE-N> <agent> [--accept=<criteria>] [--max-iters=<n>]"
+    || fail "$E_USAGE" "usage: 5dive task verifier <id|TASK-N> <agent> [--accept=<criteria>] [--max-iters=<n>]"
   [[ -z "$max_iters" || "$max_iters" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--max-iters must be a positive integer"
   # DIVE-3344: a verifier is a DISPATCH TARGET too — delivering writes

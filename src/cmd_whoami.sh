@@ -26,11 +26,11 @@ cmd_whoami() {
       # entry point the sealed harness already grades.
       --for)   fail "$E_USAGE" "--for needs a subject: 5dive whoami --for=<id|DIVE-N>" ;;
       --for=*) subject="${a#--for=}"
-               [[ -n "$subject" ]] || fail "$E_USAGE" "--for needs a subject: 5dive whoami --for=<id|DIVE-N>" ;;
+               [[ -n "$subject" ]] || fail "$E_USAGE" "--for needs a subject: 5dive whoami --for=<id|TASK-N>" ;;
       -h|--help)
         cat <<'EOF'
 5dive whoami [--json]
-5dive whoami --for=<id|DIVE-N> [--json]
+5dive whoami --for=<id|TASK-N> [--json]
 
 Print the actor, authority and tier of the CURRENT process, with the source of each.
 
@@ -51,7 +51,7 @@ Exit status: 0 when the actor was measured, 6 (auth_required) when it was not.
 --for=<id|DIVE-N>   render the RECORDED authority chain for one board row —
                     who created / started / delivered / answered-a-gate-on /
                     closed it, and under whose authority — from the ledger.
-                    Scope it with --for=task:DIVE-N, gate:DIVE-N, action:DIVE-N.
+                    Scope it with --for=task:TASK-N, gate:TASK-N, action:TASK-N.
 
   Every link resolves to exactly one of three verdicts:
     measured      an event of the right kind exists and names an identity.

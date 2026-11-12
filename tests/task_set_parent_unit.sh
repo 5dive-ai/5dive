@@ -216,7 +216,7 @@ eq_t "G4c: ... and the edge landed" \
      "NUM-9300"
 
 # The help text is what made the bare form look intended (wiki, Delta 2026-08-11).
-has_t "G5: the add help line names the IDENT form" "$( (_task_usage) 2>&1 )" "--parent=<DIVE-N>"
+has_t "G5: the add help line names the IDENT form" "$( (_task_usage) 2>&1 )" "--parent=<TASK-N>"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

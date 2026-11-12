@@ -38,7 +38,7 @@ _loop_pack_help() {
   cat <<'EOF'
 5dive loop install — install a marketplace loop pack (recurring agentic workflow)
 
-  loop install   <slug> --onto=<agent> [--cron="<5-field>"] [--ceiling=<tokens>] [--held-by=<DIVE-N>] [--dry-run]
+  loop install   <slug> --onto=<agent> [--cron="<5-field>"] [--ceiling=<tokens>] [--held-by=<TASK-N>] [--dry-run]
   loop uninstall <slug> --from=<agent> [--purge-skills]
   loop show      <slug>
 
@@ -161,7 +161,7 @@ cmd_loop_pack_install() {
   if (( JSON_MODE )); then
     ident=$(jq -r '.data.ident // empty' <<<"$out" 2>/dev/null)
   else
-    ident=$(grep -oE 'DIVE-[0-9]+' <<<"$out" | head -1) || ident=""
+    ident=$(grep -oE "$(task_ident_ere)" <<<"$out" | head -1) || ident=""
   fi
   [[ -n "$ident" ]] || fail "$E_GENERIC" "failed to register the recurring job for loop '$slug'"
 

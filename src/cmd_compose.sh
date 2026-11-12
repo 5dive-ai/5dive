@@ -902,7 +902,7 @@ _compose_hold_open() {
 
 ## First start (added by team import)
 
-Your team\'s seeded goals and recurring jobs wait for your owner\'s yes. While `5dive team plan` lists held work, start none of it. When your owner answers your plan, release what they approved with `5dive team start` (`--skip=<DIVE-N>,...` for what they dropped) or `5dive team decline` for a no. Write to your owner in '"$(_compose_kickoff_lang_name "$lang")"$', the language they use.
+Your team\'s seeded goals and recurring jobs wait for your owner\'s yes. While `5dive team plan` lists held work, start none of it. When your owner answers your plan, release what they approved with `5dive team start` (`--skip=<TASK-N>,...` for what they dropped) or `5dive team decline` for a no. Write to your owner in '"$(_compose_kickoff_lang_name "$lang")"$', the language they use.
 ' >/dev/null 2>&1 || true
   return 0
 }
@@ -2919,7 +2919,7 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
        5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
        5dive team plan    [<lead>]                    what is waiting for your yes
-       5dive team start   [<lead>] [--skip=<DIVE-N>,...]   release it (minus what you skip)
+       5dive team start   [<lead>] [--skip=<TASK-N>,...]   release it (minus what you skip)
        5dive team decline [<lead>]                    start none of it
        5dive team leave <team> <agent>                take him out of one team (he stays in the others)
        5dive team rm <team>                           forget a team; fires nobody (agent rm fires)
@@ -3912,7 +3912,7 @@ _team_plan() {
   [[ -n "$rows" ]] || echo "  (nothing is held)"
   echo ""
   echo "  start all of it:        5dive team start $TP_LEAD"
-  echo "  start all but some:     5dive team start $TP_LEAD --skip=<DIVE-N>,<DIVE-N>"
+  echo "  start all but some:     5dive team start $TP_LEAD --skip=<TASK-N>,<TASK-N>"
   echo "  start none of it:       5dive team decline $TP_LEAD"
   echo "  wait for the answer:    5dive task park $TP_KIDENT --reason=\"waiting for my owner's answer to the plan\" --wake=+3d"
 }

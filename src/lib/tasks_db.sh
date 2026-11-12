@@ -275,8 +275,11 @@ PRAGMA foreign_keys=ON;
 --   counter   per-project monotone task counter; the ident trigger bumps it
 --   lead_agent the project's coordinator (auto-assignee for its tasks; cf DIVE-333)
 --   folder     working dir the project's tasks/agents default into (advisory)
--- The default project key='dive' prefix='DIVE' is seeded below so every existing
--- DIVE-<n> ident is preserved (back-compat — see _tasks_db_migrate's dive backfill).
+-- The default project keeps key='dive'. DIVE-8295: a FRESH board seeds its prefix
+-- as TASK (TASK-1, TASK-2 …) — a customer's board must not carry our brand. A board
+-- that predates the projects table is seeded DIVE by _tasks_db_migrate's dive
+-- backfill instead, and INSERT OR IGNORE never touches a row that already exists,
+-- so every existing box keeps DIVE-<n> with no flag and no rename.
 CREATE TABLE IF NOT EXISTS projects (
   key         TEXT PRIMARY KEY,
   prefix      TEXT NOT NULL UNIQUE,
@@ -291,7 +294,7 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 INSERT OR IGNORE INTO projects (key, prefix, name, description)
-  VALUES ('dive', 'DIVE', 'Dive', 'Default project (the original DIVE-N queue)');
+  VALUES ('dive', 'TASK', 'Tasks', 'Default project');
 
 CREATE TABLE IF NOT EXISTS tasks (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1954,6 +1957,54 @@ _tasks_board_recover() {
 # repeatedly; command functions call it first. If the dir is missing and we
 # aren't root we can't create it (parent /var/lib/5dive is 2750), so emit a
 # one-time bootstrap hint instead of a cryptic failure.
+# DIVE-8295: the default project's ident prefix on a board created NOW. The schema
+# seeds TASK; FIVEDIVE_TASK_PREFIX (2-10 letters/digits, letter first) overrides it at
+# creation and ONLY at creation — the UPDATE is emitted on the fresh-store arm alone
+# and is guarded on counter=0, so it can never renumber a board that holds rows. Its
+# one standing caller is tests/lib/grading_tree.sh, which pins DIVE so the ~800
+# harnesses written against DIVE-<n> keep grading what they were written to grade
+# (same pattern as DIVE-4402's verify-policy fixture). Not a product chooser: a box
+# owner never sets it, and a bad value is refused in words, not half-applied.
+_tasks_fresh_prefix_sql() {
+  local p="${FIVEDIVE_TASK_PREFIX:-}"
+  [[ -n "$p" ]] || return 0
+  p="${p^^}"
+  if [[ ! "$p" =~ ^[A-Z][A-Z0-9]{1,9}$ ]]; then
+    printf 'warn: FIVEDIVE_TASK_PREFIX=%s is not 2-10 letters/digits starting with a letter; the new board keeps TASK\n' "$FIVEDIVE_TASK_PREFIX" >&2
+    return 0
+  fi
+  if [[ "$p" == "DIVE" ]]; then
+    printf "UPDATE projects SET prefix='DIVE', name='Dive', description='Default project (the original DIVE-N queue)' WHERE key='dive' AND counter=0;\n"
+  else
+    printf "UPDATE projects SET prefix='%s' WHERE key='dive' AND counter=0;\n" "$p"
+  fi
+}
+
+# DIVE-8295: the default project's prefix on THIS board — DIVE on every box that
+# predates the change, TASK on a board created after it. For text the CLI builds
+# itself (a fallback ident, a hint); a row's real ident is always its ident column.
+task_default_prefix() {
+  local p
+  p=$(db "SELECT prefix FROM projects WHERE key='dive';" 2>/dev/null) || p=""
+  [[ "$p" =~ ^[A-Z][A-Z0-9]*$ ]] || p="DIVE"
+  printf '%s' "$p"
+}
+
+# DIVE-8295: an ERE matching any ident THIS board can mint — one alternative per
+# project prefix, e.g. (TASK|FROG)-[0-9]+. For pulling an ident out of free text
+# (a nudge, a /goal line, a verb's output). Falls back to any <PREFIX>-<n> shape when
+# the board does not answer; every caller then looks the ident up, so a token that
+# merely looks like one (UTF-8) finds no row and is dropped there.
+task_ident_ere() {
+  local p
+  p=$(db "SELECT group_concat(prefix,'|') FROM projects;" 2>/dev/null) || p=""
+  if [[ "$p" =~ ^[A-Z][A-Z0-9]*(\|[A-Z][A-Z0-9]*)*$ ]]; then
+    printf '(%s)-[0-9]+' "$p"
+  else
+    printf '[A-Z][A-Z0-9]*-[0-9]+'
+  fi
+}
+
 tasks_db_init() {
   require_sqlite
   # DIVE-2518: prime the registry memo ONCE, here, in the top-level shell.
@@ -2011,6 +2062,7 @@ tasks_db_init() {
       # arm has just proved it created the whole schema from nothing.
       fresh_payload=$(sqlite3 -cmd ".timeout 5000" "$TASKS_DB" < <(
         _tasks_schema
+        _tasks_fresh_prefix_sql
         printf "INSERT INTO task_prefs(key,value) VALUES ('schema_epoch',%s);\n" \
           "$(sqlq "$_TASKS_SCHEMA_EPOCH")"
         # DIVE-2808: the ledger start marker was seeded inside _tasks_db_migrate,
@@ -3563,7 +3615,7 @@ resolve_task_id() {
     local up="${ref^^}"
     found=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$up");")
   else
-    fail "$E_VALIDATION" "bad task ref '$ref' (expected <number> or <PREFIX>-<number>, e.g. DIVE-42)"
+    fail "$E_VALIDATION" "bad task ref '$ref' (expected <number> or <PREFIX>-<number>, e.g. $(task_default_prefix)-42)"
   fi
   [[ -n "$found" ]] || fail "$E_NOT_FOUND" "no such task: $ref"
   RESOLVED_TASK_ID="$found"
@@ -3599,7 +3651,7 @@ _task_resolve_ref_strict() {
   local title; title=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${RESOLVED_TASK_ID};")
   local ident_number="${RESOLVED_TASK_IDENT##*-}"
   if [[ "$ident_number" != "$ref" ]]; then
-    fail "$E_VALIDATION" "'$ref' as $role is the global row id, which resolves to ${RESOLVED_TASK_IDENT} (\"${title}\") — not to an ident numbered $ref. The two number spaces diverged; name the row you mean by IDENT: ${RESOLVED_TASK_IDENT} (or DIVE-${ref}, if that is what you meant)."
+    fail "$E_VALIDATION" "'$ref' as $role is the global row id, which resolves to ${RESOLVED_TASK_IDENT} (\"${title}\") — not to an ident numbered $ref. The two number spaces diverged; name the row you mean by IDENT: ${RESOLVED_TASK_IDENT} (or $(task_default_prefix)-${ref}, if that is what you meant)."
   fi
   # It agrees TODAY. That is a coincidence of this row's history, not a property
   # of the argument form, so it still warns — and the ident form warns about

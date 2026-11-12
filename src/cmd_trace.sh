@@ -76,7 +76,7 @@ cmd_trace() {
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive trace <id|DIVE-N> [--json] [--no-audit]"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive trace <id|TASK-N> [--json] [--no-audit]"
   resolve_task_id "${positional[0]}"
   local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 

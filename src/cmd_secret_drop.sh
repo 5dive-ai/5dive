@@ -174,7 +174,7 @@ _secret_link() {
     shift
   done
   require_root secret link
-  [[ -n "$ref" || -n "$save" ]] || fail "$E_USAGE" "usage: 5dive secret link <DIVE-N> [--ttl=<minutes>] [--again] [--json] | --save=<name>"
+  [[ -n "$ref" || -n "$save" ]] || fail "$E_USAGE" "usage: 5dive secret link <TASK-N> [--ttl=<minutes>] [--again] [--json] | --save=<name>"
   [[ -z "$ref" || -z "$save" ]] || fail "$E_USAGE" "a link is for a task's gate OR a saved value (--save), not both"
   (( ! pair )) || [[ -n "$save" ]] || fail "$E_USAGE" "--pair is for a saved login: secret link --save=<name> --pair"
   (( ! card )) || [[ -n "$save" ]] || fail "$E_USAGE" "--card is for a saved card: secret link --save=<name> --card"

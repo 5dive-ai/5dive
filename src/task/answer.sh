@@ -804,7 +804,7 @@ cmd_task_answer() {
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task answer <id|DIVE-N> --value=\"...\" [--human]  (omit --value for a secret gate; the box owner adds --human in a login shell on the box)"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task answer <id|TASK-N> --value=\"...\" [--human]  (omit --value for a secret gate; the box owner adds --human in a login shell on the box)"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   # Must have a pending (unanswered) gate to answer.
   # ── DIVE-4833 — THE STALE RESPONSE, REFUSED AND RECORDED ────────────────────
@@ -2364,7 +2364,7 @@ cmd_task_escalate() {
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task escalate <id|DIVE-N>"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task escalate <id|TASK-N>"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
 
   # Don't escalate a finished task — there's nothing to get eyes on.
@@ -2446,7 +2446,7 @@ cmd_task_followup() {
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task followup <id|DIVE-N> --text=\"<message>\" [--from=<who>]"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task followup <id|TASK-N> --text=\"<message>\" [--from=<who>]"
   (( text_set )) || [[ ${#positional[@]} -lt 2 ]] || text="${positional[*]:1}"
   # Trim; a blank follow-up is a mis-tap, not a message.
   text="${text#"${text%%[![:space:]]*}"}"; text="${text%"${text##*[![:space:]]}"}"
@@ -2538,7 +2538,7 @@ cmd_task_followup() {
 
 cmd_task_rm() {
   tasks_db_init
-  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task rm <id|DIVE-N>"
+  [[ $# -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task rm <id|TASK-N>"
   resolve_task_id "$1"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   db "DELETE FROM tasks WHERE id=${id};"
   ok "$ident deleted" '{id:($i|tonumber), deleted:true}' --arg i "$id"

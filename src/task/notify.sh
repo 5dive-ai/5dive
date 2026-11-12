@@ -1705,7 +1705,7 @@ cmd_task_watch() {
     esac
     shift
   done
-  [[ ${#positional[@]} -eq 1 ]] || fail "$E_USAGE" "usage: 5dive task watch <id|DIVE-N> [--off]"
+  [[ ${#positional[@]} -eq 1 ]] || fail "$E_USAGE" "usage: 5dive task watch <id|TASK-N> [--off]"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   task_actor_claim ""
   me="$ACTOR_BOARD"

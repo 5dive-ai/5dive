@@ -391,7 +391,7 @@ Triggers (signed external event -> ordinary task):
   sudo 5dive trigger serve [--listen=127.0.0.1:8740]
   sudo 5dive trigger replay <delivery-id>
 
-Projects (ident namespaces for the queue; default 'dive' = DIVE-N):
+Projects (ident namespaces for the queue; default 'dive' = TASK-N; DIVE-N on older boards):
   5dive project add <key> --prefix=FROG [--name=] [--goal=] [--folder=] [--lead-agent=<agent>]
   5dive project ls | show <key>
   5dive project set-status <key> active|complete|archived|binned|backlogged
@@ -480,7 +480,7 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
   5dive usage --by=account [--7d]                    # by AUTH PROFILE, attributed per turn to the binding live then
   5dive usage --account=<n> [--by=agent|task] [--7d] # one profile: its seats, or the tasks that spent it
   5dive cost [--7d]                                  # budget-focused: per-agent 24h burn vs soft/ceiling + state
-  5dive activity <agent> [--7d] [--task=DIVE-N]      # what the agent actually did: files touched, commands run, cost
+  5dive activity <agent> [--7d] [--task=TASK-N]      # what the agent actually did: files touched, commands run, cost
   5dive usage budget set <agent> --daily=<tok> [--ceiling=<tok>] [--hard-stop] [--basis=quota|cost]
   5dive usage budget ls | clear <agent>              # hard-stop is OFF by default (warn-only); check runs on the heartbeat
   # TWO token bases, and they differ ~40x on agentic traffic (DIVE-4037):
@@ -490,7 +490,7 @@ Usage (per-agent / per-task token burn — subscription tokens, no dollars):
 
 Trace (causal timeline for one task, goal → ship —):
   5dive run ls|show|events|logs|retry|metrics        # execution attempts beneath tasks (DIVE-3932); one run = one agent's one attempt
-  5dive trace <id|DIVE-N> [--json] [--no-audit]      # read-only: origin (goal/parent/objective/loop) + lifecycle + gate provenance + verdict
+  5dive trace <id|TASK-N> [--json] [--no-audit]      # read-only: origin (goal/parent/objective/loop) + lifecycle + gate provenance + verdict
   5dive reflex log|replay|fake [...]                 # read-only: decision receipts + offline replay of a candidate backend (DIVE-4866)
 
 Memory (queryable team memory — read-path,):
@@ -501,9 +501,9 @@ Box disk:
 
 Dev-team tools (the devteam plugin — sudo 5dive plugin install devteam; DIVE-6938):
   5dive proof publish|on|off|status|scorecard        # zero-human proof badge, computed from digest (docs/zero-human.md)
-  5dive push <id|DIVE-N> [--open-pr[=<base>]]        # push ONLY the task's branch, ONLY after its gate clears (docs/delegated-push.md)
+  5dive push <id|TASK-N> [--open-pr[=<base>]]        # push ONLY the task's branch, ONLY after its gate clears (docs/delegated-push.md)
   5dive push setup                                   # scaffold + check the GitHub App credential (root)
-  5dive deploy <id|DIVE-N> [--target=<project@ref>]  # deploy ONLY what the task declares, ONLY after its gate clears
+  5dive deploy <id|TASK-N> [--target=<project@ref>]  # deploy ONLY what the task declares, ONLY after its gate clears
   5dive gh <gh args...>                              # actor-routed gh: writes go out as the machine account
   5dive gh whoami                                    # resolve both identities a gh write could go out as
   5dive task deliver|merge|merge-landed ...          # PR delivery, grading and the merge gate (5dive task --help)
@@ -511,7 +511,7 @@ Dev-team tools (the devteam plugin — sudo 5dive plugin install devteam; DIVE-6
 
 Identity:
   5dive whoami [--json]                    # the CURRENT process: actor, authority, tier + the SOURCE of each; exit 6 if unmeasurable
-  5dive whoami --for=<id|DIVE-N> [--json]  # the RECORDED authority chain for one row; EXIT 1 when a link that HAPPENED is unmeasurable
+  5dive whoami --for=<id|TASK-N> [--json]  # the RECORDED authority chain for one row; EXIT 1 when a link that HAPPENED is unmeasurable
                                            # scope it: --for=task:DIVE-N | gate:DIVE-N | action:DIVE-N
     Who is acting, under whose authority, at what tier — and the SOURCE of each.
     Identity is uid-first: \$EUID (or sudo's \$SUDO_UID at real root) resolved

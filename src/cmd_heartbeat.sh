@@ -490,9 +490,13 @@ _a2a_nudge_ident() {
     '[5dive-msg from=task-engine '*|'[5dive-msg from=task-engine]'*) ;;
     *) return 1 ;;
   esac
-  # -m1 rather than a grep-into-head pipe: header.sh sets -o pipefail, and a grep
-  # whose reader closes early returns non-zero, which would abort the caller.
-  id="$(grep -m1 -oE 'DIVE-[0-9]+' <<<"$payload" 2>/dev/null)" || return 1
+  # DIVE-8295: any prefix this board mints (TASK-N on a new box), not DIVE alone —
+  # a DIVE-only pattern found nothing on a TASK board and every stale nudge went out.
+  # A bash match rather than a grep pipe: no pipefail exposure, and it yields the
+  # FIRST ident even when the nudge names two (`grep -m1 -o` caps lines, not matches).
+  local ere; ere="$(task_ident_ere)"
+  [[ "$payload" =~ $ere ]] || return 1
+  id="${BASH_REMATCH[0]}"
   [[ -n "$id" ]] || return 1
   printf '%s' "$id"
 }
@@ -3997,7 +4001,7 @@ _hb_idle_marker() {
 _hb_ident() {
   local id="$1" ident
   ident=$(db "SELECT ident FROM tasks WHERE id=${id};" 2>/dev/null) || ident=""
-  echo "${ident:-DIVE-${id}}"
+  echo "${ident:-$(task_default_prefix)-${id}}"
 }
 
 # DIVE-2244 — THE DISPATCHER CLAIMS. Stamp status='in_progress' + started_at at
@@ -5962,7 +5966,7 @@ _hb_wake_start_unit_if_needed() {
 # <<< DIVE-4409 an operator-parked agent stays parked (the heartbeat wake)
 
 _hb_wake() {
-  local name="$1" fresh="$2" task_id="$3" task_ident="${4:-DIVE-$3}"
+  local name="$1" fresh="$2" task_id="$3" task_ident="${4:-$(_hb_ident "$3")}"
   _HB_WAKE_FAIL_STEP=""; _HB_WAKE_FAIL_REASON=""   # DIVE-4310: never stale
   # DIVE-1475 status guard: never inject a /goal for a task that isn't actionable.
   # The tick's picker (_hb_pick_task) only ever hands us a live todo, but the direct
