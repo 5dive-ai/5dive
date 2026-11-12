@@ -2250,17 +2250,20 @@ _sup_goal_drift() {  # <type> <home> <name> <now> <act_epoch>
   # the ident to its row and echo that id (goalDriftTask stays the numeric row id).
   # `| head -1`, not `grep -m1`: -m1 caps LINES, and the goal line names the ident
   # twice ("Task X … task start X").
-  local ident task
-  ident=$(grep -oE "$(task_ident_ere)" <<<"$setline" | head -1) || ident=""
-  [[ -n "$ident" ]] || return 0
-  local st row
-  row=$(db "SELECT id||'|'||status FROM tasks WHERE ident=$(sqlq "$ident");" 2>/dev/null || echo "")
-  task="${row%%|*}"; st="${row#*|}"
-  [[ "$task" =~ ^[0-9]+$ ]] || return 0
+  # The guarded variable stays named `task` (it now holds the ident): the
+  # unguarded_probe_substitution harness pins this site as cmd_supervisor.sh:task in
+  # BOTH its 5dive and 5dive-plugins copies, so a rename would split them.
+  local task
+  task=$(grep -oE "$(task_ident_ere)" <<<"$setline" | head -1) || task=""
+  [[ -n "$task" ]] || return 0
+  local st row id
+  row=$(db "SELECT id||'|'||status FROM tasks WHERE ident=$(sqlq "$task");" 2>/dev/null || echo "")
+  id="${row%%|*}"; st="${row#*|}"
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
   # Only a still-untouched (todo) target is drift; in_progress (by anyone) or
   # any terminal/blocked state means the goal is being served or is satisfied.
   [[ "$st" == "todo" ]] || return 0
-  echo "$task"
+  echo "$id"
 }
 
 _sup_usage() {
