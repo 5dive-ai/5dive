@@ -3191,6 +3191,41 @@ _hb_landed_check() {
   return 0
 }
 
+# DIVE-8269 — a /clear that ROTATED THE SESSION was submitted, whatever the pane
+# still showed. Measured 2026-11-11: vesper 09:00:19Z and quinn 02:40:08Z were
+# both marked wedged with '/clear' read in the composer after 2 Enters, while
+# each seat's new transcript already began `<command-name>/clear</command-name>`
+# ~1 s BEFORE the failure line. The pane read is the class that misfired, so the
+# receipt is the transcript: the seat's newest .jsonl is a DIFFERENT file from
+# the one `_hb_landed_mark` recorded before the first keystroke, AND its first
+# non-meta user record is the /clear command itself. A new file that starts with
+# anything else (a restart, a resume) is not this /clear and does not count. No
+# mark (unreadable store, no transcript yet) = cannot tell = rc 1, never a guess.
+# `_hb_landed_check` cannot do this: /clear is under its 12-char needle floor and
+# it reads a new file as not-landed by design. Sets _HB_CLEAR_RECEIPT on rc 0.
+_HB_CLEAR_RECEIPT=""
+_hb_clear_receipt() {
+  local name="$1" now_file first i tries="${_HB_CLEAR_RECEIPT_TRIES:-3}"
+  _HB_CLEAR_RECEIPT=""
+  [[ -n "$_HB_LANDED_FILE" ]] || return 1
+  for (( i = 0; i < tries; i++ )); do
+    (( i > 0 )) && sleep "${_HB_CLEAR_RECEIPT_SEC:-0.5}"
+    now_file=$(_hb_transcript_newest "$name")
+    [[ -n "$now_file" && "$now_file" != "$_HB_LANDED_FILE" ]] || continue
+    first=$(sudo -n -u "agent-${name}" head -n "${_HB_CLEAR_RECEIPT_LINES:-40}" "$now_file" 2>/dev/null \
+      | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
+      | grep -av '"isMeta"[[:space:]]*:[[:space:]]*true' \
+      | head -n 1)
+    [[ -n "$first" ]] || continue   # the new file exists but its first user record is not written yet
+    if [[ "$first" == *'<command-name>/clear</command-name>'* ]]; then
+      _HB_CLEAR_RECEIPT="the session rotated to $(basename "$now_file") (was $(basename "$_HB_LANDED_FILE")) and its first user record is <command-name>/clear</command-name>"
+      return 0
+    fi
+    return 1   # a new file that did not start with /clear: not this receipt, and waiting will not change its first record
+  done
+  return 1
+}
+
 # DIVE-4642 — ONE LINE, OR IT IS NOT A SUBMIT.
 #
 # `send-keys -l` puts the payload in the composer; the Enter that follows is what
@@ -3444,6 +3479,15 @@ _hb_send_line() {
     sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
     _hb_send_keys_step "$name" "submit retry (Enter)" Enter || { _hb_landed_check "$name" "$_hb_body" && return 0; return 1; }
     _hb_submit_settled "$name" && { _wedge_clear "$name"; return 0; }
+    # DIVE-8269: for /clear the pane is not the witness — the rotated transcript
+    # is. Checked BEFORE the wedge mark and the composer clear: a /clear that ran
+    # leaves nothing to clear, and the clear's recall arm must not touch a seat
+    # that has just started its fresh session.
+    if [[ "${text//[[:space:]]/}" == "/clear" ]] && _hb_clear_receipt "$name"; then
+      _hb_log "[$name] /clear ACCEPTED although the pane still read '${_HB_COMPOSER_UNSENT:0:60}' after 2 Enters — receipt: ${_HB_CLEAR_RECEIPT} (DIVE-8269)" 2>/dev/null || true
+      _wedge_clear "$name"
+      return 0
+    fi
     # DIVE-4642: the submit failed and we KNOW it. Two things follow, and today
     # neither happened: the seat is marked unhealthy so `5dive supervisor` names
     # it within one tick instead of reporting it busy forever, and the text we
