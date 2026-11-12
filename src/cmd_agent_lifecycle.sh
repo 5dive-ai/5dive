@@ -40,6 +40,12 @@ cmd_agent_seed_perms() {
   reg=$(registry_read 2>/dev/null) || return 0
   jq -e --arg n "$name" '.agents[$n] != null' <<<"$reg" >/dev/null 2>&1 || return 0
   normalize_restart_profile_perms "$name"
+  # DIVE-8294: an OpenClaw seat made before per-seat ports gets one here, on its
+  # next start (the nightly update's restart included), before 5dive-agent-start
+  # reads the env file. The first seat to ask keeps 18789.
+  if [[ $EUID -eq 0 && "$(jq -r --arg n "$name" '.agents[$n].type // empty' <<<"$reg" 2>/dev/null)" == openclaw ]]; then
+    openclaw_port_ensure "$name" >/dev/null 2>&1 || true
+  fi
   return 0
 }
 

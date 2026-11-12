@@ -1806,7 +1806,8 @@ chmod 600 "$TOKEN_FILE"
 
 # openclaw refuses to start the gateway when gateway.mode is unset (its
 # "suspicious or clobbered config" guard), so set it explicitly. `local`
-# matches the binding the agent uses (loopback on 127.0.0.1:18789).
+# matches the binding the agent uses (loopback on 127.0.0.1, on the seat's own
+# port: AGENT_OPENCLAW_PORT, written in by 5dive-agent-start, DIVE-8294).
 "$OPENCLAW" config set gateway.mode local 2>&1 | tail -3
 # DIVE-7355: say loopback, or a container's default bind (0.0.0.0) makes the
 # gateway refuse to start without a token.
