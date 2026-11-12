@@ -37,7 +37,7 @@ chown() { :; }   # write_agent_env stamps root:claude; not ours to grade as a us
 
 fail=0
 ok()  { echo "ok: $1"; }
-bad() { echo "FAIL: $1${2:+ ($2)}"; fail=1; }
+bad() { echo "FAIL: $1${2:+ ($2)}"; fail=$((fail+1)); }
 check() { if [[ "$2" == "$3" ]]; then ok "$1"; else bad "$1" "want=$3 got=$2"; fi; }
 port_of() { sed -n 's/^AGENT_OPENCLAW_PORT=//p' "$ENV_DIR/$1.env" 2>/dev/null | head -1; }
 
@@ -62,6 +62,11 @@ check "C7 a seat switched away from openclaw drops its port" "$(port_of oc2)" ""
 write_agent_env oc3 openclaw dashboard "" "" standard 2>/dev/null
 check "C8 a freed port is reused by the next create" "$(port_of oc3)" 18989
 check "C9 the env file keeps its other fields" "$(sed -n 's/^AGENT_TYPE=//p' "$ENV_DIR/oc3.env")" openclaw
+# A rewrite must keep the RECORDED port, not re-pick: free the slot below
+# oc3's (18789) first, so a re-pick would land somewhere else.
+rm -f "$ENV_DIR/oc1.env"
+write_agent_env oc3 openclaw "dashboard,telegram" "" "" standard 2>/dev/null
+check "C10 a rewrite keeps its port even when a lower slot is free" "$(port_of oc3)" 18989
 
 # ---------- M: migration of seats made before the fix ----------
 rm -f "$ENV_DIR"/*.env
@@ -127,4 +132,4 @@ else
   bad "S6 the pick runs under its own lock, never the registry lock"
 fi
 
-exit "$fail"
+[[ "$fail" -eq 0 ]]
