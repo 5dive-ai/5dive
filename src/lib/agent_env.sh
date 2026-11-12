@@ -110,3 +110,90 @@ agent_isolation_2src() {
   fi
   printf 'unknown:unmeasured\tunmeasured:%s:%s\n' "${e#unknown:}" "${r#unknown:}"
 }
+
+# ---------------------------------------------------------------------------
+# DIVE-8294: one OpenClaw gateway port per seat.
+#
+# Every OpenClaw seat with a channel runs `openclaw gateway run`, and every one
+# bound openclaw's default 127.0.0.1:18789. Each seat is its own Linux user, but
+# loopback ports belong to the whole host, so a second OpenClaw seat's gateway
+# could not bind and that agent never answered. OpenClaw resolves the port the
+# same way for the gateway and for its clients (`openclaw agent`, which the web
+# chat bridge runs): $OPENCLAW_GATEWAY_PORT, then gateway.port in the seat's
+# openclaw.json, then 18789. So the seat's own port is recorded here, in
+# AGENT_OPENCLAW_PORT of ${ENV_DIR}/<name>.env (the record 5dive-agent-start
+# already reads), and 5dive-agent-start writes it into the config and the env.
+#
+# Ports are 18789 + 200*n. 200 because OpenClaw derives more ports from the
+# gateway's: browser control at +2 and a browser CDP range at +11..+110.
+# The first seat keeps 18789. An existing seat with no port gets one on its
+# next start (`agent _seed_perms`, the unit's root pre-start step).
+OPENCLAW_PORT_BASE=18789
+OPENCLAW_PORT_STEP=200
+OPENCLAW_PORT_SLOTS=230
+
+openclaw_port_valid() {
+  [[ "${1:-}" =~ ^[1-9][0-9]{3,4}$ ]] && (( 10#$1 <= 65535 ))
+}
+
+# openclaw_port_listening <port> -- 0 when anything on this host LISTENs on it.
+# Reads /proc/net/tcp{,6} (no ss/netstat dependency). Tests point
+# OPENCLAW_PORT_NET_FILES at fixtures.
+openclaw_port_listening() {
+  local hex f files=()
+  hex=$(printf '%04X' "$1")
+  for f in ${OPENCLAW_PORT_NET_FILES:-/proc/net/tcp /proc/net/tcp6}; do
+    [[ -r "$f" ]] && files+=("$f")
+  done
+  (( ${#files[@]} )) || return 1
+  awk -v h="$hex" 'FNR > 1 { n = split($2, a, ":"); if (a[n] == h && $4 == "0A") f = 1 }
+                   END { exit !f }' "${files[@]}" 2>/dev/null
+}
+
+# openclaw_ports_taken [<self>] -- every port recorded for another seat.
+openclaw_ports_taken() {
+  local self="${1:-}" f n
+  for f in "$ENV_DIR"/*.env; do
+    [[ -f "$f" ]] || continue
+    n="${f##*/}"; n="${n%.env}"
+    [[ "$n" == "$self" ]] && continue
+    sed -n 's/^AGENT_OPENCLAW_PORT=//p' "$f" 2>/dev/null | head -1
+  done
+}
+
+# openclaw_port_pick [<self>] -- the lowest slot no other seat holds and nothing
+# listens on. Call it under openclaw_port_ensure's lock.
+openclaw_port_pick() {
+  local self="${1:-}" taken i p
+  taken=" $(openclaw_ports_taken "$self" | tr '\n' ' ') "
+  for (( i = 0; i < OPENCLAW_PORT_SLOTS; i++ )); do
+    p=$(( OPENCLAW_PORT_BASE + i * OPENCLAW_PORT_STEP ))
+    [[ "$taken" == *" $p "* ]] && continue
+    openclaw_port_listening "$p" && continue
+    printf '%s\n' "$p"
+    return 0
+  done
+  return 1
+}
+
+# openclaw_port_ensure <name> -- print the seat's port, picking and recording one
+# when its env file has none. Its own lock, NOT the registry lock: `agent
+# restart` holds that across `systemctl restart`, which runs the pre-start step
+# that calls this (DIVE-8195). Writes in place, so the file keeps owner and mode.
+openclaw_port_ensure() {
+  local name="${1:-}" ef cur
+  [[ -n "$name" ]] || return 1
+  ef="${ENV_DIR}/${name}.env"
+  [[ -f "$ef" ]] || return 1
+  cur=$(sed -n 's/^AGENT_OPENCLAW_PORT=//p' "$ef" 2>/dev/null | head -1)
+  if openclaw_port_valid "$cur"; then printf '%s\n' "$cur"; return 0; fi
+  (
+    flock -x -w 30 201 || exit 1
+    cur=$(sed -n 's/^AGENT_OPENCLAW_PORT=//p' "$ef" 2>/dev/null | head -1)
+    if openclaw_port_valid "$cur"; then printf '%s\n' "$cur"; exit 0; fi
+    p=$(openclaw_port_pick "$name") || exit 1
+    body=$(grep -v '^AGENT_OPENCLAW_PORT=' "$ef" 2>/dev/null || true)
+    { [[ -n "$body" ]] && printf '%s\n' "$body"; printf 'AGENT_OPENCLAW_PORT=%s\n' "$p"; } > "$ef" || exit 1
+    printf '%s\n' "$p"
+  ) 201>"${STATE_DIR}/openclaw-port.lock"
+}

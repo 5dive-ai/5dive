@@ -365,6 +365,48 @@ webchat_arm() {
   echo "the web chat answered $want"
 }
 
+# DIVE-8294: a second OpenClaw agent on the same box answers too, and the
+# first still does. Before per-seat gateway ports both bound 127.0.0.1:18789
+# and the second never answered (seen live on DIVE-8283's arm). Same account as
+# the first seat, same web chat, both asked after both gateways are up.
+second_openclaw_arm() {
+  local first="$NAME" second="${NAME}-two" prof out rc=0 p1 p2 _
+  prof=$(jq -r --arg n "$first" '.agents[$n].authProfile // empty' /var/lib/5dive/agents.json 2>/dev/null)
+  out=$(5dive agent create "$second" --type=openclaw ${prof:+--auth-profile="$prof"} </dev/null 2>&1) || rc=$?
+  printf '%s\n' "$out" | tail -5
+  (( rc == 0 )) || { DETAIL="a second openclaw agent could not be created (exit $rc): $(printf '%s' "$out" | tail -1)"; return 1; }
+  p1=$(sed -n 's/^AGENT_OPENCLAW_PORT=//p' "/var/lib/5dive/agents.d/${first}.env")
+  p2=$(sed -n 's/^AGENT_OPENCLAW_PORT=//p' "/var/lib/5dive/agents.d/${second}.env")
+  echo "gateway ports: $first=${p1:-none} $second=${p2:-none}"
+  [[ -n "$p1" && -n "$p2" && "$p1" != "$p2" ]] \
+    || { DETAIL="the two openclaw agents were not given two gateway ports ($first=${p1:-none}, $second=${p2:-none})"; return 1; }
+  NAME="$second"
+  seat_up || { DETAIL="the second openclaw agent's seat did not come up"; return 1; }
+  pin_model openclaw || return 1
+  seat_up || { DETAIL="the second openclaw agent did not come back up after the model pin"; return 1; }
+  webchat_arm || { DETAIL="second openclaw agent: $DETAIL"; return 1; }
+  out=$(ss -ltn 2>/dev/null) || true
+  grep -E ":(${p1}|${p2}) " <<<"$out" || true
+  # The first seat, asked again with the second one's gateway up.
+  NAME="$first"
+  local a b want inbox home
+  home=$(getent passwd "agent-${NAME}" | cut -d: -f6)
+  inbox="$home/.claude/channels/dashboard/agent-inbox"
+  : > /tmp/webchat-replies.jsonl
+  a=$((RANDOM % 400 + 100)) b=$((RANDOM % 400 + 500)) want=$((a + b))
+  drop_inbox "$inbox" "What is $a + $b? Reply with only the number."
+  local said=""
+  for _ in $(seq 1 100); do
+    said=$(jq -r '.body // empty' /tmp/webchat-replies.jsonl 2>/dev/null)
+    grep -qw -- "$want" <<<"$said" && break
+    sleep 3
+  done
+  echo "--- web chat replies (first agent, second running) ---"; cat /tmp/webchat-replies.jsonl
+  grep -qw -- "$want" <<<"$said" \
+    || { DETAIL="with a second openclaw agent running, the first one's web chat did not answer $a + $b"; return 1; }
+  echo "both openclaw agents answered (gateway ports $p1 and $p2)"
+}
+
 # DIVE-7370: every `5dive` command the README shows, run for real on this box.
 # One cell is enough (they share the CLI); Claude Code on 24.04 is the README's
 # own quickstart. The tree's README is staged at /opt/init-smoke-README.md.
@@ -495,6 +537,10 @@ run_arm() {
     if cell_has_webchat "$CELL"; then
       step webchat
       webchat_arm || { show_seat; finish fail; }
+    fi
+    if [[ "$type" == openclaw ]]; then
+      step second-openclaw
+      second_openclaw_arm || { show_seat; finish fail; }
     fi
     if cell_has_readme "$CELL" "$OS"; then readme_arm || finish fail; fi
     STEP="" DETAIL=""

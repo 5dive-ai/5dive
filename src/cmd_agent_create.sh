@@ -2001,6 +2001,12 @@ write_agent_env() {
   if [[ -z "$model_pin" && -r "$env_file" ]]; then
     model_pin=$(sed -n 's/^AGENT_MODEL=//p' "$env_file" | head -1)
   fi
+  # DIVE-8294: an OpenClaw seat's own gateway port (src/lib/agent_env.sh). Kept
+  # across every rewrite; a seat that is no longer openclaw drops it.
+  local oc_port=""
+  if [[ "$type" == openclaw && -r "$env_file" ]]; then
+    oc_port=$(sed -n 's/^AGENT_OPENCLAW_PORT=//p' "$env_file" | head -1)
+  fi
   {
     printf 'AGENT_NAME=%s\n' "$name"
     printf 'AGENT_TYPE=%s\n' "$type"
@@ -2013,6 +2019,7 @@ write_agent_env() {
     [[ "$can_deploy" == "1" ]] && printf 'AGENT_CAN_DEPLOY=1\n'
     [[ "$chrome" == "1" ]] && printf 'AGENT_CHROME=1\n'
     [[ -n "$model_pin" ]] && valid_model "$model_pin" && printf 'AGENT_MODEL=%s\n' "$model_pin"
+    [[ -n "$oc_port" ]] && openclaw_port_valid "$oc_port" && printf 'AGENT_OPENCLAW_PORT=%s\n' "$oc_port"
     # New telegram agents flow through our 5dive-plugins fork (bundled
     # hooks, richer slash commands). 5dive-agent-start reads this var to
     # build the runtime --channels arg, defaulting to claude-plugins-official
@@ -2025,6 +2032,13 @@ write_agent_env() {
   } > "$env_file"
   chown root:claude "$env_file"
   chmod 640 "$env_file"
+  # DIVE-8294: a new OpenClaw seat gets a port no other seat holds, so two
+  # OpenClaw agents on one box do not fight over 127.0.0.1:18789.
+  if [[ "$type" == openclaw ]] && declare -F openclaw_port_ensure >/dev/null \
+     && ! openclaw_port_valid "$oc_port"; then
+    openclaw_port_ensure "$name" >/dev/null \
+      || warn "no free OpenClaw gateway port for agent '$name'; it will try the default 18789"
+  fi
 }
 
 # Point /var/lib/5dive/agents.d/<name>-auth.env at the profile's combined.env

@@ -1562,6 +1562,23 @@ elif isinstance(m, str):
       fi
     fi ;;
   esac
+  # DIVE-8294: this seat's own gateway port (AGENT_OPENCLAW_PORT, picked by the
+  # CLI so no two OpenClaw seats share one). Without it every seat bound the
+  # default 127.0.0.1:18789, and the second OpenClaw agent on a box never
+  # answered. The gateway and `openclaw agent` both read gateway.port, so write
+  # it into the config (before the seat starts, nothing owns the state yet,
+  # DIVE-7721), and export OPENCLAW_GATEWAY_PORT, which openclaw reads first,
+  # for the pane and the web chat bridge in case the patch did not land.
+  if [[ "${AGENT_OPENCLAW_PORT:-}" =~ ^[1-9][0-9]{3,4}$ ]]; then
+    export OPENCLAW_GATEWAY_PORT="$AGENT_OPENCLAW_PORT"
+    OPENCLAW_PATH_OVERRIDE+="export OPENCLAW_GATEWAY_PORT=${AGENT_OPENCLAW_PORT}; "
+    if [[ -f "$LOCAL_OPENCLAW_CFG" \
+          && "$(jq -r '.gateway.port // empty' "$LOCAL_OPENCLAW_CFG" 2>/dev/null)" != "$AGENT_OPENCLAW_PORT" ]]; then
+      jq -cn --argjson p "$AGENT_OPENCLAW_PORT" '{gateway: {port: $p}}' \
+        | /home/claude/.local/bin/openclaw config patch --stdin >/dev/null 2>&1 \
+        || echo "warn: openclaw gateway.port ($AGENT_OPENCLAW_PORT) not written to the config — the seat still uses it through OPENCLAW_GATEWAY_PORT" >&2
+    fi
+  fi
 fi
 
 # Same shared/0600 problem as codex: antigravity (`agy`) stores its OAuth
