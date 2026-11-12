@@ -305,6 +305,10 @@ else
   # (src/header.sh:63, src/lib/tasks_db.sh:16-17) — bare, not FIVEDIVE_-prefixed.
   SBOX=$(mktemp -d)
   e2e(){ STATE_DIR="$SBOX" TASKS_DIR="$SBOX/tasks" TASKS_DB="$SBOX/tasks/tasks.db" "$BIN" "$@" 2>&1; }
+  # The ident `task add` reports ("created <IDENT> — <title>"), read from that
+  # position: the titles below start with DIVE-2518, so a bare first-DIVE- grep
+  # can pick the title when the board's prefix is not DIVE (DIVE-8295).
+  created_ident(){ grep -oE 'created [A-Z][A-Z0-9]*-[0-9]+' | head -1 | cut -d' ' -f2; }
   # `task init` is root-only, so the scratch store is created under sudo and then
   # handed BACK to the caller. The arms themselves must run unelevated: they assert
   # on the actor derived from the caller's uid, and under sudo that derivation
@@ -315,7 +319,10 @@ else
   # isolation fence, T25/T26 go red on "tasks store not initialised") — and it
   # did so silently, which reads as "the same suite, and it happened to skip".
   if sudo -n true 2>/dev/null; then
-    sudo -n env STATE_DIR="$SBOX" TASKS_DIR="$SBOX/tasks" TASKS_DB="$SBOX/tasks/tasks.db" \
+    # DIVE-8295: sudo resets the environment, so grading_tree.sh's DIVE pin must be
+    # passed through by hand or this board seeds TASK-<n>.
+    sudo -n env FIVEDIVE_TASK_PREFIX="${FIVEDIVE_TASK_PREFIX:-DIVE}" \
+      STATE_DIR="$SBOX" TASKS_DIR="$SBOX/tasks" TASKS_DB="$SBOX/tasks/tasks.db" \
       "$BIN" task init >/dev/null 2>&1 || true
     sudo -n chown -R "$(id -u):$(id -g)" "$SBOX" 2>/dev/null || true
   else
@@ -366,7 +373,7 @@ else
   elif (( probe_rows != 0 )); then
     skip "T19-T21 store isolation NOT PROVEN — the scratch store lists $probe_rows rows, so the redirect did not take; refusing to write to the shared board"
   else
-  tid=$(e2e task add "DIVE-2518 harness row" --project=dive 2>&1 | grep -oE 'DIVE-[0-9]+' | head -1)
+  tid=$(e2e task add "DIVE-2518 harness row" --project=dive 2>&1 | created_ident)
   # Confirm the FIRST write actually landed in the scratch store before doing any
   # more of them. The pre-write fence reasons about reads; this one is the write
   # itself, and it is the only check that can catch a store that reads clean and
@@ -387,7 +394,7 @@ else
     # for `claude` (uid 1000, not a registered agent) while the product was behaving
     # exactly as specified. Ground truth is the registry FILE, read directly, not
     # `actor_registry_agent` — that is the function under test.
-    tid2=$(e2e task add "DIVE-2518 claimed row" --project=dive --from="$FORGE_BOARD" 2>&1 | grep -oE 'DIVE-[0-9]+' | head -1)
+    tid2=$(e2e task add "DIVE-2518 claimed row" --project=dive --from="$FORGE_BOARD" 2>&1 | created_ident)
     # DIVE-2898: read the STORE, exactly as T19b/T19c do — not `task show`'s text.
     # This arm parsed that text with `/^created_by /`, but `task show` RIGHT-ALIGNS
     # its field names ("  created_by = x"), so the ^anchor never matched and cb was
@@ -495,7 +502,7 @@ else
     #     and a claim that WON would look identical to one that lost.
     sqlite3 "$SBOX/tasks/tasks.db" \
       "INSERT OR REPLACE INTO agents_org(name,reports_to) VALUES('leadclaimed',NULL),('leadderived',NULL),('$FORGE_BOARD','leadclaimed'),('$EXPECT_BOARD','leadderived');" 2>/dev/null
-    tid4=$(e2e task add "DIVE-2518 routing probe" --project=dive 2>&1 | grep -oE 'DIVE-[0-9]+' | head -1)
+    tid4=$(e2e task add "DIVE-2518 routing probe" --project=dive 2>&1 | created_ident)
     #     The ASK has to trip the internal-ops carve-out, because that is one of the
     #     four branches that calls _gate_route_reviewer at all — a generic ask files a
     #     gate that never consults the org table, which is what made the first cut of
@@ -534,7 +541,7 @@ else
   #     uses a name that CANNOT be a passwd entry on any runner, so the arm is not
   #     quietly satisfied by a coincidence of naming.
   cout=$(e2e task add "DIVE-2518 uid-less relay probe" --project=dive --from=council 2>&1)
-  ctid=$(printf '%s' "$cout" | grep -oE 'DIVE-[0-9]+' | head -1)
+  ctid=$(printf '%s' "$cout" | created_ident)
   ccb=$(sqlite3 "$SBOX/tasks/tasks.db" \
     "SELECT created_by||'|'||COALESCE(derived_actor,'<NULL>') FROM tasks WHERE ident='$ctid';" 2>/dev/null)
   if [[ -z "$ctid" ]]; then
