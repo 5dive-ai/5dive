@@ -356,7 +356,7 @@ _task_status_cmd() {
     esac
     shift
   done
-  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task $verb <id|DIVE-N> [--result=<text>] [--notify]"
+  [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task $verb <id|TASK-N> [--result=<text>] [--notify]"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   # DIVE-2179: `task done` on a live, unacknowledged handoff must stamp the SAME
   # ack the DIVE-1378 `start` block stamps below — even when this `done` is about
@@ -645,7 +645,7 @@ _task_status_cmd() {
     local _ko_held; _ko_held=$(_task_team_kickoff_holds "$id")
     if [[ "$_ko_held" != "0" ]]; then
       local _ko_lead; _ko_lead=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};")
-      fail "$E_VALIDATION" "$ident is a team kickoff still holding ${_ko_held} goal(s)/job(s) for the owner's answer — 'task ${verb}' would start them all. Answer it instead: 5dive team start ${_ko_lead} [--skip=<DIVE-N>,...] (owner said yes), 5dive team decline ${_ko_lead} (owner said no), or wait: 5dive task park $ident --wake=+3d"
+      fail "$E_VALIDATION" "$ident is a team kickoff still holding ${_ko_held} goal(s)/job(s) for the owner's answer — 'task ${verb}' would start them all. Answer it instead: 5dive team start ${_ko_lead} [--skip=<TASK-N>,...] (owner said yes), 5dive team decline ${_ko_lead} (owner said no), or wait: 5dive task park $ident --wake=+3d"
     fi
   fi
   if [[ "$verb" == "done" || "$verb" == "cancel" ]] && (( want_result )); then
@@ -3121,7 +3121,7 @@ cmd_task_reject() {
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task reject <id|DIVE-N> [--feedback=\"FINDING: … FIX: … VERIFY: …\"] [--merge-conflict]"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task reject <id|TASK-N> [--feedback=\"FINDING: … FIX: … VERIFY: …\"] [--merge-conflict]"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local maker iter maxi vfier
   maker=$(db "SELECT COALESCE(maker_agent,'')    FROM tasks WHERE id=${id};")

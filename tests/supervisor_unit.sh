@@ -384,7 +384,8 @@ NOW_R=$(date +%s)
 OLD_TS=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%S.000Z)
 setline() { printf '{"type":"user","timestamp":"%s","message":{"content":"A session-scoped Stop hook is now active with condition: \\"Task DIVE-%s shows status done. run 5dive task start DIVE-%s\\""}}\n' "$OLD_TS" "$1" "$1"; }
 # target task is still todo, agent active elsewhere -> drift on that id
-db "INSERT INTO tasks (id, title, status, assignee, kind) VALUES (8971, 'x', 'todo', 'gdrift', 'standard');"
+# DIVE-8295: the goal is resolved by IDENT, so the row carries the ident it names.
+db "INSERT INTO tasks (id, ident, title, status, assignee, kind) VALUES (8971, 'DIVE-8971', 'x', 'todo', 'gdrift', 'standard');"
 setline 8971 > "$TX/s.jsonl"
 t "drift: active goal targets a still-todo task -> echoes id" \
   "8971" "$(_sup_goal_drift claude "$GH" gdrift "$NOW_R" "$NOW_R")"

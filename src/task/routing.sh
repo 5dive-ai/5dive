@@ -592,7 +592,9 @@ _task_is_trivial() {
 # a command substitution that would hide assignments).
 _task_numbered_followup_parse() {
   local _title="${1^^}"
-  local _re='(^|[^A-Z0-9])(DIVE-[0-9]+)[[:space:]]+(FIX|ORPHAN|PART|ITEM)[[:space:]]*#?([0-9]+)([^A-Z0-9]|$)'
+  # DIVE-8295: any project prefix (TASK-N on a new box). The advisory below only
+  # fires when the cited ident is a real row, so a look-alike token finds nothing.
+  local _re='(^|[^A-Z0-9])([A-Z][A-Z0-9]*-[0-9]+)[[:space:]]+(FIX|ORPHAN|PART|ITEM)[[:space:]]*#?([0-9]+)([^A-Z0-9]|$)'
   _TASK_FOLLOWUP_IDENT=""
   _TASK_FOLLOWUP_KIND=""
   _TASK_FOLLOWUP_NUMBER=""

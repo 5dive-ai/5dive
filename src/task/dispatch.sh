@@ -15,7 +15,7 @@ _task_usage() {
 5dive task — shared task queue (sqlite at ${STATE_DIR}/tasks/tasks.db)
 
   init                                          one-time root bootstrap of the store
-  add <title...> [--body=<text>|--body-file=<path>] [--from=<who>] [--parent=<DIVE-N>]
+  add <title...> [--body=<text>|--body-file=<path>] [--from=<who>] [--parent=<TASK-N>]
       [--priority=low|medium|high|urgent] [--branch=<name>]
       [--assignee=<agent|role:<r>|charter:<kw>>]
       [--recurring="<5-field cron>" [--tz=<zone>]] [--accept=<criteria>|--accept-file=<path>] [--verify=<cmd>]
@@ -38,7 +38,7 @@ _task_usage() {
         command; check when --verify=<cmd> is given; the filing seat when --customer
         is set; temp otherwise — and a row that lands on temp is told, on the created
         line, what it would take to be command-graded instead. The mode is printed
-        back with its cost on the 'created DIVE-N' line and shown by 'task ls' /
+        back with its cost on the 'created TASK-N' line and shown by 'task ls' /
         'task show'.
       --mutant=<cmd>   THE NEGATIVE CONTROL, required by --review=check (DIVE-4623).
                        The command that BREAKS the delivered tree — 'git apply -R
@@ -67,7 +67,7 @@ _task_usage() {
                                green, and it says so (DIVE-6223). --verify beats it; --no-verify never beats
                                the opposite, delivery-time UPGRADE (DIVE-2730).
       [--customer] [--already-blocked=<what it blocked>]   escapes for the internal-filing cap
-      [--held-by=<id|DIVE-N>]                   born blocked behind that row, in the same write
+      [--held-by=<id|TASK-N>]                   born blocked behind that row, in the same write
                                                 (no tick can start it first); freed when it closes
       [--park=<why> --park-wake=<when> [--tz=<zone>]]   born parked, same write (DIVE-5729);
                                                 unparks at <when>: +Nm, +Nh, +Nd, or 'YYYY-MM-DD HH:MM'
@@ -82,8 +82,8 @@ _task_usage() {
                                                 <seat>:<type> an agent does, answered:<retire> the
                                                 answer survives only in gate-history, '-' nothing.
                                                 --gated=human is exactly the inbox set.
-  show <id|DIVE-N>                              full detail + subtasks + blockers
-  grade-context <id|DIVE-N> [--check=<path>]    materialize/check the private detached grading
+  show <id|TASK-N>                              full detail + subtasks + blockers
+  grade-context <id|TASK-N> [--check=<path>]    materialize/check the private detached grading
                                                 worktree and print the bounded grading packet
   assign <id> <agent>                           reassign
   verifier <id> <agent> [--accept=] [--max-iters=]   attach or re-point the verifier rail
@@ -91,7 +91,7 @@ _task_usage() {
                                                 (--body-file=<path> is the same as --file=)
   set-title <id> <text...>                      overwrite the title (audited; refused once closed)
   set-branch <id> <branch>                      bind the row to a git branch
-  set-parent <id> <DIVE-N|none>                 attach the row to its parent (audited; works on a
+  set-parent <id> <TASK-N|none>                 attach the row to its parent (audited; works on a
                                                 closed row; 'none' detaches). Name the parent by
                                                 IDENT — a bare number is the global row id, which
                                                 is NOT the ident number
@@ -303,7 +303,7 @@ cmd_task_reclaim() {
     shift
   done
   [[ -n "$target" || $all -eq 1 ]] || \
-    fail "$E_USAGE" "usage: 5dive task reclaim <id|DIVE-N>|--all [--dry-run]"
+    fail "$E_USAGE" "usage: 5dive task reclaim <id|TASK-N>|--all [--dry-run]"
 
   local -a wts=()
   local w
@@ -334,7 +334,7 @@ cmd_task_reclaim() {
       # that silently declines to act is indistinguishable from one that found
       # nothing to do, and the operator only learns the difference when the disk
       # fills again (Marcus, DIVE-1967 review).
-      step "skip $wt — task DIVE-${num} is ${st} (live)"
+      step "skip $wt — task #${num} is ${st} (live)"
       rows=$(jq -c --arg w "$wt" --arg s "$st" \
         '. + [{worktree:$w, task_status:$s, action:"skipped", reason:"task is live"}]' <<<"$rows")
       continue
@@ -546,7 +546,7 @@ cmd_task_set_branch() {
     esac
     shift
   done
-  [[ ${#positional[@]} -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task set-branch <id|DIVE-N> <branch>"
+  [[ ${#positional[@]} -ge 2 ]] || fail "$E_USAGE" "usage: 5dive task set-branch <id|TASK-N> <branch>"
   local branch="${positional[1]}"
   # No whitespace: push parses the branch as a single '\S+' token, so a space would
   # silently truncate the binding. Keep it to plausible git ref-name characters.
@@ -615,7 +615,7 @@ cmd_task_set_body() {
     text="$file_text"
   fi
   [[ -n "$task" && -n "$text" ]] \
-    || fail "$E_USAGE" "usage: 5dive task set-body <id|DIVE-N> <text...>|--file=<path>|--body-file=<path> [--append]"
+    || fail "$E_USAGE" "usage: 5dive task set-body <id|TASK-N> <text...>|--file=<path>|--body-file=<path> [--append]"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
   local st
   st=$(db "SELECT status FROM tasks WHERE id=${id};")
@@ -867,7 +867,7 @@ cmd_task_set_overlap() {
     shift
   done
   [[ -n "$task" && -n "$pol" ]] \
-    || fail "$E_USAGE" "usage: 5dive task set-overlap <template|DIVE-N> <skip|spawn> [bound]  (skip = an open instance suppresses the next slot, today's default; spawn = fire anyway up to <bound> open instances, then skip and record it)"
+    || fail "$E_USAGE" "usage: 5dive task set-overlap <template|TASK-N> <skip|spawn> [bound]  (skip = an open instance suppresses the next slot, today's default; spawn = fire anyway up to <bound> open instances, then skip and record it)"
   [[ "$pol" == "skip" || "$pol" == "spawn" ]] \
     || fail "$E_VALIDATION" "bad policy '$pol' (skip|spawn)"
   if [[ -n "$bound" ]]; then
@@ -929,7 +929,7 @@ cmd_task_set_tz() {
     shift
   done
   [[ -n "$task" && -n "$zone" ]] \
-    || fail "$E_USAGE" "usage: 5dive task set-tz <template|DIVE-N> <zone|box>  (an IANA zone such as Asia/Bangkok or UTC; 'box' = this box's zone, $(_task_box_tz))"
+    || fail "$E_USAGE" "usage: 5dive task set-tz <template|TASK-N> <zone|box>  (an IANA zone such as Asia/Bangkok or UTC; 'box' = this box's zone, $(_task_box_tz))"
   [[ "$zone" == "box" ]] && zone=$(_task_box_tz)
   _task_tz_valid "$zone" \
     || fail "$E_VALIDATION" "bad zone '$zone' (an IANA zone this box knows, e.g. Asia/Bangkok, Europe/Berlin or UTC — see 'timedatectl list-timezones')"
@@ -959,7 +959,7 @@ cmd_task_set_budget() {
     shift
   done
   [[ -n "$task" && -n "$val" ]] \
-    || fail "$E_USAGE" "usage: 5dive task set-budget <id|DIVE-N> <tokens|\$cost|none>  (none = exempt this row from the enforced default)"
+    || fail "$E_USAGE" "usage: 5dive task set-budget <id|TASK-N> <tokens|\$cost|none>  (none = exempt this row from the enforced default)"
   [[ "$val" =~ ^[1-9][0-9]*$ || "$val" =~ ^\$[0-9]+(\.[0-9]+)?$ || "$val" == "none" ]] \
     || fail "$E_VALIDATION" "budget must be a token count (e.g. 50000), a dollar cost (e.g. \$1.50), or 'none'"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
@@ -991,7 +991,7 @@ cmd_task_set_title() {
   done
   local text="${words[*]:-}"
   [[ -n "$task" && -n "$text" ]] \
-    || fail "$E_USAGE" "usage: 5dive task set-title <id|DIVE-N> <text...>"
+    || fail "$E_USAGE" "usage: 5dive task set-title <id|TASK-N> <text...>"
   # A title is a single line by construction — it renders on one row of the board
   # and inside one Telegram alert. Collapse rather than refuse: the caller's shell
   # may have handed us words that already lost their newlines anyway.
@@ -1061,9 +1061,9 @@ cmd_task_set_parent() {
     parent="${positional[1]:-}"
   fi
   [[ -n "$task" && -n "$parent" ]] \
-    || fail "$E_USAGE" "usage: 5dive task set-parent <id|DIVE-N> <DIVE-N|none>   (none detaches)"
+    || fail "$E_USAGE" "usage: 5dive task set-parent <id|TASK-N> <TASK-N|none>   (none detaches)"
   [[ ${#positional[@]} -le 2 ]] \
-    || fail "$E_USAGE" "usage: 5dive task set-parent <id|DIVE-N> <DIVE-N|none>   (got ${#positional[@]} positional arguments)"
+    || fail "$E_USAGE" "usage: 5dive task set-parent <id|TASK-N> <TASK-N|none>   (got ${#positional[@]} positional arguments)"
 
   _task_resolve_ref_strict "$task" "the task to re-parent"
   local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"

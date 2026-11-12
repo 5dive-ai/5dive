@@ -2245,15 +2245,25 @@ _sup_goal_drift() {  # <type> <home> <name> <now> <act_epoch>
   set_ts=$(grep -oE '"timestamp":"[^"]+"' <<<"$setline" | head -1 | cut -d'"' -f4) || set_ts=""
   [[ -n "$set_ts" ]] && set_epoch=$(date -d "$set_ts" +%s 2>/dev/null) || set_epoch=""
   [[ "$set_epoch" =~ ^[0-9]+$ ]] && (( now - set_epoch < _SUP_T_SLOW_MIN * 60 )) && return 0
+  # DIVE-8295: the goal names an IDENT (TASK-N on a new box, DIVE-N on ours), and an
+  # ident's number is not the row id once a second project mints rows — so resolve
+  # the ident to its row and echo that id (goalDriftTask stays the numeric row id).
+  # `| head -1`, not `grep -m1`: -m1 caps LINES, and the goal line names the ident
+  # twice ("Task X … task start X").
+  # The guarded variable stays named `task` (it now holds the ident): the
+  # unguarded_probe_substitution harness pins this site as cmd_supervisor.sh:task in
+  # BOTH its 5dive and 5dive-plugins copies, so a rename would split them.
   local task
-  task=$(grep -oE 'DIVE-[0-9]+' <<<"$setline" | head -1 | grep -oE '[0-9]+') || task=""
+  task=$(grep -oE "$(task_ident_ere)" <<<"$setline" | head -1) || task=""
   [[ -n "$task" ]] || return 0
-  local st
-  st=$(db "SELECT status FROM tasks WHERE id=${task};" 2>/dev/null || echo "")
+  local st row id
+  row=$(db "SELECT id||'|'||status FROM tasks WHERE ident=$(sqlq "$task");" 2>/dev/null || echo "")
+  id="${row%%|*}"; st="${row#*|}"
+  [[ "$id" =~ ^[0-9]+$ ]] || return 0
   # Only a still-untouched (todo) target is drift; in_progress (by anyone) or
   # any terminal/blocked state means the goal is being served or is satisfied.
   [[ "$st" == "todo" ]] || return 0
-  echo "$task"
+  echo "$id"
 }
 
 _sup_usage() {
@@ -2650,7 +2660,7 @@ _sup_classify() {
     # Observe-only: the P2 act loop is gated on class=="stuck", so this never
     # nudges/resumes/rotates — surfaced for the audit trail and board only.
     class="drift"; cause="goal-drift"
-    detail="active /goal targets DIVE-${goal_drift_task} (still todo); agent progressing elsewhere"
+    detail="active /goal targets $(db "SELECT COALESCE(ident,'DIVE-'||id) FROM tasks WHERE id=${goal_drift_task};" 2>/dev/null || echo "row ${goal_drift_task}") (still todo); agent progressing elsewhere"
   elif (( has_work )); then
     detail="active"
   elif (( stranded > 0 )); then

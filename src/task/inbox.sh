@@ -1001,7 +1001,7 @@ cmd_gate_proof() {
     require_root "gate-proof verify"
     tasks_db_init
     local vref="${2:-}"
-    [[ -n "$vref" ]] || fail "$E_USAGE" "usage: 5dive gate-proof verify <id|DIVE-N>"
+    [[ -n "$vref" ]] || fail "$E_USAGE" "usage: 5dive gate-proof verify <id|TASK-N>"
     resolve_task_id "$vref"; local vid="$RESOLVED_TASK_ID" vident="$RESOLVED_TASK_IDENT"
     local _row; _row=$(db "SELECT
         COALESCE(need_type,'')||x'1f'||
@@ -1130,7 +1130,7 @@ cmd_task_clear_recs() {
       --only=*)          only="${1#*=}" ;;
       --from=*)          from="${1#*=}" ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
-      *)  fail "$E_USAGE" "usage: 5dive task clear-recs --channel-proof=<chat_id> [--only=<id|DIVE-N>]" ;;
+      *)  fail "$E_USAGE" "usage: 5dive task clear-recs --channel-proof=<chat_id> [--only=<id|TASK-N>]" ;;
     esac
     shift
   done

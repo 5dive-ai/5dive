@@ -533,20 +533,20 @@ cmd_task_doctor() {
       --fix=*)   have_fix=1; fix_target="${1#*=}" ;;
       --fix)     have_fix=1
                  [[ $# -ge 2 && "$2" != -* ]] \
-                   || fail "$E_USAGE" "--fix needs the row to repair: 5dive task doctor --fix <id|DIVE-N> [--to=<agent>] [--dry-run]  (there is no --fix-all: one row is one decision)"
+                   || fail "$E_USAGE" "--fix needs the row to repair: 5dive task doctor --fix <id|TASK-N> [--to=<agent>] [--dry-run]  (there is no --fix-all: one row is one decision)"
                  fix_target="$2"; shift ;;
       --to=*)    fix_to="${1#*=}" ;;
       --dry-run) fix_dry=1 ;;
-      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive task doctor [--fix <id|DIVE-N> [--to=<agent>] [--dry-run]])" ;;
-      *)  fail "$E_USAGE" "unexpected argument '$1' (usage: 5dive task doctor [--fix <id|DIVE-N> [--to=<agent>] [--dry-run]])" ;;
+      -*) fail "$E_USAGE" "unknown flag: $1 (usage: 5dive task doctor [--fix <id|TASK-N> [--to=<agent>] [--dry-run]])" ;;
+      *)  fail "$E_USAGE" "unexpected argument '$1' (usage: 5dive task doctor [--fix <id|TASK-N> [--to=<agent>] [--dry-run]])" ;;
     esac
     shift
   done
   if [[ "$have_fix" == "0" ]]; then
-    [[ -z "$fix_to" ]] || fail "$E_USAGE" "--to only applies with --fix: 5dive task doctor --fix <id|DIVE-N> --to=<agent>"
+    [[ -z "$fix_to" ]] || fail "$E_USAGE" "--to only applies with --fix: 5dive task doctor --fix <id|TASK-N> --to=<agent>"
     [[ "$fix_dry" == "0" ]] || fail "$E_USAGE" "--dry-run only applies with --fix — a bare 'doctor' already changes nothing"
   else
-    [[ -n "$fix_target" ]] || fail "$E_USAGE" "--fix needs the row to repair: 5dive task doctor --fix <id|DIVE-N> [--to=<agent>] [--dry-run]"
+    [[ -n "$fix_target" ]] || fail "$E_USAGE" "--fix needs the row to repair: 5dive task doctor --fix <id|TASK-N> [--to=<agent>] [--dry-run]"
     _task_doctor_fix "$fix_target" "$fix_to" "$fix_dry"
     return $?
   fi

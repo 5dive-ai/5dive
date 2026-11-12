@@ -1408,7 +1408,7 @@ cmd_task_verify() {
     shift
   done
   [[ -n "$task" ]] \
-    || fail "$E_USAGE" "usage: 5dive task verify <id|DIVE-N> [--cmd=\"<command>\"] [--result=\"<prose verdict>\"|--result-file=<path>] [--no-done] [--merge-proof] [--timeout=<seconds>]"
+    || fail "$E_USAGE" "usage: 5dive task verify <id|TASK-N> [--cmd=\"<command>\"] [--result=\"<prose verdict>\"|--result-file=<path>] [--no-done] [--merge-proof] [--timeout=<seconds>]"
   [[ -z "$timeout_s" || "$timeout_s" =~ ^[1-9][0-9]*$ ]] \
     || fail "$E_VALIDATION" "--timeout must be a positive integer (seconds)"
   resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
@@ -2108,7 +2108,7 @@ cmd_task_block() {
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task block <id|DIVE-N> --by=<id|DIVE-N>   (or --reason=<why> --wake=<when> to hold it as a timed park)"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task block <id|TASK-N> --by=<id|TASK-N>   (or --reason=<why> --wake=<when> to hold it as a timed park)"
   # DIVE-1357: with --by this is a dependency edge (the normal, self-revisiting
   # block). WITHOUT --by, the only honest hold is a timed park — so route a
   # reason+wake block through `task park`, and REFUSE a bare reasonless/dateless
@@ -2144,7 +2144,7 @@ cmd_task_unblock() {
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task unblock <id|DIVE-N> [--by=<id|DIVE-N>]"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task unblock <id|TASK-N> [--by=<id|TASK-N>]"
   resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
   if [[ -n "$by" ]]; then
     resolve_task_id "$by"; local bid="$RESOLVED_TASK_ID"
@@ -2180,7 +2180,7 @@ cmd_task_park() {
     esac
     shift
   done
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task park <id|DIVE-N> --reason=<why / what unblocks it> --wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh|+Nm>"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task park <id|TASK-N> --reason=<why / what unblocks it> --wake=<YYYY-MM-DD[ HH:MM]|+Nd|+Nh|+Nm>"
   # DIVE-1357: a park is anchor #3 for a 'blocked' task, and an anchor MUST carry
   # a revisit or it silently becomes the block graveyard DIVE-1355 has to sweep.
   # Require BOTH a --reason (why it's held / what unblocks it) and a --wake (when
@@ -2325,7 +2325,7 @@ cmd_task_park() {
 cmd_task_unpark() {
   tasks_db_init
   local task="${1:-}"
-  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task unpark <id|DIVE-N>"
+  [[ -n "$task" ]] || fail "$E_USAGE" "usage: 5dive task unpark <id|TASK-N>"
   resolve_task_id "$task"; local tid="$RESOLVED_TASK_ID" tident="$RESOLVED_TASK_IDENT"
   db "UPDATE tasks SET parked_at=NULL, park_reason=NULL, wake_at=NULL,
         status=CASE WHEN status='blocked'
