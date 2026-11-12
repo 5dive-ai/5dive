@@ -1870,6 +1870,104 @@ _claude_owner_compact_window() { # <settings file>... -> 0 when any sets a windo
   return 1
 }
 
+# DIVE-8308: a claude seat on a BYO provider (Qwen, OpenRouter, DeepSeek, Kimi,
+# GLM) launches with its model's real context window. Claude Code knows no
+# window for a model it does not recognize and assumes 200k (measured, 2.1.322,
+# `claude -p /context` on qwen4-max-preview: "/ 200k"), so a 1M model compacts
+# at a fifth of its room. And the 400k ceiling above HIDES Claude Code's own
+# "doesn't recognize the model ... set CLAUDE_CODE_MAX_CONTEXT_TOKENS" notice:
+# with the ceiling exported the window's source is "env", and that notice is
+# only shown for source "unknown-model". CLAUDE_CODE_MAX_CONTEXT_TOKENS is the
+# knob: Claude Code reads it ONLY for a model it does not recognize (a claude-*
+# id keeps its own window), and it compacts at min(window, ceiling), so a 983k
+# model compacts at 400k and a 131k one at 131k, never past its real window.
+#
+# One value covers every model the process calls (the tier maps, the seat's own
+# model), so the SMALLEST window among them is exported. Each window comes from
+# OpenRouter's public model list (context_length, the routed provider's own if
+# smaller) or, for the direct providers, the table below. A model with no known
+# window means NOTHING is exported, with a warning in the journal: never guess
+# high. The owner's own value wins, like the ceiling above: one in the unit's
+# env, or env.CLAUDE_CODE_MAX_CONTEXT_TOKENS in a settings file.
+_claude_owner_max_context() { # <settings file>... -> 0 when any sets the window
+  local f
+  command -v jq >/dev/null 2>&1 || return 1
+  for f in "$@"; do
+    [[ -r "$f" ]] || continue
+    jq -e '(.env // {}) | objects | has("CLAUDE_CODE_MAX_CONTEXT_TOKENS")' "$f" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+# The direct providers' windows, by the catalog's own model ids. Sourced
+# 2026-11-12: Qwen from a customer seat's "Range of input length" error on
+# qwen4-max-preview (983,616 = 1M less 16,384 kept for output; OpenRouter lists
+# the 1M), used for the Token Plan's whole 1M family since it is the lower; the
+# rest from OpenRouter's list for the same vendor model (the routed provider's
+# figure where lower). Add a row only with a source.
+_claude_byo_table_window() { # <provider> <model> -> window, or nothing
+  case "$1:$2" in
+    qwen:qwen4-max-preview|qwen:qwen3.8-max|qwen:qwen3.6-flash) echo 983616 ;;
+    deepseek:deepseek-v4-pro)  echo 1024000 ;;
+    deepseek:deepseek-v4-flash) echo 1048576 ;;
+    moonshot:kimi-k2.5)        echo 262144 ;;
+    zai:glm-5.2)               echo 1048576 ;;
+    zai:glm-5-turbo)           echo 202752 ;;
+    zai:glm-4.5-air)           echo 131072 ;;
+  esac
+}
+# OpenRouter's list is public (no key goes out), cached a day under the seat's
+# home; a failed fetch falls back to the last copy. Never in local-only mode.
+_claude_openrouter_window() { # <slug> -> window, or nothing
+  local slug="$1" cache="${XDG_CACHE_HOME:-$HOME/.cache}/5dive/openrouter-models.json" tmp
+  command -v jq >/dev/null 2>&1 || return 0
+  if [[ ! -e "${FIVE_LOCAL_ONLY_FILE:-/etc/5dive/local-only}" ]] \
+     && ! [[ -s "$cache" && -n "$(find "$cache" -mmin -1440 2>/dev/null)" ]]; then
+    mkdir -p "${cache%/*}" 2>/dev/null
+    tmp=$(mktemp "$cache.XXXXXX" 2>/dev/null) || tmp=""
+    if [[ -n "$tmp" ]]; then
+      if curl -fsS -m 5 --proto '=https' "${FIVEDIVE_OPENROUTER_MODELS_URL:-https://openrouter.ai/api/v1/models}" -o "$tmp" 2>/dev/null \
+         && jq -e '.data | type == "array"' "$tmp" >/dev/null 2>&1; then
+        mv -f "$tmp" "$cache"
+      else
+        rm -f "$tmp"
+      fi
+    fi
+  fi
+  [[ -r "$cache" ]] || return 0
+  jq -r --arg s "$slug" --arg b "${slug%%:*}" '
+    [.data[]? | select(.id == $s)] + [.data[]? | select(.id == $b)] | first // empty
+    | [.context_length, .top_provider.context_length] | map(select(type == "number" and . > 0)) | min // empty' \
+    "$cache" 2>/dev/null
+}
+_claude_byo_context_window() { # -> the smallest window across the seat's models, or nothing
+  local prov m w min="" own="" seen=" "
+  case "${ANTHROPIC_BASE_URL:-}" in
+    https://openrouter.ai/api|https://openrouter.ai/api/) prov=openrouter ;;
+    https://api.deepseek.com/anthropic|https://api.deepseek.com/anthropic/) prov=deepseek ;;
+    https://api.moonshot.ai/anthropic|https://api.moonshot.ai/anthropic/) prov=moonshot ;;
+    https://api.z.ai/api/anthropic|https://api.z.ai/api/anthropic/) prov=zai ;;
+    https://token-plan.*.maas.aliyuncs.com/apps/anthropic|https://token-plan.*.maas.aliyuncs.com/apps/anthropic/) prov=qwen ;;
+    *) return 0 ;;   # an endpoint of the owner's own: no source to read
+  esac
+  command -v jq >/dev/null 2>&1 && [[ -r "$HOME/.claude/settings.json" ]] \
+    && own=$(jq -r '.model // empty | strings' "$HOME/.claude/settings.json" 2>/dev/null)
+  for m in "${ANTHROPIC_DEFAULT_OPUS_MODEL:-}" "${ANTHROPIC_DEFAULT_SONNET_MODEL:-}" \
+           "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" "${ANTHROPIC_MODEL:-}" "$own"; do
+    m="${m%\[1[mM]\]}"
+    case "$m" in ""|opus|sonnet|haiku|fable|default|best|opusplan|claude-*) continue ;; esac
+    [[ "$seen" == *" $m "* ]] && continue
+    seen+="$m "
+    if [[ "$prov" == openrouter ]]; then w=$(_claude_openrouter_window "$m")
+    else w=$(_claude_byo_table_window "$prov" "$m"); fi
+    if ! [[ "$w" =~ ^[1-9][0-9]*$ ]]; then
+      echo "warn: claude seat '${NAME-}' calls '$m' on $prov, whose context window is unknown here; Claude Code assumes 200k. Set CLAUDE_CODE_MAX_CONTEXT_TOKENS in the seat's settings env to its real window." >&2
+      return 0
+    fi
+    [[ -z "$min" ]] || (( w < min )) && min="$w"
+  done
+  printf '%s' "$min"
+}
+
 # STAGE_GUARD: env exports prepended to the launch loop (default empty). Used by
 # claude to suppress its native per-user self-stage (see the claude case below).
 STAGE_GUARD=""
@@ -1893,6 +1991,14 @@ case "$TYPE" in
          "${WORKDIR-}/.claude/settings.json" "${WORKDIR-}/.claude/settings.local.json" \
          /etc/claude-code/managed-settings.json; then
       STAGE_GUARD+="export CLAUDE_CODE_AUTO_COMPACT_WINDOW=\${CLAUDE_CODE_AUTO_COMPACT_WINDOW:-400000}; "
+    fi
+    # DIVE-8308: a BYO provider's real context window, unless the owner set one.
+    if [[ -n "${ANTHROPIC_BASE_URL:-}" && -z "${CLAUDE_CODE_MAX_CONTEXT_TOKENS:-}" ]] \
+       && ! _claude_owner_max_context "$HOME/.claude/settings.json" \
+         "${WORKDIR-}/.claude/settings.json" "${WORKDIR-}/.claude/settings.local.json" \
+         /etc/claude-code/managed-settings.json; then
+      BYO_WINDOW=$(_claude_byo_context_window)
+      [[ -z "$BYO_WINDOW" ]] || STAGE_GUARD+="export CLAUDE_CODE_MAX_CONTEXT_TOKENS=$BYO_WINDOW; "
     fi ;;
   codex)
     UNSET_CREDS="CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY GEMINI_API_KEY GOOGLE_API_KEY" ;;
