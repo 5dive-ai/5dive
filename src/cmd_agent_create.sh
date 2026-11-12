@@ -593,7 +593,7 @@ sudo_grant_batch_reset() { unset _SUDOERS_BATCH_STATE; declare -gA _SUDOERS_BATC
 # NOT write), so the guard is the harnesses, not a shared constant.
 classify_sudo_grant() {
   local line runas cmds cmd
-  local has_all=0 has_cli=0 has_a2a=0 has_other=0 any=0 runas_any=0
+  local has_all=0 has_cli=0 has_a2a=0 has_chat=0 has_other=0 any=0 runas_any=0
   while IFS= read -r line; do
     line="${line%%#*}"
     [[ "$line" == *"("*")"* ]] || continue
@@ -613,6 +613,10 @@ classify_sudo_grant() {
       [[ "$runas" == *ALL* ]] && runas_any=1
       case "$cmd" in
         ALL)                                            has_all=1 ;;
+        # DIVE-8284: the two self-only web chat rails. Alone they are `chat-only`
+        # (a sandboxed seat with web chat); beside any other scoped verb the seat
+        # is still cli-scoped.
+        "/usr/local/bin/5dive _dashboard_relay"|"/usr/local/bin/5dive _chat_e2e") has_chat=1 ;;
         "/usr/local/bin/5dive"|"/usr/local/bin/5dive *") has_cli=1 ;;
         "/usr/local/bin/5dive agent _deliver"*|"/usr/local/bin/5dive agent _capture"*|\
         "/usr/local/lib/5dive/agent-list-snapshot"|\
@@ -635,8 +639,6 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive people knock file *"|"/usr/local/bin/5dive people knock answer *"|\
         "/usr/local/bin/5dive _merge_do"*|\
         "/usr/local/bin/5dive _route_do"|"/usr/local/bin/5dive _pkg_do"|\
-        "/usr/local/bin/5dive _dashboard_relay"|\
-        "/usr/local/bin/5dive _chat_e2e"|\
         "/usr/local/bin/5dive _secret_link_notify"|\
         "/usr/local/bin/5dive agent _peek *"|"/usr/local/bin/5dive agent _skill_give *"|\
         "/usr/local/bin/5dive heartbeat _self on"|"/usr/local/bin/5dive heartbeat _self off"|\
@@ -649,6 +651,7 @@ classify_sudo_grant() {
   if   (( has_all )); then class="root-all"
   elif (( has_cli )); then class="cli-root"
   elif (( has_a2a )); then class="cli-scoped"
+  elif (( has_chat )); then class="chat-only"
   elif (( has_other )); then class="custom"
   else class="none"
   fi
@@ -673,7 +676,9 @@ isolation_implied_by_grant() {
     root-all) printf 'beyond-admin\n' ;;
     cli-root) printf 'admin\n' ;;
     cli-scoped) printf 'standard\n' ;;
-    none)     printf 'sandboxed\n' ;;
+    # DIVE-8284: the two self-only web chat rails and nothing else is what a
+    # sandboxed seat with the dashboard channel holds.
+    chat-only|none) printf 'sandboxed\n' ;;
     custom)   printf 'custom\n' ;;
     # DIVE-2098: `unknown` is NOT a class, it is the absence of a measurement,
     # and it used to fall through the catch-all into `custom` — a GENUINE class
@@ -691,6 +696,7 @@ sudo_grant_english() {
     root-all) printf 'any command, no restriction\n' ;;
     cli-root) printf 'the 5dive CLI only\n' ;;
     cli-scoped) printf 'a few named 5dive subcommands only\n' ;;
+    chat-only) printf 'its own web chat only\n' ;;
     none)     printf 'no sudo\n' ;;
     custom)   printf 'entries this CLI did not write\n' ;;
     *)        printf 'not measurable from here\n' ;;
@@ -978,6 +984,60 @@ write_standard_sudoers() {
   fi
 }
 
+# DIVE-8284: a sandboxed seat with web chat turned on, and nothing else.
+#
+# A sandboxed seat holds no sudoers by design. But since DIVE-5690/5894 the
+# dashboard chat adapter reaches the app ONLY through root (`_dashboard_relay`),
+# and on an encrypted server opens and seals each message only through root
+# (`_chat_e2e`, DIVE-6878). Both were granted in the standard template alone, so
+# `channels=dashboard` on a sandboxed seat succeeded and the chat was silently
+# deaf (lodar's grok on chill-gorge, 2026-11-12).
+#
+# These two rails are SELF-ONLY: exact path, no args, no wildcard; each derives
+# the seat from SUDO_UID and acts as that seat only (reads, acks, replies, opens
+# and seals for itself). Neither gives the seat the box token, the box key, any
+# other seat, or any other command. So the drop-in carries exactly these two
+# lines, and exists only while the seat has the dashboard channel.
+# classify_sudo_grant reports it as `chat-only`, which still implies sandboxed.
+render_sandboxed_chat_sudoers() {
+  local user="$1"
+  cat <<SUDOERS
+# Managed by 5dive (DIVE-8284). Web chat only, for sandboxed agent ${user}.
+# Do not edit by hand; written while the agent has the dashboard channel, removed when it does not.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _dashboard_relay
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _chat_e2e
+SUDOERS
+}
+
+# sync_sandboxed_chat_sudoers <user> <channels> — write the chat-only drop-in when
+# <channels> includes dashboard, remove it when not. Removes only a file this
+# function wrote (byte-equal to the render): a hand-placed policy is left alone.
+# Prints one word: written | current | removed | absent | kept.
+sync_sandboxed_chat_sudoers() {
+  local user="$1" channels="${2:-none}" d="${SUDOERS_D:-/etc/sudoers.d}" f tmp want
+  f="${d}/${user}"
+  want=$(render_sandboxed_chat_sudoers "$user")
+  if channel_in_list dashboard "$channels"; then
+    if [[ -f "$f" && "$(cat -- "$f" 2>/dev/null)" == "$want" ]]; then printf 'current\n'; return 0; fi
+    tmp=$(mktemp)
+    printf '%s\n' "$want" > "$tmp"
+    chmod 440 "$tmp"
+    if visudo -cf "$tmp" >/dev/null 2>&1; then
+      chown root:root "$tmp" 2>/dev/null || true
+      mv "$tmp" "$f"
+      chmod 440 "$f"
+      printf 'written\n'
+    else
+      rm -f "$tmp"
+      fail "$E_GENERIC" "generated chat sudoers for ${user} failed visudo validation; aborting (no partial install)"
+    fi
+    return 0
+  fi
+  if [[ ! -e "$f" ]]; then printf 'absent\n'; return 0; fi
+  if [[ "$(cat -- "$f" 2>/dev/null)" == "$want" ]]; then rm -f -- "$f"; printf 'removed\n'; return 0; fi
+  printf 'kept\n'
+}
+
 # DIVE-4081: bring EXISTING standard seats forward when the managed sudoers
 # template grows a new narrow primitive. create_agent_user writes the canonical
 # policy for NEW seats, but a seat created before DIVE-3160 kept its old drop-in
@@ -1023,9 +1083,18 @@ cmd_agent_reconcile_sudoers() {
       *)       skipped=$((skipped + 1)) ;;
     esac
   done < <(jq -r '.agents | to_entries[] | select(.value.isolation == "standard") | .key' <<<"$reg")
-  ok "standard-seat sudoers reconciled: updated=${updated}, current=${current}, skipped=${skipped}" \
-     '{updated:($u|tonumber), current:($c|tonumber), skipped:($s|tonumber)}' \
-     --arg u "$updated" --arg c "$current" --arg s "$skipped"
+  # DIVE-8284: a sandboxed seat that already had web chat before its chat-only
+  # drop-in existed gets it on this update; one without the channel loses it.
+  local chans sandboxed=0
+  while IFS=$'\t' read -r name chans; do
+    [[ -n "$name" ]] || continue
+    case "$(sync_sandboxed_chat_sudoers "agent-${name}" "$chans")" in
+      written|removed) sandboxed=$((sandboxed + 1)) ;;
+    esac
+  done < <(jq -r '.agents | to_entries[] | select(.value.isolation == "sandboxed") | "\(.key)\t\(.value.channels // "none")"' <<<"$reg")
+  ok "standard-seat sudoers reconciled: updated=${updated}, current=${current}, skipped=${skipped}; sandboxed chat grants changed=${sandboxed}" \
+     '{updated:($u|tonumber), current:($c|tonumber), skipped:($s|tonumber), sandboxedChat:($x|tonumber)}' \
+     --arg u "$updated" --arg c "$current" --arg s "$skipped" --arg x "$sandboxed"
 }
 
 # DIVE-4183: `agent grant <name> <merge|push|deploy>` — re-render ONE existing
@@ -4224,6 +4293,8 @@ cmd_create() {
   create_agent_user "$name" "$isolation" "$can_push" "$can_deploy"
 
   if [[ "$isolation" == "sandboxed" ]]; then
+    # DIVE-8284: web chat on a sandboxed seat needs its two self-only rails.
+    sync_sandboxed_chat_sudoers "agent-${name}" "$channels" >/dev/null
     step "Applying sandbox resource limits for agent-${name}"
     local dropin_dir="/etc/systemd/system/5dive-agent@${name}.service.d"
     mkdir -p "$dropin_dir"
