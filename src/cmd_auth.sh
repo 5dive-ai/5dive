@@ -3283,8 +3283,19 @@ cmd_auth_submit() {
     esac
     shift
   done
+  # DIVE-8292: `--code=-` reads the code from stdin, so it is never in a
+  # command line (ps, the audit log). 5dive.app's chat-only sign-in hands it
+  # to this server's reporter, which pipes it here. Read before anything else:
+  # an empty stdin fails the same way whatever the session, which is also how
+  # that reporter tells this form is supported.
+  if [[ "$code" == "-" ]]; then
+    code=""
+    IFS= read -r code || true
+    code="${code%$'\r'}"
+    [[ -n "$code" ]] || fail "$E_USAGE" "no callback code on stdin"
+  fi
   [[ -n "$sid" && -n "$code" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent auth submit <session_id> --code=<callback-code>"
+    || fail "$E_USAGE" "usage: 5dive agent auth submit <session_id> --code=<callback-code|->"
 
   # Callback code is URL-safe base64 (`[A-Za-z0-9_-]+`), optional `#fragment`.
   # Allow `/` and `.` so future provider shapes pass; we still refuse spaces,
