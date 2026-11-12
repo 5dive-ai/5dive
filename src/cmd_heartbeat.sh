@@ -3215,7 +3215,7 @@ _hb_clear_receipt() {
     first=$(sudo -n -u "agent-${name}" head -n "${_HB_CLEAR_RECEIPT_LINES:-40}" "$now_file" 2>/dev/null \
       | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
       | grep -av '"isMeta"[[:space:]]*:[[:space:]]*true' \
-      | head -n 1)
+      | head -n 1) || first=""
     [[ -n "$first" ]] || continue   # the new file exists but its first user record is not written yet
     if [[ "$first" == *'<command-name>/clear</command-name>'* ]]; then
       _HB_CLEAR_RECEIPT="the session rotated to $(basename "$now_file") (was $(basename "$_HB_LANDED_FILE")) and its first user record is <command-name>/clear</command-name>"
