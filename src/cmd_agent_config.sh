@@ -479,6 +479,13 @@ cmd_config() {
     trap '' PIPE HUP TERM INT
   fi
   echo "$reg" | registry_write
+  # DIVE-8284: a sandboxed seat holds no sudoers, except the two self-only web
+  # chat rails while it has the dashboard channel. Without them the chat adapter
+  # cannot reach the app and the seat is silently deaf.
+  if [[ -n "$channels_changed_to" ]] \
+     && [[ "$(jq -r --arg n "$name" '.agents[$n].isolation // ""' <<<"$reg")" == "sandboxed" ]]; then
+    sync_sandboxed_chat_sudoers "agent-${name}" "$channels_changed_to" >/dev/null
+  fi
   # DIVE-4589: the binding event is written after the registry write has SUCCEEDED
   # (a failed write must not leave a rebind recorded that never happened) and
   # before the env rewrite + auth-symlink re-point below — which is what actually

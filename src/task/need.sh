@@ -933,7 +933,7 @@ _gate_seat_can_sign() {
   fi
   case "$cls" in
     root-all|cli-root) printf 'yes|%s\n' "$cls" ;;
-    cli-scoped|none)   printf 'no|%s\n' "$cls" ;;
+    cli-scoped|chat-only|none) printf 'no|%s\n' "$cls" ;;
     *)                 printf 'unknown|%s\n' "$cls" ;;
   esac
 }

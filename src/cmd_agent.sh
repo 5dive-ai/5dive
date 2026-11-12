@@ -978,7 +978,7 @@ def codex_live_model(name):
 def classify_sudo(text, measurable):
     if not measurable:
         return {"grant": "unknown", "runas": "-", "impliedIsolation": "unknown", "measured": False, "extraEntries": False}
-    has_all = has_cli = has_scoped = has_other = runas_any = any_cmd = False
+    has_all = has_cli = has_scoped = has_chat = has_other = runas_any = any_cmd = False
     for original in text.splitlines():
         line = original.split("#", 1)[0]
         match = re.search(r"\(([^)]*)\)(.*)", line)
@@ -1017,18 +1017,20 @@ def classify_sudo(text, measurable):
                   command in ("/usr/local/bin/5dive people knock file *", "/usr/local/bin/5dive people knock answer *") or
                   command.startswith("/usr/local/bin/5dive _merge_do") or
                   command in ("/usr/local/bin/5dive _route_do", "/usr/local/bin/5dive _pkg_do") or
-                  command == "/usr/local/bin/5dive _dashboard_relay" or
-                  command == "/usr/local/bin/5dive _chat_e2e" or
                   command == "/usr/local/bin/5dive _secret_link_notify" or
                   command == "/usr/local/bin/5dive _seat_secret" or
                   command in ("/usr/local/bin/5dive agent _peek *", "/usr/local/bin/5dive agent _skill_give *",
                               "/usr/local/bin/5dive heartbeat _self on", "/usr/local/bin/5dive heartbeat _self off") or
                   command in ("/usr/local/bin/5dive sysadmin _broker", "/usr/local/bin/5dive --json sysadmin _broker")):
                 has_scoped = True
+            elif (command == "/usr/local/bin/5dive _dashboard_relay" or
+                  command == "/usr/local/bin/5dive _chat_e2e"):
+                # DIVE-8284: alone, the web chat rails of a sandboxed seat.
+                has_chat = True
             else:
                 has_other = True
-    grant = "root-all" if has_all else "cli-root" if has_cli else "cli-scoped" if has_scoped else "custom" if has_other else "none"
-    implied = {"root-all": "beyond-admin", "cli-root": "admin", "cli-scoped": "standard", "none": "sandboxed", "custom": "custom"}[grant]
+    grant = "root-all" if has_all else "cli-root" if has_cli else "cli-scoped" if has_scoped else "chat-only" if has_chat else "custom" if has_other else "none"
+    implied = {"root-all": "beyond-admin", "cli-root": "admin", "cli-scoped": "standard", "chat-only": "sandboxed", "none": "sandboxed", "custom": "custom"}[grant]
     return {"grant": grant, "runas": ("any" if runas_any else "root") if any_cmd else "-",
             "impliedIsolation": implied, "measured": True,
             "extraEntries": grant != "custom" and has_other}
