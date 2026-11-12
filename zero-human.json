@@ -1,21 +1,21 @@
 {
-  "generatedAtUtc": "2026-11-11T02:01:38Z",
-  "date": "2026-11-11",
+  "generatedAtUtc": "2026-11-12T02:01:22Z",
+  "date": "2026-11-12",
   "week": {
-    "shipped": 2032,
-    "humanAsks": 33
+    "shipped": 2041,
+    "humanAsks": 34
   },
   "day": {
-    "shipped": 104,
-    "humanAsks": 2
+    "shipped": 84,
+    "humanAsks": 1
   },
   "cumulative": {
-    "daysPublished": 124,
-    "shipped": 6384,
-    "humanAsks": 378,
+    "daysPublished": 125,
+    "shipped": 6468,
+    "humanAsks": 379,
     "since": "2026-07-11"
   },
-  "cliVersion": "0.126.3",
+  "cliVersion": "0.129.0",
   "source": "5dive digest --json [--30d]",
   "methodology": "https://github.com/5dive-ai/5dive/blob/main/docs/zero-human.md",
   "window": {
@@ -27,12 +27,12 @@
   },
   "corroborators": {
     "verifierFirstPassRate": {
-      "value": "51.8%",
+      "value": "51.2%",
       "window": "30d",
-      "firstPass": 510,
-      "graded": 985,
-      "shippedStandardTasks": 2032,
-      "coveragePct": 48.5,
+      "firstPass": 513,
+      "graded": 1001,
+      "shippedStandardTasks": 2040,
+      "coveragePct": 49.1,
       "basis": "live tasks.db query: status='done' AND kind='standard' AND done_at within the last 30 calendar days from datetime('now') \u2014 a DIFFERENT instrument from this datapoint's own week.shipped above (a frozen sum of the last 30 PUBLISHED daily datapoints, DIVE-1552, which can span more than 30 calendar days while publishing is paused). Do not read the two as the same number.",
       "iterationNullGraded": 9,
       "iterationNullBiasPctPtsMax": 0.9,
@@ -45,7 +45,7 @@
       "firedSites": 34,
       "firedSitesLifetime": 50,
       "ledgerSince": "2026-07-25 12:04:55",
-      "ledgerAgeDays": 108.6,
+      "ledgerAgeDays": 109.6,
       "note": "a site that never fires is not evidence of compliance \u2014 -6 of 44 instrumented sites have never fired lifetime; no baseline exists yet while the ledger is young (see ledgerAgeDays)"
     }
   },
