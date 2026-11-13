@@ -1980,6 +1980,8 @@ _claude_byo_context_window() { # -> the smallest window across the seat's models
     https://api.moonshot.ai/anthropic|https://api.moonshot.ai/anthropic/) prov=moonshot ;;
     https://api.z.ai/api/anthropic|https://api.z.ai/api/anthropic/) prov=zai ;;
     https://token-plan.*.maas.aliyuncs.com/apps/anthropic|https://token-plan.*.maas.aliyuncs.com/apps/anthropic/) prov=qwen ;;
+    # DIVE-8325: the Token Plan host the vendor console now shows (same key, same models).
+    https://token-plan.maas.qwencloudapi.com/apps/anthropic|https://token-plan.maas.qwencloudapi.com/apps/anthropic/) prov=qwen ;;
     *) return 0 ;;   # an endpoint of the owner's own: no source to read
   esac
   command -v jq >/dev/null 2>&1 && [[ -r "$HOME/.claude/settings.json" ]] \

@@ -105,6 +105,24 @@ OR_SEAT=(ANTHROPIC_BASE_URL=$OR ANTHROPIC_DEFAULT_OPUS_MODEL=deepseek/deepseek-v
 reset
 eq_t "T1 a qwen seat launches with its window"               983616  "$(seen claude "${QWEN_SEAT[@]}")"
 eq_t "T1b ... and keeps the 400k ceiling"                    400000  "$(ceiling "${QWEN_SEAT[@]}")"
+# DIVE-8325: the Token Plan host the vendor console now shows. Same key, same
+# models; before this, it fell to "an endpoint of the owner's own" and got nothing.
+QWEN_NEW=https://token-plan.maas.qwencloudapi.com/apps/anthropic
+reset
+eq_t "T1c a qwen4 seat on the newer Token Plan host gets its window" 983616 \
+  "$(seen claude "${QWEN_SEAT[@]}" ANTHROPIC_BASE_URL=$QWEN_NEW)"
+reset
+eq_t "T1d ... with a trailing slash too"                     983616 \
+  "$(seen claude "${QWEN_SEAT[@]}" ANTHROPIC_BASE_URL=$QWEN_NEW/)"
+reset
+eq_t "T1e the shipped Token Plan host, with a trailing slash" 983616 \
+  "$(seen claude "${QWEN_SEAT[@]}" ANTHROPIC_BASE_URL=$QWEN/)"
+reset
+eq_t "T1f a lookalike host is still the owner's own: nothing" UNSET \
+  "$(seen claude "${QWEN_SEAT[@]}" ANTHROPIC_BASE_URL=https://token-plan.maas.qwencloudapi.com.example.net/apps/anthropic)"
+reset
+eq_t "T1g the pay-as-you-go qwencloudapi host: nothing"     UNSET \
+  "$(seen claude "${QWEN_SEAT[@]}" ANTHROPIC_BASE_URL=https://ap-southeast-1.maas.qwencloudapi.com/apps/anthropic)"
 reset
 eq_t "T2 an OpenRouter seat launches with its window"        1048576 "$(seen claude "${OR_SEAT[@]}")"
 eq_t "T2b ... read from OpenRouter's list (one fetch)"       1       "$(wc -l <"$CURL_LOG" | tr -d ' ')"

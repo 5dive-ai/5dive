@@ -35,11 +35,13 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 [[ "${CLAUDE_PROVIDER_BASEURL[qwen]:-}" == "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic" ]] \
   && ok_t "CLAUDE_PROVIDER_BASEURL[qwen] = smoked token-plan endpoint" \
   || bad_t "qwen base url wrong/missing" "got: '${CLAUDE_PROVIDER_BASEURL[qwen]:-}'"
-[[ "${CLAUDE_PROVIDER_OPUS_MODEL[qwen]:-}" == "qwen3.8-max" ]] \
-  && ok_t "CLAUDE_PROVIDER_OPUS_MODEL[qwen] = qwen3.8-max" \
+# DIVE-8325: opus+sonnet moved to qwen4-max-preview (box owner's ask, smoked live
+# on teal-fox 2026-11-12); haiku stays qwen3.6-flash (no qwen4 flash exists yet).
+[[ "${CLAUDE_PROVIDER_OPUS_MODEL[qwen]:-}" == "qwen4-max-preview" ]] \
+  && ok_t "CLAUDE_PROVIDER_OPUS_MODEL[qwen] = qwen4-max-preview" \
   || bad_t "qwen opus model wrong/missing" "got: '${CLAUDE_PROVIDER_OPUS_MODEL[qwen]:-}'"
-[[ "${CLAUDE_PROVIDER_SONNET_MODEL[qwen]:-}" == "qwen3.8-max" ]] \
-  && ok_t "CLAUDE_PROVIDER_SONNET_MODEL[qwen] = qwen3.8-max" \
+[[ "${CLAUDE_PROVIDER_SONNET_MODEL[qwen]:-}" == "qwen4-max-preview" ]] \
+  && ok_t "CLAUDE_PROVIDER_SONNET_MODEL[qwen] = qwen4-max-preview" \
   || bad_t "qwen sonnet model wrong/missing" "got: '${CLAUDE_PROVIDER_SONNET_MODEL[qwen]:-}'"
 [[ "${CLAUDE_PROVIDER_HAIKU_MODEL[qwen]:-}" == "qwen3.6-flash" ]] \
   && ok_t "CLAUDE_PROVIDER_HAIKU_MODEL[qwen] = qwen3.6-flash" \
@@ -75,8 +77,8 @@ _apply_byo_claude qwen sk-sp-test-123456 qa-qwen ""
 for want in \
   "qa-qwen ANTHROPIC_BASE_URL=https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic" \
   "qa-qwen ANTHROPIC_AUTH_TOKEN=sk-sp-test-123456" \
-  "qa-qwen ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3.8-max" \
-  "qa-qwen ANTHROPIC_DEFAULT_SONNET_MODEL=qwen3.8-max" \
+  "qa-qwen ANTHROPIC_DEFAULT_OPUS_MODEL=qwen4-max-preview" \
+  "qa-qwen ANTHROPIC_DEFAULT_SONNET_MODEL=qwen4-max-preview" \
   "qa-qwen ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3.6-flash" \
   "qa-qwen API_TIMEOUT_MS=3000000" \
   "qa-qwen CLAUDE_CODE_OAUTH_TOKEN=" \
@@ -98,6 +100,12 @@ grep -qxF "qa-qwen ANTHROPIC_API_KEY=" "$capture" && ! grep -qE "^qa-qwen ANTHRO
 grep -q '"qwen|Qwen|' "$SRC/cmd_init.sh" \
   && ok_t "cmd_init.sh claude custom picker offers qwen" \
   || bad_t "init wizard does not offer qwen for claude"
+
+# DIVE-8325: the init picker says which key family it takes. A pay-as-you-go key
+# gets a bare InvalidApiKey from a Token Plan host, so "API key" alone misleads.
+grep -qF '"qwen|Qwen|Qwen models over Anthropic-compatible API (Token Plan subscription key, sk-sp-...)"' "$SRC/cmd_init.sh" \
+  && ok_t "init picker labels qwen as a Token Plan subscription key (sk-sp-...)" \
+  || bad_t "init picker qwen label does not name the subscription key" "$(grep -n 'qwen|Qwen|Qwen models over' "$SRC/cmd_init.sh")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
