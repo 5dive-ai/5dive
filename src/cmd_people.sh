@@ -29,6 +29,11 @@
 #     the agent; - an id ONLY when it belongs to a managed person NOT allowed
 #     there (or a person just removed). Never an unknown/pairing-era id, never an
 #     id in the bot's `owners`. Groups and dmPolicy are not touched.
+#   Telegram access.json owners (DIVE-8378): + telegram ids of owner and admin
+#     people allowed on the agent, so owner-only notices (Connect sign-in) reach
+#     them; - only ids this verb added (people-owners.json beside it). The first
+#     paired owner and a hand-added owner survive every sync. Stamped
+#     ownersSeed:2 so the plugin does not trim it back to one owner.
 #   Teams config.json: allowed_users by the same rule, plus access:"knock" (the
 #     Teams plugin holds a sender who is not on the list and files a knock).
 #   /etc/5dive/roles.json admins: + the teams:/telegram: keys of owner and admin
@@ -68,7 +73,8 @@ _people_usage() {
                           [--name=<text>] [--email=<addr>]
   5dive people knock answer <knock id> allow|admin|no [--by=<channel:id>] [--proof=<nonce>]
 
-  Allow = chat and give work. Admin = also pay, delete, change settings.
+  Allow = chat and give work. Admin = also pay, delete, change settings, and
+  get the agent's owner-only Telegram notices (Connect sign-in buttons).
   READS (ls) — any agent. WRITES — root. A seat may run only \`knock file\` (for
   its own agent) and \`knock answer\` with the owner's tap proof, through sudo.
   Add --json for {ok,data}. With nobody added, nothing changes on this box.
@@ -411,6 +417,51 @@ def merge_ids(current, agent, key, norm, revoked, protect=()):
     out += sorted(x for x in allow if x not in have)
     return out
 
+# DIVE-8378: owner and admin people become owners of the bot, so the owner-only
+# notices (browser Connect sign-in, usage limits, group auto-approve) reach them.
+# Only ids this verb added are ever removed; they are listed in a sidecar beside
+# access.json, NOT inside it: the channel server rewrites access.json with known
+# keys only (normalizeAccess), so a key of ours there is gone on the next pairing.
+OWNERS_SIDECAR = 'people-owners.json'
+OWNERS_SEED = 2  # plugins/telegram/groupjoin.ts OWNERS_SEED
+
+def sync_owners(acc, allow_from, agent, sidecar):
+    """Update acc['owners'] in place; True when access.json must be written."""
+    want = sorted({str(p['telegram']) for p in people if p.get('telegram')
+                   and p.get('role') in ('owner', 'admin') and allowed_on(p, agent)})
+    try:
+        with open(sidecar) as f:
+            prev = json.load(f).get('ownersManaged')
+        prev = {str(x) for x in prev} if isinstance(prev, list) else set()
+    except (FileNotFoundError, ValueError, AttributeError):
+        prev = set()
+    if not want and not prev:
+        return False  # adoption by presence: nothing of ours here, touch nothing
+    cur = acc.get('owners')
+    cur = [str(x) for x in cur if isinstance(x, (str, int))] if isinstance(cur, list) else None
+    if acc.get('ownersSeed') == OWNERS_SEED and cur is not None:
+        base = cur
+    else:
+        # An unstamped record is the old all-of-allowFrom seed (or none at all):
+        # trim it the way the plugin's nextOwners would — to the first paired
+        # user it holds — BEFORE stamping, or the stamp would freeze every
+        # client it held as an owner (DIVE-5867).
+        base = [u for u in allow_from if u.isdigit() and (cur is None or u in cur)][:1]
+    hand = [x for x in base if x not in prev]
+    new_owners = hand + [x for x in want if x not in hand]
+    managed = sorted(set(want) - set(hand))
+    if managed != sorted(prev):
+        if managed:
+            write_like(sidecar, {'ownersManaged': managed}, owner_of=os.path.dirname(sidecar))
+        else:
+            os.remove(sidecar)
+            changed.append(sidecar)
+    if new_owners == cur and acc.get('ownersSeed') == OWNERS_SEED:
+        return False
+    acc['owners'] = new_owners
+    acc['ownersSeed'] = OWNERS_SEED
+    return True
+
 def home_of(name):
     return os.path.join(home_root, 'claude' if name == 'claude' else f'agent-{name}')
 
@@ -429,10 +480,13 @@ for a in agents:
             acc = None
         if isinstance(acc, dict):
             cur = [str(x) for x in (acc.get('allowFrom') or [])]
+            acc_changed = sync_owners(acc, cur, name, os.path.join(os.path.dirname(path), OWNERS_SIDECAR))
             owners = [str(x) for x in (acc.get('owners') or []) if isinstance(x, (str, int))]
             new = merge_ids(cur, name, 'telegram', str, revoked_tg, protect=owners)
             if new != cur:
                 acc['allowFrom'] = new
+                acc_changed = True
+            if acc_changed:
                 write_like(path, acc)
     # Teams: an agent is Teams-connected when its config.json exists.
     path = os.path.join(home, '.claude', 'channels', 'teams', 'config.json')
