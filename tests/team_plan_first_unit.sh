@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 25.0s pristine, the slowest core harness (5 real compose-up runs). DIVE-8393: main went red on a core shard budget overrun (s3 306s/300s, run 43445722634, no test failed); the planner rebalances by weight, so freeing ~10s per shard means ~60s off core. This is a product onboarding flow, not the merge path: a regression here is revertible and the nightly full sweep still grades it.
 # DIVE-5729 — a hired team asks first. On a team's FIRST start, every seeded goal
 # and every declared loop is born blocked behind one kickoff row assigned to the
 # lead; nothing runs until `team start` (minus --skip) or `team decline`.

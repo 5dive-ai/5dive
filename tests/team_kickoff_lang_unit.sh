@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 13.2s pristine, same real compose-up rig as team_plan_first_unit.sh and demoted with it. DIVE-8393: main went red on a core shard budget overrun (s3 306s/300s, run 43445722634, no test failed); the planner rebalances by weight, so freeing ~10s per shard means ~60s off core. This is a product onboarding flow, not the merge path: a regression here is revertible and the nightly full sweep still grades it.
 # DIVE-6484 — a new team's kickoff in the owner's language.
 #
 # A partner's owner who writes in Russian saw this first row in English.
