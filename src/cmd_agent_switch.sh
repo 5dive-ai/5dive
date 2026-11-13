@@ -64,7 +64,7 @@ _switch_is_type() { [[ " ${SWITCH_TYPES[*]} " == *" ${1:-} "* ]]; }
 # DIVE-8371: is this switch running INSIDE the seat it switches? An agent that
 # runs `sudo 5dive agent switch <itself>` lives in 5dive-agent@<itself>.service,
 # so step 1's `systemctl stop` of that unit SIGTERMs the switch with it: the unit
-# stops, nothing is converted, nothing restarts it (OINOA fresh-boar, kostya dead
+# stops, nothing is converted, nothing restarts it (a partner box: the seat stayed dead
 # 20 h). setsid/nohup do not leave the cgroup (wiki: setsid-does-not-leave-the-
 # cgroup); only a transient service does. Either signal is enough: the process's
 # cgroup sits under that unit, or sudo was called by that seat's own user.
