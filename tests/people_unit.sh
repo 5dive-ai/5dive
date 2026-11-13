@@ -178,6 +178,54 @@ R1B=$(jq -c '[.admins, .managed, .check]' "$PEOPLE_ROLES_FILE")
   || bad_t "R1 roles" "after-admin=$R1A after-demote=$R1B"
 ( cmd_people_rm cara ) >/dev/null 2>&1
 
+# =============================================================================
+# OW — an Admin becomes an owner of the bot (DIVE-8378): owner-only notices
+# (Connect sign-in) reach her. Only ids People added are ever removed.
+# =============================================================================
+TG_DANA=1234567894
+VS="$(dirname "$VA")/people-owners.json"; OS="$(dirname "$OA")/people-owners.json"
+owners_of() { jq -c '[.owners, .ownersSeed]' "$1"; }
+printf '{"dmPolicy":"allowlist","allowFrom":["%s","%s","%s"],"owners":["%s","%s"],"ownersSeed":2,"groups":{"-100":{}}}\n' \
+  "$TG_OWNER" "$TG_UNKNOWN" "$TG_PAIR" "$TG_OWNER" "$TG_UNKNOWN" >"$VA"
+OA0=$(sha256sum <"$OA")
+( cmd_people_write add dana --name=Dana --telegram=$TG_DANA --role=admin --agents=vesper ) >/dev/null 2>&1
+[[ "$(owners_of "$VA")" == "[[\"$TG_OWNER\",\"$TG_UNKNOWN\",\"$TG_DANA\"],2]" \
+   && "$(jq -c .ownersManaged "$VS")" == "[\"$TG_DANA\"]" && "$(allow_of "$VA")" == *",$TG_DANA" \
+   && "$(jq -c .groups "$VA")" == '{"-100":{}}' && "$(sha256sum <"$OA")" == "$OA0" && ! -e "$OS" ]] \
+  && ok_t "OW1 admin on vesper: joins vesper's owners (first + hand-added kept, seed 2, tracked in the sidecar); otto untouched" \
+  || bad_t "OW1 admin -> owners" "vesper=$(jq -c . "$VA") side=$(cat "$VS" 2>&1) otto=$(jq -c . "$OA")"
+
+( cmd_people_write set dana --role=member ) >/dev/null 2>&1
+[[ "$(owners_of "$VA")" == "[[\"$TG_OWNER\",\"$TG_UNKNOWN\"],2]" && ! -e "$VS" && "$(allow_of "$VA")" == *",$TG_DANA" ]] \
+  && ok_t "OW2 demote to member: leaves owners (stays a DM user); first and hand-added owners survive" \
+  || bad_t "OW2 demote" "vesper=$(jq -c . "$VA") side=$(cat "$VS" 2>&1)"
+
+# An unstamped record is the old all-of-allowFrom seed: trimmed to the first
+# paired user before the stamp, never frozen with every client in it.
+printf '{"dmPolicy":"allowlist","allowFrom":["%s","%s","%s","%s"],"owners":["%s","%s","%s"]}\n' \
+  "$TG_OWNER" "$TG_UNKNOWN" "$TG_PAIR" "$TG_DANA" "$TG_OWNER" "$TG_UNKNOWN" "$TG_PAIR" >"$VA"
+( cmd_people_write set dana --role=admin ) >/dev/null 2>&1
+[[ "$(owners_of "$VA")" == "[[\"$TG_OWNER\",\"$TG_DANA\"],2]" ]] \
+  && ok_t "OW3 unstamped (old-seed) record: trimmed to the first paired owner, then the admin added, stamped 2" \
+  || bad_t "OW3 old seed" "vesper=$(jq -c . "$VA")"
+
+( cmd_people_rm dana ) >/dev/null 2>&1
+[[ "$(owners_of "$VA")" == "[[\"$TG_OWNER\"],2]" && ! -e "$VS" && "$(allow_of "$VA")" != *"$TG_DANA"* ]] \
+  && ok_t "OW4 rm: the admin leaves owners AND allowFrom" \
+  || bad_t "OW4 rm" "vesper=$(jq -c . "$VA") side=$(cat "$VS" 2>&1)"
+
+# A hand-added owner who is then set to Admin is not adopted: demoting her
+# through People never takes away an owner the box owner added by hand.
+printf '{"dmPolicy":"allowlist","allowFrom":["%s","%s"],"owners":["%s","%s"],"ownersSeed":2}\n' \
+  "$TG_OWNER" "$TG_DANA" "$TG_OWNER" "$TG_DANA" >"$VA"
+( cmd_people_write add dana --name=Dana --telegram=$TG_DANA --role=admin --agents=vesper ) >/dev/null 2>&1
+OW5A=$(owners_of "$VA"); OW5S=$([[ -e "$VS" ]] && cat "$VS")
+( cmd_people_write set dana --role=member ) >/dev/null 2>&1
+[[ "$OW5A" == "[[\"$TG_OWNER\",\"$TG_DANA\"],2]" && -z "$OW5S" && "$(owners_of "$VA")" == "$OW5A" ]] \
+  && ok_t "OW5 a hand-added owner set to Admin then Member stays an owner (never tracked as ours)" \
+  || bad_t "OW5 hand-added" "after-admin=$OW5A side=$OW5S after-member=$(owners_of "$VA")"
+( cmd_people_rm dana ) >/dev/null 2>&1
+
 # O1
 ( cmd_people_write add lodar --name=Owner --telegram=1234567898 --role=owner ) >/dev/null 2>&1
 ( cmd_people_rm lodar ) >/dev/null 2>&1; O1A=$?
