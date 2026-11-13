@@ -261,6 +261,26 @@ CM="${AGENT_CHANNEL_MARKETPLACE:-claude-plugins-official}"
 # the dashboard chat channel coexists with telegram on one session, each as
 # its own MCP server; --channels is variadic so repeating the flag is fine).
 IFS=',' read -ra CHANNEL_LIST <<< "$CHANNELS"
+# plugin_channel_launch <channel> -> "plugin:<plugin>@<marketplace>" for a channel
+# an ENABLED plugin declares (DIVE-8315); non-zero for any other name. Built-in
+# names never resolve here: their own arms above match first.
+plugin_channel_launch() {
+  local ch="$1" store="${FIVEDIVE_PLUGIN_STORE:-/var/lib/5dive/plugins}" key plugin mkt mf e
+  [[ "$ch" =~ ^[a-z][a-z0-9-]{1,23}$ && -r "$store/installed.json" ]] || return 1
+  while IFS=$'\t' read -r key plugin mkt; do
+    for e in .claude-plugin .5dive-plugin .codex-plugin; do
+      mf="$store/enabled/$key/$e/plugin.json"
+      [[ -r "$mf" ]] || continue
+      if jq -e --arg c "$ch" '.fivedive.channel.name == $c' "$mf" >/dev/null 2>&1; then
+        printf 'plugin:%s@%s\n' "$plugin" "$mkt"; return 0
+      fi
+      break
+    done
+  done < <(jq -r 'to_entries[] | select(.value.enabled == true and ((.value.capabilities // []) | index("channel")))
+                  | [.key, (.value.plugin // ""), (.value.marketplace // "")] | @tsv' "$store/installed.json" 2>/dev/null)
+  return 1
+}
+
 for CH in "${CHANNEL_LIST[@]}"; do
 case "$CH" in
   none|"") : ;;
@@ -319,7 +339,20 @@ case "$CH" in
       claude) ARGS+=(--channels "plugin:teams@5dive-plugins") ;;
       *) echo "channels=teams is claude-only for now (got type=$TYPE)" >&2; exit 2 ;;
     esac ;;
-  *) echo "unknown channels: $CH" >&2; exit 2 ;;
+  # DIVE-8315: a channel an enabled plugin declares in its manifest
+  # (fivedive.channel, read the way src/lib/plugin_channels.sh reads it).
+  # A name no enabled plugin declares (its plugin was removed or disabled) starts
+  # the agent WITHOUT that channel: a seat that cannot start at all is worse.
+  # valid_channel refuses unknown names at create and config, so this is not a typo.
+  *)
+    if ! PCH=$(plugin_channel_launch "$CH"); then
+      echo "[5dive] agent=$NAME channels=$CH: no enabled plugin provides it (removed or disabled?) — starting without it. Turn it back on: sudo 5dive plugin enable <plugin>" >&2
+      continue
+    fi
+    case "$TYPE" in
+      claude) ARGS+=(--channels "$PCH") ;;
+      *) echo "channels=$CH runs on claude agents only for now (got type=$TYPE)" >&2; exit 2 ;;
+    esac ;;
 esac
 done
 

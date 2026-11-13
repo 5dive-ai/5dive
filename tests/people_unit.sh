@@ -37,6 +37,9 @@
 #   E2  never by the owner's email, never re-pointing a set Teams id.
 #   E3  an admin record binds only on an Admin tap: Allow on an admin's email
 #       makes a fresh member row and grants no admin key.
+#   PC1-5 (DIVE-8315) a plugin channel's knock (fixture plugin chatx): its own
+#       Allow/No card from the manifest, no person, no access, the answer dropped
+#       into channels/chatx/knocks; --kind is required and unknown kinds refused.
 #   G1  the caller seat is read only under root; non-root fails closed to "-".
 #
 # Isolation: source src/ directly, throwaway TASKS_DB and fake homes, stubbed
@@ -55,7 +58,7 @@ TMP="$(mktemp -d /tmp/hb-people.XXXXXX)"
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
          lib/tasks_db.sh lib/actor.sh cmd_task.sh task/routing.sh task/notify.sh \
-         cmd_human.sh cmd_people.sh; do
+         cmd_human.sh cmd_people.sh lib/plugin_channels.sh; do
   source "$SRC/$f" 2>/dev/null
 done
 set +e
@@ -108,9 +111,9 @@ M_EP=$(sqlite3 "$TASKS_DB" "SELECT value FROM task_prefs WHERE key='schema_epoch
 # =============================================================================
 registry_read() { printf '%s' '{"agents":{"vesper":{"type":"claude","channels":"telegram"},"otto":{"type":"claude","channels":"telegram"}}}'; }
 audit_log() { :; }
-CARDS="$TMP/cards"; : >"$CARDS"
+CARDS="$TMP/cards"; : >"$CARDS"; CARDS_TEXT="$TMP/cards.text"; : >"$CARDS_TEXT"
 _task_agent_channel() { return 0; }
-_task_send_owner() { printf '%s\n' "$2" >>"$CARDS"; TASK_SEND_DELIVERED=1; }
+_task_send_owner() { printf '%s\n' "$2" >>"$CARDS"; printf '%s\n' "$1" >>"$CARDS_TEXT"; TASK_SEND_DELIVERED=1; }
 VA="$AGENT_HOME_ROOT/agent-vesper/.claude/channels/telegram/access.json"
 OA="$AGENT_HOME_ROOT/agent-otto/.claude/channels/telegram/access.json"
 VT="$AGENT_HOME_ROOT/agent-vesper/.claude/channels/teams/config.json"
@@ -331,6 +334,57 @@ E3Q=$( cmd_people_knock_answer "$E3B" admin 2>&1 | jq -r .data.person )
    && "$E3Q" == ada && "$(db "SELECT role||':'||teams_id FROM humans WHERE id='ada';")" == "admin:$GI" ]] \
   && ok_t "E3 Allow on an admin's email makes a fresh member (no admin key); Admin on it binds the admin record" \
   || bad_t "E3 admin bind" "allow=$E3P role=$(db "SELECT role FROM humans WHERE id=$(sqlq "$E3P");") admin=$E3Q ada=$(db "SELECT role||':'||COALESCE(teams_id,'') FROM humans WHERE id='ada';")"
+
+# PC1-PC5 — DIVE-8315: a channel a PLUGIN declares, read from its manifest
+# (src/lib/plugin_channels.sh). chatx is a fixture: core never names a real one.
+PCS="$STATE_DIR/plugins"; mkdir -p "$PCS/enabled/chatx@fixture-mkt/.claude-plugin"
+jq -n '{"chatx@fixture-mkt": {plugin:"chatx", marketplace:"fixture-mkt", enabled:true, capabilities:["channel","verb"]}}' >"$PCS/installed.json"
+jq -n '{name:"chatx", version:"0.0.1", fivedive:{contract:"1", capabilities:["channel","verb"], channel:{name:"chatx",
+        knock:{sender:"email", cards:{send:"{agent} wants to write to {sender} for the first time.", receive:"{sender} wrote to {agent} for the first time."}}}}}' \
+  >"$PCS/enabled/chatx@fixture-mkt/.claude-plugin/plugin.json"
+mkdir -p "$AGENT_HOME_ROOT/agent-otto/.claude/channels/chatx"
+NH0=$(db "SELECT COUNT(*) FROM humans;"); NA0=$(db "SELECT COUNT(*) FROM human_access;")
+ROLES0=$(cat "$PEOPLE_ROLES_FILE" 2>/dev/null | md5sum)
+: >"$CARDS"; : >"$CARDS_TEXT"
+PCK=$(cmd_people_knock_file --agent=otto --channel=chatx --kind=receive --sender=User5@Example.com --name="Pat <b>" 2>&1)
+PCID=$(jq -r .data.id <<<"$PCK")
+PCCB=$(jq -r '.inline_keyboard[0][0].callback_data' "$CARDS" 2>/dev/null)
+PCBTN=$(jq -r '[.inline_keyboard[0][].text]|join("/")' "$CARDS" 2>/dev/null)
+[[ "$PCID" =~ ^[0-9]+$ && "$(jq -r .data.status <<<"$PCK")" == pending && "$PCCB" =~ ^kn:${PCID}:allow:[0-9a-f]{32}$ \
+   && "$PCBTN" == "Allow/No" && "$(db "SELECT sender_id FROM knocks WHERE id=$PCID;")" == "user5@example.com" ]] \
+   && grep -qF '<b>Pat &lt;b&gt; (user5@example.com)</b> wrote to Otto for the first time.' "$CARDS_TEXT" \
+  && ok_t "PC1 plugin-channel knock: lower-cased address, the manifest's card for --kind (escaped), Allow/No only" \
+  || bad_t "PC1 plugin knock" "out=$PCK btn=$PCBTN text=$(cat "$CARDS_TEXT" 2>/dev/null)"
+( cmd_people_knock_answer "$PCID" admin ) >/dev/null 2>&1; PCADM=$?
+PCA=$( cmd_people_knock_answer "$PCID" allow 2>&1 )
+PCDROP="$AGENT_HOME_ROOT/agent-otto/.claude/channels/chatx/knocks/$PCID.json"
+[[ "$PCADM" == "$E_VALIDATION" && "$(jq -r .data.status <<<"$PCA")" == allowed && "$(jq -r .data.person <<<"$PCA")" == null \
+   && "$(db "SELECT COUNT(*) FROM humans;")" == "$NH0" && "$(db "SELECT COUNT(*) FROM human_access;")" == "$NA0" \
+   && "$(cat "$PEOPLE_ROLES_FILE" 2>/dev/null | md5sum)" == "$ROLES0" \
+   && "$(jq -c '[.channel, .sender, .answer]' "$PCDROP" 2>/dev/null)" == '["chatx","user5@example.com","allow"]' ]] \
+  && ok_t "PC2 Allow: no person, no access, roles untouched; Admin refused (rc $PCADM); answer dropped in channels/chatx/knocks" \
+  || bad_t "PC2 plugin allow" "adm=$PCADM out=$PCA humans=$(db "SELECT COUNT(*) FROM humans;")/$NH0 drop=$(cat "$PCDROP" 2>/dev/null)"
+PCN=$(cmd_people_knock_file --agent=otto --channel=chatx --kind=send --sender=user6@example.com 2>&1 | jq -r .data.id)
+PCNO=$( cmd_people_knock_answer "$PCN" no 2>&1 )
+PCRE=$( cmd_people_knock_file --agent=otto --channel=chatx --kind=receive --sender=user6@example.com 2>&1 )
+[[ "$(jq -r .data.status <<<"$PCNO")" == denied && "$(jq -r .data.status <<<"$PCRE")" == denied && "$(jq -r .data.id <<<"$PCRE")" == "$PCN" \
+   && "$(jq -r .answer "$AGENT_HOME_ROOT/agent-otto/.claude/channels/chatx/knocks/$PCN.json" 2>/dev/null)" == no \
+   && "$(db "SELECT COUNT(*) FROM humans;")" == "$NH0" ]] \
+  && ok_t "PC3 No: denied, dropped as no; the address stays refused for either kind; still no person" \
+  || bad_t "PC3 plugin no" "no=$PCNO re=$PCRE"
+( cmd_people_knock_file --agent=otto --channel=chatx --sender=user7@example.com ) >/dev/null 2>&1; PCNK=$?
+( cmd_people_knock_file --agent=otto --channel=chatx --kind=other --sender=user7@example.com ) >/dev/null 2>&1; PCBK=$?
+( cmd_people_knock_file --agent=otto --channel=chatx --kind=send --sender=not-an-address ) >/dev/null 2>&1; PCBA=$?
+[[ "$PCNK" == "$E_USAGE" && "$PCBK" == "$E_USAGE" && "$PCBA" == "$E_VALIDATION" ]] \
+  && ok_t "PC4 --kind is required and must be one the manifest names; a bad address is refused" \
+  || bad_t "PC4 kind/address checks" "nokind=$PCNK badkind=$PCBK badaddr=$PCBA"
+jq '."chatx@fixture-mkt".enabled = false' "$PCS/installed.json" >"$PCS/i.tmp" && mv "$PCS/i.tmp" "$PCS/installed.json"
+( cmd_people_knock_file --agent=otto --channel=chatx --kind=send --sender=user8@example.com ) >/dev/null 2>&1; PCOFF=$?
+[[ "$PCOFF" == "$E_VALIDATION" ]] && ok_t "PC5 a DISABLED plugin's channel takes no knocks (rc $PCOFF)" || bad_t "PC5 disabled plugin" "rc=$PCOFF"
+
+[[ "$(_people_html 'a<b>&c "d"')" == 'a&lt;b&gt;&amp;c "d"' ]] \
+  && ok_t "H1 _people_html escapes < > & once (bash 5.2 read & in a replacement as the match)" \
+  || bad_t "H1 html escape" "$(_people_html 'a<b>&c "d"')"
 
 # G1 — the caller seat is read only under a real root euid: below it SUDO_UID is a
 # plain env var, so a non-root caller fails CLOSED to "-" (never "" = root/app).

@@ -230,7 +230,9 @@ valid_channel() {
   [[ -n "$1" ]] || return 1
   local IFS=',' c
   for c in $1; do
-    [[ "$c" =~ ^(none|telegram|discord|dashboard|buzz|teams)$ ]] || return 1
+    # DIVE-8315: or a channel an enabled plugin declares (src/lib/plugin_channels.sh).
+    [[ "$c" =~ ^(none|telegram|discord|dashboard|buzz|teams)$ ]] \
+      || { declare -F plugin_channel >/dev/null && plugin_channel "$c" >/dev/null; } || return 1
     if [[ "$c" == "none" && "$1" != "none" ]]; then return 1; fi
   done
   return 0

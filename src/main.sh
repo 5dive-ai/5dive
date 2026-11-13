@@ -59,6 +59,7 @@ Agents:
                                                      # whether the seat is transacting, not only whether it is up)
   5dive agent types
   5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz|teams[,ch...]]
+                            # (or a channel a plugin adds: 5dive plugin list)
                             [--telegram-token=<bot-token>] [--discord-token=<token>]
                             [--workdir=<path>] [--auth-profile=<name>]
                             [--provider=<id> --api-key=<key|->]
