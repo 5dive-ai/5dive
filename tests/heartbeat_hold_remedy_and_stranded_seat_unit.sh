@@ -130,20 +130,40 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# B1. Both hold branches name an exit.
+# B1. Both hold branches name an exit — the RIGHT guard's exit (DIVE-8324).
 # ---------------------------------------------------------------------------
-_allheld_line="$(grep -n 'tier guard held all .* runnable todo' "$HB_SRC" | head -1)"
-_scancap_line="$(grep -n 'candidate(s) SCANNED' "$HB_SRC" | head -1)"
-for _pair in "all-held:$_allheld_line" "scan-cap:$_scancap_line"; do
-  _which="${_pair%%:*}"; _ln="${_pair#*:}"
-  if [[ -z "$_ln" ]]; then
-    bad_t "B1 the $_which branch log line was not found in $HB_SRC"
-  elif grep -q '5dive task assign' <<<"$_ln" && grep -q '5dive heartbeat wake-task' <<<"$_ln"; then
-    ok_t "B1 the $_which branch names both real exits"
-  else
-    bad_t "B1 the $_which branch names no exit (D1)" "line: ${_ln:0:120}"
-  fi
-done
+# The all-held and scan-cap lines are built by _hb_held_line, which names only
+# the guards that held. So B1 RUNS the shipped helper (extracted verbatim) rather
+# than grepping for one fixed sentence: a tier-only hold must name both tier
+# exits, a pace-only hold must name the pace exits and NOT the tier ones (the
+# tier guard's `task assign` cannot lift a pacing floor — that was the defect).
+_ex() { awk -v hdr="${2}() {" '$0 == hdr { on=1 } on { print } on && $0 == "}" { exit }' "$1"; }
+HL_FN="$(_ex "$HB_SRC" _hb_held_line)"
+if [[ -z "$HL_FN" ]]; then
+  bad_t "B1 could not extract _hb_held_line from $HB_SRC"
+else
+  eval "$HL_FN"
+  _HB_PICK_SCAN=3
+  for _mode in all scancap; do
+    _ln="$(_hb_held_line dev "$_mode" 3 3 0 0)"
+    if grep -q '5dive task assign' <<<"$_ln" && grep -q '5dive heartbeat wake-task' <<<"$_ln"; then
+      ok_t "B1 the $_mode branch, tier-held, names both tier exits"
+    else
+      bad_t "B1 the $_mode branch, tier-held, names no tier exit (D1)" "line: ${_ln:0:160}"
+    fi
+    _ln="$(_hb_held_line dev "$_mode" 3 0 0 3)"
+    if grep -q '5dive task escalate' <<<"$_ln" && grep -q '5dive config pace-week' <<<"$_ln" \
+       && ! grep -q 'task assign' <<<"$_ln" && ! grep -q 'tier guard' <<<"$_ln"; then
+      ok_t "B1 the $_mode branch, pace-held, names the pace exits and not the tier guard"
+    else
+      bad_t "B1 the $_mode branch, pace-held, misnames the guard or its exits (DIVE-8324)" "line: ${_ln:0:200}"
+    fi
+  done
+  _ln="$(_hb_held_line dev scancap 3 3 0 0)"
+  grep -q 'scan cap _HB_PICK_SCAN=3 reached' <<<"$_ln" \
+    && ok_t "B1 the scan-cap wording is kept" \
+    || bad_t "B1 the scan-cap line lost its cap wording" "line: ${_ln:0:160}"
+fi
 
 # B4 — the digest actually consumes the predicate (structural; the render is not
 # run here). Both halves: the source is invoked, and the seats reach the output.

@@ -123,10 +123,19 @@ run_tick() {  # run_tick <path-to-cmd_heartbeat.sh> <logfile> [scan-cap-override
     source "$SRC/lib/pace.sh" 2>/dev/null || true
     _pace_open_meter(){ printf '{"agents":[{"account":"acct","sevenDayPct":0,"sevenDayResetsAt":99999999999}]}'; }
     _PACE_USAGE_CMD=_pace_open_meter
+    # DIVE-8324: PACE_HARD=1 puts the account in the pacing floor's HARD band
+    # (urgent only), so a high/medium row is held by the pace guard — the shape
+    # of the chill-gorge report. The band is stubbed at the decision function,
+    # after pace.sh is sourced, so the tick's own loop is what does the holding.
+    if [[ -n "${PACE_HARD:-}" ]]; then
+      _pace_band() { cat >/dev/null; printf 'pace: acct is at 100%% of its week\n'; return 3; }
+    fi
     [[ -n "$cap" ]] && _HB_PICK_SCAN="$cap"
     require_root()          { :; }
     registry_read()         { cat "$REGISTRY"; }
-    registry_write()        { cat > /dev/null; }
+    # Every registry the tick writes is kept, one per line, so an arm can ask
+    # what the tick STAMPED (DIVE-8324's lastSeenWhy) without the fixture moving.
+    registry_write()        { jq -c . >> "$TMP/reg_writes.jsonl" 2>/dev/null || cat >/dev/null; }
     with_registry_lock()    { local fn="$1"; shift; "$fn" "$@"; }
     _hb_log()               { printf '%s\n' "$1" >> "$logf"; }
     _hb_send_line()         { return 0; }
@@ -154,7 +163,7 @@ run_tick() {  # run_tick <path-to-cmd_heartbeat.sh> <logfile> [scan-cap-override
     # THE observable. Records the id the tick chose, then reports success so the
     # claim path downstream runs exactly as it does in production.
     _hb_wake() { printf '%s' "$3" > "$TMP/woke"; return 0; }
-    : > "$TMP/woke"
+    : > "$TMP/woke"; : > "$TMP/reg_writes.jsonl"
     # stdout is KEPT (it used to go to /dev/null): under JSON_MODE the tick's
     # closing ok() is the operator-facing tick summary, and arm 9 grades the
     # tierHeld counter inside it. Discarding it is what made the counter
@@ -174,6 +183,19 @@ tier_held_count() {
   v=$(jq -r 'select(.data.skipped != null) | .data.skipped.tierHeld // "MISSING"' \
         "$TMP/summary.json" 2>/dev/null | tail -1)
   printf '%s' "${v:-MISSING}"
+}
+# DIVE-8324: the pace counter, same MISSING-vs-0 contract as tierHeld.
+pace_held_count() {
+  local v
+  v=$(jq -r 'select(.data.skipped != null) | .data.skipped.paceHeld // "MISSING"' \
+        "$TMP/summary.json" 2>/dev/null | tail -1)
+  printf '%s' "${v:-MISSING}"
+}
+# The lastSeenWhy the tick stamped on dev, or NONE.
+seen_why() {
+  local v
+  v=$(jq -r '.agents.dev.heartbeat.lastSeenWhy // empty' "$TMP/reg_writes.jsonl" 2>/dev/null | tail -1)
+  printf '%s' "${v:-NONE}"
 }
 # How many of the seeded rows the tick actually got a claim onto.
 n_claimed() { db "SELECT COUNT(*) FROM tasks WHERE status='in_progress';"; }
@@ -320,6 +342,84 @@ LOG8="$TMP/tick8.log"; : > "$LOG8"
 run_tick "$HB_NEW" "$LOG8" >/dev/null
 eq_t "an unheld board reports tierHeld=0 (the counter tracks reality, not a constant)" \
      "0" "$(tier_held_count)"
+
+# ---------------------------------------------------------------------------
+# 10. DIVE-8324 — a PACE hold is reported as a pace hold, not a tier hold.
+# ---------------------------------------------------------------------------
+# chill-gorge 2026-11-13: every "tier guard held all" line in 48 days shared its
+# tick with a pacing-floor HELD line, and zero tier holds existed. The tick
+# counted each pace hold twice (pace-held AND tier-held), advised `task assign`
+# (which cannot lift a pacing floor), and left the seat to age into OVERDUE.
+#
+# (a) every todo held by the pacing floor.
+reset_board
+P1=$(mk "pace held high, human creator"  high   lodar)
+P2=$(mk "pace held medium, self"         medium dev)
+LOGA="$TMP/tick_a.log"; : > "$LOGA"
+got=$(PACE_HARD=1 run_tick "$HB_NEW" "$LOGA")
+eq_t "(a) a fully pace-held queue wakes NOBODY" "NONE" "$got"
+eq_t "(a) the pace-held rows stay todo" "todo/todo" "$(status_of "$P1")/$(status_of "$P2")"
+eq_t "(a) precondition: the pacing floor held both rows (non-vacuous)" "2" \
+     "$(grep -c 'HELD by the pacing floor' "$LOGA")"
+if grep -q "pacing floor held all 2 runnable todo(s)" "$LOGA"; then
+  ok_t "(a) the all-held line names the PACING FLOOR"
+else
+  bad_t "(a) the all-held line does not name the pacing floor" "$(cat "$LOGA")"
+fi
+if grep -q "tier guard" "$LOGA"; then
+  bad_t "(a) a pace-only hold still blames the tier guard" "$(grep 'tier guard' "$LOGA")"
+else
+  ok_t "(a) the tier guard is not named when it held nothing"
+fi
+_al=$(grep "held all 2 runnable" "$LOGA")
+if grep -q "5dive task escalate" <<<"$_al" && grep -q "5dive config pace-week" <<<"$_al" \
+   && ! grep -q "task assign" <<<"$_al"; then
+  ok_t "(a) the all-held line names the pace exits, not the tier guard's"
+else
+  bad_t "(a) wrong exits on the all-held line" "$_al"
+fi
+eq_t "(a) tier-held is 0 (not double-counted)" "0" "$(tier_held_count)"
+eq_t "(a) pace-held is 2" "2" "$(pace_held_count)"
+eq_t "(a) the registry last-seen is stamped as a deliberate hold" "held (pace)" "$(seen_why)"
+
+# (b) NEGATIVE CONTROL: every todo held by a SANDBOXED creator, floor open.
+reset_board
+mk "sandboxed held A" urgent main2 >/dev/null
+mk "sandboxed held B" high   main2 >/dev/null
+LOGB="$TMP/tick_b.log"; : > "$LOGB"
+got=$(run_tick "$HB_NEW" "$LOGB")
+eq_t "(b) a fully tier-held queue wakes NOBODY" "NONE" "$got"
+_bl=$(grep "tier guard held all 2 runnable todo(s)" "$LOGB")
+if [[ -n "$_bl" ]] && grep -q "5dive task assign" <<<"$_bl" && grep -q "5dive heartbeat wake-task dev" <<<"$_bl"; then
+  ok_t "(b) a tier hold still logs the tier-guard line with task assign / wake-task"
+else
+  bad_t "(b) the tier-guard all-held line or its exits are gone" "$(cat "$LOGB")"
+fi
+grep -q "pacing floor" "$LOGB" && bad_t "(b) a tier-only hold names the pacing floor" "$(cat "$LOGB")" \
+  || ok_t "(b) the pacing floor is not named when it held nothing"
+eq_t "(b) tier-held counts both" "2" "$(tier_held_count)"
+eq_t "(b) pace-held is 0" "0" "$(pace_held_count)"
+eq_t "(b) the stamp names the tier guard" "held (tier)" "$(seen_why)"
+
+# (c) MIXED: one pace hold + one tier hold in the same tick. The sandboxed row is
+# urgent so the hard band admits it and the TIER guard is what holds it; the
+# human-filed high row is held by the floor.
+reset_board
+mk "sandboxed urgent (tier holds)" urgent main2 >/dev/null
+mk "human high (pace holds)"       high   lodar >/dev/null
+LOGC="$TMP/tick_c.log"; : > "$LOGC"
+got=$(PACE_HARD=1 run_tick "$HB_NEW" "$LOGC")
+eq_t "(c) a mixed-held queue wakes NOBODY" "NONE" "$got"
+_cl=$(grep "all 2 runnable todo(s) held" "$LOGC")
+if grep -q "tier guard 1" <<<"$_cl" && grep -q "pacing floor 1" <<<"$_cl" \
+   && grep -q "5dive task assign" <<<"$_cl" && grep -q "5dive task escalate" <<<"$_cl"; then
+  ok_t "(c) the all-held line names BOTH guards, each with its own exits"
+else
+  bad_t "(c) the mixed all-held line is wrong" "$(cat "$LOGC")"
+fi
+eq_t "(c) tier-held is 1" "1" "$(tier_held_count)"
+eq_t "(c) pace-held is 1" "1" "$(pace_held_count)"
+eq_t "(c) the stamp names both" "held (pace+tier)" "$(seen_why)"
 
 # ---------------------------------------------------------------------------
 # 6. ANCHOR — the pre-fix tick, same fixture, from a PINNED COMMIT.
