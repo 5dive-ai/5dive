@@ -213,6 +213,23 @@ out=$(printf 'pdFAKEtoken0123456789\n' | run set pipedrive); rc=$?
 out=$(run rm bitrix24); rc=$?
 [[ $rc -eq 0 && -z "$(seen BITRIX24_WEBHOOK_URL)" && "$(seen AMOCRM_TOKEN)" == longLivedFAKE.token-123 ]] \
   && ok_t "T11 rm bitrix24 drops its line, amocrm kept" || bad_t "T11 rm bitrix24" "rc=$rc $(cat "$F")"
+# DIVE-8380 (report 946): an amoCRM long-lived token is an RS256 JWT that runs
+# past 1,024 characters. One of 1,200 is saved whole; one of 5,000 is refused.
+jwt_of() {  # a JWT-shaped value of exactly $1 characters: header.payload.signature
+  local h='eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9' sig='' pay='eyJ'
+  while (( ${#sig} < 342 )); do sig+='Qx-9_zK'; done; sig=${sig:0:342}
+  while (( ${#pay} < $1 - ${#h} - 344 )); do pay+='aWF0IjoxNzMw'; done
+  pay=${pay:0:$(( $1 - ${#h} - 344 ))}
+  printf '%s.%s.%s' "$h" "$pay" "$sig"
+}
+jwt=$(jwt_of 1200); big=$(jwt_of 5000)
+[[ ${#jwt} -eq 1200 && ${#big} -eq 5000 ]] || bad_t "T11 amocrm jwt fixture" "${#jwt} ${#big}"
+out=$(printf 'acme.amocrm.com\n%s\n' "$jwt" | run set amocrm); rc=$?
+[[ $rc -eq 0 && "$(seen AMOCRM_TOKEN)" == "$jwt" && "$(seen AMOCRM_DOMAIN)" == acme.amocrm.com ]] \
+  && ok_t "T11 amocrm: a 1,200-char JWT long-lived token is saved whole" || bad_t "T11 amocrm 1200" "rc=$rc ${out:0:200}"
+out=$(printf 'acme.amocrm.com\n%s\n' "$big" | run set amocrm); rc=$?
+[[ $rc -ne 0 && "$out" == *"AMOCRM_TOKEN must be one line"* && "$(seen AMOCRM_TOKEN)" == "$jwt" ]] \
+  && ok_t "T11 amocrm: a 5,000-char value is refused, the saved token kept" || bad_t "T11 amocrm 5000" "rc=$rc ${out:0:200}"
 
 # --- T12: an app outside the catalog, its variables named by the caller (DIVE-5627)
 # A partner keeps its own app list; the box stores only the keys.

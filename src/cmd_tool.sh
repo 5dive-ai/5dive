@@ -75,10 +75,11 @@ TOOL_CUSTOM_MAX_VARS=4
 
 # Printable ASCII with no space and no single quote: every real key and token
 # fits, and the value can then sit inside '...' in a file bash sources with no
-# way to end the quote.
+# way to end the quote. 4,096, not 1,024: an amoCRM long-lived token is an RS256
+# JWT that runs past 1,024 (DIVE-8380, report 946).
 _tool_value_ok() {
   local LC_ALL=C
-  [[ "$1" =~ ^[!-~]{1,1024}$ && "$1" != *"'"* ]]
+  [[ "$1" =~ ^[!-~]{1,4096}$ && "$1" != *"'"* ]]
 }
 
 _tool_usage() {

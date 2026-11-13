@@ -384,7 +384,7 @@ _secret_drop_rule() { # <connector> [<pair: 1 | card>] [<several keys: 1>]
     return
   fi
   case "$1" in
-    tools) printf '%s' "It must be one line, with no spaces and no ' mark: only plain keyboard letters, digits and symbols, at most 1024 of them." ;;
+    tools) printf '%s' "It must be one line, with no spaces and no ' mark: only plain keyboard letters, digits and symbols, at most 4096 of them." ;;
     saved) printf '%s' "It must be one line: it is typed into one field of a page." ;;
     project-*) printf '%s' 'It may hold only letters, digits and these marks: _ . / : + = @ , ~ - (no spaces, quotes, $, # or line breaks).' ;;
     *) printf '%s' 'This one takes any value, line breaks included, so the value was not the problem. Try again in a minute.' ;;
