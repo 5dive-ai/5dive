@@ -103,9 +103,7 @@ sudo 5dive account add gpt && sudo 5dive account login gpt --type=codex
 sudo 5dive agent create scout --type=codex --auth-profile=gpt
 ```
 
-`--api-key=-` 从标准输入读取 key，不会留在 shell 历史里。[更多智能体类型、模型和 Telegram 机器人 →](docs/guide.md#agent-types)
-
-每个智能体也可以成为 Microsoft Teams 联系人，通过 teams 插件实现。[Microsoft Teams 指南 →](https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/teams)
+`--api-key=-` 从标准输入读取 key，不会留在 shell 历史里。[更多智能体类型、模型、Microsoft Teams 和 Telegram 机器人 →](docs/guide.md#agent-types)
 
 ## 雇用智能体和团队
 
