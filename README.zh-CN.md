@@ -147,6 +147,18 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 5dive task loop auto DIVE-12 on            # 让循环自动应用自己的改进
 ```
 
+## 浏览器
+
+智能体在你的服务器上用真正的 Chrome：打开网页、点击、填写表单、检查结果。对于你自己的账号，你只需亲手登录一次，智能体就会一直使用这个会话，永远看不到密码。邮箱验证码和人机验证它自己处理，处理不了时才问你。要付款的步骤，它会先问你。
+
+```sh
+sudo 5dive plugin add 5dive-ai/5dive-browser
+sudo 5dive browser setup                         # Chrome、虚拟屏幕和 VNC
+sudo -u agent-cmo 5dive browser auth github.com  # 你亲手登录一次
+```
+
+[浏览器指南 →](https://github.com/5dive-ai/5dive-browser#readme)
+
 ## 插件
 
 | 插件 | 功能 |
@@ -159,9 +171,7 @@ sudo 5dive loop install ci-analyst --onto=researcher   # 每 4 小时一份竞�
 | [UI](https://github.com/5dive-ai/5dive-ui) | 只读 Web 仪表盘 |
 | [Laya](https://github.com/5dive-ai/5dive-laya) | 处理日常决策的本地模型（8 GB 内存） |
 
-```sh
-sudo 5dive plugin add 5dive-ai/5dive-browser
-```
+其他插件的安装方式相同：`sudo 5dive plugin add 5dive-ai/5dive-voice`。
 
 [开发一个插件 →](https://github.com/5dive-ai/5dive-plugin-template)
 
