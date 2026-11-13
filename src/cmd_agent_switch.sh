@@ -61,6 +61,20 @@ _switch_label() {
 
 _switch_is_type() { [[ " ${SWITCH_TYPES[*]} " == *" ${1:-} "* ]]; }
 
+# DIVE-8371: is this switch running INSIDE the seat it switches? An agent that
+# runs `sudo 5dive agent switch <itself>` lives in 5dive-agent@<itself>.service,
+# so step 1's `systemctl stop` of that unit SIGTERMs the switch with it: the unit
+# stops, nothing is converted, nothing restarts it (OINOA fresh-boar, kostya dead
+# 20 h). setsid/nohup do not leave the cgroup (wiki: setsid-does-not-leave-the-
+# cgroup); only a transient service does. Either signal is enough: the process's
+# cgroup sits under that unit, or sudo was called by that seat's own user.
+_switch_inside_own_unit() { # <name>
+  local name="$1" cg="${SWITCH_SELF_CGROUP_FILE:-/proc/self/cgroup}"
+  [[ "${SUDO_USER:-}" == "agent-${name}" ]] && return 0
+  [[ -r "$cg" ]] || return 1
+  grep -qE "/5dive-agent@${name//./\\.}\\.service(/|\$)" "$cg"
+}
+
 # On unless the owner ran `5dive grok disable` (cmd_grok.sh): the marker create reads.
 _switch_grok_on() { [[ ! -e "${FIVE_GROK_OFF_MARKER:-/etc/5dive/arm/grok-off}" ]]; }
 
@@ -481,6 +495,33 @@ cmd_agent_switch() {
         || fail "$E_NOT_INSTALLED" "the Grok Telegram bridge (telegram-grok) is not deployed on this box"
     fi
   fi
+  # ---- DIVE-8371: a seat switching ITSELF hands the rest to a detached unit ----
+  # Every refusal above already ran here, so the caller still hears them inline.
+  # What follows (install, stop, convert, start) runs as a transient service
+  # outside this seat's cgroup, after a short delay that lets the caller's turn
+  # finish its reply. No handoff ask: the seat is the caller and cannot answer
+  # while it waits on this command; it is told to write the note itself instead.
+  if [[ "${FIVEDIVE_SWITCH_DETACHED:-0}" != 1 ]] && _switch_inside_own_unit "$name"; then
+    local self_bin delay su t_now
+    self_bin="${FIVEDIVE_SELF:-$(command -v 5dive || echo /usr/local/bin/5dive)}"
+    delay="${FIVEDIVE_SWITCH_SELF_DELAY:-20}"
+    [[ "$delay" =~ ^[0-9]+$ ]] || delay=20
+    t_now=$(date +%s)
+    su="5dive-switch-${name}-${t_now}-$$"
+    systemd-run --unit="$su" --collect --on-active="$delay" --timer-property=AccuracySec=100ms \
+        -p KillMode=process --setenv=PATH="$PATH" \
+        --setenv=FIVEDIVE_SWITCH_DETACHED=1 --setenv=FIVEDIVE_SWITCH_T0="$t_now" \
+        -- "$self_bin" agent switch "$name" --to="$to" --account="${account:-default}" >&2 \
+      || fail "$E_GENERIC" "could not start the switch outside $name's own session — nothing switched; ask the owner to switch $name from the dashboard"
+    local next_msg="switching $name to $(_switch_label "$to") (account ${account:-default}) in ${delay}s: this session stops then, and $name is back on $(_switch_label "$to") about a minute later. Write anything the next session needs into ~/${SWITCH_HANDOFF_FILE} now; it reads that file first. Progress: journalctl -u $su"
+    ok "$next_msg" \
+       '{name:$n, from:$f, to:$t, account:$a, warning:$w, detached:true, unit:$u, startsInSeconds:$d, next:$x}' \
+       --arg x "$next_msg" \
+       --arg n "$name" --arg f "$from" --arg t "$to" --arg a "${account:-default}" --arg w "$(switch_harness_warning "$name" "$from" "$to")" \
+       --arg u "$su" --argjson d "$delay"
+    return 0
+  fi
+
   if [[ ! -x "${TYPE_BIN[$to]}" ]]; then
     [[ -n "${TYPE_INSTALL[$to]:-}" ]] \
       || fail "$E_NOT_INSTALLED" "$to is not installed and has no installer"
@@ -495,6 +536,13 @@ cmd_agent_switch() {
   # ---- 1. handoff: ask the running seat for a note, then stop it ----
   local unit="5dive-agent@${name}.service" hf="$home/$SWITCH_HANDOFF_FILE" t0 waited=0 handoff_state=skipped
   t0=$(date +%s)
+  if [[ "${FIVEDIVE_SWITCH_DETACHED:-0}" == 1 ]]; then
+    # The detached half of a self-switch: the seat was told to write the note
+    # itself when it queued this, so read the file, never ask.
+    handoff=0; handoff_state=self
+    [[ "${FIVEDIVE_SWITCH_T0:-}" =~ ^[0-9]+$ && -f "$hf" ]] \
+      && (( $(stat -c %Y "$hf" 2>/dev/null || echo 0) >= FIVEDIVE_SWITCH_T0 )) && handoff_state=written
+  fi
   if (( handoff )) && systemctl is-active --quiet "$unit" 2>/dev/null; then
     step "Asking $name for a handoff note (up to ${handoff_wait}s)"
     if "${FIVEDIVE_SELF:-$(command -v 5dive || echo /usr/local/bin/5dive)}" agent send "$name" \
