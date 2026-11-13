@@ -119,6 +119,10 @@ set_claude_telegram_env_key() {
 }
 TYPE_BIN[claude]=/bin/true; TYPE_BIN[codex]=/bin/true
 FIVEDIVE_SELF=/bin/false   # handoff "send" fails -> state unreachable, no wait
+# DIVE-8371: the arms above run as an OUTSIDE caller, wherever the harness runs
+# (a seat's own unit, CI): no sudo caller, a cgroup that names no seat.
+unset SUDO_USER; export SWITCH_SELF_CGROUP_FILE="$TMP/cg-outside"
+printf '0::/system.slice/ci-runner.service\n' >"$SWITCH_SELF_CGROUP_FILE"
 
 run() { ( set -e; JSON_MODE=1; "$@" ) >"$TMP/out" 2>"$TMP/err"; echo $?; }
 
@@ -459,6 +463,66 @@ w=$(switch_harness_warning Dude grok claude); w2=$(switch_harness_warning Theo c
    && "$w2" == "Moving Theo to your Grok plan switches it from Claude Code to Grok. Its memory and instructions are converted; this chat's history is not. You can switch back any time." ]] \
   && ok_t "G15 the sentence names Grok both ways" || bad_t "G15 warning" "$w | $w2"
 unset FIVE_GROK_OFF_MARKER
+
+# =========================================================== D: a seat switching ITSELF (DIVE-8371)
+# kos runs `sudo 5dive agent switch kos` from inside 5dive-agent@kos.service. On
+# origin/main step 1 stops that unit and the stop kills the switch with it.
+KH="$SWITCH_HOME_ROOT/agent-kos"; mkdir -p "$KH/.claude"; printf 'Kos line.\n' >"$KH/.claude/CLAUDE.md"
+jq '.agents.kos = {"type":"claude","channels":"none","authProfile":"claudeacct","isolation":"standard"}' "$TMP/reg" >"$TMP/reg.t" && mv "$TMP/reg.t" "$TMP/reg"
+systemctl() { printf '%s\n' "$*" >>"$TMP/sysctl"
+  case "$1" in is-active) [[ -f "$TMP/active" ]] ;; stop) rm -f "$TMP/active" ;; start) : >"$TMP/active" ;; esac; }
+systemd-run() { printf '%s\n' "$*" >>"$TMP/sdrun"; [[ ! -f "$TMP/sdrun-fail" ]]; }
+SELFSEND="$TMP/selfsend"; printf '#!/bin/sh\necho "$*" >>%s\nexit 1\n' "$TMP/sends" >"$SELFSEND"; chmod +x "$SELFSEND"
+FIVEDIVE_SELF="$SELFSEND"
+CG_KOS="$TMP/cg-kos"; printf '0::/system.slice/system-5dive\\x2dagent.slice/5dive-agent@kos.service\n' >"$CG_KOS"
+dreset() { : >"$TMP/active"; rm -f "$TMP/sdrun" "$TMP/sysctl" "$TMP/sends" "$TMP/sdrun-fail"; }
+
+dreset; snap_reg=$(sha256sum <"$TMP/reg")
+rc=$(SWITCH_SELF_CGROUP_FILE="$CG_KOS" run cmd_agent_switch kos --to=codex --account=chatgpt)
+[[ "$rc" == 0 ]] && grep -q -- '--unit=5dive-switch-kos-' "$TMP/sdrun" && grep -q -- '-p KillMode=process' "$TMP/sdrun" \
+  && grep -q -- '--setenv=FIVEDIVE_SWITCH_DETACHED=1' "$TMP/sdrun" && grep -q -- '--on-active=20 ' "$TMP/sdrun" \
+  && grep -q -- "-- $SELFSEND agent switch kos --to=codex --account=chatgpt\$" "$TMP/sdrun" \
+  && ! grep -q '^stop' "$TMP/sysctl" 2>/dev/null && [[ -f "$TMP/active" ]] \
+  && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] \
+  && jq -e '.data.detached == true and .data.to == "codex" and (.data.unit|startswith("5dive-switch-kos-")) and .data.startsInSeconds == 20' "$TMP/out" >/dev/null \
+  && ok_t "D1 inside its own unit: the switch relaunches as a detached transient service and returns; no in-line stop, nothing converted yet" \
+  || bad_t "D1 self-switch detaches" "rc=$rc sdrun=$(cat "$TMP/sdrun" 2>/dev/null) sysctl=$(cat "$TMP/sysctl" 2>/dev/null) out=$(<"$TMP/out") err=$(tail -3 "$TMP/err")"
+[[ ! -s "$TMP/sends" ]] && jq -e '.data.next | contains("~/.5dive-handoff.md") and contains("back on Codex")' "$TMP/out" >/dev/null \
+  && ok_t "D2 no handoff ask to a seat that is the caller; it is told to write the note itself" \
+  || bad_t "D2 no handoff ask" "sends=$(cat "$TMP/sends" 2>/dev/null) out=$(<"$TMP/out")"
+
+dreset
+rc=$(SUDO_USER=agent-kos run cmd_agent_switch kos --to=codex --account=chatgpt)
+[[ "$rc" == 0 ]] && grep -q -- '--unit=5dive-switch-kos-' "$TMP/sdrun" && ! grep -q '^stop' "$TMP/sysctl" 2>/dev/null \
+  && ok_t "D3 sudo called by the seat's own user detaches too (cgroup unreadable or elsewhere)" \
+  || bad_t "D3 SUDO_USER detaches" "rc=$rc sdrun=$(cat "$TMP/sdrun" 2>/dev/null)"
+
+dreset; touch "$TMP/sdrun-fail"; snap_reg=$(sha256sum <"$TMP/reg")
+rc=$(SWITCH_SELF_CGROUP_FILE="$CG_KOS" run cmd_agent_switch kos --to=codex --account=chatgpt)
+[[ "$rc" != 0 ]] && grep -q 'nothing switched' "$TMP/err" && [[ -f "$TMP/active" ]] && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] \
+  && ok_t "D4 a detach that cannot start fails loudly and leaves the seat running and unchanged" \
+  || bad_t "D4 detach failure" "rc=$rc err=$(<"$TMP/err")"
+
+dreset; snap_reg=$(sha256sum <"$TMP/reg")
+rc=$(SWITCH_SELF_CGROUP_FILE="$CG_KOS" run cmd_agent_switch kos --to=codex --account=empty)
+[[ "$rc" != 0 ]] && grep -q 'no Codex sign-in' "$TMP/err" && [[ ! -s "$TMP/sdrun" ]] && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] \
+  && ok_t "D5 a pre-flight refusal still reaches the self-caller in line (nothing is detached)" \
+  || bad_t "D5 refusal inline" "rc=$rc err=$(<"$TMP/err") sdrun=$(cat "$TMP/sdrun" 2>/dev/null)"
+
+dreset; printf '0::/system.slice/system-5dive\\x2dagent.slice/5dive-agent@kosmo.service\n' >"$TMP/cg-other"
+rc=$(SWITCH_SELF_CGROUP_FILE="$TMP/cg-other" SUDO_USER=agent-kosmo run cmd_agent_switch kos --to=codex --account=chatgpt)
+[[ "$rc" == 0 ]] && [[ ! -s "$TMP/sdrun" ]] && grep -q '^stop 5dive-agent@kos.service' "$TMP/sysctl" \
+  && [[ "$(jq -r '.agents.kos.type' "$TMP/reg")" == codex ]] && grep -q '^start 5dive-agent@kos.service' "$TMP/sysctl" \
+  && ok_t "D6 another seat (kosmo) switching kos runs in line as before, and a name prefix is not a match" \
+  || bad_t "D6 other caller inline" "rc=$rc sdrun=$(cat "$TMP/sdrun" 2>/dev/null) sysctl=$(cat "$TMP/sysctl" 2>/dev/null) err=$(tail -3 "$TMP/err")"
+
+# The detached half: same cgroup marker would still match, the env says it is the child.
+dreset; t0=$(( $(date +%s) - 5 )); printf 'what I was doing\n' >"$KH/.5dive-handoff.md"
+rc=$(SWITCH_SELF_CGROUP_FILE="$CG_KOS" FIVEDIVE_SWITCH_DETACHED=1 FIVEDIVE_SWITCH_T0="$t0" run cmd_agent_switch kos --to=claude --account=claudeacct)
+[[ "$rc" == 0 ]] && [[ ! -s "$TMP/sdrun" ]] && [[ ! -s "$TMP/sends" ]] && grep -q '^stop 5dive-agent@kos.service' "$TMP/sysctl" \
+  && [[ "$(jq -r '.agents.kos.type' "$TMP/reg")" == claude ]] && jq -e '.data.handoff == "written" and .data.running == true' "$TMP/out" >/dev/null \
+  && ok_t "D7 the detached child does the real switch (stop, convert, start), never re-detaches or asks, and reads the self-written note" \
+  || bad_t "D7 detached child" "rc=$rc sdrun=$(cat "$TMP/sdrun" 2>/dev/null) sends=$(cat "$TMP/sends" 2>/dev/null) out=$(<"$TMP/out") err=$(tail -3 "$TMP/err")"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
