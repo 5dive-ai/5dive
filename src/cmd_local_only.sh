@@ -140,7 +140,9 @@ _lo_usage() {
     "AI models must run on your network: agent create --base-url=http://<lan-ip>:<port>/…" \
     "" \
     "allow teams: the one outside service your IT may open. Only Teams messages go out," \
-    "to Microsoft; everything above stays refused. deny teams shuts it again."
+    "to Microsoft; everything above stays refused. deny teams shuts it again." \
+    "allow email: agents' mail to a cloud mailbox (Microsoft 365, Google). A mail server" \
+    "on your office network works without it."
 }
 
 cmd_local_only() {
@@ -299,25 +301,36 @@ _lo_chat_enabled() { [[ -z "$(_lo_root)" || "${FIVE_LOCAL_ONLY_CHAT:-}" == 1 ]];
 _lo_allow() {   # on|off <name>
   local want="$1"; shift
   local name="${1:-}"
-  [[ -n "$name" && $# -eq 1 ]] || fail "$E_USAGE" "usage: sudo 5dive config local-only allow|deny teams"
+  [[ -n "$name" && $# -eq 1 ]] || fail "$E_USAGE" "usage: sudo 5dive config local-only allow|deny teams|email"
   [[ " ${LO_ALLOWABLE[*]} " == *" $name "* ]] \
-    || fail "$E_VALIDATION" "only Microsoft Teams can be opened on a local-only box (got '${name:0:40}'): sudo 5dive config local-only allow teams"
+    || fail "$E_VALIDATION" "only Microsoft Teams or email can be opened on a local-only box (got '${name:0:40}'): sudo 5dive config local-only allow teams|email"
   require_root
+  # DIVE-8315: email. A mail server on the office network works offline without
+  # this; it opens a CLOUD mailbox (Microsoft 365, Google) alone.
+  local what="Microsoft Teams" goes="Only Teams messages go out, to Microsoft" how="sudo 5dive agent teams connect <agent> --app-id=<id> --tenant-id=<id> --endpoint=https://<address your IT publishes>"
+  if [[ "$name" == email ]]; then
+    what="Email to an outside mail server"; goes="Only the agents' mail goes out, to your mail provider"
+    how="sudo 5dive agent email connect <agent> --address=<a> --provider=microsoft|google|other"
+  fi
   local f; f=$(local_only_allow_file)
   if [[ "$want" == on ]]; then
-    local_only_on || fail "$E_CONFLICT" "local-only mode is off, so Teams is not blocked here. Nothing changed."
+    local_only_on || fail "$E_CONFLICT" "local-only mode is off, so ${what} is not blocked here. Nothing changed."
     mkdir -p "$(dirname "$f")" || fail "$E_GENERIC" "could not create $(dirname "$f")"
     grep -qxF -- "$name" "$f" 2>/dev/null || printf '%s\n' "$name" >> "$f" || fail "$E_GENERIC" "could not write $f"
     chmod 0644 "$f" 2>/dev/null || true
-    printf '%s\n' "Microsoft Teams is OPEN on this local-only box. Only Teams messages go out, to Microsoft; everything else stays offline." \
-      "Connect an agent: sudo 5dive agent teams connect <agent> --app-id=<id> --tenant-id=<id> --endpoint=https://<address your IT publishes>" \
-      "Shut it again: sudo 5dive config local-only deny teams"
+    printf '%s\n' "${what} is OPEN on this local-only box. ${goes}; everything else stays offline." \
+      "Connect an agent: ${how}" \
+      "Shut it again: sudo 5dive config local-only deny ${name}"
   else
     if [[ -f "$f" ]]; then
       local rest; rest=$(grep -vxF -- "$name" "$f" || true)
       if [[ -n "$rest" ]]; then printf '%s\n' "$rest" > "$f"; else rm -f -- "$f"; fi
     fi
-    printf '%s\n' "Microsoft Teams is SHUT. Agents refuse Teams messages from now on and send none."
+    if [[ "$name" == email ]]; then
+      printf '%s\n' "Email to outside mail servers is SHUT. Mail on the office network keeps working."
+    else
+      printf '%s\n' "Microsoft Teams is SHUT. Agents refuse Teams messages from now on and send none."
+    fi
   fi
   return 0
 }

@@ -1640,6 +1640,7 @@ TOOLENV
     {"plugin": "dashboard", "marketplace": "5dive-plugins"},
     {"plugin": "buzz", "marketplace": "5dive-plugins"},
     {"plugin": "teams", "marketplace": "5dive-plugins"},
+    {"plugin": "email", "marketplace": "5dive-plugins"},
     {"plugin": "telegram", "marketplace": "claude-plugins-official"},
     {"plugin": "discord", "marketplace": "claude-plugins-official"}
   ]
@@ -1679,7 +1680,8 @@ MANAGED
               | $have + ([{"plugin":"telegram","marketplace":"5dive-plugins"},
                           {"plugin":"dashboard","marketplace":"5dive-plugins"},
                           {"plugin":"buzz","marketplace":"5dive-plugins"},
-                          {"plugin":"teams","marketplace":"5dive-plugins"}]
+                          {"plugin":"teams","marketplace":"5dive-plugins"},
+                          {"plugin":"email","marketplace":"5dive-plugins"}]
                   | map(select(. as $need
                       | ($have | any(.plugin == $need.plugin and .marketplace == $need.marketplace)) | not))))
           ' "$msj" > "$msj_tmp" 2>/dev/null && [[ -s "$msj_tmp" ]]; then

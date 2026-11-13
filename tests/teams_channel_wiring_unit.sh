@@ -51,14 +51,14 @@ valid_channel teamss && bad_t "NEGATIVE: teamss must be rejected" || ok_t "NEGAT
 valid_channel none,teams && bad_t "NEGATIVE: none,teams must be rejected" || ok_t "NEGATIVE: none,teams rejected"
 
 # 2, 3
-grep -qE '"\$plugin" == "buzz" \|\| "\$plugin" == "teams" \]\]; then' "$SRC/lib/agent_setup.sh" \
+grep -qE '"\$plugin" == "buzz" \|\| "\$plugin" == "teams"( \|\| "\$plugin" == "email")? \]\]; then' "$SRC/lib/agent_setup.sh" \
   && ok_t "install routes teams to 5dive-plugins" || bad_t "install routes teams to 5dive-plugins"
 both "install_channel_for_agent refuses non-claude" "$SRC/lib/agent_setup.sh" '"\$plugin" == "CH" && "\$type" != "claude"'
 
 # 4
 both "agent config refuses non-claude before the registry write" "$SRC/cmd_agent_config.sh" '"\$type" != "claude" \]\] && channel_in_list CH "\$v"'
 both "agent config dispatches the install" "$SRC/cmd_agent_config.sh" '_config_install_channel "\$prev_channels" "\$type" CH "\$name"'
-grep -qE 'telegram\|dashboard\|buzz\|teams\) gate_marketplace="5dive-plugins"' "$SRC/cmd_agent_config.sh" \
+grep -qE 'telegram\|dashboard\|buzz\|teams(\|email)?\) gate_marketplace="5dive-plugins"' "$SRC/cmd_agent_config.sh" \
   && ok_t "agent config staging gate covers teams" || bad_t "agent config staging gate covers teams"
 
 # 5
@@ -110,7 +110,7 @@ grep -qE 'Microsoft Teams is a plugin: sudo 5dive plugin install teams' "$SRC/ma
   && ok_t "without the plugin, agent teams says how to get it" || bad_t "without the plugin, agent teams says how to get it"
 
 # 10
-grep -qE 'for _cp in dashboard buzz teams; do' "$SRC/cmd_agent_create.sh" \
+grep -qE 'for _cp in dashboard buzz teams( email)?; do' "$SRC/cmd_agent_create.sh" \
   && ok_t "create self-check covers the teams plugin" || bad_t "create self-check covers the teams plugin"
 
 echo "$PASS passed, $FAIL failed"

@@ -64,7 +64,7 @@ _people_usage() {
                         [--telegram=] [--teams=]
   5dive people rm <id>                              # the owner cannot be removed
   5dive people sync                                 # rewrite Telegram/Teams/roles from the list
-  5dive people knock file --agent=<a> --channel=teams|telegram --sender=<id>
+  5dive people knock file --agent=<a> --channel=teams|telegram|email --sender=<id>
                           [--name=<text>] [--email=<addr>]
   5dive people knock answer <knock id> allow|admin|no [--by=<channel:id>] [--proof=<nonce>]
 
@@ -200,7 +200,7 @@ cmd_people_ls() {
   fi
   if [[ "$knocks" != "[]" ]]; then
     echo; echo "Wants to talk to your agents:"
-    jq -r '.[] | "  #\(.id) \(.name // "someone") → \(.agent) (\(.channel)\(if .email then ", " + .email else "" end))"' <<<"$knocks"
+    jq -r '.[] | if .channel == "email" then "  #\(.id) \(.agent) wants to email \(.email // "someone") for the first time" else "  #\(.id) \(.name // "someone") → \(.agent) (\(.channel)\(if .email then ", " + .email else "" end))" end' <<<"$knocks"
     echo "Answer: sudo 5dive people knock answer <number> allow   (or admin, or no)"
   fi
 }
@@ -521,17 +521,20 @@ cmd_people_knock_file() {
     agent="$seat"
   fi
   [[ -n "$agent" && -n "$channel" && -n "$sender" ]] \
-    || fail "$E_USAGE" "usage: 5dive people knock file --agent=<a> --channel=teams|telegram --sender=<id> [--name=] [--email=]"
+    || fail "$E_USAGE" "usage: 5dive people knock file --agent=<a> --channel=teams|telegram|email --sender=<id> [--name=] [--email=]"
   valid_sender_label "$agent" || fail "$E_VALIDATION" "bad agent name '$agent'"
   _people_agent_exists "$agent" || fail "$E_NOT_FOUND" "no agent named '$agent'"
   case "$channel" in
     teams)    sender="${sender,,}"; _people_check_teams "$sender" ;;
     telegram) _people_check_telegram "$sender" ;;
-    *) fail "$E_VALIDATION" "bad channel '$channel' — teams or telegram" ;;
+    # DIVE-8315: the agent wants to MAIL a new outside address. The sender id is
+    # that address; Allow lets the held mail go, and adds no person (below).
+    email)    sender="${sender,,}"; _people_check_email "$sender"; email="$sender" ;;
+    *) fail "$E_VALIDATION" "bad channel '$channel' — teams, telegram or email" ;;
   esac
   [[ -z "$email" ]] || _people_check_email "$email"
 
-  local col=teams_id; [[ "$channel" == telegram ]] && col=telegram_id
+  local col=teams_id; [[ "$channel" == telegram ]] && col=telegram_id; [[ "$channel" == email ]] && col=email
   # Already allowed (a race with an answer, or added from the app): no knock.
   local hid
   hid=$(db "SELECT h.id FROM humans h WHERE h.${col}=$(sqlq "$sender") AND h.role IS NOT NULL
@@ -597,6 +600,18 @@ _people_knock_card() {  # <kid> <agent> <channel> <name> <email> <nonce allow> <
     || return 1
   local where="Teams"; [[ "$channel" == telegram ]] && where="Telegram"
   local ag="${agent^}"
+  if [[ "$channel" == email ]]; then
+    # DIVE-8315: no Admin here — a mail address is never made an admin.
+    local mplain="${ag} wants to email ${email} for the first time."$'\n\n'"Allow = the mail goes out, and ${ag} may write to them again. No = it is dropped."
+    local mtext="${ag} wants to email <b>$(_people_html "$email")</b> for the first time."$'\n\n'"Allow = the mail goes out, and ${ag} may write to them again. No = it is dropped."
+    local mmarkup
+    mmarkup=$(jq -cn --arg k "$kid" --arg a "$n_allow" --arg n "$n_no" '{inline_keyboard:[[
+        {text:"Allow", callback_data:("kn:"+$k+":allow:"+$a)},
+        {text:"No",    callback_data:("kn:"+$k+":no:"+$n)}]]}')
+    _task_send_owner "$mtext" "$mmarkup" "" "$mplain" >/dev/null 2>&1 || true
+    [[ "${TASK_SEND_DELIVERED:-0}" == 1 ]]
+    return
+  fi
   local plain="${who} wants to talk to ${ag}${email:+ · ${email}} · in ${where}"$'\n\n'"Allow = chat and give work. Admin = also pay, delete, change settings."
   local text
   text="<b>$(_people_html "$who")</b> wants to talk to ${ag}${email:+ · $(_people_html "$email")} · in ${where}"$'\n\n'"Allow = chat and give work. Admin = also pay, delete, change settings."
@@ -659,6 +674,27 @@ cmd_people_knock_answer() {
       || fail "$E_PERMISSION" "a seat answers a knock only with the owner's tap proof for that answer"
   fi
   [[ "$status" == pending ]] || fail "$E_CONFLICT" "knock #$kid is already answered ($status)"
+  # DIVE-8315: an email knock is about one outgoing mail's recipient. Its answer
+  # releases or drops that mail in the agent's email channel and touches nobody's
+  # access: making a person here would switch the box into managed People mode
+  # and rewrite who may talk to every agent on Telegram and Teams.
+  if [[ "$channel" == email ]]; then
+    [[ "$choice" != admin ]] || fail "$E_VALIDATION" "an email address is never made an admin: answer allow or no"
+    [[ -z "$by" ]] && by="${SUDO_USER:-root}"
+    local st=denied; [[ "$choice" == allow ]] && st=allowed
+    local won1
+    won1=$(db "UPDATE knocks SET status=$(sqlq "$st"), answered_at=datetime('now'), answered_by=$(sqlq "$by")
+               WHERE id=${kid} AND status='pending'; SELECT changes();")
+    [[ "$won1" == 1 ]] || fail "$E_CONFLICT" "knock #$kid was answered meanwhile"
+    audit_log "people knock answer" ok 0 -- "knock=$kid" "agent=$agent" "answer=$choice" "channel=email" "by_claimed=$by"
+    _people_knock_drop "$kid" "$agent" "$channel" "$sender" "$name" "$choice" ""
+    if (( JSON_MODE )); then
+      jq -cn --arg k "$kid" --arg s "$st" --arg a "$agent" --arg c "$choice" '{ok:true, data:{id:($k|tonumber), status:$s, answer:$c, agent:$a, person:null}}'
+    else
+      ok "knock #$kid: $choice (${agent}'s mail to $sender $([[ "$choice" == allow ]] && echo "goes out" || echo "is dropped"))"
+    fi
+    return 0
+  fi
 
   local hid="" new_status=denied
   [[ -z "$by" ]] && by="${SUDO_USER:-root}"
@@ -716,14 +752,14 @@ cmd_people_knock_answer() {
 # dir, owned by the seat (the server watches the dir; DIVE-8036). Only for a
 # Teams knock on a Teams-connected agent; a Telegram knock is let in by sync.
 _people_knock_drop() {  # <kid> <agent> <channel> <sender> <name> <choice> <person>
-  [[ "$3" == teams ]] || return 0
-  local dir; dir="$(_people_home_of "$2")/.claude/channels/teams"
+  [[ "$3" == teams || "$3" == email ]] || return 0
+  local dir; dir="$(_people_home_of "$2")/.claude/channels/$3"
   [[ -d "$dir" ]] || return 0
   local owner; owner=$(stat -c '%u:%g' "$dir" 2>/dev/null) || return 0
   mkdir -p "$dir/knocks" && chmod 0700 "$dir/knocks" && chown "$owner" "$dir/knocks" 2>/dev/null
   local tmp; tmp=$(mktemp "$dir/knocks/.k.XXXXXX") || return 0
-  jq -n --arg k "$1" --arg a "$2" --arg s "$4" --arg n "$5" --arg c "$6" --arg p "$7" \
-    '{id:($k|tonumber), agent:$a, channel:"teams", sender:$s, name:(($n|select(length>0)) // null),
+  jq -n --arg k "$1" --arg a "$2" --arg ch "$3" --arg s "$4" --arg n "$5" --arg c "$6" --arg p "$7" \
+    '{id:($k|tonumber), agent:$a, channel:$ch, sender:$s, name:(($n|select(length>0)) // null),
       answer:$c, person:(($p|select(length>0)) // null), answered_at:(now|todate)}' >"$tmp"
   chmod 0600 "$tmp"; chown "$owner" "$tmp" 2>/dev/null
   mv -f "$tmp" "$dir/knocks/$1.json"

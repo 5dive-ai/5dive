@@ -24,7 +24,9 @@ local_only_on()   { [[ -e "$(local_only_file)" ]]; }
 # a line; `teams` is the only name it knows. Absent = fully offline. Written by
 # `sudo 5dive config local-only allow|deny teams`; read here, by the teams
 # plugin's connect and by its server at start.
-LO_ALLOWABLE=(teams)
+# DIVE-8315: `email` too — a mail server on the office network works offline as
+# it is; a cloud mailbox (Microsoft 365, Google) needs IT to open email alone.
+LO_ALLOWABLE=(teams email)
 local_only_allow_file() { printf '%s' "${FIVE_LOCAL_ONLY_ALLOW_FILE:-$(dirname "$(local_only_file)")/local-only.allow}"; }
 local_only_allows() { [[ -f "$(local_only_allow_file)" ]] && grep -qxF -- "$1" "$(local_only_allow_file)"; }
 

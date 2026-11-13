@@ -319,6 +319,13 @@ case "$CH" in
       claude) ARGS+=(--channels "plugin:teams@5dive-plugins") ;;
       *) echo "channels=teams is claude-only for now (got type=$TYPE)" >&2; exit 2 ;;
     esac ;;
+  # DIVE-8315 email — claude-only for now. The plugin reads the mailbox from
+  # ~/.claude/channels/email/config.json (written by `5dive agent email connect`).
+  email)
+    case "$TYPE" in
+      claude) ARGS+=(--channels "plugin:email@5dive-plugins") ;;
+      *) echo "channels=email is claude-only for now (got type=$TYPE)" >&2; exit 2 ;;
+    esac ;;
   *) echo "unknown channels: $CH" >&2; exit 2 ;;
 esac
 done

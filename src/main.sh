@@ -58,7 +58,7 @@ Agents:
   5dive agent info <name>                            # type, CLI version, model, channel, state + OUTPUT (DIVE-3274:
                                                      # whether the seat is transacting, not only whether it is up)
   5dive agent types
-  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz|teams[,ch...]]
+  5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz|teams|email[,ch...]]
                             [--telegram-token=<bot-token>] [--discord-token=<token>]
                             [--workdir=<path>] [--auth-profile=<name>]
                             [--provider=<id> --api-key=<key|->]
@@ -112,11 +112,12 @@ Agents:
   5dive agent rm <name> [--purge-home]               # aliases: 5dive agent fire <name>  /  5dive fire <name>
                                                      # home is quarantined to /home/.5dive-reaped/ (root 0700);
                                                      # --purge-home deletes it instead (irreversible)
-  5dive agent config <name> set channels=<none|telegram|discord|dashboard|buzz|teams[,ch...]>
+  5dive agent config <name> set channels=<none|telegram|discord|dashboard|buzz|teams|email[,ch...]>
                                                      # comma-separable; dashboard (claude/codex, no token)
                                                      # enables web-dashboard chat — the one-tap Enable chat
                                                      # path. New claude creates include it by default.
   5dive agent teams connect|status|disconnect <name>  # Microsoft Teams contact (plugin: teams)
+  5dive agent email connect|status|disconnect <name>  # its own email address (plugin: email)
   5dive agent buzz <sub> …  ·  5dive buzz <sub> …   # DIVE-6934: moved to the buzz plugin —
                                                      # 5dive plugin install buzz
   5dive agent grant <name> <merge|push|deploy>       # root: re-render an existing STANDARD seat's managed
@@ -904,6 +905,13 @@ _agent_verb_dispatch() {
             _plugin_dispatch_verb teams agent "$@" || true
           fi
           fail "$E_NOT_INSTALLED" "Microsoft Teams is a plugin: sudo 5dive plugin install teams" ;;
+        # DIVE-8315: `agent email …` lives in the email plugin. Official plugin
+        # only: connect runs as root and writes an agent's mailbox password.
+        email)
+          if [[ "$(_plugin_verb_claims email 2>/dev/null)" == "email@5dive-plugins" ]]; then
+            _plugin_dispatch_verb email agent "$@" || true
+          fi
+          fail "$E_NOT_INSTALLED" "Email is a plugin: sudo 5dive plugin install email" ;;
         telegram-discover)
           # Read-only Telegram getUpdates poll — no registry mutation, no
           # state changes. Bot token would clutter the audit log if it were

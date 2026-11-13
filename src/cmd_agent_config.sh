@@ -1,7 +1,7 @@
 cmd_config() {
   # Usage: 5dive agent config <name> set <key>=<value> [<key>=<value>...]
   #   keys:
-  #     channels                  (none|telegram|discord|dashboard|buzz|teams, comma-
+  #     channels                  (none|telegram|discord|dashboard|buzz|teams|email, comma-
   #                                separable — "telegram,dashboard" runs both;
   #                                dashboard is token-free for claude/codex;
   #                                buzz is claude-only and token-free)
@@ -128,6 +128,9 @@ cmd_config() {
         fi
         if [[ "$type" != "claude" ]] && channel_in_list teams "$v"; then
           fail "$E_VALIDATION" "channels=teams is claude-only for now (agent '$name' is type $type)"
+        fi
+        if [[ "$type" != "claude" ]] && channel_in_list email "$v"; then
+          fail "$E_VALIDATION" "channels=email is claude-only for now (agent '$name' is type $type)"
         fi
         reg=$(jq --arg n "$name" --arg v "$v" '.agents[$n].channels = $v' <<<"$reg")
         channels_changed_to="$v"
@@ -719,6 +722,12 @@ cmd_config() {
     step "Installing teams channel for agent '$name' (type=$type)"
     _config_install_channel "$prev_channels" "$type" teams "$name" ""
   fi
+  # DIVE-8315 email attach: same shape. `5dive agent email connect` writes the
+  # mailbox settings and is what calls this.
+  if [[ -n "$channels_changed_to" ]] && channel_in_list email "$channels_changed_to"; then
+    step "Installing email channel for agent '$name' (type=$type)"
+    _config_install_channel "$prev_channels" "$type" email "$name" ""
+  fi
   if [[ -n "$new_model" ]]; then
     step "Writing model=$new_model into $type runtime config"
     write_runtime_model "$type" "$name" "$new_model"
@@ -751,7 +760,7 @@ cmd_config() {
     local gate_ch gate_marketplace gate_dir gate_waited
     for gate_ch in ${channels_changed_to//,/ }; do
       case "$gate_ch" in
-        telegram|dashboard|buzz|teams) gate_marketplace="5dive-plugins" ;;
+        telegram|dashboard|buzz|teams|email) gate_marketplace="5dive-plugins" ;;
         discord)            gate_marketplace="claude-plugins-official" ;;
         *) continue ;;
       esac

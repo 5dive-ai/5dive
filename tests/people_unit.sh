@@ -37,6 +37,8 @@
 #   E2  never by the owner's email, never re-pointing a set Teams id.
 #   E3  an admin record binds only on an Admin tap: Allow on an admin's email
 #       makes a fresh member row and grants no admin key.
+#   EM1-4 (DIVE-8315) an email knock: Allow/No card, no person, no access, the
+#       answer dropped for the email channel, Admin refused, No sticks.
 #   G1  the caller seat is read only under root; non-root fails closed to "-".
 #
 # Isolation: source src/ directly, throwaway TASKS_DB and fake homes, stubbed
@@ -331,6 +333,43 @@ E3Q=$( cmd_people_knock_answer "$E3B" admin 2>&1 | jq -r .data.person )
    && "$E3Q" == ada && "$(db "SELECT role||':'||teams_id FROM humans WHERE id='ada';")" == "admin:$GI" ]] \
   && ok_t "E3 Allow on an admin's email makes a fresh member (no admin key); Admin on it binds the admin record" \
   || bad_t "E3 admin bind" "allow=$E3P role=$(db "SELECT role FROM humans WHERE id=$(sqlq "$E3P");") admin=$E3Q ada=$(db "SELECT role||':'||COALESCE(teams_id,'') FROM humans WHERE id='ada';")"
+
+# EM1-EM3 — DIVE-8315: an email knock is about one outgoing mail's recipient.
+# The card has Allow / No only; Allow and No touch nobody's access (a person row
+# would switch the box into managed People mode and rewrite every Telegram and
+# Teams allowlist); the answer lands in the agent's email state dir; Admin is
+# refused. (Addresses are @example.com: the fixture rule.)
+mkdir -p "$AGENT_HOME_ROOT/agent-otto/.claude/channels/email"
+NH0=$(db "SELECT COUNT(*) FROM humans;"); NA0=$(db "SELECT COUNT(*) FROM human_access;")
+ROLES0=$(cat "$PEOPLE_ROLES_FILE" 2>/dev/null | md5sum)
+: >"$CARDS"
+EMK=$(cmd_people_knock_file --agent=otto --channel=email --sender=User5@Example.com 2>&1)
+EMID=$(jq -r .data.id <<<"$EMK")
+EMCB=$(jq -r '.inline_keyboard[0][0].callback_data' "$CARDS" 2>/dev/null)
+EMTXT=$(jq -r '[.inline_keyboard[0][].text]|join("/")' "$CARDS" 2>/dev/null)
+[[ "$EMID" =~ ^[0-9]+$ && "$(jq -r .data.status <<<"$EMK")" == pending && "$EMCB" =~ ^kn:${EMID}:allow:[0-9a-f]{32}$ \
+   && "$EMTXT" == "Allow/No" && "$(db "SELECT sender_id||':'||email FROM knocks WHERE id=$EMID;")" == "user5@example.com:user5@example.com" ]] \
+  && ok_t "EM1 email knock: filed on the lower-cased address, owner card Allow/No (no Admin)" \
+  || bad_t "EM1 email knock" "out=$EMK cards=$EMTXT"
+( cmd_people_knock_answer "$EMID" admin ) >/dev/null 2>&1; EMADM=$?
+EMA=$( cmd_people_knock_answer "$EMID" allow 2>&1 )
+EMDROP="$AGENT_HOME_ROOT/agent-otto/.claude/channels/email/knocks/$EMID.json"
+[[ "$EMADM" == "$E_VALIDATION" && "$(jq -r .data.status <<<"$EMA")" == allowed && "$(jq -r .data.person <<<"$EMA")" == null \
+   && "$(db "SELECT COUNT(*) FROM humans;")" == "$NH0" && "$(db "SELECT COUNT(*) FROM human_access;")" == "$NA0" \
+   && "$(cat "$PEOPLE_ROLES_FILE" 2>/dev/null | md5sum)" == "$ROLES0" \
+   && "$(jq -c '[.channel, .sender, .answer]' "$EMDROP" 2>/dev/null)" == '["email","user5@example.com","allow"]' ]] \
+  && ok_t "EM2 email Allow: no person, no access, roles untouched; Admin refused (rc $EMADM); answer dropped for the email channel" \
+  || bad_t "EM2 email allow" "adm=$EMADM out=$EMA humans=$(db "SELECT COUNT(*) FROM humans;")/$NH0 drop=$(cat "$EMDROP" 2>/dev/null)"
+EMN=$(cmd_people_knock_file --agent=otto --channel=email --sender=user6@example.com 2>&1 | jq -r .data.id)
+EMNO=$( cmd_people_knock_answer "$EMN" no 2>&1 )
+EMRE=$( cmd_people_knock_file --agent=otto --channel=email --sender=user6@example.com 2>&1 )
+[[ "$(jq -r .data.status <<<"$EMNO")" == denied && "$(jq -r .data.status <<<"$EMRE")" == denied && "$(jq -r .data.id <<<"$EMRE")" == "$EMN" \
+   && "$(jq -r .answer "$AGENT_HOME_ROOT/agent-otto/.claude/channels/email/knocks/$EMN.json" 2>/dev/null)" == no \
+   && "$(db "SELECT COUNT(*) FROM humans;")" == "$NH0" ]] \
+  && ok_t "EM3 email No: denied, dropped as no, a re-knock on that address stays denied, still no person" \
+  || bad_t "EM3 email no" "no=$EMNO re=$EMRE"
+( cmd_people_knock_file --agent=otto --channel=email --sender=not-an-address ) >/dev/null 2>&1; EMBAD=$?
+[[ "$EMBAD" == "$E_VALIDATION" ]] && ok_t "EM4 a bad address is refused (rc $EMBAD)" || bad_t "EM4 bad address" "rc=$EMBAD"
 
 # G1 — the caller seat is read only under a real root euid: below it SUDO_UID is a
 # plain env var, so a non-root caller fails CLOSED to "-" (never "" = root/app).
