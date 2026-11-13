@@ -2331,6 +2331,69 @@ _hb_mark_seen() { # <name> <now> <why>
   echo "$reg" | registry_write || return 0
 }
 
+# DIVE-8324 — the ONE line a tick logs when it stepped over held candidates,
+# naming ONLY the guards that actually held something, each with its OWN exits.
+#
+# This used to be a fixed sentence: "tier guard held all N runnable todo(s) ...
+# exits: task assign ...", printed whichever guard did the holding. Since the
+# DIVE-4430 pacing floor joined the same candidate loop, that sentence blamed
+# every pace hold on the tier guard and advised a reassignment that cannot lift
+# a pace hold. Measured on chill-gorge 2026-11-13: 988 such lines since
+# 2026-09-24, every one sharing its tick with a pacing-floor HELD line for the
+# same seat, and ZERO sandboxed or tier-NOT-MEASURED holds in the whole log.
+#
+# Each exit lives on a `printf` line on purpose:
+# tests/heartbeat_hold_remedy_and_stranded_seat_unit.sh scans every _hb_log /
+# printf line of this file for `5dive <verb> <sub>` and checks each against the
+# CLI's own --help. A plain assignment would hide the advice from that scan.
+#
+# _hb_held_line <name> <all|scancap|partial> <cand_n> <n_tier> <n_unmeasured> <n_pace> [<woke-ident>]
+_hb_held_line() {
+  local name="$1" mode="$2" cand_n="$3" nt="${4:-0}" nu="${5:-0}" np="${6:-0}" woke="${7:-}"
+  local ntier=$(( nt + nu )) held lead="" who="" exits="" g="" x
+  held=$(( ntier + np ))
+  if (( ntier > 0 )); then
+    g="tier guard"
+    if (( nt > 0 && nu > 0 )); then x="tier guard ${ntier} (${nt} SANDBOXED creator, ${nu} tier NOT MEASURED)"
+    elif (( nu > 0 )); then x="tier guard ${ntier} (tier NOT MEASURED)"
+    else x="tier guard ${ntier}"; fi
+    who="${who:+${who}, }${x}"
+    printf -v exits '%s%s' "${exits:+${exits}; }" "tier guard exits: 5dive task assign <id> <equal-or-higher-tier agent>, or 5dive heartbeat wake-task ${name} <task_id> to run one now"
+  fi
+  if (( np > 0 )); then
+    [[ -n "$g" ]] && g="" || g="pacing floor"
+    who="${who:+${who}, }pacing floor ${np}"
+    printf -v exits '%s%s' "${exits:+${exits}; }" "pacing floor exits: 5dive task escalate <id> to push one row through, or raise the floor — 5dive config pace-week=<soft>/<hard> for the week, pace-5h=<pct> for the 5-hour window"
+  fi
+  # $g is set only when exactly ONE guard fired; then the line leads with it.
+  case "$mode" in
+    partial)
+      if [[ -n "$g" ]]; then lead="${g} held ${held} higher-priority todo(s)"
+      else lead="${held} higher-priority todo(s) held (${who:-no guard counted})"; fi
+      printf '[%s] %s; waking on %s instead (DIVE-2716, DIVE-8324)\n' "$name" "$lead" "$woke"
+      return 0 ;;
+    scancap)
+      if [[ -n "$g" ]]; then lead="${g} held all ${cand_n} candidate(s) SCANNED"
+      else lead="all ${cand_n} candidate(s) SCANNED were held (${who:-no guard counted — see the HELD lines above})"; fi
+      printf '[%s] %s — scan cap _HB_PICK_SCAN=%s reached, runnable rows past it were NOT examined; %s\n' \
+        "$name" "$lead" "${_HB_PICK_SCAN:-?}" "${exits:-exits: see the HELD lines above}" ;;
+    *)
+      if [[ -n "$g" ]]; then lead="${g} held all ${cand_n} runnable todo(s)"
+      else lead="all ${cand_n} runnable todo(s) held (${who:-no guard counted — see the HELD lines above})"; fi
+      printf '[%s] %s — stay idle; this seat has NO runnable work until something changes; %s\n' \
+        "$name" "$lead" "${exits:-exits: see the HELD lines above}" ;;
+  esac
+}
+
+# DIVE-8324 — the `lastSeenWhy` an all-held tick stamps: short, because
+# `agent list` shows only its first 24 characters.
+_hb_held_why() {  # <n_tier> <n_unmeasured> <n_pace>
+  local w=""
+  (( ${3:-0} > 0 )) && w="pace"
+  (( ${1:-0} + ${2:-0} > 0 )) && w="${w:+${w}+}tier"
+  printf 'held (%s)' "${w:-guard}"
+}
+
 # DIVE-3503 — record the pane fingerprint an active-defer escalation FIRED ON.
 # Survives _hb_clear_active_defer's counter reset on purpose: the counter is the
 # episode's nudge budget, this is the evidence of what the last remedy was aimed
@@ -10912,6 +10975,10 @@ cmd_heartbeat_tick() {
     # task is still never auto-run, and still names itself in the log) and lets
     # everything behind it flow.
     local task_id="" task_ident="" _cand _cand_n=0 _picked=0
+    # DIVE-8324: holds counted PER GUARD, so the summary below names the guard
+    # that held and counts it once, in its own counter (tier -> sk_held, pace ->
+    # sk_pace). The seat-level spend cap holds before this loop, in sk_capped.
+    local _h_tier=0 _h_unmeas=0 _h_pace=0
     while IFS= read -r _cand; do
       [[ -n "$_cand" ]] || continue
       _cand_n=$((_cand_n + 1))
@@ -10946,7 +11013,7 @@ cmd_heartbeat_tick() {
         # held rather than waved through.
         _pace_prio=$(db "SELECT COALESCE(NULLIF(priority,''),'medium') FROM tasks WHERE id=${task_id};" 2>/dev/null || echo "")
         if ! _pace_admits "$_pace_rc" "$_pace_prio" standard; then
-          sk_pace=$((sk_pace + 1))
+          sk_pace=$((sk_pace + 1)); _h_pace=$(( ${_h_pace:-0} + 1 ))
           _hb_log "[$name] ${task_ident} (${_pace_prio:-<priority unreadable>}) HELD by the pacing floor — $(_pace_band_name "$_pace_rc") band: ${_pace_verdict}. Considering the next candidate; exits: 5dive task escalate ${task_id} to push this row through, or raise the floor that caused this band — 5dive config pace-week=<soft>/<hard> for the week, pace-5h=<pct> for the 5-hour session window (an env FIVE_PACE_7D_SOFT/FIVE_PACE_7D_HARD/FIVE_PACE_5H on the tick wins over both) (DIVE-4430, DIVE-4631, DIVE-4890)"
           continue
         fi
@@ -11003,6 +11070,7 @@ cmd_heartbeat_tick() {
       _ctier=$(agent_tier "$_cby"); _atier=$(agent_tier "$name")
       if tier_unmeasured "$_ctier" || tier_unmeasured "$_atier"; then
         _hb_log "[$name] task ${task_ident} tier NOT MEASURED (creator ${_cby}=${_ctier}, assignee ${name}=${_atier}) — holding, not auto-running (DIVE-2213); considering the next candidate"
+        _h_unmeas=$(( ${_h_unmeas:-0} + 1 ))
         continue
       fi
       # Only measured values reach the ranking. `unknown:unregistered` ranks 0
@@ -11038,6 +11106,7 @@ cmd_heartbeat_tick() {
       _cr=$(_hb_tier_rank "$_ctier"); _ar=$(_hb_tier_rank "$_atier")
       if [[ "$_ctier" == "sandboxed" ]] && (( _cr > 0 && _ar > 0 && _cr < _ar )); then
         _hb_log "[$name] task ${task_ident} created by SANDBOXED ${_cby}(${_ctier}) < assignee(${_atier}) — holding, not auto-running (DIVE-1065/3504); considering the next candidate. Exits: reassign to a sandboxed-or-lower seat (5dive task assign), drive it once by hand (5dive heartbeat wake-task ${name} ${task_id} ${task_ident}), or re-file it from an unconfined seat."
+        _h_tier=$(( ${_h_tier:-0} + 1 ))
         continue
       fi
     fi
@@ -11048,6 +11117,10 @@ cmd_heartbeat_tick() {
 
       _picked=1; break
     done < <(_hb_pick_tasks "$name" "$_HB_PICK_SCAN")
+    # DIVE-8324: tier-held counts the TIER guard's holds only. A pace hold is
+    # already in sk_pace; adding it here too counted it twice and blamed it on
+    # the wrong guard.
+    sk_held=$((sk_held + _h_tier + _h_unmeas))
     if (( _picked == 0 )); then
       task_id=""; task_ident=""
       if (( _cand_n == 0 )); then
@@ -11064,32 +11137,24 @@ cmd_heartbeat_tick() {
       # Every candidate we looked at was held. Not silent, and it names the cap:
       # if _cand_n hit _HB_PICK_SCAN there may be runnable rows we never reached,
       # which is a different (and much louder) situation than "the queue is held".
-      sk_held=$((sk_held + _cand_n))
-      # DIVE-3501: BOTH branches must name an exit, and every verb named here
-      # must EXIST. The scan-cap branch used to advise a `task` subcommand that
-      # is not a verb — it appeared nowhere in the CLI except in that one
-      # sentence, so an operator who followed the guard's own advice got an
-      # unknown-subcommand error. The all-held branch — the one that actually
-      # strands a seat forever — named no remedy at all. Both now name the two
-      # exits that are real: re-route the row so creator >= assignee
-      # (`task assign`), or drive it manually once (`heartbeat wake-task`,
-      # dispatched at :436 and now documented in --help).
       #
-      # The advice is DUPLICATED rather than hoisted into a variable on purpose:
-      # tests/heartbeat_hold_remedy_and_stranded_seat_unit.sh asserts, against
-      # the verb list `--help` prints AT RUNTIME, that no LOG STRING in this file
-      # names a verb the CLI does not have. A hoisted string would sit on a line
-      # the scan cannot see is a log line, and the guard would go quietly blind.
-      if (( _cand_n >= _HB_PICK_SCAN )); then
-        _hb_log "[$name] tier guard held all ${_cand_n} candidate(s) SCANNED — scan cap _HB_PICK_SCAN=${_HB_PICK_SCAN} reached, runnable rows past it were NOT examined; exits: 5dive task assign <id> <equal-or-higher-tier agent>, or 5dive heartbeat wake-task ${name} <task_id> to run one now"
-      else
-        _hb_log "[$name] tier guard held all ${_cand_n} runnable todo(s) — stay idle; this seat has NO runnable work until something changes; exits: 5dive task assign <id> <equal-or-higher-tier agent>, or 5dive heartbeat wake-task ${name} <task_id> to run one now"
-      fi
+      # DIVE-3501: every exit named must be a real verb (the hold-remedy test
+      # checks each against --help at runtime). DIVE-8324: the line names ONLY
+      # the guards that held, each with its own exits — a pace hold used to be
+      # reported as a tier hold with the tier guard's `task assign` advice, which
+      # cannot lift a pacing floor. _hb_held_line keeps every exit on a printf
+      # line so that verb scan still sees it.
+      local _hl_mode=all
+      (( _cand_n >= _HB_PICK_SCAN )) && _hl_mode=scancap
+      _hb_log "$(_hb_held_line "$name" "$_hl_mode" "$_cand_n" "$_h_tier" "$_h_unmeas" "$_h_pace")"
+      # DIVE-8324: a deliberate hold is a tick DECISION about this seat, like the
+      # no-todo branch above (DIVE-4278). Without the stamp a seat the pacing
+      # floor holds on purpose ages into OVERDUE and invites a restart.
+      with_registry_lock _hb_mark_seen "$name" "$now" "$(_hb_held_why "$_h_tier" "$_h_unmeas" "$_h_pace")" >/dev/null 2>&1 || true
       continue
     fi
     if (( _cand_n > 1 )); then
-      sk_held=$((sk_held + _cand_n - 1))
-      _hb_log "[$name] tier guard held $((_cand_n - 1)) higher-priority todo(s); waking on ${task_ident} instead (DIVE-2716)"
+      _hb_log "$(_hb_held_line "$name" partial "$_cand_n" "$_h_tier" "$_h_unmeas" "$_h_pace" "$task_ident")"
     fi
 
     # --- Same-account spread ---------------------------------------------------

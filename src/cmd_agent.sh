@@ -248,6 +248,7 @@ _agent_list_table() {
     echo "∿age/cadence — past its cadence, but the last tick's own decision for this seat was not a stall: ${_hb_working}"
     echo "      busy/mid-turn: the age is how long it has been WORKING, not silent — the verb is split the queue or look at the pane, not kick the seat."
     echo "      idle (no work): the tick had no board task to dispatch. Messages sent to the seat can still be waiting — those show as \`N spooled\` on its row. Not proof of life either — for that ask the seat's own artifacts: 5dive liveness --agent=<name> (DIVE-4278)"
+    echo "      held (pace|tier): every todo was held by a guard on purpose. The exit is the guard's own, named in the heartbeat log: 5dive task escalate or 5dive config pace-week for the pacing floor, 5dive task assign for the tier guard. Not a restart (DIVE-8324)"
   fi
   local _sp_named
   _sp_named=$(/usr/bin/jq -r --argjson now "$now" "$_AGENT_LIST_HB_DEFS"'

@@ -247,22 +247,24 @@ stamp_call_sites() { # <source-file> -> code lines calling _hb_mark_seen "$name"
   ' "$1"
 }
 n_seen=$(stamp_call_sites "$SRC/cmd_heartbeat.sh")
-is 'busy-skip, active-defer and no-work each record their decision' "$n_seen" '3'
+# DIVE-8324 adds the fourth: a seat whose every todo was HELD by a guard is a
+# tick decision too, and without the stamp a pace-held seat aged into OVERDUE.
+is 'busy-skip, active-defer, no-work and all-held each record their decision' "$n_seen" '4'
 CMT_FIX="$TMPD/stamp_comment.sh"
 { printf '# a comment quoting the call: _hb_mark_seen "$name" "$now" "why"\n'
   cat "$SRC/cmd_heartbeat.sh"; } > "$CMT_FIX"
 is 'and a COMMENT quoting that call does not inflate the count' \
-   "$(stamp_call_sites "$CMT_FIX")" '3'
+   "$(stamp_call_sites "$CMT_FIX")" '4'
 TRAIL_FIX="$TMPD/stamp_trailing_comment.sh"
 { printf 'noop() { :; }  # _hb_mark_seen "$name" is deliberately NOT called here\n'
   cat "$SRC/cmd_heartbeat.sh"; } > "$TRAIL_FIX"
 is 'nor does a TRAILING comment quoting it on a line that is code' \
-   "$(stamp_call_sites "$TRAIL_FIX")" '3'
+   "$(stamp_call_sites "$TRAIL_FIX")" '4'
 HASH_FIX="$TMPD/stamp_quoted_hash.sh"
 { printf '_hb_mark_seen "$name" "$now" "note #5 is not a comment"\n'
   cat "$SRC/cmd_heartbeat.sh"; } > "$HASH_FIX"
 is "and a '#' inside a string is code, so the call on that line still counts" \
-   "$(stamp_call_sites "$HASH_FIX")" '4'
+   "$(stamp_call_sites "$HASH_FIX")" '5'
 # The wake-failure path must NOT stamp: an undeliverable wake is the stall this
 # column exists to show, and stamping it would make the alarm unreachable.
 #
