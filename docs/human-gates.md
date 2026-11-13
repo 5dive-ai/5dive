@@ -82,3 +82,21 @@ chat, with the seat that has the context. With **no** marker anywhere, the notif
 resolves to the coordinator and nothing changes. Two holders is ambiguous and
 resolves to the coordinator too: a guess about who pages a person is the wrong
 place to be clever.
+
+## 4. How often the owner is reminded
+
+By default each open question is reminded an hour after it is asked, then every
+24 hours on its own clock. With many open questions that spreads reminders across
+the whole day. To get them all in one message a day instead:
+
+```bash
+sudo 5dive config gate-reminders=daily@9     # the hour is UTC; plain `daily` = 09:00
+sudo 5dive config gate-reminders=default     # back to one clock per question
+```
+
+In daily mode the first heartbeat at or after that hour sends every open question
+in one batch (a missed hour sends on the next tick, never twice in a day). Urgent
+questions (`task need --urgent`) keep their own clock, and agent-to-agent reminders
+are unchanged. There is no `off`: a setting any agent can change must never mute the
+owner, so changing it also sends the owner one message naming who changed it. Full
+silence is `FIVEDIVE_GATE_RENAG=0` in root's cron, and that still wins.

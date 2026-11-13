@@ -382,3 +382,53 @@ _task_grade_table_from_body() {  # <id>
     seen && infence { buf = buf $0 "\n" }
     END { printf "%s", last }'
 }
+
+# ── DIVE-8398: how often an owner is reminded about open questions ─────────
+#
+# Box bug report 950: ~20 open owner questions, each reminded on its OWN 24h
+# clock from its own ask time, so the owner got 15 separate reminders in one
+# day. `gate-reminders=daily[@HH]` moves every non-urgent reminder to ONE batch
+# per day at HH:00 UTC (the heartbeat's daily slot, src/cmd_heartbeat.sh).
+#
+# THERE IS NO `off` VALUE, on purpose: any seat with `sudo 5dive` can write this
+# file, so an `off` here would be a mute button an agent could grant itself.
+# `daily` only DELAYS: every open gate is in the next slot, so none goes longer
+# than a day unreminded. Full silence stays env-only (FIVEDIVE_GATE_RENAG=0 in
+# root's cron), and that env wins over this setting.
+#
+# Sets _GATE_REM_MODE (per-gate|daily|off), _GATE_REM_HOUR (0-23, daily only)
+# and _GATE_REM_SRC (box setting|env|default). A hand-edited value that does not
+# parse reads as the default, so a typo never quiets a box.
+gate_reminders_valid() { # <value> -> 0 when a legal CLI value
+  local v="${1:-}"
+  [[ "$v" == per-gate || "$v" == default || "$v" == daily ]] && return 0
+  [[ "$v" =~ ^daily@([0-9]{1,2})$ ]] && (( 10#${BASH_REMATCH[1]} <= 23 ))
+}
+
+gate_reminders_resolve() {
+  _GATE_REM_MODE=per-gate _GATE_REM_HOUR="" _GATE_REM_SRC="default"
+  if [[ "${FIVEDIVE_GATE_RENAG:-1}" == "0" ]]; then
+    _GATE_REM_MODE=off _GATE_REM_SRC="env: FIVEDIVE_GATE_RENAG=0"
+    return 0
+  fi
+  local f v=""
+  f=$(_box_config_path)
+  [[ -r "$f" ]] && v=$(jq -r '.gate_reminders // empty | strings' "$f" 2>/dev/null || true)
+  case "$v" in
+    per-gate) _GATE_REM_SRC="box setting" ;;
+    daily)    _GATE_REM_MODE=daily _GATE_REM_HOUR=9 _GATE_REM_SRC="box setting" ;;
+    daily@*)  if gate_reminders_valid "$v"; then
+                _GATE_REM_MODE=daily _GATE_REM_HOUR=$((10#${v#daily@})) _GATE_REM_SRC="box setting"
+              fi ;;
+  esac
+  return 0
+}
+
+# One line for `5dive config` and the owner notice.
+gate_reminders_text() {
+  case "$_GATE_REM_MODE" in
+    daily) printf 'once a day at %02d:00 UTC' "$_GATE_REM_HOUR" ;;
+    off)   printf 'off' ;;
+    *)     printf 'per question: +1h, then every 24h' ;;
+  esac
+}

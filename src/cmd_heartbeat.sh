@@ -6697,7 +6697,10 @@ _HB_GATE_RENAG_NO_NATURAL_WAKE="CAST(COALESCE(NULLIF(tier,''),'2') AS INTEGER) <
                                                         JOIN tasks b ON b.id = dd.blocked_by
                                                        WHERE dd.task_id = w.id
                                                          AND b.status NOT IN ('done','cancelled')) ) ))"
-_HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
+# DIVE-8398: split into the BASE (which gates may be reminded at all) and the
+# per-gate THROTTLE (each gate's own +1h-then-24h clock). The daily slot reuses
+# the base with a slot clause in place of the throttle (_hb_gate_renag_daily_where).
+_HB_GATE_RENAG_BASE_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   AND status NOT IN ('done','cancelled') AND COALESCE(tier,2) != 0
   -- DIVE-5648: a gate held for an OFF-BOX gate owner is not re-nagged to the
   -- human; the predicate reads the pref live, so turning it off re-arms these.
@@ -6747,7 +6750,8 @@ _HB_GATE_RENAG_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   -- once; so does any confirmed send, which clears the stamp.
   AND (gate_renag_failed_at IS NULL
        OR gate_renag_failed_at <= datetime('now','-24 hours')
-       OR gate_renag_failed_at < COALESCE(need_asked_at,updated_at,created_at))
+       OR gate_renag_failed_at < COALESCE(need_asked_at,updated_at,created_at))"
+_HB_GATE_RENAG_WHERE="${_HB_GATE_RENAG_BASE_WHERE}
   AND (gate_pinged_at IS NULL
        OR gate_pinged_at < datetime(COALESCE(need_asked_at,updated_at,created_at),'+1 hour')
        OR gate_pinged_at <= datetime('now','-24 hours'))"
@@ -7152,6 +7156,46 @@ _hb_gate_renag_agent_rail() { # <reviewer> <ids> -> 0 delivered, 1 = caller must
   return 0
 }
 
+# DIVE-8398 — THE DAILY SLOT (`5dive config gate-reminders=daily[@HH]`).
+#
+# Box bug report 950: ~20 open owner questions, each on its OWN 24h clock from its
+# own ask time, so the T2 lane's per-tick batch collapsed nothing across the day:
+# 15 separate reminders between 06:10Z and 17:30Z. In daily mode the HUMAN lanes
+# (T2 and the T1 stale lane) send only in the first tick at or after HH:00 UTC,
+# and that tick sends EVERY eligible gate not reminded since the slot began, as one
+# batch per recipient. Unchanged: urgent gates (their own clock — the filer said
+# so), the T1 fresh lane over the agent rail (a seat, not the owner), the DIVE-5307
+# landed rail, and the first ask at file time.
+#
+# WHY A DAY STAMP IN task_prefs, NOT A PER-ROW CLOCK: the per-row clock is the
+# defect. One stamp per box day means a heartbeat that misses HH:00 sends once on
+# its next tick and never twice in a day. It is written AFTER the lanes ran, so a
+# sweep that dies mid-slot fires again next tick; rows it already delivered carry
+# gate_pinged_at >= the slot and are not sent twice.
+#
+# `daily` DELAYS, it never drops: every open gate is in the next slot, so none waits
+# longer than a day after its last reminder. The base WHERE (backoff, lead-review
+# hold, grace, the +1h first-ask guard) still applies unchanged.
+_hb_gate_rem_clock() { date -u +%s; }   # harness seam: a function, not an env var
+
+# Prints today's slot as 'YYYY-MM-DD HH:00:00' when THIS tick is the slot, else rc 1.
+_hb_gate_renag_daily_slot() { # <hour 0-23>
+  local hh="$1" now day hnow last
+  [[ "$hh" =~ ^[0-9]+$ ]] || return 1
+  now=$(_hb_gate_rem_clock)
+  day=$(date -u -d "@${now}" +%F) || return 1
+  hnow=$((10#$(date -u -d "@${now}" +%H)))
+  (( hnow >= 10#$hh )) || return 1
+  last=$(db "SELECT value FROM task_prefs WHERE key='gate_reminders_last_slot';" 2>/dev/null)
+  [[ "$last" == "$day" ]] && return 1
+  printf '%s %02d:00:00' "$day" "$((10#$hh))"
+}
+
+_hb_gate_renag_daily_mark() { # <slot datetime>
+  db "INSERT INTO task_prefs (key,value) VALUES ('gate_reminders_last_slot', $(sqlq "${1%% *}"))
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null || true
+}
+
 _hb_gate_renag_sweep() {
   [[ "${FIVEDIVE_GATE_RENAG:-1}" != "0" ]] || return 0
   local owner ids
@@ -7168,6 +7212,23 @@ _hb_gate_renag_sweep() {
                FROM tasks WHERE $(_hb_gate_renag_landed_where)
                GROUP BY COALESCE(assignee,'');")
   [[ -n "$_landed_done" ]] && _HB_GATE_RENAG_WHERE+=" AND id NOT IN (${_landed_done})"
+
+  # DIVE-8398: the HUMAN lanes read _hw. Per-gate (the default) it IS the per-gate
+  # WHERE, so nothing below changes on a box that did not opt in.
+  local _hw="$_HB_GATE_RENAG_WHERE" _slot="" _GATE_REM_MODE="" _GATE_REM_HOUR="" _GATE_REM_SRC=""
+  declare -F gate_reminders_resolve >/dev/null 2>&1 && gate_reminders_resolve
+  if [[ "$_GATE_REM_MODE" == daily ]]; then
+    _hw="(COALESCE(gate_urgent,0)=1 AND ${_HB_GATE_RENAG_WHERE}
+  )"
+    if _slot=$(_hb_gate_renag_daily_slot "$_GATE_REM_HOUR"); then
+      _hw="(${_hw} OR (COALESCE(gate_urgent,0)=0 AND ${_HB_GATE_RENAG_BASE_WHERE}
+  ${_landed_done:+AND id NOT IN (${_landed_done})}
+  AND (gate_pinged_at IS NULL OR gate_pinged_at < $(sqlq "$_slot"))))"
+      _hb_log "[gate-renag] daily slot ${_slot} UTC: every open non-urgent gate goes in one batch (DIVE-8398)"
+    else
+      _slot=""
+    fi
+  fi
 
   # T2/legacy hard-human gates. DIVE-3742: ONE SENDER, not one per filer.
   #
@@ -7208,7 +7269,7 @@ _hb_gate_renag_sweep() {
   local _renag_coord=""
   _renag_coord=$(_task_resolve_gate_notifier 2>/dev/null || true)
   if [[ -n "$_renag_coord" ]] && _task_agent_channel "$_renag_coord"; then
-    ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}
+    ids=$(db "SELECT id FROM tasks WHERE ${_hw}
               AND COALESCE(tier,2)=2
               ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;" | paste -sd, -)
     if [[ -n "$ids" ]]; then
@@ -7225,20 +7286,20 @@ _hb_gate_renag_sweep() {
     # would only send the same person one reminder per filing seat. Unowned rows
     # still fan out per filer inside _hb_gate_renag_unowned.
     if _human_registry_active; then
-      ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}
+      ids=$(db "SELECT id FROM tasks WHERE ${_hw}
                 AND COALESCE(tier,2)=2
                 ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;" | paste -sd, -)
       [[ -n "$ids" ]] && _hb_gate_renag_batch "" "$ids" "paired human"
     else
     while IFS= read -r owner; do
       [[ -n "$owner" ]] || continue
-      ids=$(db "SELECT id FROM tasks WHERE ${_HB_GATE_RENAG_WHERE}
+      ids=$(db "SELECT id FROM tasks WHERE ${_hw}
                 AND COALESCE(tier,2)=2
                 AND COALESCE(NULLIF(created_by,''),assignee,'')=$(sqlq "$owner")
                 ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;" | paste -sd, -)
       [[ -n "$ids" ]] && _hb_gate_renag_batch "$owner" "$ids" "paired human"
     done < <(db "SELECT DISTINCT COALESCE(NULLIF(created_by,''),assignee,'') FROM tasks
-                 WHERE ${_HB_GATE_RENAG_WHERE} AND COALESCE(tier,2)=2;")
+                 WHERE ${_hw} AND COALESCE(tier,2)=2;")
     fi
   fi
 
@@ -7251,6 +7312,16 @@ _hb_gate_renag_sweep() {
   # created_by. Same COALESCE fallback for pre-column gates.
   local grow gid filer reviewer routed
   declare -A lead_ids=()
+  # DIVE-8398: the T1 fresh lane (agent rail) keeps the per-gate clock; only the
+  # stale lane (the human channel) reads _hw. Identical strings in per-gate mode.
+  local _t1_where="$_HB_GATE_RENAG_WHERE" _fresh_and="" _stale_and=""
+  if [[ "$_hw" != "$_HB_GATE_RENAG_WHERE" ]]; then
+    _t1_where="((${_HB_GATE_RENAG_WHERE}
+  ) OR ${_hw})"
+    _fresh_and=" AND (${_HB_GATE_RENAG_WHERE}
+  )"
+    _stale_and=" AND ${_hw}"
+  fi
   while IFS= read -r grow; do
     [[ -n "$grow" ]] || continue
     IFS=$'\x1f' read -r gid filer routed <<<"$grow"
@@ -7264,7 +7335,7 @@ _hb_gate_renag_sweep() {
     fi
     lead_ids[$reviewer]+="${lead_ids[$reviewer]:+,}${gid}"
   done < <(db "SELECT id||x'1f'||COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'')||x'1f'||COALESCE(routed_reviewer,'')
-               FROM tasks WHERE ${_HB_GATE_RENAG_WHERE} AND tier=1
+               FROM tasks WHERE ${_t1_where} AND tier=1
                ORDER BY COALESCE(need_asked_at,updated_at,created_at),id;")
   # DIVE-2587: split each reviewer's batch by AGE. Fresh gates go over the agent
   # rail (quiet, in-band, no human push); anything past the backstop window keeps
@@ -7276,16 +7347,17 @@ _hb_gate_renag_sweep() {
   [[ "$_rail_h" =~ ^[0-9]+$ ]] || _rail_h=24
   for reviewer in "${!lead_ids[@]}"; do
     _fresh=$(db "SELECT id FROM tasks WHERE id IN (${lead_ids[$reviewer]})
-                 AND COALESCE(need_asked_at,updated_at,created_at) > datetime('now','-${_rail_h} hours')
+                 AND COALESCE(need_asked_at,updated_at,created_at) > datetime('now','-${_rail_h} hours')${_fresh_and}
                  ORDER BY id;" | paste -sd, -)
     _stale=$(db "SELECT id FROM tasks WHERE id IN (${lead_ids[$reviewer]})
-                 AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-${_rail_h} hours')
+                 AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-${_rail_h} hours')${_stale_and}
                  ORDER BY id;" | paste -sd, -)
     if [[ -n "$_fresh" ]] && ! _hb_gate_renag_agent_rail "$reviewer" "$_fresh"; then
       _stale="${_stale:+${_stale},}${_fresh}"
     fi
     [[ -n "$_stale" ]] && _hb_gate_renag_batch "$reviewer" "$_stale" "org lead"
   done
+  [[ -n "$_slot" ]] && _hb_gate_renag_daily_mark "$_slot"
   return 0
 }
 

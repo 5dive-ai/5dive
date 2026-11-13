@@ -74,7 +74,10 @@ eq_ "seat-isolation=default clears the key" "$(jq -r 'has("seat_isolation")' "$B
 setcfg '{"seat_isolation":"beyond-admin"}'
 eq_ "a hand-edited value reads empty" "$(box_seat_isolation)" ""
 eq_ "  and the rule is by-role" "$(box_seat_rule)" "by-role"
-cmd_box_config --help 2>/dev/null | grep -q 'seat-isolation=.*by-role' \
+# Captured first: `cmd | grep -q` under pipefail reds on SIGPIPE once the help
+# outgrows the pipe buffer (DIVE-8398 added lines and tripped it).
+_help=$(cmd_box_config --help 2>/dev/null)
+grep -q 'seat-isolation=.*by-role' <<<"$_help" \
   && ok_ "help names by-role on the seat-isolation line (5dive-api's build guard greps it)" \
   || bad_ "help names by-role on the seat-isolation line (5dive-api's build guard greps it)" "$(cmd_box_config --help 2>/dev/null | grep seat-isolation= | head -1)"
 
