@@ -117,8 +117,9 @@ if [[ -s "$LFN" ]]; then
 else
   bad_t "L1 plugin_channel_launch not found in bin/5dive-agent-start"
 fi
+_l3_ctx=$(grep -A3 'no enabled plugin provides it' bin/5dive-agent-start)
 grep -qE 'no enabled plugin provides it .* starting without it' bin/5dive-agent-start \
-  && grep -A3 'no enabled plugin provides it' bin/5dive-agent-start | grep -q '^      continue$' \
+  && grep -q '^      continue$' <<<"$_l3_ctx" \
   && ok_t "L3 an undeclared channel is skipped with a line, and the seat still starts" || bad_t "L3 skip arm"
 
 # --- O ----------------------------------------------------------------------

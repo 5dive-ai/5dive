@@ -39,9 +39,13 @@ _plugin_channels_store() { echo "${STATE_DIR:-/var/lib/5dive}/plugins"; }
 #   {name, plugin, marketplace, dir, harnesses, local_only, knock}
 # Never fails: no store, no plugins or a bad manifest all read as [].
 plugin_channels_json() {
-  local store inst out='[]' key plugin mkt dir mf e
+  local store inst out='[]' key plugin mkt dir mf e rows
   store=$(_plugin_channels_store); inst="$store/installed.json"
   [[ -r "$inst" ]] || { echo '[]'; return 0; }
+  # Captured first, not read from a process substitution (epipe corpus guard C3).
+  rows=$(jq -r 'to_entries[]
+                | select(.value.enabled == true and ((.value.capabilities // []) | index("channel")))
+                | [.key, (.value.plugin // ""), (.value.marketplace // "")] | @tsv' "$inst" 2>/dev/null) || rows=""
   while IFS=$'\t' read -r key plugin mkt; do
     [[ -n "$key" ]] || continue
     dir="$store/enabled/$key"
@@ -61,9 +65,7 @@ plugin_channels_json() {
         ' "$mf" 2>/dev/null) || continue
     [[ -n "$e" ]] || continue
     out=$(jq -c --argjson e "$e" 'if any(.[]; .name == $e.name) then . else . + [$e] end' <<<"$out")
-  done < <(jq -r 'to_entries[]
-                  | select(.value.enabled == true and ((.value.capabilities // []) | index("channel")))
-                  | [.key, (.value.plugin // ""), (.value.marketplace // "")] | @tsv' "$inst" 2>/dev/null)
+  done <<<"$rows"
   printf '%s\n' "$out"
 }
 

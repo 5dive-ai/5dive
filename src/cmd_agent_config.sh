@@ -130,10 +130,11 @@ cmd_config() {
           fail "$E_VALIDATION" "channels=teams is claude-only for now (agent '$name' is type $type)"
         fi
         # DIVE-8315: a plugin's channel names the agent types it runs on.
-        local _pch
+        local _pch _pch_list
+        _pch_list=$(plugin_channels_in "$v")
         while IFS= read -r _pch; do
           [[ -n "$_pch" ]] && plugin_channel_harness_check "$_pch" "$type" "$name"
-        done < <(plugin_channels_in "$v")
+        done <<<"$_pch_list"
         reg=$(jq --arg n "$name" --arg v "$v" '.agents[$n].channels = $v' <<<"$reg")
         channels_changed_to="$v"
         env_dirty=1
@@ -727,12 +728,13 @@ cmd_config() {
   # DIVE-8315: every channel a plugin declares, the same token-free shape. The
   # plugin's own verb (e.g. its connect) writes the per-agent settings.
   if [[ -n "$channels_changed_to" ]]; then
-    local _pch_i
+    local _pch_i _pch_i_list
+    _pch_i_list=$(plugin_channels_in "$channels_changed_to")
     while IFS= read -r _pch_i; do
       [[ -n "$_pch_i" ]] || continue
       step "Installing $_pch_i channel for agent '$name' (type=$type)"
       _config_install_channel "$prev_channels" "$type" "$_pch_i" "$name" ""
-    done < <(plugin_channels_in "$channels_changed_to")
+    done <<<"$_pch_i_list"
   fi
   if [[ -n "$new_model" ]]; then
     step "Writing model=$new_model into $type runtime config"
