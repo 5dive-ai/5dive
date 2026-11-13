@@ -183,5 +183,37 @@ ident_std=$(db "SELECT ident FROM tasks WHERE title='plain row';")
 OUT=$( (cmd_task_set_tz "$ident_std" UTC) 2>&1 ); RC=$?
 [[ "$RC" != 0 ]] && ok_t "J5: a standard row is refused" || bad_t "J5: a standard row is refused" "rc=$RC"
 
+# ── K. set-schedule changes WHEN a template fires, keeping its ident ──────────
+fresh_clock
+t_k=$(mk_tmpl "standup" "0 8 * * *" Asia/Bangkok); ident_k=$(db "SELECT ident FROM tasks WHERE id=${t_k};")
+db "UPDATE tasks SET last_fired_at='2026-10-08 01:00:00', last_skipped_at='2026-10-08 02:00:00', last_skip_reason='pace soft floor, owed 2026-10-08 01:00 UTC' WHERE id=${t_k};"
+OUT=$( (cmd_task_set_schedule "$ident_k" "30 9 * * 1-5") 2>&1 ); RC=$?
+eq_t "K1: set-schedule on a template succeeds" "$RC" 0
+eq_t "K2: the new cron is stored" "$(db "SELECT schedule FROM tasks WHERE id=${t_k};")" "30 9 * * 1-5"
+eq_t "K3: same row: ident unchanged" "$(db "SELECT ident FROM tasks WHERE id=${t_k};")" "$ident_k"
+eq_t "K4: its zone and last run are kept" "$(db "SELECT schedule_tz||'|'||last_fired_at FROM tasks WHERE id=${t_k};")" "Asia/Bangkok|2026-10-08 01:00:00"
+eq_t "K5: a slot the old cron owed is cleared" "$(db "SELECT COALESCE(last_skip_reason,'none')||'|'||COALESCE(last_skipped_at,'none') FROM tasks WHERE id=${t_k};")" "none|none"
+db "UPDATE tasks SET last_fired_at=NULL WHERE id=${t_k};"
+pass_at '2026-10-09 01:00'; eq_t "K6: the old time (08:00 Bangkok) no longer fires" "$(instances_of "$t_k")" 0
+pass_at '2026-10-09 02:30'; eq_t "K7: the new time (09:30 Bangkok, a Friday) fires" "$(instances_of "$t_k")" 1
+OUT=$( (cmd_task_set_schedule "$ident_k" 0 7 '*' '*' '*') 2>&1 ); RC=$?
+eq_t "K8: the cron as five separate words works too" "$RC:$(db "SELECT schedule FROM tasks WHERE id=${t_k};")" "0:0 7 * * *"
+OUT=$( (JSON_MODE=1; cmd_task_set_schedule "$ident_k" "0 7 * * *") 2>&1 ); RC=$?
+eq_t "K9: same cron again: ok, changed=false" "$RC:$(jq -r '.data.changed' <<<"$OUT" 2>/dev/null)" "0:false"
+OUT=$( (JSON_MODE=1; cmd_task_set_schedule "$ident_k" "15 6 * * *") 2>&1 )
+eq_t "K10: --json carries ident, schedule, zone, prior" "$(jq -r '.data | [.ident,.schedule,.schedule_tz,.prior,.changed] | join("|")' <<<"$OUT" 2>/dev/null)" "$ident_k|15 6 * * *|Asia/Bangkok|0 7 * * *|true"
+OUT=$( (cmd_task_set_schedule "$ident_k" "every day") 2>&1 ); RC=$?
+eq_t "K11: a bad cron is refused as validation (exit $E_VALIDATION), nothing stored" "$RC:$(db "SELECT schedule FROM tasks WHERE id=${t_k};")" "$E_VALIDATION:15 6 * * *"
+OUT=$( (cmd_task_set_schedule "$ident_std" "0 9 * * *") 2>&1 ); RC=$?
+eq_t "K12: a standard row is refused as validation" "$RC" "$E_VALIDATION"
+OUT=$( (cmd_task_set_schedule "NOPE-99999" "0 9 * * *") 2>&1 ); RC=$?
+eq_t "K13: a missing row is not found (exit $E_NOT_FOUND)" "$RC" "$E_NOT_FOUND"
+OUT=$( (cmd_task_set_schedule "$ident_k") 2>&1 ); RC=$?
+eq_t "K14: no cron is a usage error" "$RC" "$E_USAGE"
+OUT=$( (cmd_task set-schedule "$ident_k" "45 5 * * *") 2>&1 ); RC=$?
+eq_t "K15: dispatched as 'task set-schedule'" "$RC:$(db "SELECT schedule FROM tasks WHERE id=${t_k};")" "0:45 5 * * *"
+HELP=$(_task_help 2>/dev/null || cmd_task help 2>&1)
+has_t "K16: task --help lists set-schedule" "$HELP" "set-schedule <tmpl> <cron>"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

@@ -126,6 +126,8 @@ _task_usage() {
                                                 per-agent cost budget
   set-overlap <tmpl> <skip|spawn> [bound]       recurring template: does an open instance suppress the next slot?
   set-tz <tmpl> <zone|box>                      recurring template: the zone its schedule is read in (box = this box's zone)
+  set-schedule <tmpl> <cron>                    recurring template: change WHEN it fires (5-field cron, read in its zone);
+                                                keeps its ident, history and last run
 
   start <id>                                    -> in_progress
   done <id> [--result=<text>|--result-file=<path>] [--no-graded-sha]
@@ -458,6 +460,7 @@ cmd_task() {
     set-budget)      cmd_task_set_budget "$@" ;;
     set-overlap)     cmd_task_set_overlap "$@" ;;
     set-tz)          cmd_task_set_tz "$@" ;;
+    set-schedule)    cmd_task_set_schedule "$@" ;;
     wip-cap-install) cmd_task_wip_cap_install "$@" ;;
     orphans)         cmd_task_orphans "$@" ;;       # DIVE-3344 undispatchable rows
     doctor)          cmd_task_doctor "$@" ;;        # DIVE-3784 every undispatchable class
@@ -946,6 +949,55 @@ cmd_task_set_tz() {
   ok "$ident schedule '${sched}' now reads in ${zone} (was ${prior})." \
      '{ident:$i, schedule:$s, schedule_tz:$z, prior:$p}' \
      --arg i "$ident" --arg s "$sched" --arg z "$zone" --arg p "$prior"
+}
+
+# Change WHEN an existing recurring template fires. Without this an owner who
+# wanted "9:00" instead of "8:00" had to add a new template and rm the old one,
+# which loses the ident, the history and last_fired_at (the reason set-tz and
+# set-overlap are verbs too). The materializer re-reads `schedule` every pass,
+# so the new cron is live on the next tick. A slot the pacing floor held under
+# the OLD cron ("owed <slot>" in last_skip_reason, DIVE-6807) would still fire
+# late under the new one, so the hold stamp is cleared: the owner just chose a
+# new clock, and the old one owes nothing.
+cmd_task_set_schedule() {
+  tasks_db_init
+  local task=""
+  local -a words=()
+  local sched=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --)  shift; words+=("$@"); break ;;
+      -*)  fail "$E_USAGE" "unknown flag: $1" ;;
+      *)   if [[ -z "$task" ]]; then task="$1"; else words+=("$1"); fi ;;
+    esac
+    shift
+  done
+  # The cron may arrive as one quoted argument or as five words; both mean the same.
+  sched="${words[*]:-}"
+  [[ -n "$task" && -n "$sched" ]] \
+    || fail "$E_USAGE" "usage: 5dive task set-schedule <template|TASK-N> \"<5-field cron>\"  (e.g. \"0 9 * * 1-5\"; read in the template's zone, see task set-tz)"
+  read -r -a _ss_f <<<"$sched"; sched="${_ss_f[*]}"
+  valid_cron_expr "$sched" \
+    || fail "$E_VALIDATION" "bad schedule '$sched' (need a 5-field cron expr, e.g. \"0 2 * * *\")"
+  resolve_task_id "$task"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  local kind; kind=$(db "SELECT kind FROM tasks WHERE id=${id};")
+  [[ "$kind" == "recurring" ]] \
+    || fail "$E_VALIDATION" "$ident is kind='$kind', not a recurring TEMPLATE — only a template has a schedule. Did you mean the template this instance came from? (5dive task show $ident)"
+  local prior tz
+  prior=$(db "SELECT COALESCE(schedule,'') FROM tasks WHERE id=${id};")
+  tz=$(db "SELECT COALESCE(NULLIF(schedule_tz,''),'UTC') FROM tasks WHERE id=${id};")
+  if [[ "$prior" == "$sched" ]]; then
+    ok "$ident schedule unchanged ('${sched}' in ${tz})." \
+       '{ident:$i, schedule:$s, schedule_tz:$z, prior:$s, changed:false}' \
+       --arg i "$ident" --arg s "$sched" --arg z "$tz"
+    return 0
+  fi
+  db "UPDATE tasks SET schedule=$(sqlq "$sched"), last_skipped_at=NULL, last_skip_reason=NULL, updated_at=datetime('now') WHERE id=${id};"
+  ledger_emit "task.schedule_set" ident="$ident" task_id="$id" \
+    actor="$(task_actor)" detail="schedule '${prior}' -> '${sched}' (${tz})" || true
+  ok "$ident now fires on '${sched}' in ${tz} (was '${prior}')." \
+     '{ident:$i, schedule:$s, schedule_tz:$z, prior:$p, changed:true}' \
+     --arg i "$ident" --arg s "$sched" --arg z "$tz" --arg p "$prior"
 }
 
 cmd_task_set_budget() {
