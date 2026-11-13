@@ -160,6 +160,10 @@ cmd_box_config gate-reminders=daily@7 >/dev/null 2>&1
 grep -q "could NOT be told" "$TMP/warn" 2>/dev/null && ok_t "H7: undelivered notice is said loudly" \
   || bad_t "H7: silent change when no bot confirmed"
 
+# ── I: --help survives a reader that stops early (partner build greps it under pipefail)
+rc=$(bash -c "set -o pipefail; source <(cat src/header.sh src/lib/error_codes.sh src/lib/output.sh src/lib/verify_policy.sh src/cmd_box_config.sh) 2>/dev/null; cmd_box_config --help | head -c1 >/dev/null; echo \$?" 2>/dev/null)
+[[ "$rc" == 0 ]] && ok_t "I: config --help | head -c1 exits 0 under pipefail" || bad_t "I: --help died on SIGPIPE" "rc=$rc"
+
 # ── NEGATIVE CONTROL: revert the slot check → arm A goes red ───────────────────
 if [[ -z "${_GATE_REM_MUTANT:-}" ]]; then
   mut="$TMP/hb_mutant.sh"

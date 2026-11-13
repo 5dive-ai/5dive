@@ -39,7 +39,11 @@ cmd_box_config() {
   while (( $# )); do
     case "$1" in
       --json) JSON_MODE=1 ;;
-      -h|--help) printf '%s\n' \
+      # DIVE-8398: SIGPIPE-proof. 5dive-api's partner build runs
+      # `5dive config --help | grep -q 'seat-isolation=…'` under pipefail; the help
+      # is several pipe writes long, so a grep that exits on its match could kill
+      # this with SIGPIPE and the build would read "old CLI" and skip the step.
+      -h|--help) ( trap '' PIPE; printf '%s\n' \
         "usage: 5dive config                 # show this box's settings" \
         "       5dive config verify=<always|delivered-only|never>" \
         "       5dive config verify-small=<lines>|off" \
@@ -146,7 +150,7 @@ cmd_box_config() {
         "             every 24h on its own clock. daily[@HH] = all of them in ONE message" \
         "             a day at HH:00 UTC (default 09); urgent questions keep their own" \
         "             clock. There is no off: FIVEDIVE_GATE_RENAG=0 in root's cron is the" \
-        "             only full silence. Changing it tells the owner, naming who changed it."
+        "             only full silence. Changing it tells the owner, naming who changed it." ) 2>/dev/null || true
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
