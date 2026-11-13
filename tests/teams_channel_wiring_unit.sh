@@ -110,7 +110,7 @@ grep -qE 'Microsoft Teams is a plugin: sudo 5dive plugin install teams' "$SRC/ma
   && ok_t "without the plugin, agent teams says how to get it" || bad_t "without the plugin, agent teams says how to get it"
 
 # 10
-grep -qE 'for _cp in dashboard buzz teams; do' "$SRC/cmd_agent_create.sh" \
+grep -qE 'for _cp in dashboard buzz teams( \$\(plugin_channel_names\))?; do' "$SRC/cmd_agent_create.sh" \
   && ok_t "create self-check covers the teams plugin" || bad_t "create self-check covers the teams plugin"
 
 echo "$PASS passed, $FAIL failed"

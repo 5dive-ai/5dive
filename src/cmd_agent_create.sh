@@ -3037,15 +3037,19 @@ _resolve_inherit_sources() {
 # message. Checked where Claude Code really runs it (the checkout, for a
 # directory-source marketplace) and Claude Code's own 15-minute failure cache.
 # Emits `ok:` / `issue:` lines; never fails. Root reads the seat's files.
-selfcheck_chat_plugin_ready() { # <name> <plugin>
-  local name="$1" plugin="$2" home d bad=""
+selfcheck_chat_plugin_ready() { # <name> <plugin or plugin channel>
+  local name="$1" plugin="$2" home d bad="" mkt=5dive-plugins _pce
+  # DIVE-8315: a plugin channel is installed as its own plugin@marketplace.
+  if [[ " ${PLUGIN_CHANNEL_BUILTINS:-none telegram discord dashboard buzz teams} " != *" $plugin "* ]] && declare -F plugin_channel >/dev/null && _pce=$(plugin_channel "$plugin"); then
+    plugin=$(jq -r .plugin <<<"$_pce"); mkt=$(jq -r .marketplace <<<"$_pce")
+  fi
   home="${FIVEDIVE_AGENT_HOME_ROOT:-/home}/agent-${name}"
   [[ -f "$home/.claude/plugins/installed_plugins.json" ]] || return 0
-  jq -e --arg k "$plugin@5dive-plugins" '.plugins | has($k)' "$home/.claude/plugins/installed_plugins.json" >/dev/null 2>&1 \
+  jq -e --arg k "$plugin@$mkt" '.plugins | has($k)' "$home/.claude/plugins/installed_plugins.json" >/dev/null 2>&1 \
     || return 0   # not a Claude Code plugin install (the install step reports its own failure)
   while IFS= read -r d; do
     plugin_deps_complete "$d" || bad="$d"
-  done < <(seat_plugin_run_dirs "$home" "$plugin@5dive-plugins")
+  done < <(seat_plugin_run_dirs "$home" "$plugin@$mkt")
   if [[ -n "$bad" ]]; then
     printf 'issue:%s\n' "$plugin chat plugin CANNOT START (agent is DEAF: no packages in $bad) — run: sudo 5dive self-update while online, then sudo 5dive agent restart $name"
   elif jq -e --arg k "plugin:$plugin:$plugin" 'has($k)' "$home/.claude/mcp-needs-auth-cache.json" >/dev/null 2>&1; then
@@ -3645,7 +3649,7 @@ cmd_create() {
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz|teams[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--fresh|--no-fresh] [--defer-auth] [--own-login] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz|teams|<a plugin channel>[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--fresh|--no-fresh] [--defer-auth] [--own-login] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -3682,7 +3686,7 @@ cmd_create() {
   if [[ "$type" == "grok" ]]; then
     printf 'note: %s\n' "Grok's tool sends your agent's notes and chat turns to xAI after every turn." >&2 || true
   fi
-  valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz|teams, comma-separable)"
+  valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz|teams$(_pc=$(plugin_channel_names); [[ -n "$_pc" ]] && printf '|%s' $_pc), comma-separable)"
   # DIVE-5406: dashboard chat is OPT-IN. DIVE-856 used to fold `dashboard`
   # into every claude create on a box with connectord.env (unset --channels
   # became "dashboard", an explicit list got ",dashboard" appended). Mini App
@@ -4468,6 +4472,11 @@ cmd_create() {
       # `5dive agent teams connect` writes the bot's settings.
       teams)
         install_channel_for_agent "$type" teams "$name" "" ;;
+      # DIVE-8315: a channel a plugin declares; its own verb writes the settings later.
+      *)
+        if plugin_channel "$_ch" >/dev/null; then
+          install_channel_for_agent "$type" "$_ch" "$name" ""
+        fi ;;
     esac
   done
   # DIVE-5306: a sandboxed claude seat starts on the lite Telegram bot profile;
@@ -4981,7 +4990,7 @@ cmd_create() {
   # DIVE-7574: the chat plugin itself, where Claude Code runs it.
   if [[ "$type" == claude ]]; then
     local _cp _cp_line
-    for _cp in dashboard buzz teams; do
+    for _cp in dashboard buzz teams $(plugin_channel_names); do
       channel_in_list "$_cp" "$channels" || continue
       while IFS= read -r _cp_line; do
         case "$_cp_line" in

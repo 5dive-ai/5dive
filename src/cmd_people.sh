@@ -64,7 +64,7 @@ _people_usage() {
                         [--telegram=] [--teams=]
   5dive people rm <id>                              # the owner cannot be removed
   5dive people sync                                 # rewrite Telegram/Teams/roles from the list
-  5dive people knock file --agent=<a> --channel=teams|telegram --sender=<id>
+  5dive people knock file --agent=<a> --channel=teams|telegram|<plugin channel> --sender=<id> [--kind=<card>]
                           [--name=<text>] [--email=<addr>]
   5dive people knock answer <knock id> allow|admin|no [--by=<channel:id>] [--proof=<nonce>]
 
@@ -180,7 +180,7 @@ cmd_people_ls() {
       (SELECT group_concat(agent, ',') FROM (SELECT agent FROM human_access a WHERE a.human_id=h.id ORDER BY agent)) AS agents
     FROM humans h
     ORDER BY CASE COALESCE(h.role,'member') WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, h.id;")
-  knocks=$(dbfmt -json "SELECT id, agent, channel, name, email, created_at FROM knocks
+  knocks=$(dbfmt -json "SELECT id, agent, channel, sender_id, name, email, created_at FROM knocks
     WHERE status='pending' ORDER BY created_at, id;")
   people=$(jq -c 'map(.agents = (if .role == "owner" then ["*"] else ((.agents // "") | split(",") | map(select(length>0))) end))' <<<"${people:-[]}")
   [[ -n "$knocks" ]] || knocks="[]"
@@ -200,7 +200,10 @@ cmd_people_ls() {
   fi
   if [[ "$knocks" != "[]" ]]; then
     echo; echo "Wants to talk to your agents:"
-    jq -r '.[] | "  #\(.id) \(.name // "someone") → \(.agent) (\(.channel)\(if .email then ", " + .email else "" end))"' <<<"$knocks"
+    # DIVE-8315: a plugin channel's knock is about an address, not a person.
+    jq -r --arg pc " $(plugin_channel_names) " '.[] | .channel as $c | if ($pc | contains(" " + $c + " "))
+          then "  #\(.id) \(.agent) ↔ \(.sender_id) (\(.channel), first time: allow or no)"
+          else "  #\(.id) \(.name // "someone") → \(.agent) (\(.channel)\(if .email then ", " + .email else "" end))" end' <<<"$knocks"
     echo "Answer: sudo 5dive people knock answer <number> allow   (or admin, or no)"
   fi
 }
@@ -500,7 +503,7 @@ cmd_people_knock() {
 cmd_people_knock_file() {
   _gate_is_root || fail "$E_PERMISSION" "knock file runs as root (a seat reaches it with: sudo 5dive people knock file …)"
   tasks_db_init
-  local agent="" channel="" sender="" name="" email=""
+  local agent="" channel="" sender="" name="" email="" kind="" pce=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --agent=*)   agent="${1#*=}" ;;
@@ -508,6 +511,7 @@ cmd_people_knock_file() {
       --sender=*)  sender="${1#*=}" ;;
       --name=*)    name=$(_people_clean_text "${1#*=}" 80) ;;
       --email=*)   email="${1#*=}"; email="${email,,}" ;;
+      --kind=*)    kind="${1#*=}" ;;
       *) fail "$E_USAGE" "unknown arg: $1" ;;
     esac
     shift
@@ -521,24 +525,38 @@ cmd_people_knock_file() {
     agent="$seat"
   fi
   [[ -n "$agent" && -n "$channel" && -n "$sender" ]] \
-    || fail "$E_USAGE" "usage: 5dive people knock file --agent=<a> --channel=teams|telegram --sender=<id> [--name=] [--email=]"
+    || fail "$E_USAGE" "usage: 5dive people knock file --agent=<a> --channel=teams|telegram|<plugin channel> --sender=<id> [--kind=<card>] [--name=] [--email=]"
   valid_sender_label "$agent" || fail "$E_VALIDATION" "bad agent name '$agent'"
   _people_agent_exists "$agent" || fail "$E_NOT_FOUND" "no agent named '$agent'"
   case "$channel" in
     teams)    sender="${sender,,}"; _people_check_teams "$sender" ;;
     telegram) _people_check_telegram "$sender" ;;
-    *) fail "$E_VALIDATION" "bad channel '$channel' — teams or telegram" ;;
+    *)
+      # DIVE-8315: a plugin's channel that asks the owner (fivedive.channel.knock).
+      # The card's words come from its manifest, picked by --kind, never from argv.
+      pce=$(plugin_channel "$channel" 2>/dev/null) && jq -e '.knock' <<<"$pce" >/dev/null 2>&1 \
+        || fail "$E_VALIDATION" "bad channel '$channel' — teams, telegram, or a plugin channel that asks the owner"
+      jq -e --arg k "$kind" '$k != "" and (.knock.cards | has($k))' <<<"$pce" >/dev/null 2>&1 \
+        || fail "$E_USAGE" "--kind=$(jq -r '.knock.cards | keys | join("|")' <<<"$pce") is required for the $channel channel"
+      if [[ "$(jq -r '.knock.sender // "id"' <<<"$pce")" == email ]]; then
+        sender="${sender,,}"; _people_check_email "$sender"
+      else
+        [[ "$sender" =~ ^[A-Za-z0-9._:@+-]{1,128}$ ]] || fail "$E_VALIDATION" "bad sender id for the $channel channel"
+      fi ;;
   esac
   [[ -z "$email" ]] || _people_check_email "$email"
 
-  local col=teams_id; [[ "$channel" == telegram ]] && col=telegram_id
   # Already allowed (a race with an answer, or added from the app): no knock.
-  local hid
-  hid=$(db "SELECT h.id FROM humans h WHERE h.${col}=$(sqlq "$sender") AND h.role IS NOT NULL
-             AND (h.role='owner' OR EXISTS (SELECT 1 FROM human_access a WHERE a.human_id=h.id AND a.agent IN ('*',$(sqlq "$agent"))))
-           LIMIT 1;")
-  if [[ -n "$hid" ]]; then
-    _people_knock_out "" allowed 0 "$hid"; return 0
+  # A plugin channel's knock is about an address and never matches a person.
+  if [[ -z "$pce" ]]; then
+    local col=teams_id; [[ "$channel" == telegram ]] && col=telegram_id
+    local hid
+    hid=$(db "SELECT h.id FROM humans h WHERE h.${col}=$(sqlq "$sender") AND h.role IS NOT NULL
+               AND (h.role='owner' OR EXISTS (SELECT 1 FROM human_access a WHERE a.human_id=h.id AND a.agent IN ('*',$(sqlq "$agent"))))
+             LIMIT 1;")
+    if [[ -n "$hid" ]]; then
+      _people_knock_out "" allowed 0 "$hid"; return 0
+    fi
   fi
   # One knock per sender: a pending one is returned, not re-carded; a denied
   # one stays denied (the owner said no — re-knocking must not re-page them).
@@ -568,7 +586,11 @@ cmd_people_knock_file() {
   [[ "$kid" =~ ^[0-9]+$ ]] || fail "$E_GENERIC" "knock was not recorded"
   audit_log "people knock file" ok 0 -- "knock=$kid" "agent=$agent" "channel=$channel" "by_claimed=${SUDO_USER:-root}"
   local carded=0
-  _people_knock_card "$kid" "$agent" "$channel" "$name" "$email" "$n_allow" "$n_admin" "$n_no" && carded=1
+  if [[ -n "$pce" ]]; then
+    _people_plugin_knock_card "$kid" "$agent" "$pce" "$kind" "$sender" "$name" "$n_allow" "$n_no" && carded=1
+  else
+    _people_knock_card "$kid" "$agent" "$channel" "$name" "$email" "$n_allow" "$n_admin" "$n_no" && carded=1
+  fi
   _people_knock_out "$kid" pending "$carded" ""
 }
 
@@ -583,12 +605,40 @@ _people_knock_out() {  # <kid> <status> <carded> <human>
   fi
 }
 
-_people_html() { local s="$1"; s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; printf '%s' "$s"; }
+# Through sed, not ${s//</&lt;}: bash 5.2 (patsub_replacement, on by default)
+# reads `&` in that replacement as the match, so "<" became "<lt;" and a name with
+# a "<" sent Telegram broken HTML (DIVE-8315, measured on bash 5.2.21).
+_people_html() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
 # The owner card on Telegram. Sent through the agent's own bot when it has one,
 # else the box's gate notifier — the path gate alerts take (_task_send_owner).
 # rc 0 = delivered. Never fails the knock: an undelivered card still shows in
 # the app's Team tab.
+# DIVE-8315: a plugin channel's card. Its text is the manifest's card for this
+# kind, with {agent} and {sender} filled in (HTML-escaped). Allow and No only: an
+# address is never made an admin.
+_people_plugin_knock_card() {  # <kid> <agent> <channel entry json> <kind> <sender> <name> <nonce allow> <nonce no>
+  local kid="$1" agent="$2" pce="$3" kind="$4" sender="$5" name="${6:-}" n_allow="$7" n_no="$8"
+  _task_agent_channel "$agent" 2>/dev/null \
+    || { local nt; nt=$(_task_resolve_gate_notifier 2>/dev/null) && [[ -n "$nt" ]] && _task_agent_channel "$nt" 2>/dev/null; } \
+    || return 1
+  local ag="${agent^}" who="$sender" plain text markup
+  [[ -n "$name" ]] && who="$name ($sender)"
+  # Filled in by jq, not bash: bash 5.2 reads `&` in a ${x//p/r} replacement as
+  # the matched text, which mangled an escaped name (&lt; -> {sender}lt;).
+  plain=$(jq -r --arg k "$kind" --arg a "$ag" --arg w "$who" \
+            '.knock.cards[$k] | tostring | .[0:600] | gsub("\\{agent\\}"; $a) | gsub("\\{sender\\}"; $w)' <<<"$pce") || return 1
+  text=$(jq -r --arg k "$kind" --arg a "$ag" --arg w "$who" '
+            def esc: gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;");
+            .knock.cards[$k] | tostring | .[0:600] | esc
+            | gsub("\\{agent\\}"; ($a | esc)) | gsub("\\{sender\\}"; "<b>" + ($w | esc) + "</b>")' <<<"$pce") || return 1
+  markup=$(jq -cn --arg k "$kid" --arg a "$n_allow" --arg n "$n_no" '{inline_keyboard:[[
+      {text:"Allow", callback_data:("kn:"+$k+":allow:"+$a)},
+      {text:"No",    callback_data:("kn:"+$k+":no:"+$n)}]]}')
+  _task_send_owner "$text" "$markup" "" "$plain" >/dev/null 2>&1 || true
+  [[ "${TASK_SEND_DELIVERED:-0}" == 1 ]]
+}
+
 _people_knock_card() {  # <kid> <agent> <channel> <name> <email> <nonce allow> <nonce admin> <nonce no>
   local kid="$1" agent="$2" channel="$3" who="${4:-Someone}" email="$5"
   local n_allow="$6" n_admin="$7" n_no="$8"
@@ -660,6 +710,28 @@ cmd_people_knock_answer() {
   fi
   [[ "$status" == pending ]] || fail "$E_CONFLICT" "knock #$kid is already answered ($status)"
 
+  # DIVE-8315: a plugin channel's knock is about one address. Its answer goes to
+  # that agent's plugin and touches nobody's access: making a person here would
+  # switch the box into managed People mode and rewrite who may talk to every
+  # agent on Telegram and Teams.
+  if [[ "$channel" != teams && "$channel" != telegram ]]; then
+    [[ "$choice" != admin ]] || fail "$E_VALIDATION" "a $channel knock is answered allow or no (an address is never made an admin)"
+    [[ -z "$by" ]] && by="${SUDO_USER:-root}"
+    local pst=denied; [[ "$choice" == allow ]] && pst=allowed
+    local pwon
+    pwon=$(db "UPDATE knocks SET status=$(sqlq "$pst"), answered_at=datetime('now'), answered_by=$(sqlq "$by")
+               WHERE id=${kid} AND status='pending'; SELECT changes();")
+    [[ "$pwon" == 1 ]] || fail "$E_CONFLICT" "knock #$kid was answered meanwhile"
+    audit_log "people knock answer" ok 0 -- "knock=$kid" "agent=$agent" "answer=$choice" "channel=$channel" "by_claimed=$by"
+    _people_knock_drop "$kid" "$agent" "$channel" "$sender" "$name" "$choice" ""
+    if (( JSON_MODE )); then
+      jq -cn --arg k "$kid" --arg s "$pst" --arg a "$agent" --arg c "$choice" '{ok:true, data:{id:($k|tonumber), status:$s, answer:$c, agent:$a, person:null}}'
+    else
+      ok "knock #$kid: $choice ($agent and $sender on $channel)"
+    fi
+    return 0
+  fi
+
   local hid="" new_status=denied
   [[ -z "$by" ]] && by="${SUDO_USER:-root}"
   if [[ "$choice" != no ]]; then
@@ -716,14 +788,15 @@ cmd_people_knock_answer() {
 # dir, owned by the seat (the server watches the dir; DIVE-8036). Only for a
 # Teams knock on a Teams-connected agent; a Telegram knock is let in by sync.
 _people_knock_drop() {  # <kid> <agent> <channel> <sender> <name> <choice> <person>
-  [[ "$3" == teams ]] || return 0
-  local dir; dir="$(_people_home_of "$2")/.claude/channels/teams"
+  # DIVE-8315: and any plugin channel, into the same channels/<name>/knocks/.
+  [[ "$3" == teams ]] || [[ "$3" != telegram && "$3" =~ ^[a-z][a-z0-9-]{1,23}$ ]] || return 0
+  local dir; dir="$(_people_home_of "$2")/.claude/channels/$3"
   [[ -d "$dir" ]] || return 0
   local owner; owner=$(stat -c '%u:%g' "$dir" 2>/dev/null) || return 0
   mkdir -p "$dir/knocks" && chmod 0700 "$dir/knocks" && chown "$owner" "$dir/knocks" 2>/dev/null
   local tmp; tmp=$(mktemp "$dir/knocks/.k.XXXXXX") || return 0
-  jq -n --arg k "$1" --arg a "$2" --arg s "$4" --arg n "$5" --arg c "$6" --arg p "$7" \
-    '{id:($k|tonumber), agent:$a, channel:"teams", sender:$s, name:(($n|select(length>0)) // null),
+  jq -n --arg k "$1" --arg a "$2" --arg ch "$3" --arg s "$4" --arg n "$5" --arg c "$6" --arg p "$7" \
+    '{id:($k|tonumber), agent:$a, channel:$ch, sender:$s, name:(($n|select(length>0)) // null),
       answer:$c, person:(($p|select(length>0)) // null), answered_at:(now|todate)}' >"$tmp"
   chmod 0600 "$tmp"; chown "$owner" "$tmp" 2>/dev/null
   mv -f "$tmp" "$dir/knocks/$1.json"

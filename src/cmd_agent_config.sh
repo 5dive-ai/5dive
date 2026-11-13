@@ -1,7 +1,7 @@
 cmd_config() {
   # Usage: 5dive agent config <name> set <key>=<value> [<key>=<value>...]
   #   keys:
-  #     channels                  (none|telegram|discord|dashboard|buzz|teams, comma-
+  #     channels                  (none|telegram|discord|dashboard|buzz|teams or a plugin channel, comma-
   #                                separable — "telegram,dashboard" runs both;
   #                                dashboard is token-free for claude/codex;
   #                                buzz is claude-only and token-free)
@@ -129,6 +129,12 @@ cmd_config() {
         if [[ "$type" != "claude" ]] && channel_in_list teams "$v"; then
           fail "$E_VALIDATION" "channels=teams is claude-only for now (agent '$name' is type $type)"
         fi
+        # DIVE-8315: a plugin's channel names the agent types it runs on.
+        local _pch _pch_list
+        _pch_list=$(plugin_channels_in "$v")
+        while IFS= read -r _pch; do
+          [[ -n "$_pch" ]] && plugin_channel_harness_check "$_pch" "$type" "$name"
+        done <<<"$_pch_list"
         reg=$(jq --arg n "$name" --arg v "$v" '.agents[$n].channels = $v' <<<"$reg")
         channels_changed_to="$v"
         env_dirty=1
@@ -719,6 +725,17 @@ cmd_config() {
     step "Installing teams channel for agent '$name' (type=$type)"
     _config_install_channel "$prev_channels" "$type" teams "$name" ""
   fi
+  # DIVE-8315: every channel a plugin declares, the same token-free shape. The
+  # plugin's own verb (e.g. its connect) writes the per-agent settings.
+  if [[ -n "$channels_changed_to" ]]; then
+    local _pch_i _pch_i_list
+    _pch_i_list=$(plugin_channels_in "$channels_changed_to")
+    while IFS= read -r _pch_i; do
+      [[ -n "$_pch_i" ]] || continue
+      step "Installing $_pch_i channel for agent '$name' (type=$type)"
+      _config_install_channel "$prev_channels" "$type" "$_pch_i" "$name" ""
+    done <<<"$_pch_i_list"
+  fi
   if [[ -n "$new_model" ]]; then
     step "Writing model=$new_model into $type runtime config"
     write_runtime_model "$type" "$name" "$new_model"
@@ -750,12 +767,16 @@ cmd_config() {
     # be staged before the restart — one missing plugin means a deaf session.
     local gate_ch gate_marketplace gate_dir gate_waited
     for gate_ch in ${channels_changed_to//,/ }; do
+      local gate_plugin="$gate_ch"
       case "$gate_ch" in
         telegram|dashboard|buzz|teams) gate_marketplace="5dive-plugins" ;;
         discord)            gate_marketplace="claude-plugins-official" ;;
-        *) continue ;;
+        *)
+          # DIVE-8315: a plugin channel is cached under its own plugin@marketplace.
+          local _gpe; _gpe=$(plugin_channel "$gate_ch") || continue
+          gate_marketplace=$(jq -r .marketplace <<<"$_gpe"); gate_plugin=$(jq -r .plugin <<<"$_gpe") ;;
       esac
-      gate_dir="/home/agent-${name}/.claude/plugins/cache/${gate_marketplace}/${gate_ch}"
+      gate_dir="/home/agent-${name}/.claude/plugins/cache/${gate_marketplace}/${gate_plugin}"
       gate_waited=0
       while [[ ! -d "$gate_dir" ]] && (( gate_waited < 15 )); do
         sleep 1; gate_waited=$((gate_waited + 1))

@@ -2304,7 +2304,7 @@ cmd_doctor() {
     # line names what it actually asserted instead of a hand-typed pair that can
     # go stale the next time a channel ships.
     local ms_want
-    ms_want=$(jq -r '[.[] | "\(.plugin)@\(.marketplace)"] | join(", ")' <<<"$FIVEDIVE_CHANNEL_PLUGINS_JSON" 2>/dev/null) \
+    ms_want=$(jq -r '[.[] | "\(.plugin)@\(.marketplace)"] | join(", ")' <<<"$(channel_plugins_wanted_json 2>/dev/null || printf '%s' "$FIVEDIVE_CHANNEL_PLUGINS_JSON")" 2>/dev/null) \
       || ms_want="the 5dive fork channels"
     # DIVE-1843: the DIVE-1816 fix reconciles this allowlist on install.sh rerun
     # only, so boxes provisioned before the dashboard channel shipped stayed

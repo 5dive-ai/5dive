@@ -84,6 +84,7 @@ CORE_FILES=(
   src/lib/models.sh
   src/lib/agent_setup.sh
   src/lib/plugin_seats.sh
+  src/lib/plugin_channels.sh
   src/lib/mod_seat.sh
   src/lib/state.sh
   src/lib/env_overrides.sh

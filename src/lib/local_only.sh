@@ -347,6 +347,13 @@ _lo_channels_outside() {   # <csv> → 0 when it names a channel that dials out
     case "$c" in
       telegram|discord|buzz) return 0 ;;
       teams) local_only_allows teams || return 0 ;;   # DIVE-7658: unless IT opened it
+      none|dashboard) ;;
+      # DIVE-8315: a plugin's channel counts as outside unless its manifest says
+      # it knows local-only mode (fivedive.channel.local_only); such a plugin
+      # keeps to the office network itself and reads local-only.allow for the rest.
+      *) declare -F plugin_channel >/dev/null \
+           && plugin_channel "$c" 2>/dev/null | jq -e '.local_only.label | type == "string"' >/dev/null 2>&1 \
+           || return 0 ;;
     esac
   done
   return 1

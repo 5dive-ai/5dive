@@ -552,6 +552,7 @@ _agent_list_snapshot_python() {
   QUOTA_WALL_PCT="$QUOTA_WALL_PCT" \
   QUOTA_SNAPSHOT_MAX_AGE="$QUOTA_SNAPSHOT_MAX_AGE" \
   AGENT_ENV_DIR="${ENV_DIR:-/var/lib/5dive/agents.d}" \
+  FIVEDIVE_PLUGIN_CHANNELS="$(plugin_channels_json 2>/dev/null || echo '[]')" \
   /usr/bin/python3 - "$REGISTRY" "$AUTH_PROFILES_DIR" "$CONNECTORS_DIR" \
     "${AGENT_HOME_ROOT:-/home}" "${SUDOERS_D:-/etc/sudoers.d}" "$DEFAULT_WORKDIR" <<'PY'
 # __5DIVE_AGENT_LIST_PY_BEGIN__
@@ -1331,6 +1332,11 @@ def avatar_info(name):
 # (DIVE-8033). Plugin names mirror 5dive-agent-start's --channels.
 AGENT_ENV_DIR = os.environ.get("AGENT_ENV_DIR") or "/var/lib/5dive/agents.d"
 
+try:
+    PLUGIN_CHANNELS = json.loads(os.environ.get("FIVEDIVE_PLUGIN_CHANNELS") or "[]")
+except Exception:
+    PLUGIN_CHANNELS = []
+
 def channel_plugins(name, channels):
     out = []
     for ch in str(channels or "").split(","):
@@ -1344,6 +1350,11 @@ def channel_plugins(name, channels):
             out.append(("claude-plugins-official", "discord"))
         elif ch in ("dashboard", "buzz", "teams"):
             out.append(("5dive-plugins", ch))
+        else:
+            # DIVE-8315: a channel an enabled plugin declares (src/lib/plugin_channels.sh).
+            for pc in PLUGIN_CHANNELS:
+                if pc.get("name") == ch:
+                    out.append((pc.get("marketplace", ""), pc.get("plugin", "")))
     return out
 
 # DIVE-5993: on a Team/Enterprise login Claude Code keeps channels OFF unless

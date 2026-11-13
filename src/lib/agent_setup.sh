@@ -1232,13 +1232,13 @@ marketplace_checkout_settled() { # <repo-url> <dir> [tries]
 # checkout: a seat writes its own, so copying it would let one seat pick the
 # code another runs. Prints a 0711 stage dir holding `5dive-plugins`, owned by
 # <user>, for the seat to clone from; the caller removes it.
-offline_marketplace_stage() { # <plugin> <user>
+offline_marketplace_stage() { # <plugin> <user> [<source checkout> <marketplace name>]
   local plugin="$1" user="$2" stage src dash repo
-  src="${FIVEDIVE_OFFLINE_MKT_SRC:-/home/claude/.claude/plugins/marketplaces/5dive-plugins}"
+  src="${3:-${FIVEDIVE_OFFLINE_MKT_SRC:-/home/claude/.claude/plugins/marketplaces/5dive-plugins}}"
   dash="${FIVEDIVE_OFFLINE_DASHBOARD_DIR:-/usr/local/lib/5dive/dashboard}"
   stage=$(mktemp -d "${TMPDIR:-/tmp}/5dive-mkt.XXXXXX") || return 1
   chmod 0711 "$stage" || { rm -rf "$stage"; return 1; }
-  repo="$stage/5dive-plugins"
+  repo="$stage/${4:-5dive-plugins}"
   if [[ -f "$src/.claude-plugin/marketplace.json" ]] \
      && git -c safe.directory='*' -C "$src" rev-parse -q --verify HEAD >/dev/null 2>&1 \
      && git -c safe.directory='*' clone -q --no-hardlinks "$src" "$repo" >/dev/null 2>&1; then
@@ -1292,10 +1292,25 @@ install_channel_plugin_for_agent() {
     marketplace="5dive-plugins"
     mkt_repo="https://github.com/$(gh_org)/5dive-plugins.git"
   fi
+  # DIVE-8315: a channel a plugin declares comes from THAT plugin's marketplace,
+  # the one `5dive plugin add` registered (src/lib/plugin_channels.sh). $1 is the
+  # channel's name; from here on $plugin is the plugin that provides it.
+  local _pce="" pc_src=""
+  if [[ " ${PLUGIN_CHANNEL_BUILTINS:-none telegram discord dashboard buzz teams} " != *" $plugin "* ]] && declare -F plugin_channel >/dev/null && _pce=$(plugin_channel "$plugin"); then
+    plugin=$(jq -r .plugin <<<"$_pce"); marketplace=$(jq -r .marketplace <<<"$_pce")
+    mkt_repo=$(_plugin_seat_mkt_repo "$marketplace") \
+      || fail "$E_NOT_INSTALLED" "the $1 channel's plugin ($plugin@$marketplace) has no source a seat can clone; reinstall it: sudo 5dive plugin add <owner>/<repo>"
+    pc_src="$(_plugin_channels_store)/marketplaces/$marketplace"
+  fi
 
   # DIVE-7566: local-only — the box's own copy, never the network.
   local mkt_from="" mkt_stage=""
-  if [[ "$marketplace" == 5dive-plugins ]] && declare -F local_only_on >/dev/null && local_only_on; then
+  if [[ -n "$pc_src" ]] && declare -F local_only_on >/dev/null && local_only_on; then
+    # DIVE-8315: the box's own checkout of that marketplace, made at `plugin add`.
+    mkt_stage=$(offline_marketplace_stage "$plugin" "$user" "$pc_src" "$marketplace") \
+      || fail "$E_NOT_INSTALLED" "this box is local-only and holds no copy of $plugin@$marketplace to add (looked in $pc_src)."
+    mkt_from="$mkt_stage/$marketplace"
+  elif [[ "$marketplace" == 5dive-plugins ]] && declare -F local_only_on >/dev/null && local_only_on; then
     mkt_stage=$(offline_marketplace_stage "$plugin" "$user") \
       || fail "$E_NOT_INSTALLED" \
          "this box is local-only and holds no copy of the $plugin chat to add (looked in /home/claude/.claude/plugins/marketplaces/5dive-plugins and /usr/local/lib/5dive/dashboard). Run '5dive self-update' once while the box is online."
@@ -2967,6 +2982,17 @@ install_channel_for_agent() {
   if [[ "$plugin" == "teams" && "$type" != "claude" ]]; then
     fail "$E_VALIDATION" "channels=teams is claude-only for now (agent '$name' is type $type)"
   fi
+  # DIVE-8315: a plugin's channel: the agent types it names, then the Claude Code
+  # allowlist (an unlisted channel plugin is connected and every message dropped).
+  if [[ " ${PLUGIN_CHANNEL_BUILTINS:-none telegram discord dashboard buzz teams} " != *" $plugin "* ]] && declare -F plugin_channel >/dev/null && plugin_channel "$plugin" >/dev/null; then
+    plugin_channel_harness_check "$plugin" "$type" "$name"
+    if [[ "$type" == claude ]]; then
+      local _ms="${FIVEDIVE_MANAGED_SETTINGS:-/etc/claude-code/managed-settings.json}" _msrc=0
+      reconcile_managed_settings "$_ms" || _msrc=$?
+      (( _msrc == 0 || _msrc == 3 )) \
+        || warn "could not add the $plugin channel to $_ms: messages on it will be dropped until 'sudo 5dive doctor --fix' succeeds"
+    fi
+  fi
   case "$type" in
     claude)      install_channel_plugin_for_agent "$plugin" "$name" "$allowed_users" "$token" ;;
     codex)       install_channel_for_codex_agent "$plugin" "$name" "$token" "$allowed_users" ;;
@@ -3016,7 +3042,9 @@ reconcile_managed_settings() {
   # not preserved. A box that genuinely wants the account sync ON deletes the
   # keys AND stops running this reconcile — that is a per-box decision, and the
   # template is not where it is expressed (DIVE-4697).
-  if jq --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
+  # DIVE-8315: plus every enabled plugin's channel (channel_plugins_wanted_json).
+  local need; need=$(channel_plugins_wanted_json 2>/dev/null) || need="$FIVEDIVE_CHANNEL_PLUGINS_JSON"
+  if jq --argjson need "$need" \
         --argjson sync "$FIVEDIVE_MANAGED_SYNC_OFF_JSON" '
         .channelsEnabled = true
       | .allowedChannelPlugins = ((.allowedChannelPlugins // []) as $have
@@ -3050,7 +3078,8 @@ managed_settings_channels_ok() {
   [[ -f "$msj" ]] || return 1
   command -v jq >/dev/null 2>&1 || return 1
   [[ -n "${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}" ]] || return 1
-  jq -e --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" '
+  local need; need=$(channel_plugins_wanted_json 2>/dev/null) || need="$FIVEDIVE_CHANNEL_PLUGINS_JSON"
+  jq -e --argjson need "$need" '
         .channelsEnabled == true
     and ((.allowedChannelPlugins // []) as $have
          | $need | all(. as $n
@@ -3066,7 +3095,8 @@ managed_settings_channels_missing() {
   [[ -f "$msj" ]] || return 1
   command -v jq >/dev/null 2>&1 || return 1
   [[ -n "${FIVEDIVE_CHANNEL_PLUGINS_JSON:-}" ]] || return 1
-  jq -r --argjson need "$FIVEDIVE_CHANNEL_PLUGINS_JSON" '
+  local need; need=$(channel_plugins_wanted_json 2>/dev/null) || need="$FIVEDIVE_CHANNEL_PLUGINS_JSON"
+  jq -r --argjson need "$need" '
       (.allowedChannelPlugins // []) as $have
       | [$need[] | select(. as $n
           | ($have | any(.plugin == $n.plugin and .marketplace == $n.marketplace)) | not)
