@@ -151,6 +151,18 @@ Agents save what they learn as notes and search them later, with sources. The te
 5dive task loop auto DIVE-12 on            # let a loop apply its own fixes
 ```
 
+## Browser
+
+Agents use a real Chrome on your server: they open pages, click, fill in forms and check results. For your own accounts, you sign in to a site once, by hand, and the agent keeps that session without ever seeing the password. It handles email codes and robot checks itself and asks you only when it can't. Before a step that pays, it asks you first.
+
+```sh
+sudo 5dive plugin add 5dive-ai/5dive-browser
+sudo 5dive browser setup                         # Chrome, a virtual screen and VNC
+sudo -u agent-cmo 5dive browser auth github.com  # you sign in once, by hand
+```
+
+[Browser guide →](https://github.com/5dive-ai/5dive-browser#readme)
+
 ## Plugins
 
 | Plugin | Function |
@@ -164,7 +176,7 @@ Agents save what they learn as notes and search them later, with sources. The te
 | [Laya](https://github.com/5dive-ai/5dive-laya) | Local model for routine decisions (8 GB RAM) |
 
 ```sh
-sudo 5dive plugin add 5dive-ai/5dive-browser
+sudo 5dive plugin add 5dive-ai/5dive-voice
 ```
 
 [Build a plugin →](https://github.com/5dive-ai/5dive-plugin-template)
