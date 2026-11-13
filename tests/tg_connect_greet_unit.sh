@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# TIER: nightly — 27.4s pristine, the second-slowest unguarded core harness (Telegram connect greeting against a curl stub). DIVE-8393: main went red on a core shard budget overrun (s3 306s/300s, run 43445722634, no test failed); the planner rebalances by weight, so freeing ~10s per shard means ~60s off core. This is a product onboarding flow, not the merge path: a regression here is revertible and the nightly full sweep still grades it.
 # DIVE-7478 — the owner is greeted the moment Telegram is connected, and sees
 # "typing" until the agent's session polls (`agent _tg_connect_greet`).
 #
