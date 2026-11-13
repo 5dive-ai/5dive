@@ -1676,7 +1676,7 @@ _task_tell_filer() {
     return 0
   fi
   msg="🔔 ${ident} is ${status} (closed by ${closer:-?}). Result: ${result:-<none>}"
-  msg+=$'\n\n'"You asked to be told (--tell-me), so you promised your owner a ping. Check it is actually LIVE (merged, released, deployed, on the box) and then send your owner one plain line. Not live yet: arm an 'at' timer to check again, do not file a row."
+  msg+=$'\n\n'"You asked to be told (--tell-me), so you promised your owner a ping. Check it is actually LIVE (merged, released, deployed, on the box), then send your owner the result itself now, in one message: the file attached if there is one, never a grade or verification note. Not live yet: arm an 'at' timer to check again, do not file a row."
   errf=$(mktemp "${TMPDIR:-/tmp}/5dive-tell.XXXXXX" 2>/dev/null) || errf=/dev/null
   if ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$who" --from="task-engine" --message="$msg" ) >/dev/null 2>"$errf"; then
     ledger_emit task.tell_filer ident="$ident" task_id="$id" actor="$closer" detail="woke ${who} on ${status}" 2>/dev/null || true

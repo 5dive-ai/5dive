@@ -1060,13 +1060,25 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     fi
     local tell_note=""
     [[ -n "$tell_me_by" ]] && tell_note=" · ${tell_me_by} is woken once when it closes (--tell-me)"
+    # DIVE-8362: the one moment a lead can opt in to hearing that routed work
+    # finished is the filing, and it used to pass silently, so the owner got
+    # results only when they asked again. A HINT, not a default: DIVE-5852's
+    # opt-in stays. Only a seat with its own channel (it has an owner to report
+    # to) filing to a DIFFERENT seat sees it.
+    local tell_tip=""
+    if [[ -z "$tell_me_by" && "$kind" == "standard" && -n "$assignee" \
+          && -n "$derived_actor" && "$derived_actor" != "cli" && "$assignee" != "$derived_actor" \
+          && -e "${CONNECTORS_DIR:-/nonexistent}/telegram-${derived_actor}.env" ]]; then
+      tell_tip="tip: add --tell-me (or 5dive task watch ${ident}) to be woken when it closes, so you can send your owner the result"
+      tell_note+=" · ${tell_tip}"
+    fi
     ok "created ${ident} — $title${hold_note}${coord_note}${review_note}${verify_note}${tell_note}" \
-       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", tellMeBy:(if $tm=="" then null else $tm end), autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, verifyPolicy:$vp, verifyOverride:$vo, verifyDeferred:($vdf=="1"), reviewMode:$rm, reviewModeChosen:($rc=="1"), parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
+       '{id:($i|tonumber), ident:$id, project:$pr, title:$t, priority:$p, assignee:$a, created_by:$c, kind:"standard", tellMeBy:(if $tm=="" then null else $tm end), tellMeTip:(if $tt=="" then null else $tt end), autoCoordinated:($ac=="1"), verifyDefaulted:($vd=="1"), verifyUnavailable:($vu=="1"), verifySkipped:($vs!=""), verifySkipReason:$vs, verifier:$v, verifyPolicy:$vp, verifyOverride:$vo, verifyDeferred:($vdf=="1"), reviewMode:$rm, reviewModeChosen:($rc=="1"), parentLinkWarning:($wi!=""), citedParent:$wi, citedSeries:(if $wi=="" then "" else ($wk+" #"+$wn) end), openTitleMatches:($wm|split(",")|map(select(length>0)))}' \
        --arg i "$id" --arg id "$ident" --arg pr "$project" --arg t "$title" --arg p "$priority" --arg a "${assignee:-}" --arg c "$creator" --arg ac "$auto_coordinated" --arg vd "$verify_defaulted" --arg vu "$verify_unavailable" --arg vs "$verify_skipped" --arg v "${verifier:-}" \
        --arg vp "$_vp_policy" --arg vo "$_vp_override" --arg vdf "$_vp_deferred" \
        --arg rm "$review_mode" --arg rc "$([[ -n "$review_flag" ]] && echo 1 || echo 0)" \
        --arg wi "$followup_warn_ident" --arg wk "$followup_warn_kind" --arg wn "$followup_warn_number" --arg wm "$followup_warn_matches" \
-       --arg tm "$tell_me_by"
+       --arg tm "$tell_me_by" --arg tt "$tell_tip"
   fi
 }
 
@@ -1453,8 +1465,12 @@ cmd_task_show() {
     # tier-2 gate, until the body was archived to a file by hand.
     # A pipe has no such cap. `jq -s` slurps the stream into one array; the
     # printf order IS the contract — row, subtasks, blocked_by, previous_gates.
-    local _show_filter='{ok:true, data:{task:(.[0][0]), subtasks:.[1], blocked_by:.[2], previous_gates:.[3]}}'
-    (( no_body )) && _show_filter='{ok:true, data:{task:(.[0][0] | del(.body, .result)), subtasks:.[1], blocked_by:.[2], previous_gates:.[3]}}'
+    # DIVE-8362: tell_me_by/told_at are ALWAYS keys. dbfmt drops null-valued
+    # keys (DIVE-1610), so an unarmed --tell-me read as a missing field and a
+    # support read of a box could not tell "nobody is woken" from "not emitted".
+    local _show_tmq='(.[0][0] | .tell_me_by = (.tell_me_by // null) | .told_at = (.told_at // null))'
+    local _show_filter="{ok:true, data:{task:${_show_tmq}, subtasks:.[1], blocked_by:.[2], previous_gates:.[3]}}"
+    (( no_body )) && _show_filter="{ok:true, data:{task:(${_show_tmq} | del(.body, .result)), subtasks:.[1], blocked_by:.[2], previous_gates:.[3]}}"
     printf '%s\n%s\n%s\n%s\n' "$task" "$subs" "$deps" "$previous_gates" \
       | jq -cs "$_show_filter"
   else
@@ -1486,6 +1502,18 @@ cmd_task_show() {
     # it fires in. Standard rows print nothing, so their output is unchanged.
     local _show_sched; _show_sched=$(db "SELECT CASE WHEN kind='recurring' AND schedule IS NOT NULL THEN schedule||' ('||COALESCE(NULLIF(schedule_tz,''),'UTC')||')' ELSE '' END FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
     [[ -n "$_show_sched" ]] && printf '%16s = %s\n' schedule "$_show_sched"
+    # DIVE-8362: whether closing this row wakes anyone. A lead that routed its
+    # owner's ask and armed nothing is the "results only when asked" defect, so
+    # the unarmed state is printed too, with the one command that arms it.
+    local _show_tm _show_told _show_ident
+    _show_tm=$(db "SELECT COALESCE(tell_me_by,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    _show_told=$(db "SELECT COALESCE(told_at,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    _show_ident=$(db "SELECT ident FROM tasks WHERE id=${id};" 2>/dev/null || printf '%s' "${pos[0]}")
+    if [[ -n "$_show_tm" ]]; then
+      printf '%16s = %s is woken once when it closes%s\n' tell_me_by "$_show_tm" "${_show_told:+ (told ${_show_told})}"
+    else
+      printf '%16s = nobody is woken when it closes (arm: 5dive task watch %s)\n' tell_me_by "${_show_ident:-${pos[0]}}"
+    fi
     # DIVE-4899: the companions bound beside delivery_ref, printed only when a
     # row has some — a single-PR row's show output is unchanged byte for byte.
     # DIVE-5348: the DERIVED set (companions + pull URLs in the result and the
