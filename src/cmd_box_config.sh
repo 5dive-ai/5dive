@@ -57,6 +57,7 @@ cmd_box_config() {
         "       5dive config mod-seat=on|off|default" \
         "       5dive config telegram-app=on|off|default" \
         "       5dive config seat-isolation=by-role|admin|standard|default" \
+        "       5dive config gate-reminders=daily[@HH]|per-gate|default" \
         "       5dive config local-only on|off|status|check   # nothing leaves your network (see: 5dive config local-only --help)" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
@@ -139,11 +140,17 @@ cmd_box_config() {
         "             seats standard. An explicit --isolation always wins." \
         "             Existing seats are not changed: 'agent grant <name> admin' does that." \
         "  account-poll  on = the heartbeat reads every Claude account's 5h/7d usage from" \
-        "             the provider every 10 min, busy or not (DIVE-6713). Off by default."
+        "             the provider every 10 min, busy or not (DIVE-6713). Off by default." \
+        "  gate-reminders  how often the owner is reminded about open questions (DIVE-8398)." \
+        "             per-gate (the default) = each question +1h after it is asked, then" \
+        "             every 24h on its own clock. daily[@HH] = all of them in ONE message" \
+        "             a day at HH:00 UTC (default 09); urgent questions keep their own" \
+        "             clock. There is no off: FIVEDIVE_GATE_RENAG=0 in root's cron is the" \
+        "             only full silence. Changing it tells the owner, naming who changed it."
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll, gate-reminders)" ;;
     esac
     shift
   done
@@ -201,6 +208,12 @@ cmd_box_config() {
     # dashboard reads this field's PRESENCE to know the box can take the toggle.
     local ap; ap=$(jq -r '.account_poll // "off"' <<<"$(_box_config_read)" 2>/dev/null || printf off)
     [[ "$ap" == on ]] || ap=off
+    # DIVE-8398: the reminder cadence, the hour in UTC and where it came from.
+    local _GATE_REM_MODE="per-gate" _GATE_REM_HOUR="" _GATE_REM_SRC="default" gr grs="per question"
+    if declare -F gate_reminders_resolve >/dev/null 2>&1; then
+      gate_reminders_resolve; grs="$(gate_reminders_text); ${_GATE_REM_SRC}"
+    fi
+    gr="$_GATE_REM_MODE"; [[ "$gr" == daily ]] && gr="daily@$(printf '%02d' "$_GATE_REM_HOUR")"
     ok "verify = ${policy} (${src})
 verify-small = ${small} (${ssrc})
 coauthor = ${coauthor} (box-wide, default on)
@@ -219,11 +232,14 @@ openrouter-keys = $(jq -r '"reflex: \(.reflex) · " + (if (.plugins | length) ==
 mod-seat = ${ms} (box-wide, default off)
 telegram-app = ${ta} (box-wide, default on)
 seat-isolation = ${si} (box-wide; default by-role = leads and solo agents admin, team members standard)
-account-poll = ${ap} (box-wide, default off)" \
+account-poll = ${ap} (box-wide, default off)
+gate-reminders = ${gr} (${grs})" \
        '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s,
          reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk, reflex_key_source:$rks,
          reflex_endpoint:$re, reflex_endpoint_source:$res, reflex_api:$ra, reflex_api_source:$ras, reflex_endpoint_key:$rek,
-         reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, telegram_app:$ta, seat_isolation:$si, account_poll:$ap, path:$p}' \
+         reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, telegram_app:$ta, seat_isolation:$si, account_poll:$ap,
+         gate_reminders:$gr, gate_reminders_hour_utc:(if $grh == "" then null else ($grh|tonumber) end), gate_reminders_source:$grsrc, path:$p}' \
+       --arg gr "$_GATE_REM_MODE" --arg grh "$_GATE_REM_HOUR" --arg grsrc "$_GATE_REM_SRC" \
        --arg ms "$ms" --arg ok "$ok_k" --arg ta "$ta" --arg si "$si" --arg ap "$ap" --argjson oks "$okeys" \
        --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" \
        --arg pw "$pw" --arg pws "$pws" --arg p5 "$p5" --arg p5s "$p5s" \
@@ -346,17 +362,27 @@ account-poll = ${ap} (box-wide, default off)" \
       # own boxes only for now: it polls every Claude account every 10 min.
       account-poll|account_poll) [[ "$v" == on || "$v" == off || "$v" == default ]] \
                 || fail "$E_VALIDATION" "account-poll takes one of: on, off, default — got '$v'" ;;
+      # DIVE-8398. Stored as .gate_reminders; `default` clears it (= per-gate).
+      # No `off`: a value any sudo-5dive seat can write must never mute the owner.
+      gate-reminders|gate_reminders) gate_reminders_valid "$v" \
+                || fail "$E_VALIDATION" "gate-reminders takes daily, daily@<hour 0-23 UTC>, per-gate, or default — got '${v:0:40}'. There is no off: reminders can be bundled, not silenced" ;;
       # DIVE-4890. Validated in full before anything is written, like every key
       # above: one bad value in a multi-key call writes none of them.
       pace-week|pace_week) _pace_week_valid "$v" \
                 || fail "$E_VALIDATION" "pace-week takes <soft>/<hard> (integers, soft <= hard <= 100, e.g. 85/95), off, or default — got '$v'" ;;
       pace-5h|pace_5h) _pace_5h_valid "$v" \
                 || fail "$E_VALIDATION" "pace-5h takes a percentage (an integer 0-100, e.g. 85), off, or default — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll)" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll, gate-reminders)" ;;
     esac
   done
   require_root
   json=$(_box_config_read)
+  # DIVE-8398: the reminder cadence BEFORE this write, so the owner is told only
+  # when it really changes (a repeated identical set sends nothing).
+  local _GATE_REM_MODE _GATE_REM_HOUR _GATE_REM_SRC gr_before="" _gr_have=0
+  if declare -F gate_reminders_resolve >/dev/null 2>&1; then
+    _gr_have=1; gate_reminders_resolve; gr_before="$(gate_reminders_text)"
+  fi
   local -a applied=()
   # DIVE-4559: WRITE THE KEY THAT WAS SET. This loop hardcoded `.verify = $v`
   # while iterating over every key — harmless with one key, and a silent
@@ -379,9 +405,13 @@ account-poll = ${ap} (box-wide, default off)" \
           || "$k" == reflex-endpoint || "$k" == reflex_endpoint || "$k" == reflex-api || "$k" == reflex_api \
           || "$k" == mod-seat || "$k" == mod_seat || "$k" == telegram-app || "$k" == telegram_app \
           || "$k" == seat-isolation || "$k" == seat_isolation \
-          || "$k" == account-poll || "$k" == account_poll ) ]]; then
+          || "$k" == account-poll || "$k" == account_poll \
+          || "$k" == gate-reminders || "$k" == gate_reminders ) ]]; then
       json=$(jq --arg k "${k//-/_}" 'del(.[$k])' <<<"$json")
     else
+      if [[ "$k" == gate-reminders || "$k" == gate_reminders ]]; then
+        case "$v" in daily) v="daily@09" ;; daily@*) v="daily@$(printf '%02d' "$((10#${v#daily@}))")" ;; esac
+      fi
       json=$(jq --arg k "${k//-/_}" --arg v "$v" '.[$k] = $v' <<<"$json")
     fi
     applied+=("$k")
@@ -395,6 +425,11 @@ account-poll = ${ap} (box-wide, default off)" \
   chown root:claude "$tmp" 2>/dev/null || true
   chmod 640 "$tmp"
   mv "$tmp" "$cfg"
+  if (( _gr_have )); then
+    gate_reminders_resolve
+    local gr_after; gr_after="$(gate_reminders_text)"
+    [[ "$gr_after" != "$gr_before" ]] && _gate_reminders_tell_owner "$gr_before" "$gr_after"
+  fi
   if [[ -n "$key_op" ]]; then _reflex_key_write "$key_op" "$key_val"; key_val=""; fi
   if [[ -n "$ekey_op" ]]; then _reflex_key_write "$ekey_op" "$ekey_val" "$(_reflex_endpoint_key_file)"; ekey_val=""; fi
   if [[ -n "$okey_op" ]]; then _openrouter_key_write "$okey_op" "$okey_val" "$okey_for"; okey_val=""; fi
@@ -417,6 +452,38 @@ account-poll = ${ap} (box-wide, default off)" \
      --arg ok "$okst" --argjson oks "$okeys" --arg v "$policy" --arg sm "$small" --arg pw "$pw" --arg p5 "$p5" --arg rr "$rr" --arg rm "$rm" --arg rk "$rk" --arg rks "$rks" \
      --arg re "$re" --arg ra "$ra" --arg rc "$rc" \
      --arg a "$(IFS=,; printf '%s' "${applied[*]}")" --arg p "$cfg"
+}
+
+# DIVE-8398: an agent cannot change how often the owner is reminded SILENTLY.
+# One message to the owner through the same bot the reminders ride (the gate
+# notifier, _hb_gate_renag_sweep's T2 lane). The setting is written either way;
+# a notice no bot confirmed is said loudly on stderr and in the audit log, so the
+# seat that ran the command cannot read it as told.
+_gate_reminders_by() {
+  local u="${SUDO_USER:-${USER:-root}}"
+  u="${u#agent-}"
+  printf '%s' "${u:-root}"
+}
+_gate_reminders_tell_owner() { # <before text> <after text>
+  local before="$1" after="$2" by text n=""
+  by=$(_gate_reminders_by)
+  if [[ "$_GATE_REM_MODE" == daily ]]; then
+    text="Question reminders now come once a day at $(printf '%02d' "$_GATE_REM_HOUR"):00 UTC (changed by ${by}). Say if you want them back as they were."
+  else
+    text="Question reminders are back to one per question: an hour after it is asked, then every day (changed by ${by}; it was ${before})."
+  fi
+  TASK_SEND_DELIVERED=0
+  n=$(_task_resolve_gate_notifier 2>/dev/null || true)
+  if [[ -n "$n" ]] && _task_agent_channel "$n"; then
+    _task_send_owner "$text" "" "" || true
+  fi
+  if [[ "${TASK_SEND_DELIVERED:-0}" == 1 ]]; then
+    audit_log "config gate-reminders" "owner-told" 0 -- "now=${after}" "via=${n}" "by=${by}" 2>/dev/null || true
+    return 0
+  fi
+  audit_log "config gate-reminders" "owner-not-told" 1 -- "now=${after}" "by=${by}" 2>/dev/null || true
+  warn "gate-reminders changed to: ${after} — but the owner could NOT be told (no paired bot confirmed the notice). Tell them yourself."
+  return 0
 }
 
 # DIVE-5043: the reflex-key-source line in plain words.
