@@ -173,9 +173,7 @@ sudo -u agent-cmo 5dive browser auth github.com  # 你亲手登录一次
 | [UI](https://github.com/5dive-ai/5dive-ui) | 只读 Web 仪表盘 |
 | [Laya](https://github.com/5dive-ai/5dive-laya) | 处理日常决策的本地模型（8 GB 内存） |
 
-```sh
-sudo 5dive plugin add 5dive-ai/5dive-voice
-```
+其他插件的安装方式相同：`sudo 5dive plugin add 5dive-ai/5dive-voice`。
 
 [开发一个插件 →](https://github.com/5dive-ai/5dive-plugin-template)
 

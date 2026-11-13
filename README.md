@@ -175,9 +175,7 @@ sudo -u agent-cmo 5dive browser auth github.com  # you sign in once, by hand
 | [UI](https://github.com/5dive-ai/5dive-ui) | Read-only web dashboard |
 | [Laya](https://github.com/5dive-ai/5dive-laya) | Local model for routine decisions (8 GB RAM) |
 
-```sh
-sudo 5dive plugin add 5dive-ai/5dive-voice
-```
+Install any of them the same way: `sudo 5dive plugin add 5dive-ai/5dive-voice`.
 
 [Build a plugin →](https://github.com/5dive-ai/5dive-plugin-template)
 
