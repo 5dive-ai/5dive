@@ -345,7 +345,7 @@ _init_ai_step() { # <type> <label>
               "zai|z.ai|GLM models over Anthropic-compatible API" \
               "deepseek|DeepSeek|DeepSeek models over Anthropic-compatible API" \
               "moonshot|Moonshot|Kimi models over Anthropic-compatible API" \
-              "qwen|Qwen|Qwen models over Anthropic-compatible API (Token Plan key)"
+              "qwen|Qwen|Qwen models over Anthropic-compatible API (Token Plan subscription key, sk-sp-...)"
             [[ -n "${CLAUDE_PROVIDER_BASEURL[$byo_provider]:-}" ]] \
               || fail "$E_VALIDATION" "unknown provider '$byo_provider'"
             _init_secret byo_key "${byo_provider} API key"

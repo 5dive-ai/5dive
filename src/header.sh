@@ -1312,6 +1312,15 @@ valid_base_url() {
 # (separate key namespaces). There is NO EU Token Plan endpoint to switch to for
 # latency; EU-based boxes pay the ~170ms RTT to Singapore. Do not re-investigate
 # without a new signal (a region added upstream, or a workspace provisioned in it).
+# DIVE-8325 (2026-11-13): opus+sonnet default moved to qwen4-max-preview at a box
+# owner's request. Smoked LIVE on teal-fox 2026-11-12 on a Token Plan key: 200,
+# served as qwen4.0-max-preview, on both this host and
+# token-plan.maas.qwencloudapi.com/apps/anthropic (what the vendor console now
+# shows; same key works on both, so the default host stays). qwen4-flash-preview
+# answers "Model not exist.", so haiku stays qwen3.6-flash. A preview id can be
+# renamed upstream: re-smoke before trusting it if a seat starts failing. Existing
+# seats keep the model they were written with (this table is read at create/auth
+# set only).
 declare -A CLAUDE_PROVIDER_BASEURL=(
   [deepseek]="https://api.deepseek.com/anthropic"
   [moonshot]="https://api.moonshot.ai/anthropic"
@@ -1323,14 +1332,14 @@ declare -A CLAUDE_PROVIDER_OPUS_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
   [openrouter]="deepseek/deepseek-v4.1-flash"
-  [qwen]="qwen3.8-max"
+  [qwen]="qwen4-max-preview"
   [zai]="glm-5.2"
 )
 declare -A CLAUDE_PROVIDER_SONNET_MODEL=(
   [deepseek]="deepseek-v4-pro"
   [moonshot]="kimi-k2.5"
   [openrouter]="deepseek/deepseek-v4.1-flash"
-  [qwen]="qwen3.8-max"
+  [qwen]="qwen4-max-preview"
   [zai]="glm-5-turbo"
 )
 declare -A CLAUDE_PROVIDER_HAIKU_MODEL=(
