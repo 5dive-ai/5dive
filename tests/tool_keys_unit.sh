@@ -224,10 +224,10 @@ jwt_of() {  # a JWT-shaped value of exactly $1 characters: header.payload.signat
 }
 jwt=$(jwt_of 1200); big=$(jwt_of 5000)
 [[ ${#jwt} -eq 1200 && ${#big} -eq 5000 ]] || bad_t "T11 amocrm jwt fixture" "${#jwt} ${#big}"
-out=$(printf 'acme.amocrm.ru\n%s\n' "$jwt" | run set amocrm); rc=$?
-[[ $rc -eq 0 && "$(seen AMOCRM_TOKEN)" == "$jwt" && "$(seen AMOCRM_DOMAIN)" == acme.amocrm.ru ]] \
+out=$(printf 'acme.amocrm.com\n%s\n' "$jwt" | run set amocrm); rc=$?
+[[ $rc -eq 0 && "$(seen AMOCRM_TOKEN)" == "$jwt" && "$(seen AMOCRM_DOMAIN)" == acme.amocrm.com ]] \
   && ok_t "T11 amocrm: a 1,200-char JWT long-lived token is saved whole" || bad_t "T11 amocrm 1200" "rc=$rc ${out:0:200}"
-out=$(printf 'acme.amocrm.ru\n%s\n' "$big" | run set amocrm); rc=$?
+out=$(printf 'acme.amocrm.com\n%s\n' "$big" | run set amocrm); rc=$?
 [[ $rc -ne 0 && "$out" == *"AMOCRM_TOKEN must be one line"* && "$(seen AMOCRM_TOKEN)" == "$jwt" ]] \
   && ok_t "T11 amocrm: a 5,000-char value is refused, the saved token kept" || bad_t "T11 amocrm 5000" "rc=$rc ${out:0:200}"
 
