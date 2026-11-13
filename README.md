@@ -60,6 +60,8 @@ docker exec -it 5dive 5dive init
 
 More in [docker/README.md](docker/README.md).
 
+**Vultr** (no terminal): deploy it in one click from the [Vultr Marketplace](https://www.vultr.com/marketplace/apps/5dive/).
+
 </details>
 
 5dive app to chat and manage your team, with optional end-to-end encryption: link your server free at [5dive.ai/self-host](https://5dive.ai/self-host).

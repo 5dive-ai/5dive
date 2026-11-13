@@ -58,6 +58,8 @@ docker exec -it 5dive 5dive init
 
 详见 [docker/README.md](docker/README.md)。
 
+**Vultr**（无需终端）：在 [Vultr Marketplace](https://www.vultr.com/marketplace/apps/5dive/) 上一键部署。
+
 </details>
 
 用 5dive 应用与团队聊天、管理团队，可选端到端加密：在 [5dive.ai/self-host](https://5dive.ai/self-host) 免费连接你的服务器。
