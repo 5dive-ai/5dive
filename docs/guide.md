@@ -95,6 +95,8 @@ No broker, no protocol, no framework. Shared filesystem, shared CLI.
 | `opencode`    | OpenCode               | API key | Telegram |
 | `pi`          | third-party multi-provider harness | API key / `--provider` | Telegram |
 
+Each agent can also be a Microsoft Teams contact, through the teams plugin. [Microsoft Teams guide →](https://github.com/5dive-ai/5dive-plugins/tree/main/plugins/teams#readme)
+
 <details>
 <summary><b>About <code>hermes</code> / <code>openclaw</code> (third-party multi-provider harnesses)</b></summary>
 
