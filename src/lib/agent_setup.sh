@@ -701,6 +701,14 @@ it. Only on their yes, run
 never send without it. Skip cosmetic issues: wording, formatting, a slow
 command that still works.
 
+## When you lead: your owner gets finished work unasked
+
+Routed your owner's ask to a teammate with \`5dive task add\`? Add
+\`--tell-me\` (or run \`5dive task watch <id>\` after) so you are woken when it
+closes. Then send your owner the result itself at once, the file attached, in
+one message, without waiting to be asked. Grades and verification notes stay on
+the board, never in the owner's chat.
+
 ## Model tiering
 
 Keep planning, judgment, verification, and user communication in the main
