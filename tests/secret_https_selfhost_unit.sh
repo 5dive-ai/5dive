@@ -14,6 +14,9 @@
 # (CADDY_REAL=<binary>, >= 2.11) also adapts the generated Caddyfiles when given.
 #   * DIVE-8361: the box's own <name>.5dive.app (/etc/5dive/app-name) is tried
 #     FIRST, one certificate for that one name (H10).
+#   * DIVE-8446: with no name yet, the first https need asks 5dive.app to make
+#     one (POST /server/selfhost/name?new=1); past the weekly limit for free
+#     names it gets none and the IP certificate is used (H11).
 # Run: bash tests/secret_https_selfhost_unit.sh
 set -uo pipefail
 
@@ -46,6 +49,8 @@ SECRET_HTTPS_CADDYFILE="$TMP/etc5dive/secret-https.Caddyfile"
 SECRET_HTTPS_UNIT_DIR="$TMP/systemd"
 SECRET_HTTPS_LOCK="$TMP/https.lock"
 SECRET_HTTPS_APP_NAME_FILE="$TMP/etc5dive/app-name"
+SECRET_HTTPS_CHAT_ONLY_FILE="$TMP/etc5dive/chat-only"
+SECRET_HTTPS_CONNECTORD_ENV="$TMP/etc5dive/connectord.env"
 SECRET_HTTPS_WAIT_S=1; SECRET_DROP_POLL_S=0; SECRET_DROP_WAIT_S=1
 TOOLS_ENV_FILE="$CONNECTORS_DIR/tools.sh"; TOOLS_WRITE_LOCK="$TMP/tools.lock"
 export SECRET_PROJECTS_DIR="$TMP/projects"; mkdir -p "$SECRET_PROJECTS_DIR"
@@ -97,6 +102,11 @@ EOF
 cat > "$MOCKBIN/curl" <<'EOF'
 #!/usr/bin/env bash
 echo "curl $*" >> "$MOCK_LOG"
+# DIVE-8446: 5dive.app's name call answers MOCK_NAME_JSON (and the header file it was given).
+if [[ "$*" == *"/server/selfhost/name"* ]]; then
+  for a in "$@"; do [[ "$a" == @* ]] && cat "${a#@}" >> "$MOCK_LOG.hdr"; done
+  printf '%s' "${MOCK_NAME_JSON:-}"; exit 0
+fi
 h=""
 for a in "$@"; do
   case "$a" in https://*) h="${a#https://}"; h="${h%%/*}" ;; esac
@@ -131,8 +141,9 @@ seed_gate() {   # <ident> <key> <connector>
 # A fresh self-hosted box: no FIVE_DOMAIN, no conf, no front.
 fresh() {
   rm -f "$SECRET_DROP_PROVISIONING" "$SECRET_DROP_CONF" "$SECRET_HTTPS_CADDYFILE" "$STATE_DIR/secret-https.failed" "$SECRET_HTTPS_APP_NAME_FILE"
+  rm -f "$SECRET_HTTPS_CHAT_ONLY_FILE" "$SECRET_HTTPS_CONNECTORD_ENV" "$MOCK_LOG.hdr"
   rm -rf "$SECRET_HTTPS_UNIT_DIR" "$SECRET_DROP_DIR"; : > "$MOCK_LOG"
-  unset BUSY_PORTS LINKTLS_ACTIVE NO_CADDY
+  unset BUSY_PORTS LINKTLS_ACTIVE NO_CADDY MOCK_NAME_JSON
 }
 link() { ( _secret_link "$@" ) 2>&1; }
 url_of() { printf '%s' "$1" | jq -r '.data.url // empty' 2>/dev/null; }
@@ -292,7 +303,7 @@ out=$(link DIVE-21 --again); rc=$?
   || bad_t "H10i a busy 443 fails the name way and is not tried again the IP way" "rc=$rc out=$out"
 fresh; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="brave-otter.5dive.app"
 out=$( ( _secret_https enable --via=5dive-app ) 2>&1); rc=$?
-[[ $rc -eq $E_NOT_INSTALLED && "$out" == *"no 5dive.app name yet"* && ! -e "$unitf" ]] \
+[[ $rc -eq $E_NOT_INSTALLED && "$out" == *"no 5dive.app name"* && ! -e "$unitf" ]] \
   && ok_t "H10j --via=5dive-app with no name: refused, says why, nothing on" || bad_t "H10j --via=5dive-app with no name: refused, says why, nothing on" "rc=$rc out=$out"
 for bad in 'evil.example.com' 'x.5dive.app.evil.example' 'a b.5dive.app' '-x.5dive.app'; do
   fresh; named "$bad"; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="192.0.2.10 $bad"
@@ -307,6 +318,52 @@ printf '# an older front\n{\n\tadmin off\n}\nhttps://keen-lynx.5dive.app {\n\tre
 : > "$MOCK_LOG"; out=$( ( _secret_https enable --via=auto ) 2>&1); rc=$?
 [[ $rc -eq 0 ]] && grep -qF '/browser/viewer/' "$SECRET_HTTPS_CADDYFILE" && grep -qF 'https://keen-lynx.5dive.app {' "$SECRET_HTTPS_CADDYFILE" \
   && ok_t "H10m a 5dive-app front is refreshed in place by --via=auto (mode kept)" || bad_t "H10m a 5dive-app front is refreshed in place by --via=auto (mode kept)" "rc=$rc out=$out"
+
+# --- H11: DIVE-8446, the name is made at the box's first https need ----------------
+TOKEN_MARK="cafe$(printf '%060d' 8446)"
+linked_box() {   # a box linked to 5dive.app for chat: the marker and the token file
+  printf 'API=https://api.example.test\nLINKED_AT=2026-11-14T00:00:00Z\n' > "$SECRET_HTTPS_CHAT_ONLY_FILE"
+  printf 'CONNECTORD_TOKEN=%s\n' "$TOKEN_MARK" > "$SECRET_HTTPS_CONNECTORD_ENV"
+}
+name_calls() { grep -c '/server/selfhost/name' "$MOCK_LOG" 2>/dev/null; }
+fresh; linked_box; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="brave-otter.5dive.app 192.0.2.10"
+export MOCK_NAME_JSON='{"name":"brave-otter","host":"brave-otter.5dive.app","ip":"192.0.2.10"}'
+out=$(link DIVE-21 --again); rc=$?; url=$(url_of "$out")
+[[ $rc -eq 0 && "$url" =~ ^https://brave-otter\.5dive\.app/[A-Za-z0-9_-]{43}$ ]] \
+  && ok_t "H11a no name yet: the first link asks 5dive.app for one and serves on it" \
+  || bad_t "H11a no name yet: the first link asks 5dive.app for one and serves on it" "rc=$rc out=$out"
+t  "H11b ... the name file now holds it (the reporter keeps it from here)" "NAME=brave-otter.5dive.app" "$(cat "$SECRET_HTTPS_APP_NAME_FILE" 2>/dev/null)"
+t  "H11c ... one call, POST ?new=1 over IPv4 (the name is made at the address it comes from)" "1" "$(grep -c -- '--ipv4 --max-time 20 -X POST -H @.* https://api.example.test/server/selfhost/name?new=1' "$MOCK_LOG")"
+tn "H11d ... the token never rides argv" "$TOKEN_MARK" "$(cat "$MOCK_LOG")"
+t  "H11e ... it rides the header file" "Authorization: Bearer $TOKEN_MARK" "$(cat "$MOCK_LOG.hdr" 2>/dev/null)"
+fresh; linked_box; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="192.0.2.10"
+export MOCK_NAME_JSON='{"name":null,"host":null,"ip":"192.0.2.10","why":"weekly_cap"}'
+out=$(link DIVE-21 --again); rc=$?; url=$(url_of "$out")
+[[ $rc -eq 0 && "$url" == https://192.0.2.10/* && ! -e "$SECRET_HTTPS_APP_NAME_FILE" ]] \
+  && ok_t "H11f past 5dive.app's weekly limit: no name, the IP certificate instead, the link still works" \
+  || bad_t "H11f past 5dive.app's weekly limit: no name, the IP certificate instead, the link still works" "rc=$rc out=$out"
+t  "H11g ... the conf names the IP way" $'SECRET_HTTPS_MODE=ip\nSECRET_HTTPS_HOST=192.0.2.10' "$(cat "$SECRET_DROP_CONF" 2>/dev/null)"
+: > "$MOCK_LOG"; out=$(link DIVE-21 --again); rc=$?
+t  "H11h ... and the next link asks 5dive.app nothing (it asks again only at its next https enable)" "0 0" "$rc $(name_calls)"
+fresh; linked_box; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="brave-otter.5dive.app"
+export MOCK_NAME_JSON='{"name":null,"host":null,"ip":"192.0.2.10","why":"weekly_cap"}'
+out=$( ( _secret_https enable --via=5dive-app ) 2>&1); rc=$?
+[[ $rc -eq $E_NOT_INSTALLED && "$out" == *"this week's free names"* && ! -e "$unitf" ]] \
+  && ok_t "H11i --via=5dive-app past the weekly limit: refused in plain words, nothing on" || bad_t "H11i --via=5dive-app past the weekly limit: refused in plain words, nothing on" "rc=$rc out=$out"
+export MOCK_NAME_JSON='{"name":"calm-fox","host":"calm-fox.5dive.app","ip":"192.0.2.10"}' TLS_OK_HOSTS="calm-fox.5dive.app"
+out=$( ( _secret_https enable --via=5dive-app ) 2>&1); rc=$?
+t  "H11j --via=5dive-app with room: asks, then serves on the new name" "0 calm-fox.5dive.app" "$rc $(printf '%s' "$out" | jq -r '.data.host' 2>/dev/null)"
+fresh; named brave-otter.5dive.app; linked_box; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="brave-otter.5dive.app" MOCK_NAME_JSON='{"host":"other-word.5dive.app"}'
+out=$(link DIVE-21 --again); rc=$?
+t  "H11k a box that holds a name asks for none" "0 0" "$rc $(name_calls)"
+fresh; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="192.0.2.10 brave-otter.5dive.app" MOCK_NAME_JSON='{"host":"brave-otter.5dive.app"}'
+out=$(link DIVE-21 --again); rc=$?; url=$(url_of "$out")
+[[ $rc -eq 0 && "$url" == https://192.0.2.10/* && "$(name_calls)" == 0 ]] \
+  && ok_t "H11l a box not linked to 5dive.app asks nothing and uses the IP way" || bad_t "H11l a box not linked to 5dive.app asks nothing and uses the IP way" "rc=$rc out=$out"
+fresh; linked_box; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="192.0.2.10 evil.example.com" MOCK_NAME_JSON='{"host":"evil.example.com"}'
+out=$(link DIVE-21 --again); url=$(url_of "$out")
+[[ "$url" == https://192.0.2.10/* && ! -e "$SECRET_HTTPS_APP_NAME_FILE" ]] \
+  && ok_t "H11m an answer not shaped <label>.5dive.app is never written or served" || bad_t "H11m an answer not shaped <label>.5dive.app is never written or served" "out=$out"
 
 # --- H7: a real Caddy adapts both generated files (when one is given) ------------
 if [[ -n "${CADDY_REAL:-}" && -x "${CADDY_REAL}" ]]; then

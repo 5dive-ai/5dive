@@ -746,11 +746,16 @@ _secret_drop_ensure_server() {
 #           sslip.io's operator answers for the name, and it is not on the Public
 #           Suffix List, so every sslip.io user shares one 50-a-week cert bucket.
 #   domain  the owner's own name, pointed at the box (lodar: "sslip or self").
-#   5dive-app  DIVE-8361: the box's free <name>.5dive.app. 5dive.app gives it at
-#           link and points it at the box's address (its reporter keeps
-#           /etc/5dive/app-name), so no domain is needed and nobody but our own
-#           DNS answers for it. One certificate for that one name: the page and
-#           the browser's sign-in screen are paths on it. Tried FIRST.
+#   5dive-app  DIVE-8361: the box's free <name>.5dive.app. 5dive.app points it at
+#           the box's address (its reporter keeps /etc/5dive/app-name), so no
+#           domain is needed and nobody but our own DNS answers for it. One
+#           certificate for that one name: the page and the browser's sign-in
+#           screen are paths on it. Tried FIRST. DIVE-8446: the name is made
+#           here, at the box's first https need (never at link, so a box that
+#           links and leaves spends nothing): with no name file, this asks
+#           5dive.app for one. Past 5dive.app's weekly limit for free names the
+#           answer is none, and the IP certificate is used instead; the box asks
+#           again only at its next `secret https enable`.
 # The first `secret link` on such a box tries ip, then sslip, by itself; only
 # when both fail (NAT, closed ports) is the owner asked for a domain or sent to
 # the terminal. Not FIVE_DOMAIN: on a box that sets it, the browser plugin takes
@@ -762,6 +767,10 @@ SECRET_HTTPS_CADDY_MIN=2.11
 SECRET_HTTPS_LOCK="/run/5dive-secret-https.lock"
 # DIVE-8361: where the self-host reporter keeps the name 5dive.app gave this box.
 SECRET_HTTPS_APP_NAME_FILE="${SECRET_HTTPS_APP_NAME_FILE:-/etc/5dive/app-name}"
+# DIVE-8446: what the box's 5dive.app link left (the API it calls, and its token).
+SECRET_HTTPS_CHAT_ONLY_FILE="${SECRET_HTTPS_CHAT_ONLY_FILE:-/etc/5dive/chat-only}"
+SECRET_HTTPS_CONNECTORD_ENV="${SECRET_HTTPS_CONNECTORD_ENV:-/etc/5dive/connectord.env}"
+SECRET_HTTPS_APP_WHY=""
 # How long one way gets to show a valid certificate, and how long a box where
 # both automatic ways failed waits before the next `secret link` tries again.
 SECRET_HTTPS_WAIT_S="${SECRET_HTTPS_WAIT_S:-60}"
@@ -787,6 +796,33 @@ _secret_https_app_name() {
   local h; h=$(sed -n 's/^NAME=//p' "$SECRET_HTTPS_APP_NAME_FILE" 2>/dev/null | head -1)
   [[ "$h" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.5dive\.app$ ]] || return 1
   printf '%s' "$h"
+}
+
+# DIVE-8446: the box's first https need: ask 5dive.app to make its name (it is
+# made at the address this call comes FROM, so IPv4 only, as the reporter
+# does). rc 0 = the name file now holds one. Otherwise SECRET_HTTPS_APP_WHY
+# says why (weekly_cap: 5dive.app's weekly limit for free names). The token
+# rides a header file, never argv. A box not linked to 5dive.app asks nothing.
+_secret_https_ask_app_name() {
+  SECRET_HTTPS_APP_WHY=""
+  local api hdr out host
+  api=$(sed -n 's/^API=//p' "$SECRET_HTTPS_CHAT_ONLY_FILE" 2>/dev/null | head -1)
+  [[ "$api" =~ ^https?://[A-Za-z0-9.:-]+(/[A-Za-z0-9._/-]*)?$ ]] || { SECRET_HTTPS_APP_WHY="not_linked"; return 1; }
+  hdr=$(umask 077; mktemp) || return 1
+  sed -n 's/^CONNECTORD_TOKEN=\(.*\)$/Authorization: Bearer \1/p' "$SECRET_HTTPS_CONNECTORD_ENV" 2>/dev/null | head -1 > "$hdr"
+  if [[ ! -s "$hdr" ]]; then rm -f "$hdr"; SECRET_HTTPS_APP_WHY="not_linked"; return 1; fi
+  out=$(curl -sS --ipv4 --max-time 20 -X POST -H @"$hdr" "${api%/}/server/selfhost/name?new=1" 2>/dev/null)
+  rm -f "$hdr"
+  host=$(jq -r '.host // empty' <<<"$out" 2>/dev/null)
+  if [[ ! "$host" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.5dive\.app$ ]]; then
+    SECRET_HTTPS_APP_WHY=$(jq -r '.why // empty' <<<"$out" 2>/dev/null)
+    [[ "$SECRET_HTTPS_APP_WHY" =~ ^[a-z_0-9\ .-]{1,60}$ ]] || SECRET_HTTPS_APP_WHY="no answer from 5dive.app"
+    return 1
+  fi
+  mkdir -p "${SECRET_HTTPS_APP_NAME_FILE%/*}" 2>/dev/null
+  ( umask 022; printf 'NAME=%s\n' "$host" > "$SECRET_HTTPS_APP_NAME_FILE.tmp" ) 2>/dev/null \
+    && mv -f "$SECRET_HTTPS_APP_NAME_FILE.tmp" "$SECRET_HTTPS_APP_NAME_FILE" 2>/dev/null
+  _secret_https_app_name >/dev/null
 }
 
 # The box's public IPv4 from its own interfaces (the browser plugin's filter).
@@ -900,8 +936,14 @@ _secret_https_enable() { # <5dive-app|ip|sslip|domain> [<host>]
         || { SECRET_HTTPS_WHY="this box has no public IPv4 address (it is behind a router or NAT)"; return 1; }
       if [[ "$mode" == ip ]]; then host="$ip"; else host="${ip//./-}.sslip.io"; fi ;;
     5dive-app)
-      host=$(_secret_https_app_name) \
-        || { SECRET_HTTPS_WHY="this box has no 5dive.app name yet (5dive.app names a server when it links)"; return 1; } ;;
+      host=$(_secret_https_app_name) || { _secret_https_ask_app_name && host=$(_secret_https_app_name); } || {
+        case "$SECRET_HTTPS_APP_WHY" in
+          weekly_cap) SECRET_HTTPS_WHY="5dive.app has given out this week's free names; try again next week, or use --via=ip" ;;
+          not_linked) SECRET_HTTPS_WHY="this box has no 5dive.app name (it is not linked to 5dive.app)" ;;
+          *) SECRET_HTTPS_WHY="this box has no 5dive.app name yet (5dive.app: ${SECRET_HTTPS_APP_WHY:-no answer})" ;;
+        esac
+        return 1
+      } ;;
     domain)
       host="${host,,}"
       [[ "$host" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] \
@@ -970,7 +1012,9 @@ _secret_https_auto() {
   # DIVE-8361: the box's own 5dive.app name first: a normal certificate, no
   # third party answering for it. Where it fails for a reason the IP way shares
   # (a busy port, no Caddy) the IP way is not worth a second wait.
-  if _secret_https_app_name >/dev/null; then
+  # DIVE-8446: no name yet: this is its first https need, so ask for one. None
+  # (5dive.app's weekly limit, not linked): the IP way, as before.
+  if _secret_https_app_name >/dev/null || _secret_https_ask_app_name; then
     if _secret_https_enable 5dive-app; then exec 9>&-; return 0; fi
     why_app="$SECRET_HTTPS_WHY"
     if [[ "$why_app" != "no valid certificate"* && "$why_app" != "Caddy refused"* ]]; then
