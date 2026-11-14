@@ -21,7 +21,18 @@ updates:
   - package-ecosystem: pip
     directories:
       - /python
-      - /marketplace/linode/apps/linode-marketplace-5dive
     schedule: { interval: weekly }
     open-pull-requests-limit: 0
     commit-message: { prefix: "fix(deps)" }
+  # The Linode app's requirements.txt is Akamai's starter list, copied for the
+  # pull request to their marketplace-apps repo. Nothing installs it from here
+  # (their deploy script clones THEIR repo) and our playbook uses few of these
+  # packages, so bumps here change nothing that runs (lodar 11-14: "so annoying
+  # to bump it"). ignore also applies to security updates.
+  - package-ecosystem: pip
+    directory: /marketplace/linode/apps/linode-marketplace-5dive
+    schedule: { interval: weekly }
+    open-pull-requests-limit: 0
+    commit-message: { prefix: "fix(deps)" }
+    ignore:
+      - dependency-name: "*"
