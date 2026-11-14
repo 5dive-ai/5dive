@@ -426,7 +426,18 @@ account_each() {
 # `--clear` unpins. A pin whose account is gone is dropped, and back to the
 # newest login. A pinned login that is signed out right now is skipped, not
 # dropped: a file mid-refresh must not lose the owner's choice.
-ACCOUNT_DEFAULT_TYPES=(claude codex grok)
+#
+# DIVE-8481: Gemini (antigravity) counts too: an OINOA client signed in to
+# Gemini and "use for new employees" failed, since `account default
+# <acct>:antigravity` was refused and `account default <acct>` found no login.
+# No-type order is claude, codex, grok, then antigravity. A ledger written
+# before a type was counted never recorded that type's logins, so the first
+# read that counts it writes the ones already on the box as `seen` (an upgrade
+# changes no hire), and records `<epoch> \t * \t <type> \t tracked` so a
+# login added after that is `added`. Ledgers older than these lines tracked
+# ACCOUNT_LEDGER_BASE_TYPES.
+ACCOUNT_DEFAULT_TYPES=(claude codex grok antigravity)
+ACCOUNT_LEDGER_BASE_TYPES=(claude codex grok)
 ACCOUNT_DEFAULT_ACCOUNT="" ACCOUNT_DEFAULT_TYPE="" ACCOUNT_DEFAULT_SINCE="" ACCOUNT_DEFAULT_PINNED=0
 
 account_logins_ledger() { printf '%s/.logins' "${AUTH_PROFILES_DIR}"; }
@@ -458,15 +469,19 @@ _account_logins_now() {
 # A line is dropped only when its account is gone. A login that is signed out,
 # or whose file is being rewritten by a token refresh, keeps its line: if it
 # lost it, the next read would stamp it `added` and hand it the default.
-declare -gA ACCOUNT_LOGINS=() ACCOUNT_LOGINS_LIVE=()
+declare -gA ACCOUNT_LOGINS=() ACCOUNT_LOGINS_LIVE=() ACCOUNT_LOGINS_TRACKED=()
 account_logins_sync() {
   local ledger ts acct t state key now changed=0 fresh=0
+  local -A seeding=()
   ledger=$(account_logins_ledger)
   printf -v now '%(%s)T' -1
-  ACCOUNT_LOGINS=() ACCOUNT_LOGINS_LIVE=()
+  ACCOUNT_LOGINS=() ACCOUNT_LOGINS_LIVE=() ACCOUNT_LOGINS_TRACKED=()
   if [[ -r "$ledger" ]]; then
     while IFS=$'\t' read -r ts acct t state; do
       [[ "$ts" =~ ^[0-9]+$ && -n "$acct" && -n "$t" ]] || continue
+      if [[ "$acct" == '*' && "$state" == tracked ]]; then
+        ACCOUNT_LOGINS_TRACKED["$t"]="$ts"; continue
+      fi
       case "$state" in seen|added|undone) ;; *) continue ;; esac
       if [[ -d "${AUTH_PROFILES_DIR}/${acct}" ]]; then
         ACCOUNT_LOGINS["$acct"$'\t'"$t"]="$ts"$'\t'"$state"
@@ -477,11 +492,16 @@ account_logins_sync() {
   elif [[ ! -e "$ledger" ]]; then
     fresh=1 changed=1
   fi
+  # DIVE-8481: a type this ledger has not counted yet is seeded like a fresh box.
+  for t in "${ACCOUNT_DEFAULT_TYPES[@]}"; do
+    [[ " ${ACCOUNT_LEDGER_BASE_TYPES[*]} " == *" $t "* || -n "${ACCOUNT_LOGINS_TRACKED[$t]:-}" ]] && continue
+    seeding["$t"]=1 ACCOUNT_LOGINS_TRACKED["$t"]="$now" changed=1
+  done
   _account_logins_now
   for key in ${ACCOUNT_LOGINS_NOW[@]+"${ACCOUNT_LOGINS_NOW[@]}"}; do
     ACCOUNT_LOGINS_LIVE["$key"]=1
     [[ -z "${ACCOUNT_LOGINS[$key]:-}" ]] || continue
-    if (( fresh )); then
+    if (( fresh )) || [[ -n "${seeding[${key#*$'\t'}]:-}" ]]; then
       ACCOUNT_LOGINS["$key"]="$now"$'\t'seen
     else
       ACCOUNT_LOGINS["$key"]="$now"$'\t'added
@@ -502,16 +522,21 @@ _account_logins_write() {
   {
     for key in "${!ACCOUNT_LOGINS[@]}"; do
       printf '%s\t%s\n' "${ACCOUNT_LOGINS[$key]%%$'\t'*}" "${key}"$'\t'"${ACCOUNT_LOGINS[$key]#*$'\t'}"
-    done | sort -n
-  } >"$tmp" 2>/dev/null && chmod 600 "$tmp" 2>/dev/null && mv -f "$tmp" "$ledger" 2>/dev/null \
+    done
+    for key in "${!ACCOUNT_LOGINS_TRACKED[@]}"; do
+      printf '%s\t*\t%s\ttracked\n' "${ACCOUNT_LOGINS_TRACKED[$key]}" "$key"
+    done
+  } | sort -n >"$tmp" 2>/dev/null && chmod 600 "$tmp" 2>/dev/null && mv -f "$tmp" "$ledger" 2>/dev/null \
     || rm -f "$tmp" 2>/dev/null
   return 0
 }
 
-# account_default_v [type] — the default login for a new hire (of <type>, when
-# given): the newest `added` one that is still signed in. Left in
-# ACCOUNT_DEFAULT_{ACCOUNT,TYPE,SINCE}; rc 1 when there is none, and the caller
-# keeps its own rule.
+# account_default_v [type...] — the default login for a new hire (of one of
+# the space-separated <type>s, when given): the newest `added` one that is still
+# signed in. Left in ACCOUNT_DEFAULT_{ACCOUNT,TYPE,SINCE}; rc 1 when there is
+# none, and the caller keeps its own rule. DIVE-8481: a hire path that cannot
+# make a seat of every type names the ones it can, so a Gemini default it
+# cannot land on is skipped, as before Gemini was counted.
 account_default_v() {
   local want="${1:-}" key ts state best_ts=-1 best=""
   ACCOUNT_DEFAULT_ACCOUNT="" ACCOUNT_DEFAULT_TYPE="" ACCOUNT_DEFAULT_SINCE="" ACCOUNT_DEFAULT_PINNED=0
@@ -520,7 +545,7 @@ account_default_v() {
   # DIVE-7415: the owner's pin first, while it is signed in for that harness.
   if account_default_pin_v; then
     key="$ACCOUNT_PIN_ACCOUNT"$'\t'"$ACCOUNT_PIN_TYPE"
-    if [[ -n "${ACCOUNT_LOGINS_LIVE[$key]:-}" ]] && [[ -z "$want" || "$ACCOUNT_PIN_TYPE" == "$want" ]]; then
+    if [[ -n "${ACCOUNT_LOGINS_LIVE[$key]:-}" ]] && [[ -z "$want" || " $want " == *" $ACCOUNT_PIN_TYPE "* ]]; then
       ACCOUNT_DEFAULT_ACCOUNT="$ACCOUNT_PIN_ACCOUNT" ACCOUNT_DEFAULT_TYPE="$ACCOUNT_PIN_TYPE" ACCOUNT_DEFAULT_PINNED=1
       TZ=UTC printf -v ACCOUNT_DEFAULT_SINCE '%(%Y-%m-%dT%H:%M:%SZ)T' "$ACCOUNT_PIN_SINCE"
       return 0
@@ -529,7 +554,7 @@ account_default_v() {
   for key in "${!ACCOUNT_LOGINS[@]}"; do
     ts="${ACCOUNT_LOGINS[$key]%%$'\t'*}" state="${ACCOUNT_LOGINS[$key]#*$'\t'}"
     [[ "$state" == added && -n "${ACCOUNT_LOGINS_LIVE[$key]:-}" ]] || continue
-    [[ -z "$want" || "${key#*$'\t'}" == "$want" ]] || continue
+    [[ -z "$want" || " $want " == *" ${key#*$'\t'} "* ]] || continue
     # Two logins first seen in the same second: the one that sorts first wins,
     # so the answer never depends on the hash order.
     if (( ts > best_ts )) || { (( ts == best_ts )) && [[ "$key" < "$best" ]]; }; then
@@ -608,7 +633,7 @@ _account_default_json() {
 #
 # DIVE-7415: `5dive account default <account>[:<type>]` pins that login, and it
 # stays the default when a newer one is added; with no type, the account's own
-# login in claude, codex, grok order. `--clear` unpins (back to the newest login).
+# login in claude, codex, grok, antigravity order (DIVE-8481: Gemini last). `--clear` unpins (back to the newest login).
 cmd_account_default() {
   local undo="" pin="" clear=0 a
   local usage="usage: 5dive account default [<account>[:<type>] | --clear | --undo=<account>:<type>]"

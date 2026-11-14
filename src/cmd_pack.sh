@@ -3762,9 +3762,13 @@ cmd_import() {
   # and the next pack hired runs on Codex there. Only onto a harness the pack
   # lands on; a Claude-only model or effort pin is dropped on the way, as
   # `--type=` drops it. With no login added, the rules below are unchanged.
+  # DIVE-8481: a Gemini default only for a pack that lands on antigravity; any
+  # other pack skips it and gets what it got before Gemini was counted.
   if [[ -z "$profile" && -z "$p_type" && -z "$p_provider" && -z "$p_api_key" ]]; then
     lazy_need account_default_v
-    if account_default_v \
+    local _dtypes=""
+    grep -qxF antigravity < <(printf '%s\n' "${_lands[@]+"${_lands[@]}"}") || _dtypes="claude codex grok"
+    if account_default_v "$_dtypes" \
        && grep -qxF -- "$ACCOUNT_DEFAULT_TYPE" < <(printf '%s\n' "${_lands[@]+"${_lands[@]}"}"); then
       profile="$ACCOUNT_DEFAULT_ACCOUNT"
       if [[ "$ACCOUNT_DEFAULT_TYPE" != "$type" ]]; then
