@@ -116,8 +116,14 @@ resolve_codex() {
 }
 
 codex_dispatcher_enabled() {
-  local channels=",${1:-},"
-  [[ "$channels" == *,telegram,* || "$channels" == *,dashboard,* ]]
+  local c IFS=,
+  for c in ${1:-}; do
+    case "$c" in
+      none|discord|buzz|"") ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
 }
 
 
@@ -281,6 +287,51 @@ plugin_channel_launch() {
   return 1
 }
 
+# DIVE-8464: Teams and plugin channels on a Codex seat. The dispatcher spawns
+# each as a channel adapter (CODEX_DISPATCHER_PLUGIN_ADAPTERS, a JSON map of
+# channel -> absolute entry path), and a plugin's own Codex PreToolUse guard
+# (its mail/role guard) is wired into config.toml below. Both come from the
+# plugin's manifest: fivedive.channel.codex_adapter // fivedive.codex_adapter,
+# and the same for codex_hook, as paths inside the plugin's enabled dir.
+CODEX_ADAPTERS_JSON='{}'
+CODEX_ADAPTER_HOOKS=()
+plugin_store_dir_for() {   # plugin_store_dir_for <plugin> -> its enabled dir
+  local store="${FIVEDIVE_PLUGIN_STORE:-/var/lib/5dive/plugins}" key
+  [[ -r "$store/installed.json" ]] || return 1
+  key=$(jq -r --arg p "$1" 'first(to_entries[] | select(.value.enabled == true and (.value.plugin // "") == $p) | .key) // empty' "$store/installed.json" 2>/dev/null)
+  [[ -n "$key" && -d "$store/enabled/$key" ]] || return 1
+  printf '%s\n' "$store/enabled/$key"
+}
+codex_adapter_add() {      # codex_adapter_add <channel> <plugin dir>
+  local ch="$1" dir="$2" mf="" e rel hook
+  for e in .claude-plugin .5dive-plugin .codex-plugin; do
+    [[ -r "$dir/$e/plugin.json" ]] && { mf="$dir/$e/plugin.json"; break; }
+  done
+  [[ -n "$mf" ]] || return 1
+  rel=$(jq -r '(.fivedive.channel.codex_adapter // .fivedive.codex_adapter // empty) | strings' "$mf" 2>/dev/null)
+  # A path inside the plugin only: no absolute path, no climbing out of it.
+  [[ "$rel" =~ ^[A-Za-z0-9._/-]+$ && "$rel" != /* && "$rel" != *..* && -f "$dir/$rel" ]] || return 1
+  # The adapter runs from a copy the seat owns: the plugin store is root-owned
+  # (2755) and holds no node_modules, and the adapter's first boot installs its
+  # dependencies beside itself. The copy is refreshed on every start (a plugin
+  # update lands), node_modules is kept. The GUARD below stays in the store:
+  # it imports node builtins only and needs nothing written.
+  local run="$HOME/.5dive/codex-adapters/$ch"
+  mkdir -p "$run" 2>/dev/null \
+    && tar -C "$dir" --exclude=./node_modules -cf - . 2>/dev/null | tar -C "$run" --no-same-owner -xf - 2>/dev/null \
+    || { echo "[5dive] agent=$NAME channels=$ch: could not copy its plugin into $run — starting without it" >&2; return 1; }
+  CODEX_ADAPTERS_JSON=$(jq -c --arg c "$ch" --arg p "$run/$rel" '. + {($c): $p}' <<<"$CODEX_ADAPTERS_JSON")
+  hook=$(jq -r '(.fivedive.channel.codex_hook // .fivedive.codex_hook // empty) | strings' "$mf" 2>/dev/null)
+  if [[ "$hook" =~ ^[A-Za-z0-9._/-]+$ && "$hook" != /* && "$hook" != *..* && -f "$dir/$hook" ]]; then
+    CODEX_ADAPTER_HOOKS+=("$ch=$dir/$hook")
+  elif [[ -n "$hook" ]]; then
+    echo "[5dive] agent=$NAME channels=$ch: its Codex guard ($hook) is missing — the channel is NOT started without it" >&2
+    CODEX_ADAPTERS_JSON=$(jq -c --arg c "$ch" 'del(.[$c])' <<<"$CODEX_ADAPTERS_JSON")
+    return 1
+  fi
+  return 0
+}
+
 for CH in "${CHANNEL_LIST[@]}"; do
 case "$CH" in
   none|"") : ;;
@@ -337,7 +388,14 @@ case "$CH" in
   teams)
     case "$TYPE" in
       claude) ARGS+=(--channels "plugin:teams@5dive-plugins") ;;
-      *) echo "channels=teams is claude-only for now (got type=$TYPE)" >&2; exit 2 ;;
+      # DIVE-8464: the dispatcher runs the teams plugin as a channel adapter.
+      codex)
+        if PDIR=$(plugin_store_dir_for teams); then
+          codex_adapter_add teams "$PDIR"
+        else
+          echo "[5dive] agent=$NAME channels=teams: the teams plugin is not installed or enabled — starting without it. Install it: sudo 5dive plugin install teams" >&2
+        fi ;;
+      *) echo "channels=teams runs on claude and codex agents only (got type=$TYPE)" >&2; exit 2 ;;
     esac ;;
   # DIVE-8315: a channel an enabled plugin declares in its manifest
   # (fivedive.channel, read the way src/lib/plugin_channels.sh reads it).
@@ -349,8 +407,16 @@ case "$CH" in
       echo "[5dive] agent=$NAME channels=$CH: no enabled plugin provides it (removed or disabled?) — starting without it. Turn it back on: sudo 5dive plugin enable <plugin>" >&2
       continue
     fi
+    PCH_DIR=""
+    [[ "$TYPE" == codex ]] && PCH_DIR=$(plugin_store_dir_for "$(sed -E 's/^plugin:([^@]+)@.*/\1/' <<<"$PCH")" || true)
     case "$TYPE" in
       claude) ARGS+=(--channels "$PCH") ;;
+      # DIVE-8464: a plugin that names a codex_adapter runs under the dispatcher.
+      codex)
+        if [[ -n "$PCH_DIR" ]] && codex_adapter_add "$CH" "$PCH_DIR"; then :
+        else
+          echo "[5dive] agent=$NAME channels=$CH: its plugin has no Codex adapter — starting without it" >&2
+        fi ;;
       *) echo "channels=$CH runs on claude agents only for now (got type=$TYPE)" >&2; exit 2 ;;
     esac ;;
 esac
@@ -722,6 +788,28 @@ TOML
       echo "warn: telegram channel set for codex agent '$NAME' but telegram-codex plugin not found (TELEGRAM_CODEX_PLUGIN_DIR / /usr/local/lib/5dive/telegram-codex / 5dive-plugins checkout) — MCP + hooks not wired" >&2
     fi
   fi
+  # DIVE-8464: each adapter plugin's own guard (the email plugin's mail guard:
+  # no root commands, pay, delete or settings while the turn is an email) as a
+  # Codex PreToolUse hook. One stanza per guard, keyed by a marker comment so a
+  # restart never appends it twice; a moved plugin dir is re-pointed in place.
+  for _h in "${CODEX_ADAPTER_HOOKS[@]}"; do
+    _hch="${_h%%=*}"; _hpath="${_h#*=}"
+    _hmark="# 5dive-codex-adapter-hook: $_hch"
+    _cfg="$AGENT_CODEX_HOME/config.toml"
+    if grep -qxF "$_hmark" "$_cfg" 2>/dev/null; then
+      # The stanza is ours (marker line, then the fixed lines below); rewrite only
+      # its command line when the plugin dir moved (a plugin update re-keys it).
+      awk -v m="$_hmark" -v cmd="command = \"bun $_hpath\"" '
+        $0 == m { inblk = 1 } inblk && /^command = / { print cmd; inblk = 0; next } { print }' \
+        "$_cfg" > "$_cfg.hook.$$" && chmod 600 "$_cfg.hook.$$" && mv -f "$_cfg.hook.$$" "$_cfg" \
+        || { rm -f "$_cfg.hook.$$"; echo "warn: could not update the $_hch guard hook in config.toml" >&2; }
+    else
+      printf '\n%s\n[[hooks.PreToolUse]]\n\n[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "bun %s"\ntimeout = 30\nasync = false\n' \
+        "$_hmark" "$_hpath" >> "$_cfg" \
+        || echo "warn: could not add the $_hch guard hook to config.toml" >&2
+    fi
+    codex_ensure_feature "$_cfg" hooks
+  done
   # DIVE-4923: DIVE-1192 promised every codex seat native memory, but the only
   # writer of `memories = true` was the telegram MCP block above, which a
   # dispatcher-mode seat (and any seat without telegram) never gets — measured on
@@ -731,6 +819,8 @@ TOML
   CODEX_OVERRIDE="export CODEX_HOME=$(printf %q "$AGENT_CODEX_HOME"); "
   if codex_dispatcher_enabled "$CHANNELS"; then
     CODEX_OVERRIDE+="export CODEX_BIN=$(printf %q "$CODEX_REAL_BIN") CODEX_DISPATCHER_CHANNELS=$(printf %q "$CHANNELS") CODEX_DISPATCHER_WORKDIR=$(printf %q "$WORKDIR"); "
+    [[ "$CODEX_ADAPTERS_JSON" == '{}' ]] \
+      || CODEX_OVERRIDE+="export CODEX_DISPATCHER_PLUGIN_ADAPTERS=$(printf %q "$CODEX_ADAPTERS_JSON"); "
   fi
 fi
 
