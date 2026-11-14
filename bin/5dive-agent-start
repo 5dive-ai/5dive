@@ -821,6 +821,14 @@ TOML
     CODEX_OVERRIDE+="export CODEX_BIN=$(printf %q "$CODEX_REAL_BIN") CODEX_DISPATCHER_CHANNELS=$(printf %q "$CHANNELS") CODEX_DISPATCHER_WORKDIR=$(printf %q "$WORKDIR"); "
     [[ "$CODEX_ADAPTERS_JSON" == '{}' ]] \
       || CODEX_OVERRIDE+="export CODEX_DISPATCHER_PLUGIN_ADAPTERS=$(printf %q "$CODEX_ADAPTERS_JSON"); "
+    # DIVE-8464: app-server has no --dangerously-bypass-hook-trust, so a guard
+    # hook is skipped until trusted. The dispatcher trusts exactly these
+    # commands, the ones written below, and nothing else in config.toml.
+    if (( ${#CODEX_ADAPTER_HOOKS[@]} )); then
+      _trust='[]'
+      for _h in "${CODEX_ADAPTER_HOOKS[@]}"; do _trust=$(jq -c --arg c "bun ${_h#*=}" '. + [$c]' <<<"$_trust"); done
+      CODEX_OVERRIDE+="export CODEX_DISPATCHER_TRUST_HOOKS=$(printf %q "$_trust"); "
+    fi
   fi
 fi
 

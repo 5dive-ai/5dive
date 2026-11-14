@@ -118,6 +118,10 @@ if [[ -z "$blk" ]]; then bad_t "K1 hook block not found in $START"; else
     && ok_t "K3 a moved plugin dir is re-pointed in place" || bad_t "K3" "$(cat "$AGENT_CODEX_HOME/config.toml")"
 fi
 
+# --- T: the dispatcher is told exactly which hook commands to trust -------------
+grep -q 'CODEX_DISPATCHER_TRUST_HOOKS=' "$START" && grep -q '_trust=$(jq -c --arg c "bun ${_h#\*=}"' "$START" \
+  && ok_t "T1 agent-start passes the wired guard commands as CODEX_DISPATCHER_TRUST_HOOKS" || bad_t "T1 trust list"
+
 # --- V ------------------------------------------------------------------------
 grep -q '"$type" != "claude" && "$type" != "codex" ]] && channel_in_list teams' src/cmd_agent_config.sh \
   && ok_t "V1 agent config allows teams on codex" || bad_t "V1"
