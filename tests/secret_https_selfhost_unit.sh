@@ -12,6 +12,8 @@
 # Isolation: src/ libs sourced, every path in TMP; systemctl, ss, caddy, curl and
 # ip are mocks on PATH. No root, no network beyond 127.0.0.1. A real Caddy
 # (CADDY_REAL=<binary>, >= 2.11) also adapts the generated Caddyfiles when given.
+#   * DIVE-8361: the box's own <name>.5dive.app (/etc/5dive/app-name) is tried
+#     FIRST, one certificate for that one name (H10).
 # Run: bash tests/secret_https_selfhost_unit.sh
 set -uo pipefail
 
@@ -43,6 +45,7 @@ SECRET_DROP_PROC_NET="$TMP/procnet"; mkdir -p "$SECRET_DROP_PROC_NET" "$TMP/etc5
 SECRET_HTTPS_CADDYFILE="$TMP/etc5dive/secret-https.Caddyfile"
 SECRET_HTTPS_UNIT_DIR="$TMP/systemd"
 SECRET_HTTPS_LOCK="$TMP/https.lock"
+SECRET_HTTPS_APP_NAME_FILE="$TMP/etc5dive/app-name"
 SECRET_HTTPS_WAIT_S=1; SECRET_DROP_POLL_S=0; SECRET_DROP_WAIT_S=1
 TOOLS_ENV_FILE="$CONNECTORS_DIR/tools.sh"; TOOLS_WRITE_LOCK="$TMP/tools.lock"
 export SECRET_PROJECTS_DIR="$TMP/projects"; mkdir -p "$SECRET_PROJECTS_DIR"
@@ -127,7 +130,7 @@ seed_gate() {   # <ident> <key> <connector>
 }
 # A fresh self-hosted box: no FIVE_DOMAIN, no conf, no front.
 fresh() {
-  rm -f "$SECRET_DROP_PROVISIONING" "$SECRET_DROP_CONF" "$SECRET_HTTPS_CADDYFILE" "$STATE_DIR/secret-https.failed"
+  rm -f "$SECRET_DROP_PROVISIONING" "$SECRET_DROP_CONF" "$SECRET_HTTPS_CADDYFILE" "$STATE_DIR/secret-https.failed" "$SECRET_HTTPS_APP_NAME_FILE"
   rm -rf "$SECRET_HTTPS_UNIT_DIR" "$SECRET_DROP_DIR"; : > "$MOCK_LOG"
   unset BUSY_PORTS LINKTLS_ACTIVE NO_CADDY
 }
@@ -263,10 +266,52 @@ out=$( ( _secret_https enable --via=auto ) 2>&1); rc=$?
 out=$( ( _secret_https enable --via=auto --host=box.example.org ) 2>&1); rc=$?
 t  "H9e --via=auto takes no --host" "$E_USAGE" "$rc"
 
+# --- H10: DIVE-8361, the box's own <name>.5dive.app first ---------------------------
+named() { printf 'NAME=%s\n' "$1" > "$SECRET_HTTPS_APP_NAME_FILE"; }
+fresh; named brave-otter.5dive.app; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="brave-otter.5dive.app 192.0.2.10"
+out=$(link DIVE-21 --again); rc=$?; url=$(url_of "$out")
+[[ $rc -eq 0 && "$url" =~ ^https://brave-otter\.5dive\.app/[A-Za-z0-9_-]{43}$ ]] \
+  && ok_t "H10a a box with a 5dive.app name: the first link is https://<name>.5dive.app/<token>" \
+  || bad_t "H10a a box with a 5dive.app name: the first link is https://<name>.5dive.app/<token>" "rc=$rc out=$out"
+t  "H10b the conf names the way and the host" $'SECRET_HTTPS_MODE=5dive-app\nSECRET_HTTPS_HOST=brave-otter.5dive.app' "$(cat "$SECRET_DROP_CONF" 2>/dev/null)"
+cf=$(cat "$SECRET_HTTPS_CADDYFILE" 2>/dev/null)
+tc "H10c one site, one name: https://<name>.5dive.app" "https://brave-otter.5dive.app {" "$cf"
+t  "H10d ... and no other site address (one certificate)" "1" "$(grep -c '^https://' <<<"$cf")"
+tc "H10e the login screen is a path on the same name" "@viewer path /browser/viewer/*" "$cf"
+tn "H10f no IP-only profile" "profile shortlived" "$cf"
+tn "H10g ... and the IP way was never tried" "https://192.0.2.10/" "$(cat "$MOCK_LOG")"
+fresh; named brave-otter.5dive.app; export BOX_IP=192.0.2.10 TLS_OK_HOSTS=192.0.2.10
+out=$(link DIVE-21 --again); rc=$?; url=$(url_of "$out")
+[[ $rc -eq 0 && "$url" == https://192.0.2.10/* ]] && grep -q 'https://brave-otter.5dive.app/healthz' "$MOCK_LOG" \
+  && ok_t "H10h no certificate for the name (ports closed, DNS not there yet): the IP way next" \
+  || bad_t "H10h no certificate for the name (ports closed, DNS not there yet): the IP way next" "rc=$rc out=$out"
+fresh; named brave-otter.5dive.app; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="brave-otter.5dive.app 192.0.2.10" BUSY_PORTS=443
+out=$(link DIVE-21 --again); rc=$?
+[[ $rc -eq $E_NOT_INSTALLED && "$out" == *"port 80 or 443"* ]] && ! grep -q 'https://192.0.2.10/' "$MOCK_LOG" \
+  && ok_t "H10i a busy 443 fails the name way and is not tried again the IP way" \
+  || bad_t "H10i a busy 443 fails the name way and is not tried again the IP way" "rc=$rc out=$out"
+fresh; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="brave-otter.5dive.app"
+out=$( ( _secret_https enable --via=5dive-app ) 2>&1); rc=$?
+[[ $rc -eq $E_NOT_INSTALLED && "$out" == *"no 5dive.app name yet"* && ! -e "$unitf" ]] \
+  && ok_t "H10j --via=5dive-app with no name: refused, says why, nothing on" || bad_t "H10j --via=5dive-app with no name: refused, says why, nothing on" "rc=$rc out=$out"
+for bad in 'evil.example.com' 'x.5dive.app.evil.example' 'a b.5dive.app' '-x.5dive.app'; do
+  fresh; named "$bad"; export BOX_IP=192.0.2.10 TLS_OK_HOSTS="192.0.2.10 $bad"
+  out=$(link DIVE-21 --again); url=$(url_of "$out")
+  [[ "$url" == https://192.0.2.10/* ]] || bad_t "H10k a name file not shaped <label>.5dive.app is ignored ($bad)" "$out"
+done
+ok_t "H10k a name file not shaped <label>.5dive.app is ignored (4 shapes)"
+fresh; named keen-lynx.5dive.app; export BOX_IP="" TLS_OK_HOSTS="keen-lynx.5dive.app"
+out=$( ( _secret_https enable --via=5dive-app ) 2>&1); rc=$?
+t  "H10l --via=5dive-app works behind a router (the name points at its outside address)" "0 keen-lynx.5dive.app 5dive-app" "$rc $(printf '%s' "$out" | jq -r '"\(.data.host) \(.data.mode)"' 2>/dev/null)"
+printf '# an older front\n{\n\tadmin off\n}\nhttps://keen-lynx.5dive.app {\n\treverse_proxy 127.0.0.1:3127\n}\n' > "$SECRET_HTTPS_CADDYFILE"
+: > "$MOCK_LOG"; out=$( ( _secret_https enable --via=auto ) 2>&1); rc=$?
+[[ $rc -eq 0 ]] && grep -qF '/browser/viewer/' "$SECRET_HTTPS_CADDYFILE" && grep -qF 'https://keen-lynx.5dive.app {' "$SECRET_HTTPS_CADDYFILE" \
+  && ok_t "H10m a 5dive-app front is refreshed in place by --via=auto (mode kept)" || bad_t "H10m a 5dive-app front is refreshed in place by --via=auto (mode kept)" "rc=$rc out=$out"
+
 # --- H7: a real Caddy adapts both generated files (when one is given) ------------
 if [[ -n "${CADDY_REAL:-}" && -x "${CADDY_REAL}" ]]; then
-  for m in ip sslip; do
-    h=192.0.2.10; [[ $m == sslip ]] && h=192-0-2-10.sslip.io
+  for m in ip sslip 5dive-app; do
+    h=192.0.2.10; [[ $m == sslip ]] && h=192-0-2-10.sslip.io; [[ $m == 5dive-app ]] && h=brave-otter.5dive.app
     _secret_https_caddyfile "$m" "$h" > "$TMP/cf.$m"
     if "$CADDY_REAL" adapt --config "$TMP/cf.$m" --adapter caddyfile > "$TMP/cf.$m.json" 2>"$TMP/cf.$m.err"; then
       ok_t "H7 real Caddy $("$CADDY_REAL" version | cut -d' ' -f1) adapts the $m Caddyfile"

@@ -746,6 +746,11 @@ _secret_drop_ensure_server() {
 #           sslip.io's operator answers for the name, and it is not on the Public
 #           Suffix List, so every sslip.io user shares one 50-a-week cert bucket.
 #   domain  the owner's own name, pointed at the box (lodar: "sslip or self").
+#   5dive-app  DIVE-8361: the box's free <name>.5dive.app. 5dive.app gives it at
+#           link and points it at the box's address (its reporter keeps
+#           /etc/5dive/app-name), so no domain is needed and nobody but our own
+#           DNS answers for it. One certificate for that one name: the page and
+#           the browser's sign-in screen are paths on it. Tried FIRST.
 # The first `secret link` on such a box tries ip, then sslip, by itself; only
 # when both fail (NAT, closed ports) is the owner asked for a domain or sent to
 # the terminal. Not FIVE_DOMAIN: on a box that sets it, the browser plugin takes
@@ -755,6 +760,8 @@ SECRET_HTTPS_UNIT="5dive-secret-https"
 SECRET_HTTPS_UNIT_DIR="/etc/systemd/system"
 SECRET_HTTPS_CADDY_MIN=2.11
 SECRET_HTTPS_LOCK="/run/5dive-secret-https.lock"
+# DIVE-8361: where the self-host reporter keeps the name 5dive.app gave this box.
+SECRET_HTTPS_APP_NAME_FILE="${SECRET_HTTPS_APP_NAME_FILE:-/etc/5dive/app-name}"
 # How long one way gets to show a valid certificate, and how long a box where
 # both automatic ways failed waits before the next `secret link` tries again.
 SECRET_HTTPS_WAIT_S="${SECRET_HTTPS_WAIT_S:-60}"
@@ -775,6 +782,12 @@ _secret_https_host() {
   printf '%s' "$h"
 }
 _secret_https_failed_file() { printf '%s' "${STATE_DIR}/secret-https.failed"; }
+# DIVE-8361: the box's <name>.5dive.app, only in that exact shape. rc 1 = none.
+_secret_https_app_name() {
+  local h; h=$(sed -n 's/^NAME=//p' "$SECRET_HTTPS_APP_NAME_FILE" 2>/dev/null | head -1)
+  [[ "$h" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.5dive\.app$ ]] || return 1
+  printf '%s' "$h"
+}
 
 # The box's public IPv4 from its own interfaces (the browser plugin's filter).
 # Empty behind NAT, which is the answer: neither automatic way works there.
@@ -877,7 +890,7 @@ _secret_https_conf_set() { # <mode> <host>, keeping every other line of the conf
 
 # Turn the front on one way. rc 0 = a verified certificate answers and the conf
 # names the host; otherwise the front is off again and SECRET_HTTPS_WHY says why.
-_secret_https_enable() { # <ip|sslip|domain> [<host>]
+_secret_https_enable() { # <5dive-app|ip|sslip|domain> [<host>]
   local mode="$1" host="${2:-}" ip=""
   SECRET_HTTPS_WHY=""
   case "$mode" in
@@ -886,11 +899,14 @@ _secret_https_enable() { # <ip|sslip|domain> [<host>]
       [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] \
         || { SECRET_HTTPS_WHY="this box has no public IPv4 address (it is behind a router or NAT)"; return 1; }
       if [[ "$mode" == ip ]]; then host="$ip"; else host="${ip//./-}.sslip.io"; fi ;;
+    5dive-app)
+      host=$(_secret_https_app_name) \
+        || { SECRET_HTTPS_WHY="this box has no 5dive.app name yet (5dive.app names a server when it links)"; return 1; } ;;
     domain)
       host="${host,,}"
       [[ "$host" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] \
         || { SECRET_HTTPS_WHY="'${host}' is not a domain name (box.example.com)"; return 1; } ;;
-    *) SECRET_HTTPS_WHY="unknown way '${mode}' (ip, sslip or domain)"; return 1 ;;
+    *) SECRET_HTTPS_WHY="unknown way '${mode}' (5dive-app, ip, sslip or domain)"; return 1 ;;
   esac
   systemctl stop "$SECRET_HTTPS_UNIT" >/dev/null 2>&1 || true
   if _secret_https_port_busy 443 || _secret_https_port_busy 80; then
@@ -950,7 +966,20 @@ _secret_https_auto() {
   fi
   exec 9>"$SECRET_HTTPS_LOCK" 2>/dev/null && flock 9 2>/dev/null || true
   _secret_https_host >/dev/null && { exec 9>&-; return 0; }   # another call made it meanwhile
-  local why_ip=""
+  local why_ip="" why_app=""
+  # DIVE-8361: the box's own 5dive.app name first: a normal certificate, no
+  # third party answering for it. Where it fails for a reason the IP way shares
+  # (a busy port, no Caddy) the IP way is not worth a second wait.
+  if _secret_https_app_name >/dev/null; then
+    if _secret_https_enable 5dive-app; then exec 9>&-; return 0; fi
+    why_app="$SECRET_HTTPS_WHY"
+    if [[ "$why_app" != "no valid certificate"* && "$why_app" != "Caddy refused"* ]]; then
+      SECRET_HTTPS_WHY="$why_app"
+      ( umask 077; printf 'at=%s\nwhy=%s\n' "$now" "$why_app" > "$ff" ) 2>/dev/null || true
+      exec 9>&-
+      return 1
+    fi
+  fi
   if _secret_https_enable ip; then exec 9>&-; return 0; fi
   why_ip="$SECRET_HTTPS_WHY"
   # sslip.io only helps where the IP certificate itself failed: no public IP, a
@@ -971,7 +1000,7 @@ _secret_https_refresh() {
   local h m; h=$(_secret_https_host) || { SECRET_HTTPS_WHY="this box has no https name yet"; return 1; }
   grep -qF '/browser/viewer/' "$SECRET_HTTPS_CADDYFILE" 2>/dev/null && return 0
   m=$(_secret_https_get SECRET_HTTPS_MODE)
-  [[ "$m" =~ ^(ip|sslip|domain)$ ]] || { SECRET_HTTPS_WHY="the https conf names no way ($m)"; return 1; }
+  [[ "$m" =~ ^(5dive-app|ip|sslip|domain)$ ]] || { SECRET_HTTPS_WHY="the https conf names no way ($m)"; return 1; }
   ( umask 022; _secret_https_caddyfile "$m" "$h" > "$SECRET_HTTPS_CADDYFILE" ) || { SECRET_HTTPS_WHY="cannot write $SECRET_HTTPS_CADDYFILE"; return 1; }
   systemctl restart "$SECRET_HTTPS_UNIT" >/dev/null 2>&1 \
     || { SECRET_HTTPS_WHY="the https front did not restart (journalctl -u $SECRET_HTTPS_UNIT)"; return 1; }
@@ -992,7 +1021,7 @@ _secret_https_no_name_msg() { # <terminal command>
     "$why" "${ip:-this box}" "$1"
 }
 
-# `5dive secret https [status|enable --via=ip|sslip|domain|auto [--host=<name>]|disable]`
+# `5dive secret https [status|enable --via=5dive-app|ip|sslip|domain|auto [--host=<name>]|disable]`
 _secret_https() {
   local sub="${1:-status}"; shift || true
   local via="" host="" a
@@ -1008,18 +1037,18 @@ _secret_https() {
       if [[ -n "$h" ]]; then
         ok "secret links: on, via ${m:-?} - https://${h}/..." '{on: true, managed: true, mode: $m, host: $h}' --arg m "$m" --arg h "$h"
       else
-        ok "secret links: no https address yet; the first secret link makes one (an IP certificate, then sslip.io). Your own domain: sudo 5dive secret https enable --via=domain --host=<name>" '{on: false, managed: true}'
+        ok "secret links: no https address yet; the first secret link makes one (this box's 5dive.app name, else an IP certificate, then sslip.io). Your own domain: sudo 5dive secret https enable --via=domain --host=<name>" '{on: false, managed: true}'
       fi ;;
     enable)
       for a in "$@"; do
         case "$a" in
           --via=*)  via="${a#*=}" ;;
           --host=*) host="${a#*=}" ;;
-          *) fail "$E_USAGE" "unknown: $a (5dive secret https enable --via=ip|sslip|domain|auto [--host=<name>])" ;;
+          *) fail "$E_USAGE" "unknown: $a (5dive secret https enable --via=5dive-app|ip|sslip|domain|auto [--host=<name>])" ;;
         esac
       done
       require_root secret https
-      [[ "$via" =~ ^(ip|sslip|domain|auto)$ ]] || fail "$E_USAGE" "--via must be ip, sslip, domain or auto"
+      [[ "$via" =~ ^(5dive-app|ip|sslip|domain|auto)$ ]] || fail "$E_USAGE" "--via must be 5dive-app, ip, sslip, domain or auto"
       [[ "$via" == domain && -z "$host" ]] && fail "$E_USAGE" "--via=domain needs --host=<your domain>, pointed at this box"
       [[ "$via" != domain && -n "$host" ]] && fail "$E_USAGE" "--via=$via makes its own name; --host is for --via=domain"
       if [[ "$via" == auto ]]; then

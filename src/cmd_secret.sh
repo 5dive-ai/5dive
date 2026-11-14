@@ -92,11 +92,12 @@ _secret_usage() {
       code; a card's <name>.number, <name>.exp (MM/YY), <name>.cvc and
       <name>.holder; a bare <name> is a one-value item)
 
-  5dive secret https [status | enable --via=ip|sslip|domain|auto [--host=<name>] | disable]
+  5dive secret https [status | enable --via=5dive-app|ip|sslip|domain|auto [--host=<name>] | disable]
       A self-hosted box (no 5dive domain) has no https name for those links, so
-      its FIRST `secret link` makes one by itself: a Let's Encrypt certificate for
-      the box's public IP, else <ip>.sslip.io, served by Caddy on this box (ports
-      80 and 443). Nothing about a value passes through 5dive's servers. Behind
+      its FIRST `secret link` makes one by itself: the box's own free
+      <name>.5dive.app (5dive.app names a server when it links), else a Let's
+      Encrypt certificate for the box's public IP, else <ip>.sslip.io, served by
+      Caddy on this box (ports 80 and 443). Nothing about a value passes through 5dive's servers. Behind
       NAT or closed ports neither works: point your own domain at the box and run
       `sudo 5dive secret https enable --via=domain --host=box.example.com`, or use
       `secret write` at a terminal. --via=auto keeps the name the box has, else
