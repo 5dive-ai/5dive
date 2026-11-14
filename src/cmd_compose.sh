@@ -1831,10 +1831,12 @@ _compose_apply_prefer_type() {
 # the pair a roster's seats move between (prefer_type above); the Claude-only
 # pins are dropped as there. A pack seat is left to cmd_import, which knows the
 # harnesses its pack lands on. Prints the spec, unchanged with no login added.
+# DIVE-8481: a Gemini default is skipped (a plain seat never moves onto
+# antigravity), so the answer is the one it was before Gemini was counted.
 _compose_apply_newest_login() {
   local spec="$1"
   lazy_need account_default_v
-  account_default_v || { printf '%s\n' "$spec"; return 0; }
+  account_default_v "claude codex grok" || { printf '%s\n' "$spec"; return 0; }
   [[ "$ACCOUNT_DEFAULT_TYPE" == claude || "$ACCOUNT_DEFAULT_TYPE" == codex ]] \
     || { printf '%s\n' "$spec"; return 0; }
   jq --arg a "$ACCOUNT_DEFAULT_ACCOUNT" --arg t "$ACCOUNT_DEFAULT_TYPE" '
