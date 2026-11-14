@@ -427,7 +427,7 @@ account_each() {
 # newest login. A pinned login that is signed out right now is skipped, not
 # dropped: a file mid-refresh must not lose the owner's choice.
 #
-# DIVE-8481: Gemini (antigravity) counts too: an OINOA client signed in to
+# DIVE-8481: Gemini (antigravity) counts too: a partner's client signed in to
 # Gemini and "use for new employees" failed, since `account default
 # <acct>:antigravity` was refused and `account default <acct>` found no login.
 # No-type order is claude, codex, grok, then antigravity. A ledger written

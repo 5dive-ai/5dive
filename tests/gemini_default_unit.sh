@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DIVE-8481 — a Gemini (antigravity) login can be the login new agents use.
-# even-branch (OINOA, 2026-11-14): the client signed in to Gemini and tapped
+# A partner box (2026-11-14): the client signed in to Gemini and tapped
 # "use for new employees"; the box ran `account default client-gemini:antigravity`
 # and refused it (the type list was claude codex grok), and the 5dive app's
 # `account default <acct>` found "no claude codex grok login". Graded on a
@@ -87,8 +87,8 @@ fresh_box; gemini_login client-gemini
 account_types_authed_arr client-gemini
 eq_t 'fixture: the real reader sees the Gemini login as antigravity' antigravity "${ACCOUNT_TYPES_AUTHED[*]}"
 
-echo '== 1. account default <acct>:antigravity (what the OINOA app sends) =='
-# even-branch's box: the shared demo AI only, then the client's Gemini.
+echo '== 1. account default <acct>:antigravity (what the partner app sends) =='
+# The partner box: the shared demo AI only, then the client's Gemini.
 fresh_box; claude_login demo-ai; pick >/dev/null; gemini_login client-gemini
 JSON_MODE=1
 _o=$(cli cmd_account_default client-gemini:antigravity)
