@@ -2359,7 +2359,17 @@ if [[ "$TYPE" == "claude" && -n "${WORKDIR:-}" ]]; then
   # where it sits relative to the root (DIVE-5089: the walk stops at a git root).
   # Skip only when that exact canonical key already carries the flag — which is
   # every default-workdir agent, whose key the create-time preseed wrote.
-  if ! jq -e --arg d "$_wtr_dir" '.projects[$d].hasTrustDialogAccepted == true' \
+  #
+  # DIVE-8440: AND only when the top-level hasSeenAutoDefaultNudge is already
+  # true. DIVE-5255 seeds that flag at create time only, so a seat created before
+  # it can still open "Make auto mode your default permission mode?" after a
+  # restart (seen after `agent set-account`, 2026-11-12): the next Telegram
+  # message or dispatched /goal lands in the dialog, Enter picks "Yes", the
+  # message is lost and the seat silently switches to auto mode. Riding this
+  # read-modify-write back-fills every seat on its next start. It must be in the
+  # SKIP condition, not only in the merge: every default-workdir seat already
+  # trusts its workdir, so a merge-only change would reach almost no one.
+  if ! jq -e --arg d "$_wtr_dir" '.projects[$d].hasTrustDialogAccepted == true and .hasSeenAutoDefaultNudge == true' \
          "$_wtr_cfg" >/dev/null 2>&1; then
     _wtr_base='{}'
     if [[ -r "$_wtr_cfg" ]] && jq -e 'type == "object"' "$_wtr_cfg" >/dev/null 2>&1; then
@@ -2376,6 +2386,7 @@ if [[ "$TYPE" == "claude" && -n "${WORKDIR:-}" ]]; then
             hasTrustDialogAccepted: true,
             hasCompletedProjectOnboarding: true
           }) })
+        | .hasSeenAutoDefaultNudge = true
       ' <<<"$_wtr_base" 2>/dev/null) || _wtr_next=""
     if [[ -n "$_wtr_next" ]]; then
       if _wtr_tmp=$(mktemp "${_wtr_cfg}.XXXXXX" 2>/dev/null); then
@@ -2387,7 +2398,7 @@ if [[ "$TYPE" == "claude" && -n "${WORKDIR:-}" ]]; then
           # DIVE-1591 (2026-08-05): an unattributable red needs an instrument,
           # not another run. The workdir is a path, not a credential, so it can
           # be logged in full.
-          echo "[5dive] agent=${NAME} trusted workdir ${_wtr_dir} in ${_wtr_cfg}" >&2
+          echo "[5dive] agent=${NAME} trusted workdir ${_wtr_dir} and set hasSeenAutoDefaultNudge in ${_wtr_cfg}" >&2
         else
           rm -f "$_wtr_tmp" 2>/dev/null || :
           echo "[5dive] agent=${NAME} WARN: could not write ${_wtr_cfg} — the folder-trust dialog may arm for ${_wtr_dir}" >&2
@@ -2399,7 +2410,7 @@ if [[ "$TYPE" == "claude" && -n "${WORKDIR:-}" ]]; then
       echo "[5dive] agent=${NAME} WARN: could not build the workdir trust seed for ${_wtr_dir} — leaving ${_wtr_cfg} untouched" >&2
     fi
   else
-    echo "[5dive] agent=${NAME} workdir ${_wtr_dir} is already trusted in ${_wtr_cfg} — no trust seed needed" >&2
+    echo "[5dive] agent=${NAME} workdir ${_wtr_dir} is already trusted and the auto-mode nudge already seen in ${_wtr_cfg} — no seed needed" >&2
   fi
   unset _wtr_cfg _wtr_dir _wtr_base _wtr_next _wtr_tmp 2>/dev/null || :
 fi
