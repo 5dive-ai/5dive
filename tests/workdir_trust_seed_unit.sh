@@ -39,6 +39,8 @@ check "extracted block is non-empty and closed" \
   "$([[ -n "$BLOCK" && "$(tail -1 <<<"$BLOCK")" == "fi" ]] && echo yes || echo no)" "yes"
 check "extracted block really seeds hasTrustDialogAccepted" \
   "$(grep -q 'hasTrustDialogAccepted' <<<"$BLOCK" && echo yes || echo no)" "yes"
+check "extracted block really seeds hasSeenAutoDefaultNudge (DIVE-8440)" \
+  "$(grep -q 'hasSeenAutoDefaultNudge = true' <<<"$BLOCK" && echo yes || echo no)" "yes"
 check "extracted block reads the existing config (read-modify-write)" \
   "$(grep -q 'jq -e .type == .object' <<<"$BLOCK" && echo yes || echo no)" "yes"
 
@@ -53,10 +55,13 @@ SANDBOX="$TMP/home/agent-probe"; mkdir -p "$SANDBOX"
 # agent re-arms the theme picker AND loses root trust — worse than the stall.
 preseed() {
   jq -nc --arg r "$ROOT" '{
-    theme:"dark", hasCompletedOnboarding:true,
+    theme:"dark", hasCompletedOnboarding:true, hasSeenAutoDefaultNudge:true,
     projects: { ($r): {hasTrustDialogAccepted:true, hasCompletedProjectOnboarding:true} }
   }'
 }
+# DIVE-8440: what the create path wrote BEFORE DIVE-5255 (no nudge flag). 37 of
+# 44 seats on teal-fox still carried this shape on 2026-11-14.
+preseed_pre5255() { preseed | jq -c 'del(.hasSeenAutoDefaultNudge)'; }
 # A LIVE config: preseed plus Claude Code's own state. Without these keys an
 # assertion cannot SEE a clobber — a jq -n rewrite would still produce a valid
 # config with the right trust entry and pass.
@@ -149,6 +154,37 @@ H=$(run pretrusted claude "$REPO" "$TRUSTED")
 check "already-trusted workdir: config untouched" "$(unchanged "$H" "$TRUSTED")" "same"
 check "already-trusted workdir: says why it skipped" \
   "$(grep -c "is already trusted" "$H/.stderr")" "1"
+
+# --- 4d. DIVE-8440: a pre-DIVE-5255 seat at its DEFAULT workdir ---------------
+# The workdir is already trusted, so the old guard skipped the whole block and the
+# nudge flag was never seeded: the seat could open "Make auto mode your default
+# permission mode?" after a restart and lose its next message to it. The flag must
+# land, and every other key must survive unchanged.
+OLDLIVE=$(preseed_pre5255 | jq -c '. + {
+  numStartups: 41, machineID: "m-abc", userID: "u-xyz",
+  seenNotifications: ["tips"], pluginUsage: {"telegram": 3}
+}')
+H=$(run pre5255 claude "$ROOT" "$OLDLIVE")
+check "pre-5255 seat at trusted default workdir: nudge flag is SET" \
+  "$(jqf "$H" '.hasSeenAutoDefaultNudge')" "true"
+check "pre-5255 seat: every other key is unchanged" \
+  "$([[ "$(jq -S -c 'del(.hasSeenAutoDefaultNudge)' "$H/.claude.json")" == "$(jq -S -c . <<<"$OLDLIVE")" ]] && echo same || echo changed)" "same"
+check "pre-5255 seat: no extra project entry added" "$(jqf "$H" '.projects | length')" "1"
+check "pre-5255 seat: exits 0 under set -e" "$(cat "$H/.rc")" "0"
+check "pre-5255 seat: no WARN" "$(grep -c 'WARN' "$H/.stderr")" "0"
+check "pre-5255 seat: mode 600" "$(stat -c '%a' "$H/.claude.json")" "600"
+# A flag Claude Code itself wrote as false is flipped, not left alone.
+H=$(run nudgefalse claude "$ROOT" "$(preseed | jq -c '.hasSeenAutoDefaultNudge = false')")
+check "nudge flag false: flipped to TRUE" "$(jqf "$H" '.hasSeenAutoDefaultNudge')" "true"
+# Second start is a no-op once both flags hold.
+FIRST=$(cat "$H/.claude.json")
+( set -euo pipefail; HOME="$H"; NAME=probe; TYPE=claude; WORKDIR="$ROOT"; DEFAULT_WORKDIR="$ROOT"; eval "$BLOCK" ) 2>>"$H/.stderr"
+check "nudge back-fill: second start is a no-op" \
+  "$([[ "$FIRST" == "$(cat "$H/.claude.json")" ]] && echo same || echo changed)" "same"
+# An untrusted workdir on a pre-5255 seat gets both in one write.
+H=$(run pre5255sandbox claude "$SANDBOX" "$(preseed_pre5255)")
+check "pre-5255 seat, untrusted workdir: trusted" "$(trusted "$H" "$SANDBOX")" "true"
+check "pre-5255 seat, untrusted workdir: nudge flag set" "$(jqf "$H" '.hasSeenAutoDefaultNudge')" "true"
 
 # --- 5. ASSERT THE FIELD, NOT THE KEY ----------------------------------------
 # Claude Code creates the project entry itself on first visit with
@@ -259,7 +295,7 @@ mut_red "entry added without the trust boolean" "$M3" fieldless "$SANDBOX" "$(pr
   ".projects[\"$SANDBOX\"].hasTrustDialogAccepted" "true"
 
 # The shipped guard line, so every guard mutant below is a whole-line swap.
-GUARD='  if ! jq -e --arg d "$_wtr_dir" '"'"'.projects[$d].hasTrustDialogAccepted == true'"'"' \'
+GUARD='  if ! jq -e --arg d "$_wtr_dir" '"'"'.projects[$d].hasTrustDialogAccepted == true and .hasSeenAutoDefaultNudge == true'"'"' \'
 check "guard line present in the block exactly once" "$(grep -cFx "$GUARD" <<<"$BLOCK")" "1"
 # Prefix/suffix split, NOT ${b/pat/rep}: bash 5.2's patsub_replacement expands a
 # bare `&` in the replacement to the matched text, so an `&&` guard came out as
@@ -297,8 +333,20 @@ M6="${BLOCK//WORKDIR/_WD_RESOLVED_TOO_EARLY}"
 mut_red "workdir resolved too early (the create-path patch: empty for sandboxed)" "$M6" tooearly "$SANDBOX" "$(preseed)" \
   ".projects[\"$SANDBOX\"].hasTrustDialogAccepted" "true"
 
+# M8 — DIVE-8440, THE TRAP the ticket names: the flag added to the MERGE only,
+# with the pre-8440 skip condition kept. Every default-workdir seat already
+# trusts its workdir, so the block never runs for it and the flag never lands.
+M8=$(swap_guard "$BLOCK" '  if ! jq -e --arg d "$_wtr_dir" '"'"'.projects[$d].hasTrustDialogAccepted == true'"'"' \')
+mut_red "nudge flag in the merge only, skip keyed on trust alone" "$M8" mergeonly "$ROOT" "$(preseed_pre5255)" \
+  '.hasSeenAutoDefaultNudge' "true"
+
+# M9 — the skip widened but the merge never writes the flag.
+M9="${BLOCK//| .hasSeenAutoDefaultNudge = true/}"
+mut_red "skip widened, flag never written" "$M9" guardonly "$ROOT" "$(preseed_pre5255)" \
+  '.hasSeenAutoDefaultNudge' "true"
+
 # Every mutant must actually differ from the block, or mut_red graded a typo.
-for m in M2 M3 M4 M5 M6 M7; do
+for m in M2 M3 M4 M5 M6 M7 M8 M9; do
   check "mutant $m really differs from the shipped block" \
     "$([[ "${!m}" != "$BLOCK" ]] && echo differs || echo identical)" "differs"
   # A mutant that does not parse leaves the config untouched and so "goes red"
