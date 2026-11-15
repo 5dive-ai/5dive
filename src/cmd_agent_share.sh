@@ -140,7 +140,11 @@ _share_scan() {
   # the page is published under that name. Every other hit stands.
   local hits; hits=$(_pack_memory_leakscan "$d" "$name" 2>&1 >/dev/null) || true
   rm -rf "$d"
-  hits=$(printf '%s\n' "$hits" | grep -viE ": identity-name: agent-${name}$" | grep -v '^$' || true)
+  # DIVE-8507: nor is our own public site. Every character pack's persona links
+  # https://5dive.com/team (or .ai), so every hired agent was refused on it. Only
+  # the bare apex (or www.) passes: a box's own <name>.5dive.ai still refuses.
+  hits=$(printf '%s\n' "$hits" | grep -viE ": identity-name: agent-${name}$" \
+    | grep -viE ": hostname: (www\.)?5dive\.(com|ai)$" | grep -v '^$' || true)
   [[ -z "$hits" ]] && return 0
   printf '%s\n' "$hits" >&2
   return 1
@@ -149,12 +153,16 @@ _share_scan() {
 # DIVE-8149: the staged skills that are ours and unchanged, one id per line.
 # <stage> <agent>. Prints nothing when the agent has no lock, a lock it cannot
 # read, or a skill that does not match: the safe answer is "scan it".
-# computedHash is the `skills` CLI's own: sha256 over each file's relative path
-# then its bytes, files in JavaScript localeCompare order (.git and
-# node_modules skipped). localeCompare is ICU collation, which python cannot
-# reproduce exactly, so three orders are tried. That is no weaker: a match means
-# the staged bytes ARE the public bytes in some order, so nothing private is in
-# them.
+# DIVE-8507: computedHash is the `skills` CLI's own hashSkillFiles (skills
+# 1.8.1, dist/_chunks/remove.mjs), and this is that recipe exactly: files sorted
+# by their UTF-8 relative path in plain byte order (Buffer.compare), then per
+# file `path NUL len(content) NUL content`, CRLF folded to LF in a file with no
+# NUL byte. DIVE-8149 guessed "path then bytes, localeCompare order" and so
+# matched no seat ever (ecbdd4ba... against the lock's a7617c10...).
+# The CLI skips metadata.json and the dirs .git/__pycache__/__pypackages__ when
+# hashing. Bytes it skips are bytes the hash does not vouch for, and an exempt
+# skill is not scanned at all, so a staged skill holding any of them (or a
+# symlink) is never exempt: it is scanned like any other.
 _share_public_skill_ids() {
   local stage="$1" name="$2" lock
   lock="${AGENT_HOME_ROOT:-/home}/agent-${name}/skills-lock.json"
@@ -171,29 +179,29 @@ def norm(src):
     s = str(src or "").strip().lower()
     s = re.sub(r"^(https?://)?(www\.)?github\.com/", "", s)
     return re.sub(r"(\.git)?/*$", "", s)
+UNHASHED_DIRS = (".git", "__pycache__", "__pypackages__")
 def files_of(root):
+    """[(utf-8 relpath, abspath)], or None when the hash would not cover it all."""
     out = []
     for cur, dirs, names in os.walk(root, followlinks=False):
-        dirs[:] = [x for x in dirs if x not in (".git", "node_modules")]
+        for x in dirs:
+            if x in UNHASHED_DIRS or os.path.islink(os.path.join(cur, x)):
+                return None
         for n in names:
             p = os.path.join(cur, n)
-            if os.path.isfile(p) and not os.path.islink(p):
-                out.append((os.path.relpath(p, root).replace(os.sep, "/"), p))
+            if n == "metadata.json" or os.path.islink(p) or not os.path.isfile(p):
+                return None
+            out.append((os.path.relpath(p, root).replace(os.sep, "/").encode("utf-8"), p))
     return out
-def icu_key(s):  # ICU root order: punctuation < digits < letters, case second
-    k = []
-    for c in s:
-        if c.isalpha(): k.append((2, c.lower()))
-        elif c.isdigit(): k.append((1, c))
-        else: k.append((0, c))
-    return (k, s)
-orders = (icu_key, lambda s: (s.lower(), s), lambda s: s)
-def digest(files, key):
+def digest(files):
     h = hashlib.sha256()
-    for rel, p in sorted(files, key=lambda f: key(f[0])):
-        h.update(rel.encode("utf-8"))
+    for rel, p in sorted(files, key=lambda f: f[0]):
         with open(p, "rb") as fh:
-            h.update(fh.read())
+            body = fh.read()
+        if b"\0" not in body:
+            body = body.replace(b"\r\n", b"\n")
+        h.update(rel + b"\0" + str(len(body)).encode() + b"\0")
+        h.update(body)
     return h.hexdigest()
 for sid in sorted(os.listdir(skills_dir)):
     entry = skills.get(sid)
@@ -204,7 +212,7 @@ for sid in sorted(os.listdir(skills_dir)):
     if norm(entry.get("source")) != ours or not re.fullmatch(r"[0-9a-f]{64}", want):
         continue
     files = files_of(root)
-    if files and any(digest(files, k) == want for k in orders):
+    if files and digest(files) == want:
         print(sid)
 PY
 }

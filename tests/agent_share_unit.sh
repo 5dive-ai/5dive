@@ -209,23 +209,17 @@ fixture gamma "I am agent-gamma on this box."
 (cmd_agent_share gamma) >/dev/null 2>&1 && ok_t "the agent's own account name is not a leak" || bad_t "own account name refused"
 
 echo '== DIVE-8149: our own skill, unchanged, is not refused; an edited copy is =='
-# The lock `skills add` writes in the agent's home, with the skills CLI's OWN
-# hash (copied from its computeSkillFolderHash: path then bytes per file, files
-# in JavaScript localeCompare order), computed by node so the CLI's python
-# re-implementation is graded against the real algorithm, not against itself.
+# The lock `skills add` writes in the agent's home. DIVE-8507: the hashes are
+# FIXED VECTORS produced by the real `skills` CLI 1.8.1 (computeSkillFolderHash
+# in node_modules/skills/dist/_chunks/remove.mjs) over exactly these fixture
+# bytes, never by a re-implementation: DIVE-8149's test computed its expected
+# hash with the same wrong recipe as the code, so it passed and matched no seat.
 gh_org() { printf '%s' "${GH_ORG:-5dive-ai}"; }
 AGENT_HOME_ROOT="$TMP/homes"
-skills_hash() { # <skill dir>
-  node -e '
-const fs=require("fs"),path=require("path"),crypto=require("crypto");
-const root=process.argv[1],files=[];
-(function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){const p=path.join(d,e.name);
-  if(e.isDirectory()){if(e.name===".git"||e.name==="node_modules")continue;walk(p);}
-  else if(e.isFile())files.push({rel:path.relative(root,p).split("\\").join("/"),p});}})(root);
-files.sort((a,b)=>a.rel.localeCompare(b.rel));
-const h=crypto.createHash("sha256");for(const f of files){h.update(f.rel);h.update(fs.readFileSync(f.p));}
-console.log(h.digest("hex"));' "$1"
-}
+# skills 1.8.1 over cli_skill_fixture's two files:
+CLI_FIXTURE_HASH=07dee1788573bf08d4111bbd5f9613884dd3aa228de017743cbec11d04b41cf4
+# DIVE-8149's recipe (path+bytes, localeCompare) over the same bytes: must NOT match.
+CLI_FIXTURE_OLD_RECIPE=df24e8ea6c822fc2ee3f25157e4b898e8050f85dffdaae094d9588783d931c56
 cli_skill_fixture() { # <agent>: the default 5dive-cli skill, as public as ours is
   local s="$TMP/fixture/$1/skills/5dive-cli"; mkdir -p "$s/references"
   printf -- '---\nname: 5dive-cli\n---\nRun the local CLI.\n' > "$s/SKILL.md"
@@ -233,13 +227,11 @@ cli_skill_fixture() { # <agent>: the default 5dive-cli skill, as public as ours 
 }
 lock_for() { # <agent> <source> [hash]
   mkdir -p "$AGENT_HOME_ROOT/agent-$1"
-  jq -n --arg s "$2" --arg h "${3-$(skills_hash "$TMP/fixture/$1/skills/5dive-cli")}" \
+  jq -n --arg s "$2" --arg h "${3-$CLI_FIXTURE_HASH}" \
     '{version:1, skills:{"5dive-cli":{source:$s, sourceType:"github", skillPath:"5dive-cli/SKILL.md", computedHash:$h}}}' \
     > "$AGENT_HOME_ROOT/agent-$1/skills-lock.json"
 }
-if ! command -v node >/dev/null 2>&1; then
-  bad_t '8149: node is needed to compute the skills CLI hash' "no node on PATH"
-else
+{
   fixture vesper ""; cli_skill_fixture vesper
   # Control: the fixture skill really does trip the scan, with no lock.
   out=$( (cmd_agent_share vesper) 2>&1 ); rc=$?
@@ -276,8 +268,58 @@ else
   out=$( (cmd_agent_share vesper) 2>&1 ); rc=$?
   eq_t '8149/own skill next to ours is still scanned' "$E_VALIDATION" "$rc"
   not_t '8149/... and ours is not in the list' "$out" "skills/5dive-cli/"
-fi
+  # DIVE-8507: the old recipe's hash is refused (the bug: it was all 8149 matched).
+  fixture vesper ""; cli_skill_fixture vesper; lock_for vesper 5dive-ai/skills "$CLI_FIXTURE_OLD_RECIPE"
+  (cmd_agent_share vesper) >/dev/null 2>&1 && bad_t '8507/the DIVE-8149 recipe hash is scanned' "shared" || ok_t '8507/the DIVE-8149 recipe hash is scanned'
+  # One edited byte (not a line, a byte) is scanned again.
+  lock_for vesper 5dive-ai/skills
+  sed -i 's/DIVE-1234/DIVE-1235/' "$TMP/fixture/vesper/skills/5dive-cli/references/commands.md"
+  (cmd_agent_share vesper) >/dev/null 2>&1 && bad_t '8507/one edited byte is scanned' "shared" || ok_t '8507/one edited byte is scanned'
+  # Bytes the CLI's hash skips (metadata.json, __pycache__/) would ride an
+  # exempt skill unscanned: such a skill is never exempt.
+  fixture vesper ""; cli_skill_fixture vesper; lock_for vesper 5dive-ai/skills
+  printf '{"note":"/home/owner/z"}\n' > "$TMP/fixture/vesper/skills/5dive-cli/metadata.json"
+  out=$( (cmd_agent_share vesper) 2>&1 ); rc=$?
+  eq_t '8507/a metadata.json the hash skips voids the exemption' "$E_VALIDATION" "$rc"
+  has_t '8507/... and it is scanned' "$out" "skills/5dive-cli/metadata.json:1: host-path"
+  fixture vesper ""; cli_skill_fixture vesper; lock_for vesper 5dive-ai/skills
+  mkdir -p "$TMP/fixture/vesper/skills/5dive-cli/__pycache__"; printf 'x\n' > "$TMP/fixture/vesper/skills/5dive-cli/__pycache__/m.pyc"
+  (cmd_agent_share vesper) >/dev/null 2>&1 && bad_t '8507/a __pycache__ dir voids the exemption' "shared" || ok_t '8507/a __pycache__ dir voids the exemption'
+  # The recipe's edges, straight on the reader, against a second skills 1.8.1
+  # vector: byte order (SKILL.md < Zeta/ < a-b < a_b, not locale order), CRLF
+  # folded to LF in a text file, kept in a file holding NUL, a non-ASCII path.
+  st="$TMP/vec"; rm -rf "$st"; mkdir -p "$st/skills/s/Zeta" "$st/skills/s/sub" "$AGENT_HOME_ROOT/agent-vec"
+  printf -- '---\nname: s\n---\r\nsudo x\r\n' > "$st/skills/s/SKILL.md"; printf 'b\0\r\n' > "$st/skills/s/bin.dat"
+  printf 'u\n' > "$st/skills/s/Zeta/up.md"; printf 'l\n' > "$st/skills/s/a-b.md"; printf 'l2\n' > "$st/skills/s/a_b.md"
+  printf 'e\n' > "$st/skills/s/sub/é.md"
+  jq -n '{version:1, skills:{s:{source:"5dive-ai/skills", computedHash:"3c8ecc4b50dd861a8c778741e6a02db581d766c5eaa3a4f27a141f40cd9e5621"}}}' \
+    > "$AGENT_HOME_ROOT/agent-vec/skills-lock.json"
+  eq_t '8507/skills 1.8.1 vector: byte order, CRLF fold, NUL file, utf-8 path' "s" "$(_share_public_skill_ids "$st" vec)"
+  printf 'b\0\n' > "$st/skills/s/bin.dat"
+  eq_t '8507/... a NUL file keeps its CRLF (LF there is a different hash)' "" "$(_share_public_skill_ids "$st" vec)"
+}
 unset AGENT_HOME_ROOT
+
+echo '== DIVE-8507: a character pack as shipped shares =='
+# The pack's browser offer (`sudo 5dive plugin add ...`) sits in a
+# 5dive:browser-offer block, and its persona links our own site.
+fixture pack ""
+printf '<!-- 5dive:browser-offer:begin (box-specific) -->\n- run `sudo 5dive plugin add 5dive-ai/5dive-browser --yes`\n<!-- 5dive:browser-offer:end -->\n' >> "$TMP/fixture/pack/CLAUDE.md"
+printf 'links:\n  profile: https://5dive.com/team\n  site: https://www.5dive.ai/\n' >> "$TMP/fixture/pack/persona.yaml"
+out=$( (cmd_agent_share pack) 2>&1 ); rc=$?
+eq_t '8507/pack browser-offer block + our site link: shares (rc 0)' 0 "$rc"
+pmd=$(tar -xOzf "$(_share_dir_of_agent pack)/pack.tar.gz" --wildcards '*CLAUDE.md' 2>/dev/null)
+has_t '8507/... the copy carries the pack text (control)' "$pmd" "You find leads and write them up."
+not_t '8507/... but not the box-specific offer' "$pmd" "plugin add 5dive-ai/5dive-browser"
+# Only the bare apex passes: a box's own address under our domain still refuses.
+fixture pack ""
+printf 'links:\n  profile: https://teal-fox.5dive.ai/team\n' >> "$TMP/fixture/pack/persona.yaml"
+out=$( (cmd_agent_share pack) 2>&1 ); rc=$?
+eq_t '8507/a box address under our domain still refuses' "$E_VALIDATION" "$rc"
+has_t '8507/... and names it' "$out" "persona.yaml:5: hostname: teal-fox.5dive.ai"
+fixture pack ""
+printf 'see acme-5dive.com\n' >> "$TMP/fixture/pack/persona.yaml"
+(cmd_agent_share pack) >/dev/null 2>&1 && bad_t '8507/a lookalike domain still refuses' "shared" || ok_t '8507/a lookalike domain still refuses'
 
 echo '== the page server serves shares =='
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
