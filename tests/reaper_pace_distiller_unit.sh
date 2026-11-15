@@ -47,6 +47,7 @@ hasnt() { case "$2" in *"$3"*) bad "$1" "[$2] contains [$3]" ;; *) ok "$1" ;; es
 # sourced, so this harness can never read — or poison — a running host's
 # pacing state, and so it needs no box path to run at all (DIVE-4731).
 export FIVE_PACE_READING_CACHE_DIR="$TMPD/pace-reading"
+export FIVE_PACE_SEAT_BOUND_FILE="$TMPD/pace-seat-bound.json"   # DIVE-8512: never the live host's remembered bounds
 
 # ═════════════════════════════ A — the reaper ═════════════════════════════
 . src/lib/reap.sh
