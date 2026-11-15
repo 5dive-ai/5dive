@@ -481,10 +481,107 @@ cmd_disk_alarm() {
   fi
 }
 
+# -------- DIVE-8491: grow the root filesystem into a disk that got bigger --------
+#
+# The partner disk trigger (5dive-api, DIVE-8212) moves a nearly full box to the
+# next server type with upgrade_disk: Hetzner hands it an 80 GB disk. On a box
+# whose image boots cloud-init, growpart/resizefs then fill it. The 2026-10-17
+# cx43->cx23 disk clones (frank-lake, zen-spruce and four more) carry
+# /etc/cloud/cloud-init.disabled, so they kept a 40 GB root on an 80 GB disk:
+# frank-lake read "used 11.6 of 40.0 GB" after its 01:25Z 11-15 move, a move that
+# bills more and delivers no space. Nobody may log into a client box (lodar
+# 10-30), so the box grows itself, here, on the hourly tick.
+#
+# It does what cloud-init's growpart + resizefs modules do, and nothing more:
+#   - root only, and only on a box 5dive built (provisioning.env). A self-hosted
+#     box may leave space unallocated on purpose; that is its owner's call.
+#   - / must be ext4 on a plain partition of a whole disk (resize2fs grows it
+#     online, no reboot). LVM, RAID, overlay, xfs, btrfs: skipped, logged.
+#   - that partition must be the LAST one on its disk: Hetzner puts sda14/15 at
+#     the front and sda1 (root) at the end. Anything after it -> skipped.
+#   - nothing to grow (under 1 GiB of slack) -> nothing runs.
+# Then `growpart <disk> <n>` and `resize2fs <part>`. A filesystem smaller than its
+# partition (a growpart that ran, a resize2fs that did not) is grown alone.
+#
+# Test seams: FIVEDIVE_DISK_SYSFS (a fake /sys/class/block), FIVEDIVE_DISK_ROOT_DEV
+# and FIVEDIVE_DISK_ROOT_FSTYPE (what findmnt would say). FIVEDIVE_DISK_GROW=0
+# turns the step off (the sweep harness sets it: it must never reach a CI disk).
+DISK_SYSFS="${FIVEDIVE_DISK_SYSFS:-/sys/class/block}"
+DISK_GROW_MIN_SECTORS=$(( 1024 * 1024 * 2 ))   # 1 GiB in 512-byte sectors
+
+_disk_grow_managed() { [[ -f "${SELF_UPDATE_PROVISIONING:-/etc/5dive/provisioning.env}" ]]; }
+
+# Filesystem size in 512-byte sectors, from the superblock. Empty if unreadable.
+_disk_fs_sectors() {
+  local dev="$1" bc bs
+  read -r bc bs < <(LC_ALL=C dumpe2fs -h "$dev" 2>/dev/null \
+    | awk -F: '/^Block count:/{gsub(/ /,"",$2); c=$2} /^Block size:/{gsub(/ /,"",$2); s=$2} END{print c, s}')
+  [[ "${bc:-}" =~ ^[0-9]+$ && "${bs:-}" =~ ^[0-9]+$ ]] || return 0
+  printf '%s' $(( bc * bs / 512 ))
+}
+
+cmd_disk_grow() {
+  local dry=0 a src fstype part disk n start size total p pstart end slack fs
+  for a in "$@"; do
+    case "$a" in
+      --dry-run) dry=1 ;;
+      -h|--help) echo "usage: 5dive disk grow [--dry-run]   # grow / into free space after a bigger disk (see: 5dive disk --help)"; return 0 ;;
+      *) die "disk grow: unknown flag '$a'" ;;
+    esac
+  done
+  if ! _disk_is_root; then _disk_log "disk-grow skipped=not-root"; return 0; fi
+  if ! _disk_grow_managed; then _disk_log "disk-grow skipped=self-hosted"; return 0; fi
+  src="${FIVEDIVE_DISK_ROOT_DEV:-$(findmnt -no SOURCE / 2>/dev/null)}"
+  fstype="${FIVEDIVE_DISK_ROOT_FSTYPE:-$(findmnt -no FSTYPE / 2>/dev/null)}"
+  if [[ "$fstype" != ext4 ]]; then _disk_log "disk-grow skipped=fstype:${fstype:-unknown}"; return 0; fi
+  part="${src#/dev/}"
+  if [[ "$src" != /dev/* || -z "$part" || "$part" == */* || ! -r "$DISK_SYSFS/$part/partition" ]]; then
+    _disk_log "disk-grow skipped=not-a-partition:${src:-unknown}"; return 0
+  fi
+  # The parent disk is the sysfs dir the partition sits under.
+  disk=$(basename "$(dirname "$(readlink -f "$DISK_SYSFS/$part")")")
+  n=$(cat "$DISK_SYSFS/$part/partition" 2>/dev/null)
+  start=$(cat "$DISK_SYSFS/$part/start" 2>/dev/null)
+  size=$(cat "$DISK_SYSFS/$part/size" 2>/dev/null)
+  total=$(cat "$DISK_SYSFS/$disk/size" 2>/dev/null)
+  if [[ ! "$n" =~ ^[0-9]+$ || ! "$start" =~ ^[0-9]+$ || ! "$size" =~ ^[0-9]+$ || ! "$total" =~ ^[0-9]+$ || ! -d "$DISK_SYSFS/$disk" ]]; then
+    _disk_log "disk-grow skipped=unreadable part=$part disk=$disk"; return 0
+  fi
+  for p in "$DISK_SYSFS/$disk"/*/partition; do
+    [[ -e "$p" ]] || continue
+    pstart=$(cat "$(dirname "$p")/start" 2>/dev/null)
+    if [[ "$pstart" =~ ^[0-9]+$ ]] && (( pstart > start )); then
+      _disk_log "disk-grow skipped=root-not-last part=$part after=$(basename "$(dirname "$p")")"; return 0
+    fi
+  done
+  end=$(( start + size )); slack=$(( total - end ))
+  if (( slack >= DISK_GROW_MIN_SECTORS )); then
+    if ! command -v growpart >/dev/null 2>&1; then _disk_log "disk-grow skipped=no-growpart part=$part slack_mb=$(( slack / 2048 ))"; return 0; fi
+    if [[ "$dry" == 1 ]]; then _disk_log "disk-grow would-grow part=$part disk=$disk slack_mb=$(( slack / 2048 )) dry_run=1"; return 0; fi
+    if ! LC_ALL=C timeout 120 growpart "/dev/$disk" "$n" >/dev/null 2>&1; then
+      _disk_log "disk-grow FAILED step=growpart part=$part disk=$disk slack_mb=$(( slack / 2048 ))"; return 0
+    fi
+    size=$(cat "$DISK_SYSFS/$part/size" 2>/dev/null)
+    _disk_log "disk-grow grew-partition part=$part disk=$disk from_mb=$(( (end - start) / 2048 )) to_mb=$(( ${size:-0} / 2048 ))"
+  fi
+  fs=$(_disk_fs_sectors "/dev/$part")
+  if [[ ! "$fs" =~ ^[0-9]+$ ]]; then _disk_log "disk-grow skipped=fs-size-unreadable part=$part"; return 0; fi
+  (( size - fs >= DISK_GROW_MIN_SECTORS )) || return 0
+  if [[ "$dry" == 1 ]]; then _disk_log "disk-grow would-resize part=$part fs_mb=$(( fs / 2048 )) part_mb=$(( size / 2048 )) dry_run=1"; return 0; fi
+  if LC_ALL=C timeout 600 resize2fs "/dev/$part" >/dev/null 2>&1; then
+    _disk_log "disk-grow resized part=$part fs_mb_before=$(( fs / 2048 )) part_mb=$(( size / 2048 ))"
+  else
+    _disk_log "disk-grow FAILED step=resize2fs part=$part fs_mb=$(( fs / 2048 )) part_mb=$(( size / 2048 ))"
+  fi
+  return 0
+}
+
 # Hourly from /etc/cron.d/5dive-disk. Always returns 0: a cron that fails loudly
 # every hour mails root and fixes nothing.
 cmd_disk_tick() {
   local now last pct
+  # DIVE-8491: first, so a box just moved to a bigger disk is read at its new size.
+  if [[ "${FIVEDIVE_DISK_GROW:-1}" != 0 ]]; then cmd_disk_grow || true; fi
   now=$(date +%s); last=$(_disk_state_get '.last_sweep_at'); [[ "$last" =~ ^[0-9]+$ ]] || last=0
   pct=$(_disk_free_pct "$DISK_ALARM_PATH" || echo 100)
   if (( now - last >= DISK_SWEEP_EVERY )) || { (( pct < DISK_PRESSURE_PCT )) && (( now - last >= DISK_PRESSURE_SWEEP_EVERY )); }; then
@@ -501,6 +598,7 @@ cmd_disk() {
     sweep) cmd_disk_sweep "$@" ;;
     alarm) cmd_disk_alarm "$@" ;;
     tick)  cmd_disk_tick "$@" ;;
+    grow)  cmd_disk_grow "$@" ;;
     ""|-h|--help|help)
       cat <<'EOF'
 usage: 5dive disk sweep [--dry-run]   delete ONLY caches a tool rebuilds on its own:
@@ -510,8 +608,11 @@ usage: 5dive disk sweep [--dry-run]   delete ONLY caches a tool rebuilds on its 
                                       pip download caches (via npm/nvm/pip); apt-get
                                       clean; disabled snap revisions. Logs what it freed.
        5dive disk alarm               tell the box owner once when the disk is under 5% free
-       5dive disk tick                the hourly cron driver: daily sweep (hourly under
-                                      pressure), then the alarm
+       5dive disk grow [--dry-run]    on a box 5dive built: grow / (ext4, last partition)
+                                      into the rest of its disk after a move to a bigger
+                                      server; does nothing when there is nothing to grow
+       5dive disk tick                the hourly cron driver: grow, daily sweep (hourly
+                                      under pressure), then the alarm
 Never touched: homes, projects, agent memory and transcripts, model caches,
 reaped-agent backups, node versions. Log: /var/log/5dive/disk-sweep.log
 EOF
