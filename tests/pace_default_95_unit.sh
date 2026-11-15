@@ -39,6 +39,7 @@ bad_(){ FAIL=$((FAIL+1)); printf 'FAIL %s — %s\n' "$1" "${2:-}"; }
 unset FIVE_PACE_7D_SOFT FIVE_PACE_7D_HARD FIVE_PACE_5H FIVE_PACE_BLIND FIVE_PACE_UNMETERED
 export BOX_CONFIG="$TMP/box.json"; printf '{}\n' >"$BOX_CONFIG"
 export FIVE_PACE_READING_CACHE_DIR="$TMP/pace-reading"
+export FIVE_PACE_SEAT_BOUND_FILE="$TMP/pace-seat-bound.json"   # DIVE-8512: never the live host's remembered bounds
 
 SRC=src
 # shellcheck disable=SC1090

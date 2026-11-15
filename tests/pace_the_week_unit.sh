@@ -54,6 +54,7 @@ trap 'rc=$?; rm -rf "$TMPD"; echo "HARNESS-RC=$rc"' EXIT
 # sources grader_pool.sh, so this harness can never read — or poison — the
 # running host's pacing state.
 export FIVE_PACE_READING_CACHE_DIR="$TMPD/pace-reading"
+export FIVE_PACE_SEAT_BOUND_FILE="$TMPD/pace-seat-bound.json"   # DIVE-8512: never the live host's remembered bounds
 # DIVE-4890: the floors are also a box setting now, read at call time from the
 # box file. Point it at scratch too, or a host that ran `5dive config
 # pace-week=…` would grade every arm below against its own floors.

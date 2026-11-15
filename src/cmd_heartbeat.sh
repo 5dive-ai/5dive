@@ -11051,6 +11051,9 @@ cmd_heartbeat_tick() {
     # that held and counts it once, in its own counter (tier -> sk_held, pace ->
     # sk_pace). The seat-level spend cap holds before this loop, in sk_capped.
     local _h_tier=0 _h_unmeas=0 _h_pace=0
+    # DIVE-8512: the wake line reads the picked row's pace verdict; reset per
+    # seat so it can never carry the previous seat's.
+    local _pace_verdict="" _pace_rc=0
     while IFS= read -r _cand; do
       [[ -n "$_cand" ]] || continue
       _cand_n=$((_cand_n + 1))
@@ -11552,7 +11555,11 @@ cmd_heartbeat_tick() {
       continue
     fi
     if (( _wake_rc == 0 )); then
-      _hb_log "[$name] due + todo ${task_ident} — waking (fresh=${eff_fresh})"
+      # DIVE-8512: a row the pacing floor admitted BLIND names that on this line.
+      local _pace_note=""
+      declare -F _pace_wake_note >/dev/null 2>&1 \
+        && _pace_note=$(_pace_wake_note "${_pace_rc:-0}" "${_pace_verdict:-}" 2>/dev/null || printf '')
+      _hb_log "[$name] due + todo ${task_ident} — waking (fresh=${eff_fresh}${_pace_note})"
       with_registry_lock _hb_wake_budget_inc "$name" "$today" >/dev/null 2>&1 || true  # DIVE-1858: count this wake
       with_registry_lock _hb_clear_active_defer "$name" >/dev/null 2>&1 || true  # DIVE-1486: episode over
       local nudge_n

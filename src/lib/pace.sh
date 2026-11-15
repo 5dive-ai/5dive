@@ -811,6 +811,94 @@ _pace_account_seven_bound() {  # <account> [<now-epoch>] -> "<pct><US><resets>" 
 # Overridable by the same contract as _PACE_ACCOUNT_CMD, for the same reason.
 _PACE_ACCOUNT_BOUND_CMD="${_PACE_ACCOUNT_BOUND_CMD:-_pace_account_seven_bound}"
 
+# ── DIVE-8512: THE SEAT DOCUMENT'S READING IS A LOWER BOUND TOO ─────────────
+#
+# Measured on chill-gorge, 4 nights in 13 days (11-02, 11-08, 11-09, 11-14):
+#
+#   20:05:14Z  DIVE-1305 (high) HELD — hard … acct-1 is at 99% (from the SEAT reading)
+#   20:10:21Z  due + todo DIVE-1305 — waking (fresh=false)
+#
+# and the account still read 99% hours later. The account carrier was empty
+# (the hold already said "from the seat reading"), so `_pace_account_seven_bound`
+# — which reads the SAME carrier — had nothing either. The only 99% the floor
+# had came from the seat usage document, and that document is replaced whole
+# every `_PACE_CACHE_SEC`. The first re-collect after the nightly update was
+# non-empty (no meter-failure line) but carried no sevenDayPct for acct-1 — its
+# seats had just restarted and not rendered a statusline yet — so the floor saw
+# no current reading, no bound, and went BLIND, which is OPEN by default.
+#
+# The DIVE-4586 argument applies to this source unchanged: a weekly percentage
+# never falls before its own reset. So every fresh collect REMEMBERS, per
+# account, the highest seat reading whose reset is still in the future — paired
+# with THAT reading's own reset, never a sibling's (a pct and its reset are one
+# reading) — and the bound branch consults it beside the account bound. It is
+# admitted in the same ONE direction: it can raise the floor, never open it,
+# never buy the near-reset relaxation, and it is dropped the moment its window
+# turns over. A later document that carries the account replaces the entry (the
+# last reading wins); one that is silent about it leaves the entry alone, which
+# is the whole fix.
+#
+# A FILE, beside the usage cache, for the reason the reading cache is one: the
+# floor is graded inside command substitutions and across ticks.
+_pace_seat_bound_path() {
+  printf '%s' "${FIVE_PACE_SEAT_BOUND_FILE:-${_PACE_CACHE_FILE%.json}.seat-bound.json}"
+}
+
+# `_pace_seat_bound_remember <now>` (usage document on stdin) — merge the
+# document's per-account weekly readings into the remembered bounds. Accounts
+# the document does not carry keep their entry until its reset passes. Never
+# fails the caller.
+_pace_seat_bound_remember() {  # <now>  [<usage-json-on-stdin>]
+  local now="${1:-}" json f old new tmp
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  json=$(cat)
+  [[ -n "$json" ]] || return 0
+  f=$(_pace_seat_bound_path)
+  old=$(jq -c 'if type == "object" then . else {} end' "$f" 2>/dev/null) || old=""
+  [[ -n "$old" ]] || old='{}'
+  new=$(printf '%s' "$json" | jq -c --argjson now "$now" --argjson old "$old" '
+    [ (.data // .) | .. | objects
+      | select((.account? | type) == "string" and (.sevenDayPct? | type) == "number")
+      | { a: .account, p: .sevenDayPct,
+          r: (.sevenDayResetsAt
+              | if type == "number" then floor
+                elif type == "string" and test("^[0-9]+$") then tonumber
+                else null end) }
+      | select(.r != null and .r > $now) ]
+    | group_by(.a)
+    | map(max_by(.p) | { key: .a, value: { pct: .p, resets: .r, asOf: $now } })
+    | from_entries as $fresh
+    | ($old | with_entries(select((.value.resets? | type) == "number" and .value.resets > $now)))
+      + $fresh
+  ' 2>/dev/null) || return 0
+  [[ -n "$new" ]] || return 0
+  tmp="${f}.$$"
+  if mkdir -p "$(dirname "$f")" 2>/dev/null && printf '%s' "$new" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# `_pace_seat_seven_bound <account> [<now>]` -> "<pct><US><resets>" or EMPTY.
+# The same contract as `_pace_account_seven_bound`: a dated reading, measured
+# no later than now, inside a window that has not turned over.
+_pace_seat_seven_bound() {  # <account> [<now-epoch>]
+  local acct="${1:-}" now="${2:-}" f pct="" sr="" asof=""
+  [[ -n "$acct" ]] || return 0
+  [[ "$now" =~ ^[0-9]+$ ]] || now=$(date +%s)
+  f=$(_pace_seat_bound_path)
+  [[ -r "$f" && -s "$f" ]] || return 0
+  IFS=$'\t' read -r pct sr asof < <(jq -r --arg a "$acct" '
+    .[$a] // empty | select(type == "object")
+    | [ (.pct // "" | tostring), (.resets // "" | tostring), (.asOf // "" | tostring) ] | @tsv
+  ' "$f" 2>/dev/null || printf '') || true
+  [[ "$pct" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 0
+  [[ "$sr" =~ ^[0-9]+$ && "$asof" =~ ^[0-9]+$ ]] || return 0
+  (( asof <= now && sr > now )) || return 0
+  printf '%s%s%s' "$pct" "$_GRADER_READING_US" "$sr"
+}
+_PACE_SEAT_BOUND_CMD="${_PACE_SEAT_BOUND_CMD:-_pace_seat_seven_bound}"
+
 # ── DIVE-4629: "NOT MEASURED YET" AND "CANNOT BE MEASURED HERE" ARE TWO STATES
 #
 # Everything above this point is about a number that exists and could not be
@@ -1036,18 +1124,29 @@ _pace_band_7d() {  # <account> [<now-epoch>]  [<usage-json-on-stdin>]
     if [[ -n "$lb_pair" ]]; then
       lb_seven="${lb_pair%%$_GRADER_READING_US*}"; lb_resets="${lb_pair#*$_GRADER_READING_US}"
       lb_seven="${lb_seven%%.*}"
-      if [[ "$lb_seven" =~ ^[0-9]+$ ]]; then
+      [[ "$lb_seven" =~ ^[0-9]+$ ]] || lb_seven=""
+    fi
+    # DIVE-8512: the remembered SEAT reading is the second bound. The higher of
+    # the two wins — both are lower bounds on the same quantity.
+    local sb_pair="" sb_seven="" lb_src="reading"
+    sb_pair=$($_PACE_SEAT_BOUND_CMD "$acct" "$now" 2>/dev/null || printf '')
+    if [[ -n "$sb_pair" ]]; then
+      sb_seven="${sb_pair%%$_GRADER_READING_US*}"; sb_seven="${sb_seven%%.*}"
+      if [[ "$sb_seven" =~ ^[0-9]+$ ]] && { [[ -z "$lb_seven" ]] || (( sb_seven > lb_seven )); }; then
+        lb_seven="$sb_seven"; lb_resets="${sb_pair#*$_GRADER_READING_US}"; lb_src="seat reading"
+      fi
+    fi
+    if [[ -n "$lb_seven" ]]; then
         if (( lb_seven >= _PACE_FLOOR_7D_HARD )); then
-          printf 'pace: %s has no CURRENT weekly reading, but its last reading (%s%%) is inside a week that has not reset yet — a weekly percentage never falls before its reset, so the account is at AT LEAST %s%% (hard floor %s%%) — urgent only\n' \
-                 "$acct" "$lb_seven" "$lb_seven" "$_PACE_FLOOR_7D_HARD"
+          printf 'pace: %s has no CURRENT weekly reading, but its last %s (%s%%) is inside a week that has not reset yet — a weekly percentage never falls before its reset, so the account is at AT LEAST %s%% (hard floor %s%%) — urgent only\n' \
+                 "$acct" "$lb_src" "$lb_seven" "$lb_seven" "$_PACE_FLOOR_7D_HARD"
           return 3
         fi
         if (( lb_seven >= _PACE_FLOOR_7D_SOFT )); then
-          printf 'pace: %s has no CURRENT weekly reading, but its last reading (%s%%) is inside a week that has not reset yet — at LEAST %s%% (soft floor %s%%); a lower bound cannot buy the near-reset relaxation, so the floor stays armed — high/urgent only\n' \
-                 "$acct" "$lb_seven" "$lb_seven" "$_PACE_FLOOR_7D_SOFT"
+          printf 'pace: %s has no CURRENT weekly reading, but its last %s (%s%%) is inside a week that has not reset yet — at LEAST %s%% (soft floor %s%%); a lower bound cannot buy the near-reset relaxation, so the floor stays armed — high/urgent only\n' \
+                 "$acct" "$lb_src" "$lb_seven" "$lb_seven" "$_PACE_FLOOR_7D_SOFT"
           return 2
         fi
-      fi
     fi
   fi
   # DIVE-4629. Still no number, and no bound either. Before calling the account
@@ -1353,6 +1452,25 @@ _pace_band_name() {
   esac
 }
 
+# ── DIVE-8512: A BLIND ADMIT IS NOT SILENT ──────────────────────────────────
+#
+# Band 0 is never logged, so a blind meter that admits a row (open by default)
+# left only `due + todo DIVE-N — waking` — indistinguishable from a measured
+# admit, and the chill-gorge reporter could not tell which branch let the row
+# through. `_pace_verdict_blind` recognises the verdicts the blind branch of
+# `_pace_band_7d` prints (no account named, no reading, unparseable reading —
+# all three say "blind" in exactly these two shapes); `_pace_wake_note` turns a
+# blind verdict into the wake line's suffix and a measured one into nothing.
+_pace_verdict_blind() {  # <verdict>
+  local v="${1:-}"
+  [[ "$v" == *"blind meter, policy="* || "$v" == *"— blind, never read as 0%"* ]]
+}
+_pace_wake_note() {  # <band-rc> <verdict> -> ", pace=<band>: <verdict>" or EMPTY
+  local rc="${1:-0}" v="${2:-}"
+  _pace_verdict_blind "$v" || return 0
+  printf ', pace=%s: %s' "$(_pace_band_name "$rc")" "$v"
+}
+
 # ── The snapshot, and why it is CACHED ──────────────────────────────────────
 #
 # `heartbeat tick` runs EVERY MINUTE (measured on this host, 2026-09-13: a tick
@@ -1400,6 +1518,9 @@ _pace_usage_snapshot() {  # -> the usage document on stdout, or EMPTY
        && printf '%s' "$out" > "$tmp" 2>/dev/null; then
       mv -f "$tmp" "$_PACE_CACHE_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
     fi
+    # DIVE-8512: remember each account's weekly reading before the next collect
+    # can drop it (see `_pace_seat_seven_bound`).
+    _pace_seat_bound_remember "$now" <<<"$out" || true
   fi
   printf '%s' "$out"
 }

@@ -36,6 +36,7 @@ trap 'rc=$?; rm -rf "$TMPD"; echo "HARNESS-RC=$rc"' EXIT
 export STATE_DIR="$TMPD/state"; mkdir -p "$STATE_DIR"
 export BOX_CONFIG="$TMPD/box.json"
 export FIVE_PACE_READING_CACHE_DIR="$TMPD/pace-reading"
+export FIVE_PACE_SEAT_BOUND_FILE="$TMPD/pace-seat-bound.json"   # DIVE-8512: never the live host's remembered bounds
 unset FIVE_PACE_7D_SOFT FIVE_PACE_7D_HARD FIVE_PACE_5H FIVE_PACE_BLIND FIVE_PACE_UNMETERED
 
 # shellcheck disable=SC1090
