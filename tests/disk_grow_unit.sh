@@ -99,19 +99,19 @@ check "the filesystem alone is grown"                          '[[ "$(calls)" ==
 
 echo "== guards: each one stops the write"
 disk 80 40 40 1; grow
-check "a partition after root: skipped"                        '[[ -z "$(calls)" ]] && lastlog | grep -q "skipped=root-not-last part=sda1 after=sda2"' "calls=$(calls) log=$(lastlog)"
+check "a partition after root: skipped"                        '[[ -z "$(calls)" ]] && grep -q "skipped=root-not-last part=sda1 after=sda2" <<<"$(lastlog)"' "calls=$(calls) log=$(lastlog)"
 disk 80 40 40; rm -f "$SELF_UPDATE_PROVISIONING"; grow; : >"$SELF_UPDATE_PROVISIONING"
-check "a self-hosted box (no provisioning.env): skipped"       '[[ -z "$(calls)" ]] && lastlog | grep -q "skipped=self-hosted"' "calls=$(calls) log=$(lastlog)"
+check "a self-hosted box (no provisioning.env): skipped"       '[[ -z "$(calls)" ]] && grep -q "skipped=self-hosted" <<<"$(lastlog)"' "calls=$(calls) log=$(lastlog)"
 disk 80 40 40; FIVEDIVE_DISK_EUID=1000 grow
-check "not root: skipped"                                      '[[ -z "$(calls)" ]] && lastlog | grep -q "skipped=not-root"' "calls=$(calls)"
+check "not root: skipped"                                      '[[ -z "$(calls)" ]] && grep -q "skipped=not-root" <<<"$(lastlog)"' "calls=$(calls)"
 disk 80 40 40; FIVEDIVE_DISK_ROOT_FSTYPE=xfs grow
-check "not ext4: skipped"                                      '[[ -z "$(calls)" ]] && lastlog | grep -q "skipped=fstype:xfs"' "calls=$(calls)"
+check "not ext4: skipped"                                      '[[ -z "$(calls)" ]] && grep -q "skipped=fstype:xfs" <<<"$(lastlog)"' "calls=$(calls)"
 disk 80 40 40; FIVEDIVE_DISK_ROOT_DEV=/dev/mapper/vg-root grow
-check "root on LVM (not a plain partition): skipped"           '[[ -z "$(calls)" ]] && lastlog | grep -q "skipped=not-a-partition"' "calls=$(calls)"
+check "root on LVM (not a plain partition): skipped"           '[[ -z "$(calls)" ]] && grep -q "skipped=not-a-partition" <<<"$(lastlog)"' "calls=$(calls)"
 disk 80 40 40; GROWPART_FAIL=1 grow
-check "growpart fails: resize2fs does not run, FAILED logged"  '[[ "$(calls)" == "growpart /dev/sda 1;" ]] && lastlog | grep -q "FAILED step=growpart"' "calls=$(calls)"
+check "growpart fails: resize2fs does not run, FAILED logged"  '[[ "$(calls)" == "growpart /dev/sda 1;" ]] && grep -q "FAILED step=growpart" <<<"$(lastlog)"' "calls=$(calls)"
 disk 80 40 40; grow --dry-run
-check "--dry-run writes nothing and says what it would do"     '[[ -z "$(calls)" ]] && lastlog | grep -q "would-grow part=sda1 disk=sda slack_mb=40960 dry_run=1"' "calls=$(calls) log=$(lastlog)"
+check "--dry-run writes nothing and says what it would do"     '[[ -z "$(calls)" ]] && grep -q "would-grow part=sda1 disk=sda slack_mb=40960 dry_run=1" <<<"$(lastlog)"' "calls=$(calls) log=$(lastlog)"
 
 echo "== the hourly tick runs it"
 # shellcheck disable=SC1090
@@ -120,7 +120,7 @@ disk 80 40 40; FIVEDIVE_DISK_FAKE_DF="50 50" tick
 check "disk tick grows a moved box"                            '[[ "$(calls)" == "growpart /dev/sda 1;resize2fs /dev/sda1;" ]]' "calls=$(calls)"
 disk 80 40 40; FIVEDIVE_DISK_GROW=0 FIVEDIVE_DISK_FAKE_DF="50 50" tick
 check "FIVEDIVE_DISK_GROW=0 keeps the tick off the disk"       '[[ -z "$(calls)" ]]' "calls=$(calls)"
-check "disk --help names the verb"                             '( source "$CODE"; cmd_disk --help ) | grep -q "5dive disk grow"'
+check "disk --help names the verb"                             'grep -q "5dive disk grow" <<<"$( source "$CODE"; cmd_disk --help )"'
 
 echo "== mutation arms: each guard removed, the same fixture must write"
 mutant() { # <name> <sed expr> <env assignment or -> <fixture...>
