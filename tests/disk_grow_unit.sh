@@ -12,8 +12,9 @@ set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+# shellcheck disable=SC2154  # rc is assigned inside the trap string
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 SRC=src
 
 TMP="$(mktemp -d /tmp/disk-grow-unit.XXXXXX)"
