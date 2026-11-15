@@ -1,26 +1,20 @@
 {
-  "date": "2026-11-14",
-  "generatedAtUtc": "2026-11-14T02:01:31Z",
+  "date": "2026-11-15",
+  "generatedAtUtc": "2026-11-15T02:01:22Z",
   "window": {
     "days": 30,
-    "from": "2026-10-15",
-    "to": "2026-11-13",
+    "from": "2026-10-16",
+    "to": "2026-11-14",
     "basis": "each task counts once, on the UTC day of its last task.done; the window is the whole days before the publish date"
   },
   "totals": {
-    "shipped": 2078,
-    "reviewed": 1084,
-    "firstTry": 608,
-    "sentBack": 476,
-    "sendBacks": 644
+    "shipped": 2069,
+    "reviewed": 1059,
+    "firstTry": 586,
+    "sentBack": 473,
+    "sendBacks": 638
   },
   "days": [
-    {
-      "date": "2026-10-15",
-      "reviewed": 52,
-      "firstTry": 34,
-      "sentBack": 18
-    },
     {
       "date": "2026-10-16",
       "reviewed": 27,
@@ -194,46 +188,52 @@
       "reviewed": 43,
       "firstTry": 25,
       "sentBack": 18
+    },
+    {
+      "date": "2026-11-14",
+      "reviewed": 27,
+      "firstTry": 12,
+      "sentBack": 15
     }
   ],
   "reasons": {
     "basis": "one fixed category per send-back, by rule from the reviewer's finding; no match or no preserved finding = other. Sums to totals.sendBacks.",
-    "total": 644,
+    "total": 638,
     "categories": [
       {
         "key": "conflict",
         "label": "Clashes with newer work",
-        "count": 35
+        "count": 33
       },
       {
         "key": "safety",
         "label": "Safety or privacy",
-        "count": 35
+        "count": 36
       },
       {
         "key": "writing",
         "label": "Unclear writing",
-        "count": 153
+        "count": 146
       },
       {
         "key": "tests",
         "label": "Failing tests",
-        "count": 275
+        "count": 277
       },
       {
         "key": "proof",
         "label": "No proof it works",
-        "count": 52
+        "count": 50
       },
       {
         "key": "ask",
         "label": "Not what was asked",
-        "count": 27
+        "count": 28
       },
       {
         "key": "other",
         "label": "Other",
-        "count": 67
+        "count": 68
       }
     ]
   },
