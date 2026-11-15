@@ -25,6 +25,7 @@ export FIVEDIVE_DISK_TMP_ROOT="$TMP/tmp"
 export FIVEDIVE_DISK_SWEEP_LOG="$TMP/log/disk-sweep.log"
 export FIVEDIVE_DISK_USERS="$ME:$TMP/home"
 export STATE_DIR="$TMP/state"
+export FIVEDIVE_DISK_GROW=0   # DIVE-8491: the grow step is graded in disk_grow_unit.sh and must never reach a CI disk
 mkdir -p "$FIVEDIVE_DISK_TMP_ROOT" "$TMP/home" "$STATE_DIR"
 
 # shellcheck disable=SC1090
