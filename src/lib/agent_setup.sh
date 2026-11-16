@@ -2047,8 +2047,12 @@ install_channel_for_codex_agent() {
   local plugin="$1" name="$2" token="$3" allowed_users="${4:-}"
   local user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
-  [[ "$plugin" == "telegram" || "$plugin" == "dashboard" ]] \
-    || fail "$E_VALIDATION" "codex channel plugin unsupported: $plugin (telegram and dashboard only)"
+  # DIVE-8464: teams and a plugin's own channel (email) run as dispatcher
+  # adapters: nothing to write here beyond bun and the dispatcher itself, the
+  # plugin keeps its config under ~/.claude/channels/<name> as on Claude.
+  [[ "$plugin" == "telegram" || "$plugin" == "dashboard" || "$plugin" == "teams" ]] \
+    || { declare -F plugin_channel_runs_on >/dev/null && plugin_channel_runs_on "$plugin" codex; } \
+    || fail "$E_VALIDATION" "codex channel plugin unsupported: $plugin (telegram, dashboard, teams, or a plugin channel with a Codex adapter)"
   if [[ "$plugin" == "telegram" && -z "$token" ]]; then
     fail "$E_VALIDATION" "codex telegram channel requires a bot token"
   fi
@@ -2986,9 +2990,10 @@ install_channel_for_agent() {
   if [[ "$plugin" == "buzz" && "$type" != "claude" ]]; then
     fail "$E_VALIDATION" "channels=buzz is claude-only (agent '$name' is type $type)"
   fi
-  # DIVE-7658: Teams is a Claude Code channel plugin for now (other harnesses later).
-  if [[ "$plugin" == "teams" && "$type" != "claude" ]]; then
-    fail "$E_VALIDATION" "channels=teams is claude-only for now (agent '$name' is type $type)"
+  # DIVE-7658: Teams is a Claude Code channel plugin; DIVE-8464: and a Codex
+  # dispatcher adapter. Other harnesses later.
+  if [[ "$plugin" == "teams" && "$type" != "claude" && "$type" != "codex" ]]; then
+    fail "$E_VALIDATION" "channels=teams runs on claude and codex agents only (agent '$name' is type $type)"
   fi
   # DIVE-8315: a plugin's channel: the agent types it names, then the Claude Code
   # allowlist (an unlisted channel plugin is connected and every message dropped).

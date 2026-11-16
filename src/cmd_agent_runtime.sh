@@ -1209,8 +1209,14 @@ _agent_delivery_mode() {
 # asserted byte-identical by tests/codex_dispatch_delivery_unit.sh; a copy that
 # only a comment asks you to keep in sync is how DIVE-4036 happened.
 _codex_dispatcher_enabled() {
-  local channels=",${1:-},"
-  [[ "$channels" == *,telegram,* || "$channels" == *,dashboard,* ]]
+  local c IFS=,
+  for c in ${1:-}; do
+    case "$c" in
+      none|discord|buzz|"") ;;
+      *) return 0 ;;
+    esac
+  done
+  return 1
 }
 
 # A pure-TUI control line has no meaning to the dispatcher: it owns one

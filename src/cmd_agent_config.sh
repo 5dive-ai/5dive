@@ -126,8 +126,9 @@ cmd_config() {
         if [[ "$type" != "claude" ]] && channel_in_list buzz "$v"; then
           fail "$E_VALIDATION" "channels=buzz is claude-only (agent '$name' is type $type)"
         fi
-        if [[ "$type" != "claude" ]] && channel_in_list teams "$v"; then
-          fail "$E_VALIDATION" "channels=teams is claude-only for now (agent '$name' is type $type)"
+        # DIVE-8464: Codex runs Teams through its dispatcher (a channel adapter).
+        if [[ "$type" != "claude" && "$type" != "codex" ]] && channel_in_list teams "$v"; then
+          fail "$E_VALIDATION" "channels=teams runs on claude and codex agents only (agent '$name' is type $type)"
         fi
         # DIVE-8315: a plugin's channel names the agent types it runs on.
         local _pch _pch_list

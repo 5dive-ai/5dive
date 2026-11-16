@@ -60,6 +60,7 @@ plugin_channels_json() {
           | .name as $n | select(($b | contains(" " + $n + " ")) | not)
           | {name, plugin: $p, marketplace: $m, dir: $d,
              harnesses: ((.harnesses // ["claude"]) | map(strings)),
+             codex_adapter: (.codex_adapter | if type == "string" then . else null end),
              local_only: (.local_only // null | if type == "object" then . else null end),
              knock: (.knock // null | if type == "object" and (.cards | type) == "object" then . else null end)}
         ' "$mf" 2>/dev/null) || continue
@@ -81,11 +82,16 @@ plugin_channel() {
 plugin_channel_names() { plugin_channels_json | jq -r '[.[].name] | join(" ")'; }
 
 # plugin_channel_runs_on <name> <type> -> 0 when that agent type can run it.
-# Claude Code only for now: it is the one harness that loads a channel plugin by
-# name (--channels plugin:<p>@<m>); the others are wired per channel in core.
+# Claude Code loads a channel plugin by name (--channels plugin:<p>@<m>). Codex
+# runs one as a dispatcher adapter (DIVE-8464), so it also needs the manifest's
+# codex_adapter. The other harnesses are wired per channel in core.
 plugin_channel_runs_on() {
-  [[ "${2:-}" == claude ]] || return 1
-  plugin_channel "${1:-}" | jq -e --arg t "${2:-}" '.harnesses | index($t)' >/dev/null 2>&1
+  local e
+  case "${2:-}" in claude|codex) ;; *) return 1 ;; esac
+  e=$(plugin_channel "${1:-}") || return 1
+  jq -e --arg t "$2" '.harnesses | index($t)' >/dev/null 2>&1 <<<"$e" || return 1
+  [[ "$2" == claude ]] && return 0
+  [[ -n "$(jq -r '.codex_adapter // empty' <<<"$e" 2>/dev/null)" ]]
 }
 
 # plugin_channel_harness_check <name> <type> <agent> — fail with the sentence a

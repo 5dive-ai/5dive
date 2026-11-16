@@ -10,7 +10,7 @@
 #   1. valid_channel accepts teams (and not a near-miss)
 #   2. install_channel_plugin_for_agent routes it to 5dive-plugins
 #   3. install_channel_for_agent refuses non-claude types
-#   4. agent config: claude-only check, the install dispatch, the staging gate
+#   4. agent config: claude/codex-only check, the install dispatch, the staging gate
 #   5. agent create: the per-channel install arm (the site DIVE-3509 found missing)
 #   6. 5dive-agent-start emits --channels plugin:teams@5dive-plugins
 #   7. managed settings allowlist it: header constant AND both install.sh copies
@@ -56,7 +56,10 @@ grep -qE '"\$plugin" == "buzz" \|\| "\$plugin" == "teams" \]\]; then' "$SRC/lib/
 both "install_channel_for_agent refuses non-claude" "$SRC/lib/agent_setup.sh" '"\$plugin" == "CH" && "\$type" != "claude"'
 
 # 4
-both "agent config refuses non-claude before the registry write" "$SRC/cmd_agent_config.sh" '"\$type" != "claude" \]\] && channel_in_list CH "\$v"'
+# DIVE-8464: teams also runs on codex (a dispatcher adapter); buzz stays claude-only.
+grep -qE '"\$type" != "claude" \]\] && channel_in_list buzz "\$v"' "$SRC/cmd_agent_config.sh" \
+  && grep -qE '"\$type" != "claude" && "\$type" != "codex" \]\] && channel_in_list teams "\$v"' "$SRC/cmd_agent_config.sh" \
+  && ok_t "agent config refuses teams off claude/codex before the registry write" || bad_t "agent config refuses teams off claude/codex before the registry write"
 both "agent config dispatches the install" "$SRC/cmd_agent_config.sh" '_config_install_channel "\$prev_channels" "\$type" CH "\$name"'
 grep -qE 'telegram\|dashboard\|buzz\|teams\) gate_marketplace="5dive-plugins"' "$SRC/cmd_agent_config.sh" \
   && ok_t "agent config staging gate covers teams" || bad_t "agent config staging gate covers teams"
@@ -66,7 +69,7 @@ both "agent create installs the plugin" "$SRC/cmd_agent_create.sh" 'install_chan
 
 # 6
 both "5dive-agent-start emits the channel" bin/5dive-agent-start 'ARGS\+=\(--channels "plugin:CH@5dive-plugins"\)'
-grep -qE 'channels=teams is claude-only' bin/5dive-agent-start && ok_t "5dive-agent-start refuses non-claude" || bad_t "5dive-agent-start refuses non-claude"
+grep -qE 'channels=teams runs on claude and codex agents only' bin/5dive-agent-start && ok_t "5dive-agent-start refuses teams off claude/codex" || bad_t "5dive-agent-start refuses teams off claude/codex"
 
 # 7
 grep -qF '{"plugin":"teams","marketplace":"5dive-plugins"}' <<<"$FIVEDIVE_CHANNEL_PLUGINS_JSON" \
