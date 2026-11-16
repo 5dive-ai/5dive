@@ -52,7 +52,12 @@ run() {
     systemd-run(){ echo "systemd-run $*" >> "$WORK/b/calls"; }
     systemctl(){ return 3; }   # no unit is active
     # The engine's /health: never the real :8765 (this host runs whisper-service).
-    curl(){ printf '%s\n' "$*" >> "$WORK/b/curl"; [[ -e "$WORK/b/engine" ]]; }
+    # DIVE-8559: OpenRouter's GET /key answers from $WORK/b/orkey (body) + orcode;
+    # no orkey file = the network is down.
+    curl(){ printf '%s\n' "$*" >> "$WORK/b/curl"
+      if [[ "$*" == */key* ]]; then cat >/dev/null; [[ -e "$WORK/b/orkey" ]] || return 7
+        printf '%s\n%s' "$(cat "$WORK/b/orkey")" "$(cat "$WORK/b/orcode" 2>/dev/null || echo 200)"; return 0; fi
+      [[ -e "$WORK/b/engine" ]]; }
     eval "$block"
     eval "$code"
   ) 2>&1
@@ -104,7 +109,34 @@ printf 'voice_effective_stt_backend(){ echo "5dive voice: falling back" >&2; ech
 out="$(run 'cmd_plugin_auto_voice --status')"
 grep -q 'voice: broken' <<<"$out" && ! grep -q 'falling back' <<<"$out" \
   && ok_t "OPENROUTER falling back to local (no key / local-only) + dead whisper -> broken, the lib's stderr kept out" || bad_t "OPENROUTER fallback" "$out"
-rm -f "$WORK/b/voice-backend.sh"
+# --- DIVE-8559: OpenRouter hearing with a key that cannot pay for audio is broken -----
+orlib(){ printf 'voice_effective_stt_backend(){ echo openrouter; }\nvoice_openrouter_key(){ echo sk-or-FAKEKEY123; }\n' > "$WORK/b/voice-backend.sh"; }
+orbox(){ box 20000 no yes yes no; orlib; [[ -n "$1" ]] && printf '%s' "$1" > "$WORK/b/orkey"; [[ -n "${2:-}" ]] && printf '%s' "$2" > "$WORK/b/orcode"; return 0; }
+orbox '{"data":{"limit":5,"limit_remaining":0.2733916599999997}}'
+out="$(run 'cmd_plugin_auto_voice --status')"
+grep -q 'voice: broken' <<<"$out" && grep -q 'stt_backend local' <<<"$out" && ! grep -q 'voice: on' <<<"$out" \
+  && grep -q '/key' "$WORK/b/curl" && ! grep -q FAKEKEY "$WORK/b/curl" \
+  && ok_t "POKE-TWO (DIVE-8559): OpenRouter key with \$0.27 left -> broken, names the local switch, key never on argv" \
+  || bad_t "OR SHORT" "$out | curl=$(cat "$WORK/b/curl" 2>/dev/null)"
+out="$(run 'cmd_plugin_auto_voice --on')"; rc=$?
+(( rc != 0 )) && grep -q 'stt_backend local' <<<"$out" && ! grep -q 'systemd-run' "$WORK/b/calls" \
+  && ok_t "OR SHORT --on: does not re-run setup (it cannot refill a key), says how to hear locally" || bad_t "OR SHORT --on" "rc=$rc $out | $(calls)"
+orbox '{"error":{"message":"User not found."}}' 401
+out="$(run 'cmd_plugin_auto_voice --status')"
+grep -q 'voice: broken' <<<"$out" && ok_t "OR refused key (HTTP 401) -> broken" || bad_t "OR 401" "$out"
+orbox '{"data":{"limit":5,"limit_remaining":4.2}}'
+out="$(run 'cmd_plugin_auto_voice --status')"
+grep -q 'voice: on' <<<"$out" && ok_t "OR key with \$4.20 left -> on" || bad_t "OR funded" "$out"
+orbox '{"data":{"limit":null,"limit_remaining":null}}'
+out="$(run 'cmd_plugin_auto_voice --status')"
+grep -q 'voice: on' <<<"$out" && ok_t "OR key with no cap (limit_remaining null) -> on" || bad_t "OR uncapped" "$out"
+orbox ''
+out="$(run 'cmd_plugin_auto_voice --status')"
+grep -q 'voice: on' <<<"$out" && ok_t "OR /key unreachable (network down) -> on, a flaky link never reports broken" || bad_t "OR offline" "$out"
+orbox '{"data":{"limit_remaining":0.2}}' 500
+out="$(run 'cmd_plugin_auto_voice --status')"
+grep -q 'voice: on' <<<"$out" && ok_t "OR /key HTTP 500 -> on (only a definite answer flips it)" || bad_t "OR 500" "$out"
+rm -f "$WORK/b/voice-backend.sh" "$WORK/b/orkey" "$WORK/b/orcode"
 # --wait: setup ends with the wrapper written and the engine dead -> a failure, not "ready".
 box 20000 no yes yes no
 out="$(run '_va_installing(){ n=$(cat "$WORK/b/n" 2>/dev/null || echo 0); echo $((n+1)) > "$WORK/b/n"; (( n < 2 )); }; cmd_plugin_auto_voice --wait')"; rc=$?
