@@ -661,6 +661,18 @@ works; an office apt mirror is used with plain `apt` as root. `sudo 5dive config
 puts back exactly what it changed, except the office chat: it keeps running, because it only
 answers on your office network (stop it with `sudo 5dive local serve --stop`).
 
+**The office chat on your firm's own name.** `sudo 5dive local serve --domain=team.yourfirm.com`
+serves the chat page as `https://team.yourfirm.com` (port 443) straight from the box, so no chat
+message or file passes through 5dive's servers. Your IT points that name at the box's office
+address in the office's own DNS. Give the firm's certificate with `--cert=<file> --key=<file>`
+(the full chain, the key without a password) and browsers open it with no warning; without one the
+box makes a self-signed certificate that names the domain. A certificate for another name, an
+expired one or a key that does not match is refused before anything changes, and a later
+`local serve` keeps your certificate. Renew it by running the same command with the new files;
+`5dive local status` shows when it runs out. People sign in by pairing their device with a one-time
+code (`sudo 5dive local pair`), not with a 5dive or Microsoft account. `--domain=none` goes back to
+the office address.
+
 **Microsoft Teams on a local-only box.** Teams is shut by default. Your IT can open it alone with
 `sudo 5dive config local-only allow teams`: agents can then be Teams contacts, and only Teams
 messages go out, to Microsoft. Everything else above stays refused, and `check` still names any
