@@ -2757,10 +2757,36 @@ _va_stt_backend() {
   [[ -r "$lib" ]] && b="$( . "$lib" >/dev/null 2>&1 && voice_effective_stt_backend 2>/dev/null )"
   [[ "$b" == openrouter ]] && printf 'openrouter\n' || printf 'local\n'
 }
+# DIVE-8559: hearing on OpenRouter is not "on" just because a key exists. A key
+# whose cap has under $0.50 left gets HTTP 402 on every note (OpenRouter refuses
+# audio below that), and a revoked one gets 401, while --status said "on" — so
+# poke-two went deaf with a green status. Ask OpenRouter's free GET /key, no audio
+# sent. Only a definite answer counts: no key, no network or no cap set (null
+# limit_remaining) is "not short", so a flaky link never reports a box as broken.
+VA_OR_MIN_USD="${FIVEDIVE_VOICE_OR_MIN_USD:-0.50}"
+_va_or_short() {
+  local lib="${FIVEDIVE_VOICE_LIB:-/usr/local/lib/5dive/voice-backend.sh}" out code rem
+  [[ -r "$lib" ]] || return 1
+  # The key rides curl's stdin as a --config header, never argv (same reason as
+  # voice_openrouter_curl: /proc is readable by every seat on the box).
+  out="$( . "$lib" >/dev/null 2>&1 || exit 1
+          declare -F voice_openrouter_key >/dev/null || exit 1
+          k="$(voice_openrouter_key 2>/dev/null)" && [[ -n "$k" ]] || exit 1
+          printf 'header = "Authorization: Bearer %s"\n' "$k" \
+            | curl --config - -sS --max-time 4 -w '\n%{http_code}' \
+                "${VOICE_OPENROUTER_BASE:-https://openrouter.ai/api/v1}/key" 2>/dev/null )" || return 1
+  code="${out##*$'\n'}"
+  [[ "$code" =~ ^(401|402|403)$ ]] && return 0
+  [[ "$code" == 2* ]] || return 1
+  rem="$(grep -oE '"limit_remaining":-?[0-9][0-9.eE+-]*' <<<"$out" | head -n1 | cut -d: -f2)" || rem=""
+  [[ -n "$rem" ]] || return 1
+  awk -v r="$rem" -v m="$VA_OR_MIN_USD" 'BEGIN { exit !(r + 0 < m + 0) }'
+}
 _va_engine_up() {
-  [[ "$(_va_stt_backend)" == openrouter ]] && return 0
+  if [[ "$(_va_stt_backend)" == openrouter ]]; then ! _va_or_short; return; fi
   curl -fsS --max-time 2 "$VA_HEALTH_URL" >/dev/null 2>&1
 }
+VA_OR_SHORT_PROSE="voice: broken — voice notes are heard on OpenRouter, and its key has under \$0.50 left (or was refused), so every note fails. Hear them on this server instead: sudo 5dive voice config set stt_backend local. Or top up the OpenRouter key."
 # The background setup is still running (its unit, or the no-systemd child).
 _va_installing() {
   [[ -n "${FIVEDIVE_VOICE_AUTO_INSTALLING:-}" ]] && { [[ "$FIVEDIVE_VOICE_AUTO_INSTALLING" == 1 ]]; return; }
@@ -2847,7 +2873,8 @@ cmd_plugin_auto_voice() {
         managed)    prose="voice: managed — 5dive set voice up on this server; nothing to offer" ;;
         on)         prose="voice: on — voice notes are heard on this server (5dive-transcribe <file>)" ;;
         installing) prose="voice: installing — wait for it: 5dive plugin auto-voice --wait" ;;
-        broken)     prose="voice: broken — speech-to-text is installed but its engine is not answering, so voice notes are not heard. Repair: sudo 5dive plugin auto-voice --on, then 5dive plugin auto-voice --wait. Details: $(_va_log), journalctl -u whisper-service" ;;
+        broken)     [[ "$(_va_stt_backend)" == openrouter ]] && { ok "$VA_OR_SHORT_PROSE" '{verdict:"broken", reason:"openrouter_key"}'; return 0; }
+                    prose="voice: broken — speech-to-text is installed but its engine is not answering, so voice notes are not heard. Repair: sudo 5dive plugin auto-voice --on, then 5dive plugin auto-voice --wait. Details: $(_va_log), journalctl -u whisper-service" ;;
         declined)   prose="voice: declined — the owner said no; do not offer it again unless they ask for voice" ;;
         ask)        prose="voice: ask — ask the owner once: «$VA_ASK» Yes: sudo 5dive plugin auto-voice --on. No: sudo 5dive plugin auto-voice --off" ;;
       esac
@@ -2864,6 +2891,8 @@ cmd_plugin_auto_voice() {
         on)         _va_record on owner || true; ok "Speech-to-text is already on this server." '{verdict:"on"}'; return 0 ;;
         installing) ok "Speech-to-text is installing. Wait for it: 5dive plugin auto-voice --wait" '{verdict:"installing"}'; return 0 ;;
         broken)
+          # Re-running setup does not refill an OpenRouter key (DIVE-8559).
+          [[ "$(_va_stt_backend)" == openrouter ]] && fail "$E_GENERIC" "${VA_OR_SHORT_PROSE#voice: broken — }"
           _va_install repair || fail "$E_GENERIC" "voice could not be repaired (see $(_va_log))"
           ok "Repairing speech-to-text on this server: its setup runs again in the background. Wait for it: 5dive plugin auto-voice --wait" \
              '{verdict:"installing", repair:true}'
