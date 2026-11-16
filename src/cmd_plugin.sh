@@ -2778,7 +2778,7 @@ _va_or_short() {
   code="${out##*$'\n'}"
   [[ "$code" =~ ^(401|402|403)$ ]] && return 0
   [[ "$code" == 2* ]] || return 1
-  rem="$(grep -oE '"limit_remaining":-?[0-9][0-9.eE+-]*' <<<"$out" | head -n1 | cut -d: -f2)"
+  rem="$(grep -oE '"limit_remaining":-?[0-9][0-9.eE+-]*' <<<"$out" | head -n1 | cut -d: -f2)" || rem=""
   [[ -n "$rem" ]] || return 1
   awk -v r="$rem" -v m="$VA_OR_MIN_USD" 'BEGIN { exit !(r + 0 < m + 0) }'
 }
