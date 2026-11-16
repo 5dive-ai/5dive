@@ -239,5 +239,89 @@ check 'B40 no visible credentials folder: the server serves TLS from its runtime
 check 'B41 ... and reads the box token from there' '[[ "$(code -H "Authorization: Bearer boxtok-123" "http://127.0.0.1:$LOOP2/server/messages/pending?agent=alice")" != 401 && "$(code "http://127.0.0.1:$LOOP2/server/messages/pending?agent=alice")" == 401 ]]'
 kill "$SRV2" 2>/dev/null; wait "$SRV2" 2>/dev/null
 
+# ── D. DIVE-8565: the firm's own name (--domain, --cert/--key, port 443) ─────
+export FIVE_LOCAL_CHAT_ROOT="$TMPD/rootd"
+mkdir -p "$TMPD/rootd/etc/systemd/system"
+DCONF="$TMPD/rootd/etc/5dive/local-chat"
+serve_d() {   # as serve_, plus `ss` stubbed: SS_OUT is what holds the port
+  ( set -euo pipefail
+    require_root() { :; }; getent() { return 0; }; systemctl() { return 0; }
+    ss() { [[ -n "${SS_OUT:-}" ]] && printf '%s\n' "$SS_OUT"; return 0; }
+    _lc_bun() { printf /usr/local/bin/bun; }; _lc_agents_write() { :; }
+    _lc_serve "$@" )
+}
+pair_d() { ( set -euo pipefail; require_root() { :; }; _lc_admin() { :; }; _lc_pair "$@" ); }
+# A firm's own authority and certificates it signed.
+CA="$TMPD/ca"; mkdir -p "$CA"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 -subj "/CN=Firm CA" \
+  -keyout "$CA/ca.key" -out "$CA/ca.pem" >/dev/null 2>&1
+leaf() {   # leaf <name> <out-prefix> [<days>]
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=$1" -keyout "$2.key" -out "$2.csr" >/dev/null 2>&1
+  printf 'subjectAltName=DNS:%s\n' "$1" >"$2.ext"
+  openssl x509 -req -in "$2.csr" -CA "$CA/ca.pem" -CAkey "$CA/ca.key" -CAcreateserial -days "${3:-30}" -extfile "$2.ext" -out "$2.leaf" >/dev/null 2>&1
+  cat "$2.leaf" "$CA/ca.pem" >"$2.pem"   # the chain, as IT hands it over
+}
+leaf team.example.test "$CA/team"; leaf other.example.test "$CA/other"
+# An already-expired one, signed with dates in the past (openssl 3.0 has no
+# x509 -not_after; `openssl ca` takes -startdate/-enddate).
+mkdir -p "$CA/db"; : >"$CA/db/index"; echo 01 >"$CA/db/serial"
+printf '[ca]\ndefault_ca=c\n[c]\ndatabase=%s/db/index\nnew_certs_dir=%s/db\nserial=%s/db/serial\ndefault_md=sha256\npolicy=p\n[p]\ncommonName=supplied\n[x]\nsubjectAltName=DNS:team.example.test\n' "$CA" "$CA" "$CA" >"$CA/ca.cnf"
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=team.example.test" -keyout "$CA/old.key" -out "$CA/old.csr" >/dev/null 2>&1
+openssl ca -batch -config "$CA/ca.cnf" -extensions x -cert "$CA/ca.pem" -keyfile "$CA/ca.key" -in "$CA/old.csr" -out "$CA/old.pem" \
+  -startdate 20200101000000Z -enddate 20200201000000Z -notext >/dev/null 2>&1
+
+out=$(serve_d --addr=192.0.2.10 --domain=Team.Example.TEST. 2>&1); r=$?
+check 'D1 --domain serves on the name, port 443 by default (the address is just https://<name>)' '(( r == 0 )) && grep -qx "Office chat is ON: https://team.example.test" <<<"$out" && grep -qx "LAN_PORT=443" "$DCONF/config" && grep -qx "DOMAIN=team.example.test" "$DCONF/config"'
+check 'D2 ... and says IT points the name at the office address' 'grep -qF "Your IT points team.example.test at 192.0.2.10" <<<"$out"'
+UNIT="$TMPD/rootd/etc/systemd/system/5dive-local-chat.service"
+check 'D3 port 443: the never-root unit gets ONLY the bind capability, NoNewPrivileges kept' 'grep -qx "AmbientCapabilities=CAP_NET_BIND_SERVICE" "$UNIT" && grep -qx "CapabilityBoundingSet=CAP_NET_BIND_SERVICE" "$UNIT" && grep -qx "NoNewPrivileges=yes" "$UNIT" && grep -qx "User=5dive-chat" "$UNIT" && grep -qx "LC_LAN_PORT=443" < <(grep -o "LC_LAN_PORT=[0-9]*" "$UNIT")'
+check 'D4 no certificate given: a self-signed one names BOTH the domain and the office address' 'openssl x509 -in "$DCONF/cert.pem" -noout -ext subjectAltName | grep -q "DNS:team.example.test" && openssl x509 -in "$DCONF/cert.pem" -noout -ext subjectAltName | grep -q "IP Address:192.0.2.10" && grep -qx "CERT=self" "$DCONF/config"'
+out=$(pair_d 2>&1); r=$?
+check 'D5 pair names https://team.example.test and still warns about the self-signed cert' '(( r == 0 )) && grep -qF "open:  https://team.example.test" <<<"$out" && grep -q "self-signed" <<<"$out"'
+out=$(JSON_MODE=1 _lc_status 2>&1)
+check 'D6 status --json: url, domain, self-signed' '[[ "$(jq -r ".data.url, .data.domain, .data.certificate" <<<"$out" | tr "\n" " ")" == "https://team.example.test team.example.test self-signed " ]]'
+
+cp "$DCONF/cert.pem" "$TMPD/before.pem"
+out=$(serve_d --domain=team.example.test --cert="$CA/other.pem" --key="$CA/other.key" 2>&1); r=$?
+check 'D7 a certificate for another name is refused, nothing replaced' '(( r != 0 )) && grep -q "not for team.example.test" <<<"$out" && cmp -s "$TMPD/before.pem" "$DCONF/cert.pem"'
+out=$(serve_d --domain=team.example.test --cert="$CA/team.pem" --key="$CA/other.key" 2>&1); r=$?
+check 'D8 a key that is not the certificate'"'"'s is refused, nothing replaced' '(( r != 0 )) && grep -q "does not belong" <<<"$out" && cmp -s "$TMPD/before.pem" "$DCONF/cert.pem"'
+if [[ -s "$CA/old.pem" ]]; then
+  out=$(serve_d --domain=team.example.test --cert="$CA/old.pem" --key="$CA/old.key" 2>&1); r=$?
+  check 'D9 an expired certificate is refused' '(( r != 0 )) && grep -q "expired" <<<"$out" && cmp -s "$TMPD/before.pem" "$DCONF/cert.pem"'
+else bad_ 'D9 an expired certificate is refused' "could not make an expired cert with this openssl"; fi
+out=$(serve_d --cert="$CA/team.pem" 2>&1); r=$?
+check 'D10 --cert without --key is refused' '(( r != 0 )) && grep -q "together" <<<"$out"'
+out=$(serve_d --domain=-bad..name 2>&1); r=$?
+check 'D11 a malformed name is refused, the saved one kept' '(( r != 0 )) && grep -qx "DOMAIN=team.example.test" "$DCONF/config"'
+
+out=$(serve_d --domain=team.example.test --cert="$CA/team.pem" --key="$CA/team.key" 2>&1); r=$?
+check 'D12 the firm'"'"'s certificate is taken: the whole chain as given, key 0600, CERT=own' '(( r == 0 )) && cmp -s "$CA/team.pem" "$DCONF/cert.pem" && cmp -s "$CA/team.key" "$DCONF/key.pem" && [[ "$(stat -c %a "$DCONF/key.pem")" == 600 ]] && grep -qx "CERT=own" "$DCONF/config" && grep -q "Certificate: yours, valid until" <<<"$out"'
+out=$(pair_d 2>&1)
+check 'D13 pair with the firm'"'"'s certificate: no self-signed warning, just the address and the code' 'grep -qF "open:  https://team.example.test" <<<"$out" && ! grep -q "self-signed" <<<"$out" && grep -q "^2. Type this code" <<<"$out"'
+serve_d >/dev/null 2>&1; r=$?
+check 'D14 a later serve with no flags KEEPS the firm'"'"'s certificate (never swapped for a self-signed one)' '(( r == 0 )) && cmp -s "$CA/team.pem" "$DCONF/cert.pem" && grep -qx "CERT=own" "$DCONF/config"'
+out=$(JSON_MODE=1 _lc_status 2>&1)
+check 'D15 status --json says own, and when it runs out' '[[ "$(jq -r .data.certificate <<<"$out")" == own && -n "$(jq -r .data.certificateUntil <<<"$out")" ]]'
+out=$(SS_OUT='LISTEN 0 4096 *:443 *:* users:(("caddy",pid=20147,fd=3))' serve_d 2>&1); r=$?
+check 'D16 port 443 held by another program: refused, names it, nothing started' '(( r != 0 )) && grep -q "port 443 is already used by caddy" <<<"$out"'
+out=$(serve_d --domain=none 2>&1); r=$?
+check 'D17 --domain=none goes back to the office address; the firm cert (no IP in it) is replaced by a self-signed one' '(( r == 0 )) && grep -qx "DOMAIN=" "$DCONF/config" && grep -qx "Office chat is ON: https://192.0.2.10" <<<"$out" && grep -qx "CERT=self" "$DCONF/config" && openssl x509 -in "$DCONF/cert.pem" -noout -ext subjectAltName | grep -q "IP Address:192.0.2.10"'
+out=$(serve_d --domain=team.example.test --port=8443 2>&1); r=$?
+check 'D18 --port with --domain wins; above 1024 the unit gets no capability' '(( r == 0 )) && grep -qx "Office chat is ON: https://team.example.test:8443" <<<"$out" && ! grep -q "CAP_NET_BIND_SERVICE" "$UNIT"'
+out=$(serve_d --port=80 2>&1); r=$?
+check 'D19 a low port other than 443 is still refused' '(( r != 0 )) && grep -q "443 or 1024-65535" <<<"$out"'
+
+# Live: the real server on the firm's certificate. A browser that trusts the
+# firm's authority opens it BY NAME with no warning; any other name fails.
+DP=$((LAN + 4)); DL=$((LAN + 5))
+env -u LC_TOKEN_FILE LC_STATE="$TMPD/state3" LC_LAN_ADDR=127.0.0.1 LC_LAN_PORT=$DP LC_LOOP_PORT=$DL \
+  LC_CERT="$CA/team.pem" LC_KEY="$CA/team.key" LC_TOKEN_FILE="$TMPD/connectord.env" \
+  "$BUN" "$TMPD/server.ts" serve >"$TMPD/server3.log" 2>&1 & SRV3=$!
+for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$DL/" && break; sleep 0.1; done
+check 'D20 live: https://team.example.test verifies against the firm'"'"'s authority (no warning) and serves the page' '[[ "$(curl -s --cacert "$CA/ca.pem" --resolve "team.example.test:$DP:127.0.0.1" "https://team.example.test:$DP/" | grep -c "Connect this device")" -ge 1 ]]'
+check 'D21 live: the same server under another name fails verification' '! curl -s -o /dev/null --cacert "$CA/ca.pem" --resolve "other.example.test:$DP:127.0.0.1" "https://other.example.test:$DP/"'
+kill "$SRV3" 2>/dev/null; wait "$SRV3" 2>/dev/null
+
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))

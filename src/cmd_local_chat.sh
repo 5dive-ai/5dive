@@ -4,6 +4,8 @@
 # are outside the office. This serves one from the box itself:
 #
 #   sudo 5dive local serve [--addr=<office IP>] [--port=8443]   start it (local-only on runs this)
+#   sudo 5dive local serve --domain=team.firm.com [--cert=<pem> --key=<pem>]
+#                                                               on the firm's own name (DIVE-8565)
 #   sudo 5dive local serve --stop                               stop it, put the API base back
 #   sudo 5dive local pair [--owner]                             one-time code + cert fingerprint
 #                                                               (--owner: the device may also open /panel, DIVE-7576)
@@ -24,6 +26,19 @@
 #
 # No end-to-end sealing here: the box is the only server and TLS covers the LAN
 # hop. `chat e2e enable` is refused while local-only is on (src/lib/local_only.sh).
+#
+# DIVE-8565: THE FIRM'S OWN NAME. `--domain=team.firm.com` serves the page as
+# https://team.firm.com (port 443 unless --port says otherwise) from this box,
+# so a Private customer's people open the firm's own address and nothing passes
+# through my.5dive.ai or api.5dive.com. The listener still binds the office
+# address: the firm's IT points the name at it in its own DNS (we never touch
+# DNS). With `--cert/--key` (the firm's certificate, from its own authority or
+# a public one) the browser shows no warning; without them the box makes a
+# self-signed one that also names the domain. A firm certificate is never
+# replaced by a self-signed one on a later `serve`: it is kept until it no longer
+# covers the name, and `local status` shows when it runs out. Port 443 is below
+# 1024, so the unit gives the never-root user only CAP_NET_BIND_SERVICE.
+# Sign-in stays the paired-device code (no 5dive or Clerk account).
 #
 # Test seams: FIVE_LOCAL_CHAT_ROOT prefixes every path this file writes;
 # systemctl/useradd/runuser/openssl/ip are looked up on PATH.
@@ -52,6 +67,19 @@ _lc_conf_get() {
   v=$(sed -n "s/^$1=//p" "$f" 2>/dev/null) || v=""
   printf '%s' "${v%%$'\n'*}"
 }
+
+# DIVE-8565: the page's address — the firm's name when one is set, else the
+# office IP; ":443" is left out. Reads the saved config.
+_lc_url() {
+  local host port
+  host=$(_lc_conf_get DOMAIN); [[ -n "$host" ]] || host=$(_lc_conf_get LAN_ADDR)
+  [[ -n "$host" ]] || return 0
+  port=$(_lc_conf_get LAN_PORT)
+  if [[ -z "$port" || "$port" == 443 ]]; then printf 'https://%s' "$host"; else printf 'https://%s:%s' "$host" "$port"; fi
+}
+
+# A hostname with at least one dot, labels of letters, digits and hyphens.
+LC_DOMAIN_RE='^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$'
 
 # DIVE-7566: the token the agents' chat rail and the office chat share. A box
 # linked to 5dive.app has one (connectord.env); a box never linked, which is
@@ -158,6 +186,8 @@ _lc_addr_ambiguous() {
 _lc_usage() {
   printf '%s\n' \
     "usage: sudo 5dive local serve [--addr=<office IP>] [--port=<port>]   # start the office chat" \
+    "       sudo 5dive local serve --domain=team.yourfirm.com [--cert=<file> --key=<file>]" \
+    "                                                   # on your firm's own name (port 443); --domain=none undoes it" \
     "       sudo 5dive local serve --stop" \
     "       sudo 5dive local pair [--owner] [--name=<person>]  # a one-time code to connect a phone or laptop" \
     "                                                   # --owner: it may also manage the server at /panel" \
@@ -234,19 +264,64 @@ _lc_restage() {
   fi
 }
 
-# A self-signed cert for the office address; remade when the address changed.
+# The certificate: the firm's own (DIVE-8565, CERT=own in the config) while it
+# still covers the domain, else a self-signed one for the office address and the
+# domain; the self-signed one is remade when either changed.
+# _lc_cert <addr> [<domain>]
 _lc_cert() {
-  local addr="$1" etc; etc=$(_lc_etc)
-  if [[ -s "$etc/cert.pem" && -s "$etc/key.pem" ]] \
-     && openssl x509 -in "$etc/cert.pem" -noout -ext subjectAltName 2>/dev/null | grep -qF "IP Address:${addr}"; then
-    return 0
+  local addr="$1" domain="${2:-}" etc san; etc=$(_lc_etc)
+  if [[ "$(_lc_conf_get CERT)" == own && -n "$domain" && -s "$etc/cert.pem" && -s "$etc/key.pem" ]]; then
+    openssl x509 -in "$etc/cert.pem" -noout -checkhost "$domain" 2>/dev/null | grep -q 'does match' && return 0
+    warn "local chat: your certificate no longer covers ${domain}; using a self-signed one until you give a new one (--cert= --key=)."
+  fi
+  if [[ -s "$etc/cert.pem" && -s "$etc/key.pem" ]]; then
+    san=$(openssl x509 -in "$etc/cert.pem" -noout -ext subjectAltName 2>/dev/null) || san=""
+    if grep -qF "IP Address:${addr}" <<<"$san" && { [[ -z "$domain" ]] || grep -qF "DNS:${domain}" <<<"$san"; }; then
+      _lc_conf_set CERT self; return 0
+    fi
   fi
   ( umask 077
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 825 \
-      -subj "/CN=5dive office chat" -addext "subjectAltName=IP:${addr}" \
+      -subj "/CN=${domain:-5dive office chat}" -addext "subjectAltName=IP:${addr}${domain:+,DNS:${domain}}" \
       -keyout "$etc/key.pem" -out "$etc/cert.pem" >/dev/null 2>&1 ) \
     || fail "$E_GENERIC" "local chat: could not make the TLS certificate (openssl)."
   chmod 0644 "$etc/cert.pem"; chmod 0600 "$etc/key.pem"
+  _lc_conf_set CERT self
+}
+
+# _lc_conf_set <KEY> <value> — replace or add one line of the config.
+_lc_conf_set() {
+  local f; f=$(_lc_conf)
+  { [[ -r "$f" ]] && grep -v "^$1=" "$f"; printf '%s=%s\n' "$1" "$2"; } >"$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+# DIVE-8565: take the firm's certificate. Checked BEFORE anything is written:
+# it must be a certificate for <domain>, not expired, and <key> must be its key.
+# The full chain in <cert> is kept as given (the browser needs the middle ones).
+# _lc_cert_check_own <cert> <key> <domain> — fails with the reason, else 0.
+_lc_cert_check_own() {
+  local cert="$1" key="$2" domain="$3" a b
+  [[ -r "$cert" && -s "$cert" ]] || fail "$E_VALIDATION" "local chat: cannot read the certificate file ($cert)."
+  [[ -r "$key" && -s "$key" ]] || fail "$E_VALIDATION" "local chat: cannot read the key file ($key)."
+  openssl x509 -in "$cert" -noout >/dev/null 2>&1 || fail "$E_VALIDATION" "local chat: $cert is not a PEM certificate."
+  openssl x509 -in "$cert" -noout -checkhost "$domain" 2>/dev/null | grep -q 'does match' \
+    || fail "$E_VALIDATION" "local chat: that certificate is not for ${domain}, so browsers would refuse it. Ask your IT for one that names ${domain}."
+  openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 \
+    || fail "$E_VALIDATION" "local chat: that certificate has expired ($(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'))."
+  a=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+  b=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
+  [[ -n "$a" && "$a" == "$b" && "$b" != e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ]] \
+    || fail "$E_VALIDATION" "local chat: that key does not belong to that certificate (or is protected by a password; give the key without one)."
+}
+
+# DIVE-8565: who already holds <port>? Prints the process name, rc 0 when taken
+# by something other than the office chat itself.
+_lc_port_holder() {
+  local port="$1" line
+  line=$(ss -Hltnp "sport = :${port}" 2>/dev/null | head -1) || return 1
+  [[ -n "$line" ]] || return 1
+  grep -q '"bun"' <<<"$line" && systemctl is-active --quiet "$(_lc_svc)" 2>/dev/null && return 1
+  sed -n 's/.*users:(("\([^"]*\)".*/\1/p' <<<"$line" | grep . || printf 'another program'
 }
 
 _lc_fingerprint() {
@@ -295,18 +370,24 @@ _lc_unit_text() {
     "ProtectHome=read-only" \
     "PrivateTmp=yes" \
     "Restart=on-failure" \
-    "RestartSec=3" \
-    "" \
-    "[Install]" \
-    "WantedBy=multi-user.target"
+    "RestartSec=3"
+  # DIVE-8565: port 443 (the firm's own name) is below 1024. Only that one
+  # capability, kept by the never-root user; NoNewPrivileges stays on.
+  (( port < 1024 )) && printf '%s\n' \
+    "AmbientCapabilities=CAP_NET_BIND_SERVICE" \
+    "CapabilityBoundingSet=CAP_NET_BIND_SERVICE"
+  printf '%s\n' "" "[Install]" "WantedBy=multi-user.target"
 }
 
 _lc_serve() {
-  local addr="" port="" stop=0 a
+  local addr="" port="" stop=0 a domain="" domain_set=0 cert="" key=""
   for a in "$@"; do
     case "$a" in
       --addr=*) addr="${a#--addr=}" ;;
       --port=*) port="${a#--port=}" ;;
+      --domain=*) domain="${a#--domain=}"; domain_set=1 ;;
+      --cert=*) cert="${a#--cert=}" ;;
+      --key=*)  key="${a#--key=}" ;;
       --stop)   stop=1 ;;
       *) fail "$E_USAGE" "unknown flag: $a (see: 5dive local --help)" ;;
     esac
@@ -321,20 +402,47 @@ _lc_serve() {
     (( arc == 0 )) || fail "$E_VALIDATION" "local chat: this server has no office (private) address. Name one: sudo 5dive local serve --addr=<IP>"
   fi
   [[ "$addr" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || fail "$E_VALIDATION" "local chat: --addr must be an IPv4 address ($addr)."
+  # DIVE-8565: the firm's own name. --domain=none (or empty) goes back to the IP.
+  if (( domain_set )); then
+    domain="${domain,,}"; domain="${domain%.}"
+    [[ "$domain" == none ]] && domain=""
+    [[ -z "$domain" || "$domain" =~ $LC_DOMAIN_RE ]] \
+      || fail "$E_VALIDATION" "local chat: --domain must be a name like team.yourfirm.com (got: ${domain:0:80})."
+  else
+    domain=$(_lc_conf_get DOMAIN)
+  fi
+  [[ -n "$cert" || -n "$key" ]] && {
+    [[ -n "$cert" && -n "$key" ]] || fail "$E_USAGE" "local chat: give the certificate and its key together: --cert=<file> --key=<file>."
+    [[ -n "$domain" ]] || fail "$E_USAGE" "local chat: a certificate needs the name it is for: --domain=team.yourfirm.com"
+    _lc_cert_check_own "$cert" "$key" "$domain"
+  }
+  # A new name on this call without --port: the standard https port, so the
+  # address is just https://<name>.
+  [[ -z "$port" && $domain_set == 1 && -n "$domain" ]] && port=443
   [[ -n "$port" ]] || port=$(_lc_conf_get LAN_PORT); port="${port:-8443}"
-  [[ "$port" =~ ^[0-9]{2,5}$ ]] && (( port >= 1024 && port <= 65535 )) \
-    || fail "$E_VALIDATION" "local chat: --port must be 1024-65535 ($port)."
+  [[ "$port" =~ ^[0-9]{2,5}$ ]] && (( port == 443 || (port >= 1024 && port <= 65535) )) \
+    || fail "$E_VALIDATION" "local chat: --port must be 443 or 1024-65535 ($port)."
+  local holder
+  if holder=$(_lc_port_holder "$port"); then
+    fail "$E_VALIDATION" "local chat: port ${port} is already used by ${holder} on this server, so the chat was NOT started. Free it, or pick another: --port=<port>."
+  fi
   local loop; loop=$(_lc_conf_get LOOP_PORT); loop="${loop:-8480}"
   local bun; bun=$(_lc_bun)
 
   install -d -m 0755 -- "$(_lc_etc)" || fail "$E_GENERIC" "local chat: cannot create $(_lc_etc)."
   local tokf; tokf=$(_lc_token_file) || fail "$E_GENERIC" "local chat: could not make the chat's access key (openssl)."
-  printf 'LAN_ADDR=%s\nLAN_PORT=%s\nLOOP_PORT=%s\nTOKEN_FILE=%s\n' "$addr" "$port" "$loop" "$tokf" >"$(_lc_conf)"
+  local certmode; certmode=$(_lc_conf_get CERT)
+  printf 'LAN_ADDR=%s\nLAN_PORT=%s\nLOOP_PORT=%s\nTOKEN_FILE=%s\nDOMAIN=%s\nCERT=%s\n' "$addr" "$port" "$loop" "$tokf" "$domain" "$certmode" >"$(_lc_conf)"
   getent passwd "$(_lc_user)" >/dev/null 2>&1 \
     || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$(_lc_user)" \
     || fail "$E_GENERIC" "local chat: could not create the $(_lc_user) system user."
   _lc_stage
-  _lc_cert "$addr"
+  if [[ -n "$cert" ]]; then
+    ( umask 077; install -m 0644 -- "$cert" "$(_lc_etc)/cert.pem" && install -m 0600 -- "$key" "$(_lc_etc)/key.pem" ) \
+      || fail "$E_GENERIC" "local chat: could not copy the certificate into $(_lc_etc)."
+    _lc_conf_set CERT own
+  fi
+  _lc_cert "$addr" "$domain"
   _lc_agents_write
   _lc_unit_text "$bun" "$addr" "$port" "$loop" "$tokf" >"$(_lc_unit)" || fail "$E_GENERIC" "local chat: cannot write $(_lc_unit)."
   _lp_install
@@ -346,9 +454,14 @@ _lc_serve() {
   printf 'http://127.0.0.1:%s\n' "$loop" >"$(five_api_base_file).tmp" \
     && chmod 0644 "$(five_api_base_file).tmp" && mv -f "$(five_api_base_file).tmp" "$(five_api_base_file)" \
     || fail "$E_GENERIC" "local chat: cannot write $(five_api_base_file)."
-  printf '%s\n' "Office chat is ON: https://${addr}:${port}" \
+  printf '%s\n' "Office chat is ON: $(_lc_url)" \
     "Connect a phone or laptop: sudo 5dive local pair   (the owner's: --owner, to manage at /panel)" \
     "Restart each agent once so its chat moves here: sudo 5dive agent restart <name>"
+  [[ -n "$domain" ]] && printf '%s\n' \
+    "Your IT points ${domain} at ${addr} in the office's own DNS." \
+    "$([[ "$(_lc_conf_get CERT)" == own ]] && printf 'Certificate: yours, valid until %s.' "$(openssl x509 -in "$(_lc_etc)/cert.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')" \
+      || printf 'Certificate: self-signed, so browsers warn once. For no warning: sudo 5dive local serve --cert=<file> --key=<file>')"
+  return 0
 }
 
 _lc_serve_stop() {
@@ -403,6 +516,7 @@ _lc_pair() {
   local addr port code hash exp
   addr=$(_lc_conf_get LAN_ADDR); port=$(_lc_conf_get LAN_PORT)
   [[ -n "$addr" ]] || fail "$E_NOT_FOUND" "local chat is not set up: sudo 5dive local serve"
+  local url own=0; url=$(_lc_url); [[ "$(_lc_conf_get CERT)" == own ]] && own=1
   # 8 characters from an alphabet with no look-alikes (no 0/O, 1/I/L).
   # DIVE-7566: bounded input, so tr ends on EOF and never takes the SIGPIPE
   # `tr </dev/urandom | head` did under pipefail (rc 141 on every run).
@@ -412,17 +526,23 @@ _lc_pair() {
   exp=$(( $(date +%s) + 900 ))
   _lc_admin pair-add "$hash" "$exp" "$role" ${name:+"$name"} >/dev/null || fail "$E_GENERIC" "local chat: could not save the code."
   if (( JSON_MODE )); then
-    jq -cn --arg u "https://${addr}:${port}" --arg c "${code:0:4}-${code:4}" --arg f "$(_lc_fingerprint)" --argjson e "$exp" --arg r "$role" --arg n "$name" \
-      '{ok:true, data:({url:$u, code:$c, fingerprint:$f, expires:$e, role:$r} + (if $n == "" then {} else {name:$n} end))}'
+    jq -cn --arg u "$url" --arg c "${code:0:4}-${code:4}" --arg f "$(_lc_fingerprint)" --argjson e "$exp" --arg r "$role" --arg n "$name" --argjson o "$own" \
+      '{ok:true, data:({url:$u, code:$c, fingerprint:$f, expires:$e, role:$r, certificate:(if $o == 1 then "own" else "self-signed" end)} + (if $n == "" then {} else {name:$n} end))}'
     return 0
   fi
-  printf '%s\n' \
-    "1. On the phone or laptop, open:  https://${addr}:${port}" \
-    "2. Your browser warns the certificate is self-signed. Check it ends with:" \
-    "     $(_lc_fingerprint | tail -c 24)" \
-    "   (full SHA-256: $(_lc_fingerprint)) — then continue." \
-    "3. Type this code:  ${code:0:4}-${code:4}   (works once, for 15 minutes)" \
-    "$([[ $role == owner ]] && printf '%s' "This device may also manage the server: https://${addr}:${port}/panel" || printf '%s' "This device can chat. To manage the server too: sudo 5dive local pair --owner")"
+  if (( own )); then
+    printf '%s\n' \
+      "1. On the phone or laptop, open:  ${url}" \
+      "2. Type this code:  ${code:0:4}-${code:4}   (works once, for 15 minutes)"
+  else
+    printf '%s\n' \
+      "1. On the phone or laptop, open:  ${url}" \
+      "2. Your browser warns the certificate is self-signed. Check it ends with:" \
+      "     $(_lc_fingerprint | tail -c 24)" \
+      "   (full SHA-256: $(_lc_fingerprint)) — then continue." \
+      "3. Type this code:  ${code:0:4}-${code:4}   (works once, for 15 minutes)"
+  fi
+  printf '%s\n' "$([[ $role == owner ]] && printf '%s' "This device may also manage the server: ${url}/panel" || printf '%s' "This device can chat. To manage the server too: sudo 5dive local pair --owner")"
 }
 
 _lc_devices() {
@@ -445,20 +565,23 @@ _lc_devices() {
 }
 
 _lc_status() {
-  local addr port state base
-  addr=$(_lc_conf_get LAN_ADDR); port=$(_lc_conf_get LAN_PORT)
+  local url state base domain cmode until=""
+  url=$(_lc_url); domain=$(_lc_conf_get DOMAIN); cmode=$(_lc_conf_get CERT)
+  [[ -s "$(_lc_etc)/cert.pem" ]] && until=$(openssl x509 -in "$(_lc_etc)/cert.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
   state=$(systemctl is-active "$(_lc_svc)" 2>/dev/null) || true
   base=$(five_api_base)
   if (( JSON_MODE )); then
-    jq -cn --arg s "${state:-inactive}" --arg u "${addr:+https://${addr}:${port}}" --arg b "$base" \
-      '{ok:true, data:{state:$s, url:$u, apiBase:$b}}'
+    jq -cn --arg s "${state:-inactive}" --arg u "$url" --arg b "$base" --arg d "$domain" --arg c "${cmode:-self}" --arg x "$until" \
+      '{ok:true, data:{state:$s, url:$u, apiBase:$b, domain:$d, certificate:(if $c == "own" then "own" else "self-signed" end), certificateUntil:$x}}'
     return 0
   fi
   if [[ "$state" == active ]]; then
-    printf '%s\n' "Office chat: on — https://${addr}:${port}" "Agents' chat goes to: ${base}"
+    printf '%s\n' "Office chat: on — ${url}" "Agents' chat goes to: ${base}"
+    [[ -n "$until" ]] && printf '%s\n' "Certificate: $([[ "$cmode" == own ]] && printf 'yours' || printf 'self-signed'), valid until ${until}"
   else
-    printf '%s\n' "Office chat: off${addr:+ (set up for https://${addr}:${port}; start: sudo 5dive local serve)}"
+    printf '%s\n' "Office chat: off${url:+ (set up for ${url}; start: sudo 5dive local serve)}"
   fi
+  return 0
 }
 
 # local_chat_notice <agent|""> <text> — show a notice in the office chat (a gate
