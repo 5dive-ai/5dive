@@ -271,7 +271,8 @@ _lc_restage() {
 _lc_cert() {
   local addr="$1" domain="${2:-}" etc san; etc=$(_lc_etc)
   if [[ "$(_lc_conf_get CERT)" == own && -n "$domain" && -s "$etc/cert.pem" && -s "$etc/key.pem" ]]; then
-    openssl x509 -in "$etc/cert.pem" -noout -checkhost "$domain" 2>/dev/null | grep -q 'does match' && return 0
+    san=$(openssl x509 -in "$etc/cert.pem" -noout -checkhost "$domain" 2>/dev/null) || san=""
+    grep -q 'does match' <<<"$san" && return 0
     warn "local chat: your certificate no longer covers ${domain}; using a self-signed one until you give a new one (--cert= --key=)."
   fi
   if [[ -s "$etc/cert.pem" && -s "$etc/key.pem" ]]; then
@@ -292,7 +293,8 @@ _lc_cert() {
 # _lc_conf_set <KEY> <value> — replace or add one line of the config.
 _lc_conf_set() {
   local f; f=$(_lc_conf)
-  { [[ -r "$f" ]] && grep -v "^$1=" "$f"; printf '%s=%s\n' "$1" "$2"; } >"$f.tmp" && mv -f "$f.tmp" "$f"
+  { if [[ -r "$f" ]]; then grep -v "^$1=" "$f" || true; fi; printf '%s=%s\n' "$1" "$2"; } >"$f.tmp" && mv -f "$f.tmp" "$f"
+  return $?
 }
 
 # DIVE-8565: take the firm's certificate. Checked BEFORE anything is written:
@@ -300,11 +302,12 @@ _lc_conf_set() {
 # The full chain in <cert> is kept as given (the browser needs the middle ones).
 # _lc_cert_check_own <cert> <key> <domain> — fails with the reason, else 0.
 _lc_cert_check_own() {
-  local cert="$1" key="$2" domain="$3" a b
+  local cert="$1" key="$2" domain="$3" a b m
   [[ -r "$cert" && -s "$cert" ]] || fail "$E_VALIDATION" "local chat: cannot read the certificate file ($cert)."
   [[ -r "$key" && -s "$key" ]] || fail "$E_VALIDATION" "local chat: cannot read the key file ($key)."
   openssl x509 -in "$cert" -noout >/dev/null 2>&1 || fail "$E_VALIDATION" "local chat: $cert is not a PEM certificate."
-  openssl x509 -in "$cert" -noout -checkhost "$domain" 2>/dev/null | grep -q 'does match' \
+  m=$(openssl x509 -in "$cert" -noout -checkhost "$domain" 2>/dev/null) || m=""
+  grep -q 'does match' <<<"$m" \
     || fail "$E_VALIDATION" "local chat: that certificate is not for ${domain}, so browsers would refuse it. Ask your IT for one that names ${domain}."
   openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1 \
     || fail "$E_VALIDATION" "local chat: that certificate has expired ($(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//'))."

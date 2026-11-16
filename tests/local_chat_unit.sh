@@ -275,7 +275,7 @@ check 'D1 --domain serves on the name, port 443 by default (the address is just 
 check 'D2 ... and says IT points the name at the office address' 'grep -qF "Your IT points team.example.test at 192.0.2.10" <<<"$out"'
 UNIT="$TMPD/rootd/etc/systemd/system/5dive-local-chat.service"
 check 'D3 port 443: the never-root unit gets ONLY the bind capability, NoNewPrivileges kept' 'grep -qx "AmbientCapabilities=CAP_NET_BIND_SERVICE" "$UNIT" && grep -qx "CapabilityBoundingSet=CAP_NET_BIND_SERVICE" "$UNIT" && grep -qx "NoNewPrivileges=yes" "$UNIT" && grep -qx "User=5dive-chat" "$UNIT" && grep -qx "LC_LAN_PORT=443" < <(grep -o "LC_LAN_PORT=[0-9]*" "$UNIT")'
-check 'D4 no certificate given: a self-signed one names BOTH the domain and the office address' 'openssl x509 -in "$DCONF/cert.pem" -noout -ext subjectAltName | grep -q "DNS:team.example.test" && openssl x509 -in "$DCONF/cert.pem" -noout -ext subjectAltName | grep -q "IP Address:192.0.2.10" && grep -qx "CERT=self" "$DCONF/config"'
+check 'D4 no certificate given: a self-signed one names BOTH the domain and the office address' 'san=$(openssl x509 -in "$DCONF/cert.pem" -noout -ext subjectAltName) && grep -q "DNS:team.example.test" <<<"$san" && grep -q "IP Address:192.0.2.10" <<<"$san" && grep -qx "CERT=self" "$DCONF/config"'
 out=$(pair_d 2>&1); r=$?
 check 'D5 pair names https://team.example.test and still warns about the self-signed cert' '(( r == 0 )) && grep -qF "open:  https://team.example.test" <<<"$out" && grep -q "self-signed" <<<"$out"'
 out=$(JSON_MODE=1 _lc_status 2>&1)
@@ -306,7 +306,7 @@ check 'D15 status --json says own, and when it runs out' '[[ "$(jq -r .data.cert
 out=$(SS_OUT='LISTEN 0 4096 *:443 *:* users:(("caddy",pid=20147,fd=3))' serve_d 2>&1); r=$?
 check 'D16 port 443 held by another program: refused, names it, nothing started' '(( r != 0 )) && grep -q "port 443 is already used by caddy" <<<"$out"'
 out=$(serve_d --domain=none 2>&1); r=$?
-check 'D17 --domain=none goes back to the office address; the firm cert (no IP in it) is replaced by a self-signed one' '(( r == 0 )) && grep -qx "DOMAIN=" "$DCONF/config" && grep -qx "Office chat is ON: https://192.0.2.10" <<<"$out" && grep -qx "CERT=self" "$DCONF/config" && openssl x509 -in "$DCONF/cert.pem" -noout -ext subjectAltName | grep -q "IP Address:192.0.2.10"'
+check 'D17 --domain=none goes back to the office address; the firm cert (no IP in it) is replaced by a self-signed one' '(( r == 0 )) && grep -qx "DOMAIN=" "$DCONF/config" && grep -qx "Office chat is ON: https://192.0.2.10" <<<"$out" && grep -qx "CERT=self" "$DCONF/config" && san=$(openssl x509 -in "$DCONF/cert.pem" -noout -ext subjectAltName) && grep -q "IP Address:192.0.2.10" <<<"$san"'
 out=$(serve_d --domain=team.example.test --port=8443 2>&1); r=$?
 check 'D18 --port with --domain wins; above 1024 the unit gets no capability' '(( r == 0 )) && grep -qx "Office chat is ON: https://team.example.test:8443" <<<"$out" && ! grep -q "CAP_NET_BIND_SERVICE" "$UNIT"'
 out=$(serve_d --port=80 2>&1); r=$?
