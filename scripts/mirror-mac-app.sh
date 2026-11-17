@@ -20,12 +20,17 @@
 # Env:   GH_TOKEN, GITHUB_REPOSITORY (default 5dive-ai/5dive),
 #        MAC_APP_SRC_REPO (default 5dive-ai/5dive-desktop),
 #        MAC_APP_FILES (default "5dive.dmg"; the .zip was dropped in DIVE-8659:
-#        nothing used it, there is no auto-updater)
+#        nothing used it, there is no auto-updater),
+#        APP_OPTIONAL_FILES (default "5dive-setup.exe", the Windows app,
+#        DIVE-8666): copied the same way when the desktop release has it, and
+#        skipped with a notice when it does not, so a desktop release from
+#        before Windows (or a Windows build that failed) never blocks the .dmg.
 set -euo pipefail
 
 dst_repo="${GITHUB_REPOSITORY:-5dive-ai/5dive}"
 src_repo="${MAC_APP_SRC_REPO:-5dive-ai/5dive-desktop}"
 read -r -a files <<< "${MAC_APP_FILES:-5dive.dmg}"
+read -r -a optional <<< "${APP_OPTIONAL_FILES-5dive-setup.exe}"
 
 if [[ -n "${1:-}" ]]; then
   dst_path="repos/${dst_repo}/releases/tags/${1}"
@@ -58,6 +63,13 @@ for f in "${files[@]}"; do
   if [[ -z "$(fingerprint "$src_json" "$f")" ]]; then
     echo "::error::${src_repo}@${src_tag} has no ${f} — refusing to copy a partial Mac app."
     exit 1
+  fi
+done
+for f in "${optional[@]}"; do
+  if [[ -n "$(fingerprint "$src_json" "$f")" ]]; then
+    files+=("$f")
+  else
+    echo "  ${f}: not on ${src_repo}@${src_tag}, skipped"
   fi
 done
 for f in "${files[@]}"; do
