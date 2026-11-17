@@ -32,10 +32,11 @@ STUB
 chmod +x "$TMP/bin/gh"
 export PATH="$TMP/bin:$PATH" STUB_DIR="$TMP" GITHUB_REPOSITORY=5dive-ai/5dive
 
-src() { # src <dmg digest> [zip digest]  -> desktop latest release
-  local zip=""
+src() { # src <dmg digest> [zip digest] [exe digest]  -> desktop latest release
+  local zip="" exe=""
   [[ -n "${2:-}" ]] && zip=",{\"name\":\"5dive-mac.zip\",\"size\":20,\"digest\":\"$2\"}"
-  printf '{"tag_name":"v0.2.0","assets":[{"name":"5dive.dmg","size":10,"digest":"%s"}%s]}' "$1" "$zip" \
+  [[ -n "${3:-}" ]] && exe=",{\"name\":\"5dive-setup.exe\",\"size\":30,\"digest\":\"$3\"}"
+  printf '{"tag_name":"v0.2.0","assets":[{"name":"5dive.dmg","size":10,"digest":"%s"}%s%s]}' "$1" "$zip" "$exe" \
     > "$TMP/api/repos_5dive-ai_5dive-desktop_releases_latest.json"
 }
 dst() { # dst <path-file-suffix> <tag> <assets json>
@@ -90,6 +91,32 @@ printf '{"tag_name":"v0.2.0","assets":[]}' > "$TMP/api/repos_5dive-ai_5dive-desk
 run
 [[ $rc -ne 0 && "$(uploads)" == 0 ]] && grep -q 'has no 5dive.dmg' <<< "$out" \
   && ok "missing dmg is an error" || no "missing dmg" "rc=$rc out=$out"
+
+echo "8. DIVE-8666: desktop release with the Windows installer: dmg and exe both copied"
+src sha256:ccc "" sha256:eee
+dst latest v0.136.0 '[]'
+run
+[[ $rc -eq 0 && "$(uploads)" == 2 ]] && ok "two uploads" || no "two uploads" "rc=$rc $(cat "$TMP/calls")"
+grep -q '^release upload v0.136.0 -R 5dive-ai/5dive .*/5dive-setup.exe --clobber' "$TMP/calls" \
+  && grep -q '^release download v0.2.0 -R 5dive-ai/5dive-desktop -p 5dive-setup.exe' "$TMP/calls" \
+  && ok "exe read from 5dive-desktop and uploaded onto Latest" || no "exe copy" "$(cat "$TMP/calls")"
+
+echo "9. same digests again: no-op for the exe too"
+dst latest v0.136.0 '[{"name":"5dive.dmg","size":10,"digest":"sha256:ccc"},{"name":"5dive-setup.exe","size":30,"digest":"sha256:eee"}]'
+run
+[[ $rc -eq 0 && "$(uploads)" == 0 ]] && ok "nothing uploaded" || no "exe idempotent" "rc=$rc $(cat "$TMP/calls")"
+
+echo "10. desktop release WITHOUT the exe (before Windows, or its build failed): dmg still copied, exe skipped"
+src sha256:ddd
+dst latest v0.137.0 '[]'
+run
+[[ $rc -eq 0 && "$(uploads)" == 1 ]] && grep -q 'upload .*5dive.dmg' "$TMP/calls" && grep -q '5dive-setup.exe: not on' <<< "$out" \
+  && ok "missing exe never blocks the dmg" || no "optional exe" "rc=$rc out=$out $(cat "$TMP/calls")"
+
+echo "11. desktop release with an exe but no dmg: refused, nothing copied (not even the exe)"
+printf '{"tag_name":"v0.2.0","assets":[{"name":"5dive-setup.exe","size":30,"digest":"sha256:eee"}]}' > "$TMP/api/repos_5dive-ai_5dive-desktop_releases_latest.json"
+run
+[[ $rc -ne 0 && "$(uploads)" == 0 ]] && ok "no partial copy" || no "no partial copy" "rc=$rc $(cat "$TMP/calls")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]
