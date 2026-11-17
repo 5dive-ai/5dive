@@ -258,7 +258,8 @@ _lp_run() {
     settings)
       jq -cn --argjson lo "$(_lp_local_only_rows)" --argjson a "$(_lp_accounts)" \
         --argjson up "$(_lp_update_ready && echo true || echo false)" --arg v "${FIVE_VERSION:-}" \
-        '{localOnly:$lo, accounts:$a, updateFromFile:$up, version:$v}' ;;
+        --argjson c "$(_lc_cert_json 2>/dev/null || echo null)" \
+        '{localOnly:$lo, accounts:$a, updateFromFile:$up, version:$v, certificate:$c}' ;;
     account-test)
       local acct="$1" u m h k
       u=$(profile_env_value "$acct" FIVEDIVE_CUSTOM_BASE_URL)

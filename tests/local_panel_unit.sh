@@ -115,6 +115,7 @@ okv 'A1 team lists the agents' '.data | map(.name) == ["alice","bob"]' team
 okv 'A2 board: open rows and waiting gates' '(.data.tasks[0].ident == "DIVE-1") and (.data.gates | length == 2)' board
 okv 'A3 secrets: names only, never values' '.data == ["GITHUB_TOKEN","OPENAI_API_KEY"]' secrets
 okv 'A4 settings: local-only rows, the local AI, update hidden' '(.data.localOnly | length == 2) and (.data.localOnly[1] == {ok:false,item:"snap store",state:"online"}) and (.data.accounts == [{name:"office-ai",harness:"claude",baseUrl:"http://gpu.office:11434",model:"qwen3"}]) and (.data.updateFromFile == false)' settings
+okv 'A4b DIVE-8611 settings carry the certificate for the panel (no certificate here: not the firm'"'"'s, no warning)' '(.data.certificate.mine == false) and (.data.certificate.warning == "") and (.data.certificate | has("daysLeft") and has("renewsBySelf") and has("until"))' settings
 okv 'A5 agent-restart' '.data.done' agent-restart alice
 check 'A5a … ran `agent restart alice`' 'grep -qx -- "--json agent restart alice " <<<"$(tail -1 "$LOG")"'
 okv 'A6 agent-remove' '.data.done' agent-remove bob

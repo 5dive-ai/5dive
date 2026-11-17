@@ -801,8 +801,11 @@ input,textarea{width:100%;padding:12px;font:inherit;border:1px solid var(--line)
 .code{font:600 34px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:4px;text-align:center;padding:14px;margin:8px 0;border:1px dashed var(--accent);border-radius:12px}
 .pick{display:block;width:100%;text-align:left;border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--ink);font:inherit;padding:10px 12px;margin:6px 0;cursor:pointer}
 .pick span{display:block;color:var(--mute);font-size:13px}.pick.on{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+.cw{max-width:720px;margin:12px auto 0;padding:12px 14px;border-radius:14px;border:1px solid var(--warn);color:var(--warn);background:var(--card);font-weight:600}
+@media (max-width:752px){.cw{margin:12px 16px 0}}
 </style></head><body>
 <header><h1 id="title">Office server</h1><a href="/">💬 Chat</a></header>
+<div id="cw" class="cw" hidden></div>
 <main id="app"><div class="empty">Loading…</div></main>
 <div class="toast" id="toast"></div>
 <nav class="tabs" id="tabs" hidden>
@@ -879,6 +882,7 @@ const views = {
   },
   async settings() {
     const d = await api("/api/panel/settings");
+    certWarn(d.certificate);
     const leaks = d.localOnly.filter((r) => !r.ok);
     // DIVE-7579 (m5): the headline and only what needs the owner. The full list
     // of checked items (unit names) stays one tap away, not on the screen.
@@ -892,6 +896,10 @@ const views = {
       '<div class="card"><h3>Your AI</h3>' + (d.accounts.length ? d.accounts.map((a) =>
         '<div class="item"><div class="grow"><b>' + esc(a.model || a.name) + '</b><span>' + esc(a.baseUrl) + '</span></div><button class="btn line" data-test="' + esc(a.name) + '">Test</button></div>').join("")
         : '<p class="mute">No local AI added yet.</p>') + '</div>' +
+      // DIVE-8611: the firm's own certificate, when it runs out, and whether renewals come in by themselves.
+      (d.certificate && d.certificate.mine ? '<div class="card"><h3>Certificate</h3><p class="' + (d.certificate.warning ? "leak" : "mute") + '">' +
+        (d.certificate.warning ? "⚠️ " + esc(d.certificate.warning) : "✅ Valid until " + esc(d.certificate.until) + ". " +
+          (d.certificate.renewsBySelf ? "When your IT renews it, the chat takes the new one by itself." : "When your IT renews it, they give the new files to this server once more.")) + '</p></div>' : "") +
       '<div class="card"><h3>Connected devices</h3><button class="btn" id="inv" style="margin:6px 0 4px">＋ Invite a person</button>' + d.devices.map((v) =>
         '<div class="item"><div class="grow"><b>' + esc(v.name) + (v.id === d.me ? " (this one)" : "") + '</b><span>' + (v.role === "owner" ? "Can manage" : "Chat only") + ' · last seen ' + esc(seen(v.last_seen)) + '</span></div><button class="btn red" data-rv="' + esc(v.id) + '">Remove</button></div>').join("") + '</div>' +
       (d.updateFromFile ? '<div class="card"><h3>Update</h3><p class="mute">This server runs 5dive ' + esc(d.version || "") + '. Got an update file from your IT team? Pick it and install.</p>' +
@@ -917,6 +925,11 @@ const views = {
     if (d.updateFromFile) { try { const u = await api("/api/panel/update"); if (u && u.state === "running") watchUpdate(); else if (u && u.state !== "none") updateDone(u); } catch (er) {} }
   },
 };
+// DIVE-8611: the certificate warning sits above every tab until it is renewed.
+function certWarn(c) {
+  const e = $("#cw"), w = c && c.mine && c.warning ? c.warning : "";
+  e.textContent = w ? "⚠️ " + w : ""; e.hidden = !w;
+}
 // DIVE-7886: save a Support file. The text root answers with is the file,
 // byte for byte (a Blob of a string is its UTF-8), downloaded under root's name.
 async function supportFile(btn) {
@@ -1069,8 +1082,11 @@ window.onhashchange = () => show(views[location.hash.slice(1)] ? location.hash.s
 // after "Skip for now").
 (async () => {
   let skip = false; try { skip = sessionStorage.getItem("skipSetup") === "1"; } catch (er) {}
-  if (!location.hash && !skip) {
-    try { const d = await api("/api/panel/settings"); if (!d.accounts.length) { setup(); return; } } catch (er) { if (/can chat/.test(er.message)) return; }
+  // DIVE-8611: read once on open, so the certificate warning shows whatever tab opens.
+  let d = null;
+  try { d = await api("/api/panel/settings"); certWarn(d.certificate); } catch (er) { if (/can chat/.test(er.message)) return; }
+  if (!location.hash && !skip && d) {
+    if (!d.accounts.length) { setup(); return; }
   }
   window.onhashchange();
 })();

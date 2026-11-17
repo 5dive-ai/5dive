@@ -312,6 +312,91 @@ check 'D18 --port with --domain wins; above 1024 the unit gets no capability' '(
 out=$(serve_d --port=80 2>&1); r=$?
 check 'D19 a low port other than 443 is still refused' '(( r != 0 )) && grep -q "443 or 1024-65535" <<<"$out"'
 
+# ── E. DIVE-8611: a renewed certificate is taken; a warning 14 days before ────
+# The firm's files as certbot keeps them: live/ names are links that move to
+# each new file in archive/. The source checks want root's files; here the
+# test user's (the seam only counts under FIVE_LOCAL_CHAT_ROOT).
+export LC_CERT_SRC_UID; LC_CERT_SRC_UID=$(id -u)
+umask 022   # as root's files are: a 0002 test shell would make every source group-writable (refused, E12)
+LE="$TMPD/rootd/etc/letsencrypt"; mkdir -p "$LE/renewal-hooks" "$LE/archive/team" "$LE/live/team"
+cp "$CA/team.pem" "$LE/archive/team/fullchain1.pem"; cp "$CA/team.key" "$LE/archive/team/privkey1.pem"; chmod 0600 "$LE/archive/team/privkey1.pem"
+ln -sfn ../../archive/team/fullchain1.pem "$LE/live/team/fullchain.pem"; ln -sfn ../../archive/team/privkey1.pem "$LE/live/team/privkey.pem"
+renew() {   # renew <prefix> <n>: certbot writes the nth files and moves the links
+  cp "$1.pem" "$LE/archive/team/fullchain$2.pem"; cp "$1.key" "$LE/archive/team/privkey$2.pem"; chmod 0600 "$LE/archive/team/privkey$2.pem"
+  ln -sfn "../../archive/team/fullchain$2.pem" "$LE/live/team/fullchain.pem"; ln -sfn "../../archive/team/privkey$2.pem" "$LE/live/team/privkey.pem"
+}
+SYSLOG="$TMPD/systemctl.log"
+sync_d() { ( set -euo pipefail; require_root() { :; }; systemctl() { printf '%s\n' "$*" >>"$SYSLOG"; return 0; }; _lc_cert_sync ) }
+TIMER="$TMPD/rootd/etc/systemd/system/5dive-local-chat-cert.timer"; CSVC="$TMPD/rootd/etc/systemd/system/5dive-local-chat-cert.service"
+HOOK="$LE/renewal-hooks/deploy/5dive-office-chat"; MOTD="$TMPD/rootd/etc/motd.d/5dive-office-chat-certificate"
+mkdir -p "$TMPD/rel"
+out=$(cd "$LE/live" && serve_d --domain=team.example.test --port=8443 --cert=team/fullchain.pem --key=team/privkey.pem 2>&1); r=$?
+check 'E1 serve keeps WHERE the firm'"'"'s files are: absolute, the certbot link itself (not the file it points at today)' '(( r == 0 )) && grep -qx "CERT_SRC=$LE/live/team/fullchain.pem" "$DCONF/config" && grep -qx "KEY_SRC=$LE/live/team/privkey.pem" "$DCONF/config" && grep -qx "CERT=own" "$DCONF/config"'
+check 'E2 ... and says a renewal there is taken by itself' 'grep -qF "When IT renews it at $LE/live/team/fullchain.pem, the chat takes the new one by itself" <<<"$out"'
+check 'E3 a daily timer runs `local _cert-sync` (oneshot, catches up after a power-off)' 'grep -qx "ExecStart=/usr/local/bin/5dive local _cert-sync" "$CSVC" && grep -qx "Type=oneshot" "$CSVC" && grep -qx "OnCalendar=daily" "$TIMER" && grep -qx "Persistent=true" "$TIMER"'
+check 'E4 certbot is on the box: its deploy hook runs the same sync right after a renewal' '[[ -x "$HOOK" ]] && grep -qx "exec /usr/local/bin/5dive local _cert-sync" "$HOOK"'
+serve_d >/dev/null 2>&1; r=$?
+check 'E5 a later serve with no flags keeps the source paths' '(( r == 0 )) && grep -qx "CERT_SRC=$LE/live/team/fullchain.pem" "$DCONF/config" && grep -qx "KEY_SRC=$LE/live/team/privkey.pem" "$DCONF/config"'
+: >"$SYSLOG"; out=$(sync_d 2>&1); r=$?
+check 'E6 sync with nothing renewed: no copy, no restart, no warning' '(( r == 0 )) && ! grep -q "took" <<<"$out" && ! grep -q try-restart "$SYSLOG" && cmp -s "$CA/team.pem" "$DCONF/cert.pem" && [[ ! -e "$MOTD" ]]'
+
+leaf team.example.test "$CA/team2" 60; renew "$CA/team2" 2
+: >"$SYSLOG"; out=$(sync_d 2>&1); r=$?
+check 'E7 RENEWED: sync takes the new pair (chain + key, key 0600) and restarts the chat on it' '(( r == 0 )) && grep -q "took the renewed certificate from $LE/live/team/fullchain.pem" <<<"$out" && cmp -s "$CA/team2.pem" "$DCONF/cert.pem" && cmp -s "$CA/team2.key" "$DCONF/key.pem" && [[ "$(stat -c %a "$DCONF/key.pem")" == 600 ]] && grep -qx "try-restart 5dive-local-chat.service" "$SYSLOG"'
+check 'E8 ... no half-copies left behind' '[[ ! -e "$DCONF/.cert.new" && ! -e "$DCONF/.key.new" ]]'
+
+leaf other.example.test "$CA/wrong" 60; renew "$CA/wrong" 3
+: >"$SYSLOG"; out=$(sync_d 2>&1); r=$?
+check 'E9 a "renewal" for another name is NOT taken: the old one stays, the reason is said, no restart' '(( r == 0 )) && grep -q "was NOT taken" <<<"$out" && grep -q "not for team.example.test" <<<"$out" && cmp -s "$CA/team2.pem" "$DCONF/cert.pem" && ! grep -q try-restart "$SYSLOG"'
+cp "$CA/team.pem" "$LE/archive/team/fullchain4.pem"; cp "$CA/team2.key" "$LE/archive/team/privkey4.pem"
+ln -sfn ../../archive/team/fullchain4.pem "$LE/live/team/fullchain.pem"; ln -sfn ../../archive/team/privkey4.pem "$LE/live/team/privkey.pem"
+out=$(sync_d 2>&1); r=$?
+check 'E10 a certificate whose key is not the new key (caught mid-renewal) is NOT taken' '(( r == 0 )) && grep -q "does not belong" <<<"$out" && cmp -s "$CA/team2.pem" "$DCONF/cert.pem" && cmp -s "$CA/team2.key" "$DCONF/key.pem"'
+if [[ -s "$CA/old.pem" ]]; then
+  renew "$CA/old" 5; out=$(sync_d 2>&1)
+  check 'E11 an expired "renewal" is NOT taken' 'grep -q "expired" <<<"$out" && cmp -s "$CA/team2.pem" "$DCONF/cert.pem"'
+else bad_ 'E11 an expired renewal is not taken' "no expired cert with this openssl"; fi
+leaf team.example.test "$CA/team3" 60; renew "$CA/team3" 6; chmod 0666 "$LE/archive/team/fullchain6.pem"
+out=$(sync_d 2>&1)
+check 'E12 a file another user could change is NOT followed (else they could put their certificate on the firm'"'"'s name)' 'grep -q "can be changed by a user other than root" <<<"$out" && cmp -s "$CA/team2.pem" "$DCONF/cert.pem"'
+chmod 0644 "$LE/archive/team/fullchain6.pem"; out=$(LC_CERT_SRC_UID=12345 sync_d 2>&1)
+check 'E13 a file not owned by root is NOT followed' 'grep -q "can be changed by a user other than root" <<<"$out" && cmp -s "$CA/team2.pem" "$DCONF/cert.pem"'
+out=$(sync_d 2>&1)
+check 'E14 ... and once it is root'"'"'s and locked, it is taken' 'grep -q "took the renewed" <<<"$out" && cmp -s "$CA/team3.pem" "$DCONF/cert.pem"'
+
+# 14 days before: the server's login message, status, the panel.
+leaf team.example.test "$CA/soon" 10; renew "$CA/soon" 7
+out=$(sync_d 2>&1)
+check 'E15 runs out in under 14 days: sync warns in plain words, naming the day and where IT renews it' 'grep -q "took the renewed" <<<"$out" && grep -qE "certificate runs out in [0-9]+ days, on [0-9]{4}-[0-9]{2}-[0-9]{2}\. Ask your IT to renew it at $LE/live/team/fullchain.pem: the chat takes the new one by itself" <<<"$out"'
+check 'E16 ... and the same sentence is the server'"'"'s login message (pam_motd reads /etc/motd.d)' 'grep -q "runs out in" "$MOTD" && [[ "$(stat -c %a "$MOTD")" == 644 ]]'
+out=$(JSON_MODE=1 _lc_status 2>&1)
+check 'E17 status --json: days left, where renewals come from, the warning' '[[ "$(jq -r .data.certificateDaysLeft <<<"$out")" -le 10 && "$(jq -r .data.certificateRenewsFrom <<<"$out")" == "$LE/live/team/fullchain.pem" ]] && [[ "$(jq -r .data.certificateWarning <<<"$out")" == *"runs out in"* ]]'
+status_on() { ( systemctl() { [[ "$1" == is-active ]] && printf 'active\n'; return 0; }; _lc_status ) }
+out=$(status_on 2>&1)
+check 'E18 status (text): renewals followed from where, and the warning' 'grep -qF "Renewals: taken from $LE/live/team/fullchain.pem by themselves" <<<"$out" && grep -q "runs out in" <<<"$out"'
+out=$(_lc_cert_json)
+check 'E19 the panel gets {mine, until, daysLeft, renewsBySelf, warning}' 'jq -e ".mine == true and .renewsBySelf == true and (.daysLeft <= 10) and (.until | test(\"^[0-9]{4}-\")) and (.warning | test(\"runs out in\"))" <<<"$out"'
+leaf team.example.test "$CA/fresh" 80; renew "$CA/fresh" 8
+out=$(sync_d 2>&1)
+check 'E20 renewed in time: the login message and the warning are gone' 'grep -q "took the renewed" <<<"$out" && ! grep -q "runs out in" <<<"$out" && [[ ! -e "$MOTD" ]] && [[ "$(jq -r .warning <<<"$(_lc_cert_json)")" == "" ]]'
+cp "$CA/old.pem" "$DCONF/cert.pem"
+check 'E21 already run out: says so, and that phones refuse the chat until IT renews it' '[[ "$(_lc_cert_warning)" == *"ran out on 2020-02-01. Phones and laptops refuse the chat until your IT renews it at"* ]]'
+sed -i "/^CERT_SRC=/d;/^KEY_SRC=/d" "$DCONF/config"
+check 'E22 a box set up before this (no source kept): the warning says what IT runs' '[[ "$(_lc_cert_warning)" == *"runs: sudo 5dive local serve --cert=<file> --key=<file>"* ]]'
+check 'E23 ... and status says renewals are not followed yet' '[[ "$(status_on)" == *"Renewals: not followed"* ]]'
+cp "$CA/fresh.pem" "$DCONF/cert.pem"; cp "$CA/fresh.key" "$DCONF/key.pem"
+_lc_conf_set CERT self
+check 'E24 a self-signed certificate never warns (it is not IT'"'"'s to renew)' '[[ -z "$(_lc_cert_warning)" ]] && [[ "$(jq -r .mine <<<"$(_lc_cert_json)")" == false ]]'
+out=$(sync_d 2>&1); r=$?
+check 'E25 sync on a self-signed chat does nothing' '(( r == 0 )) && ! grep -q took <<<"$out" && cmp -s "$CA/fresh.pem" "$DCONF/cert.pem"'
+rm -f "$TIMER" "$CSVC"
+( set -euo pipefail; require_root() { :; }; systemctl() { return 0; }; _lc_bun() { printf /usr/local/bin/bun; }; _lc_restage ) >/dev/null 2>&1
+check 'E26 an update (local _restage) adds the daily check to a chat set up before it' '[[ -s "$TIMER" && -s "$CSVC" ]]'
+printf 'x\n' >"$MOTD"
+( set -euo pipefail; systemctl() { return 0; }; five_api_base_file() { printf '%s' "$TMPD/api-base"; }; _lc_serve_stop ) >/dev/null 2>&1
+check 'E27 serve --stop removes the timer, the certbot hook and the login message' '[[ ! -e "$TIMER" && ! -e "$CSVC" && ! -e "$HOOK" && ! -e "$MOTD" ]]'
+check 'E28 the panel page shows the warning above every tab, and a Certificate card in Settings' 'grep -q "id=\"cw\" class=\"cw\" hidden" src/cmd_local_chat_server.sh && grep -q "function certWarn" src/cmd_local_chat_server.sh && grep -q "<h3>Certificate</h3>" src/cmd_local_chat_server.sh'
+
 # Live: the real server on the firm's certificate. A browser that trusts the
 # firm's authority opens it BY NAME with no warning; any other name fails.
 DP=$((LAN + 4)); DL=$((LAN + 5))
