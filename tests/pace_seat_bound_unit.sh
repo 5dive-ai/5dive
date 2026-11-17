@@ -69,9 +69,13 @@ OTHER=$(row acct-2 20 "$FUT")     # tick 2 is non-empty: another account still r
 
 fresh(){ rm -f "$FIVE_PACE_CACHE_FILE" "$FIVE_PACE_SEAT_BOUND_FILE"; }
 tick(){ # <doc> [<now>] -> "<rc>\t<verdict>"; expires the usage cache first, as five minutes would
-  DOC="$1"; local n="${2:-$NOW}" snap v rc=0
+  DOC="$1"; local n="${2:-}" snap v rc=0
   [[ -f "$FIVE_PACE_CACHE_FILE" ]] && touch -d '10 minutes ago' "$FIVE_PACE_CACHE_FILE"
   snap=$(_pace_usage_snapshot)
+  # DIVE-8624: grade at a "now" read AFTER the snapshot. The snapshot stamps the
+  # remembered reading with its own clock (asOf), and a bound measured after
+  # "now" is refused; a script-start $NOW lost A2/A3 whenever a second ticked over.
+  [[ -n "$n" ]] || n=$(date -u +%s)
   v=$(printf '%s' "$snap" | _pace_band acct-1 "$n") || rc=$?
   printf '%s\t%s' "$rc" "$v"
 }
