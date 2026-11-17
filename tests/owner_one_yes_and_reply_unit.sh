@@ -158,14 +158,17 @@ bindrow() { # <ident> <hex> — a fresh gate with a bound ask
 }
 bindrow DIVE-4 2222222222bb
 settle_as DIVE-4 lead:clip lead approve
-[[ ! -s "$RUNLOG" && "$(cat "$TMP/err")" == *"NOT approved"* ]] \
+! grep -q '^browser approve' "$RUNLOG" && [[ "$(cat "$TMP/err")" == *"NOT approved"* ]] \
   && ok_t "Y8 a lead's clear approves no browser step, and says so" || bad_t "Y8 lead" "run=$(cat "$RUNLOG") err=$(cat "$TMP/err")"
-settle_as DIVE-4 human:lodar channel-session approve
-[[ ! -s "$RUNLOG" ]] && ok_t "Y9 an agent citing the owner's chat approves nothing either" || bad_t "Y9 cited chat" "run=$(cat "$RUNLOG")"
-settle_as DIVE-4 human:lodar sudo-uid "maybe later"
-[[ ! -s "$RUNLOG" && "$(cat "$TMP/err")" == *"neither a yes nor a no"* ]] \
+bindrow DIVE-41 2222222222b1
+settle_as DIVE-41 human:lodar channel-session approve
+! grep -q '^browser approve' "$RUNLOG" && ok_t "Y9 an agent citing the owner's chat approves nothing either" || bad_t "Y9 cited chat" "run=$(cat "$RUNLOG")"
+bindrow DIVE-42 2222222222b2
+settle_as DIVE-42 human:lodar sudo-uid "maybe later"
+! grep -q '^browser approve' "$RUNLOG" && [[ "$(cat "$TMP/err")" == *"neither a yes nor a no"* ]] \
   && ok_t "Y10 an answer that is neither yes nor no leaves the ask as it was" || bad_t "Y10 unclear" "run=$(cat "$RUNLOG")"
-settle_as DIVE-4 human:lodar nonce+channel-session ok
+bindrow DIVE-43 2222222222b3
+settle_as DIVE-43 human:lodar nonce+channel-session ok
 [[ "$(grep -c '^browser approve' "$RUNLOG")" == 1 ]] \
   && ok_t "Y11 the owner's tap (nonce) approves" || bad_t "Y11 tap" "run=$(cat "$RUNLOG")"
 
@@ -196,6 +199,65 @@ A7=$(mkreq agent-fixture 5555555555ee send); seed_task DIVE-7
 cmd_task_need DIVE-7 --type=approval --browser-ask="$A7" --ask="Send the order confirmation to the test buyer?" --from=fixture >/dev/null 2>&1
 [[ "$(db "SELECT COALESCE(needs_capability,'') FROM tasks WHERE ident='DIVE-7';")" == human_tap ]] \
   && ok_t "Y16 a non-pay ask declares human_tap" || bad_t "Y16 human_tap" "$(db "SELECT needs_capability FROM tasks WHERE ident='DIVE-7';")"
+
+# ── C (DIVE-8643, box report 1096): an answer that cannot approve the ask still
+# reaches the owner. Their typed «да», cited by the seat, cleared the gate and left
+# the ask open with nothing to tap: the row sat out the 30-minute page-read window.
+# The seat's Telegram is a seam: CARDLOG records what the owner was sent.
+CARDLOG="$TMP/card.log"
+with_route() { # the seat has a paired owner on Telegram; every send is confirmed
+  local_only_on() { return 1; }
+  _owner_ask_route() { OA_OWNER_HID="" OA_OWNER_TG=111; return 0; }
+  _task_send_gate_owner() { printf 'TEXT %s\nMARKUP %s\n' "$1" "$2" >> "$CARDLOG"; TASK_SEND_DELIVERED=1; TASK_SEND_TARGETS=111; }
+  _owner_ask_screenshot() { :; }
+}
+no_route() { local_only_on() { return 1; }; _owner_ask_route() { OA_ROUTE_WHY="seat fixture has no paired Telegram channel"; return 1; }; }
+
+bindrow DIVE-9 7777777777a1; A9=$(jq -r .ask "$TMP/owner-ask-gates/$(idof DIVE-9).json")
+nh0=$(jq -r '.nonce_hash // ""' "$(reqf "$A9")")
+( with_route; : > "$CARDLOG"; settle_as DIVE-9 human:owner channel-session "Да"; cat "$TMP/err" > "$TMP/err9" )
+nh1=$(jq -r '.nonce_hash // ""' "$(reqf "$A9")")
+tapn=$(sed -n 's/.*"callback_data":"bap:7777777777a1:\([^"]*\)".*/\1/p' "$CARDLOG" | head -1)
+! grep -q '^browser approve' "$RUNLOG" && grep -q "bap:7777777777a1:" "$CARDLOG" && grep -q "bdn:7777777777a1:" "$CARDLOG" \
+  && [[ "$nh1" != "$nh0" && "$(_human_nonce_sha "$tapn")" == "$nh1" ]] \
+  && ok_t "C1 the owner's cited «Да» approves nothing, and the owner gets the ask's own Approve / Decline buttons (fresh proof)" \
+  || bad_t "C1 card on a cited chat yes" "run=$(cat "$RUNLOG") card=$(cat "$CARDLOG" 2>&1) nh0=$nh0 nh1=$nh1"
+grep -q "^agent send fixture --message=.*did not approve browser ask $A9.*Approve / Decline buttons: their tap wakes you" "$RUNLOG" \
+  && [[ ! -e "$TMP/owner-ask-gates/$(idof DIVE-9).json" ]] \
+  && ok_t "C2 ...the seat is told to wait for that tap, not re-run, and the gate's stale proof is dropped" \
+  || bad_t "C2 seat told" "run=$(cat "$RUNLOG") gates=$(ls "$TMP/owner-ask-gates")"
+# The tap on that card is what approves: the real `owner-ask tap` path, nonce from the card.
+( with_route; _owner_ask_granter_uid() { id -u; }; _owner_ask_tap "bap:7777777777a1:${tapn}" --tap-uid=111 ) >"$TMP/tap3" 2>&1
+grep -q "^browser approve $A9 --human-proof=${tapn}\$" "$RUNLOG" \
+  && ok_t "C3 the owner's tap on the re-sent card approves the ask with that card's proof" \
+  || bad_t "C3 tap approves" "run=$(cat "$RUNLOG")"
+
+bindrow DIVE-10 7777777777a2; A10=$(jq -r .ask "$TMP/owner-ask-gates/$(idof DIVE-10).json")
+( no_route; settle_as DIVE-10 human:owner channel-session yes )
+! grep -q '^browser approve' "$RUNLOG" \
+  && grep -q "^agent send fixture --message=.*nothing reached them to tap (seat fixture has no paired Telegram channel).*--browser-ask=$A10" "$RUNLOG" \
+  && ok_t "C4 with no route to the owner the seat is told to put the ask back on the row as a card, not left to re-run into it" \
+  || bad_t "C4 no route" "run=$(cat "$RUNLOG")"
+
+bindrow DIVE-11 7777777777a3
+( with_route; : > "$CARDLOG"; settle_as DIVE-11 human:owner channel-session no )
+! grep -q '^browser approve' "$RUNLOG" && [[ ! -s "$CARDLOG" ]] && ! grep -q '^agent send' "$RUNLOG" \
+  && ok_t "C5 a cited no sends no Approve card" || bad_t "C5 no" "run=$(cat "$RUNLOG") card=$(cat "$CARDLOG")"
+
+bindrow DIVE-12 7777777777a4
+( with_route; : > "$CARDLOG"; settle_as DIVE-12 human:owner sudo-uid "да, отправляй" )
+! grep -q '^browser approve' "$RUNLOG" && grep -q "bap:7777777777a4:" "$CARDLOG" \
+  && ok_t "C6 an owner's answer that is neither a recognised yes nor no (Russian «да») also gets the card" \
+  || bad_t "C6 unclear gets card" "run=$(cat "$RUNLOG") card=$(cat "$CARDLOG")"
+
+# MUTANT: the card call removed from the refusal — C1/C2 go red (the 1096 silence).
+bindrow DIVE-13 7777777777a5
+( eval "$(declare -f _owner_ask_gate_settle | sed 's/|| _owner_ask_gate_card [^;]*;/;/')"
+  with_route; : > "$CARDLOG"; settle_as DIVE-13 human:owner channel-session yes
+  grep -c "bap:7777777777a5:" "$CARDLOG"; grep -c '^agent send' "$RUNLOG" ) > "$TMP/mut2" 2>/dev/null
+[[ "$(tr '\n' ' ' < "$TMP/mut2")" == "0 0 " ]] \
+  && ok_t "C7 MUTANT: without the card the owner gets nothing and the seat is not told — C1/C2 are what catch it" \
+  || bad_t "C7 mutant did not bite" "$(cat "$TMP/mut2")"
 
 # ── M: the reply reaches the owner ─────────────────────────────────────────
 as_root_login
