@@ -4,7 +4,7 @@ name: mac-app-mirror
 #   https://github.com/5dive-ai/5dive/releases/latest/download/5dive.dmg
 # so a visitor lands on this repo (the one with the stars), as Opensteer does.
 # 5dive-ai/5dive-desktop stays the source: its v* tags build the .dmg. This
-# copies that release's 5dive.dmg and 5dive-mac.zip onto THIS repo's Latest
+# copies that release's 5dive.dmg onto THIS repo's Latest
 # release (scripts/mirror-mac-app.sh, idempotent by sha256 digest).
 #
 # Triggers:
