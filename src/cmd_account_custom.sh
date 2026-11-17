@@ -109,6 +109,45 @@ usage: 5dive account add <name> --provider=custom --base-url=<url> --model=<name
 ACCTCUSTOM
 }
 
+# DIVE-8610: _custom_ai_repin_claude_seats <account> <new model> <old id>...
+# Moves every claude seat on <account> whose settings.json pin is one of the ids
+# the account served before (its old model, or one of its old tier ids), or an
+# Anthropic claude-* id, onto
+# <new model>, and the registry's own `model` field with it. Anything else is
+# left alone: no pin or a bare alias (opus/sonnet/haiku) follows the account's
+# map by itself, and any other id is a pin someone chose. Parked seats move too,
+# so they come up right when started. Never fatal: a seat that cannot be written
+# is named, with the one command that fixes it.
+_custom_ai_repin_claude_seats() {
+  local acct="$1" want="$2"; shift 2
+  (( $# )) || return 0
+  local reg seats agent cur old hit
+  reg=$(registry_read)
+  seats=$(jq -r --arg p "$acct" '.agents | to_entries[] | select(.value.authProfile == $p and ((.value.type // "claude") == "claude")) | .key' <<<"$reg") || seats=""
+  while IFS= read -r agent; do
+    [[ -n "$agent" ]] || continue
+    cur=$(resolve_agent_model claude "$agent") || cur=""
+    [[ -n "$cur" && "$cur" != "$want" ]] || continue
+    model_latest "$cur" >/dev/null 2>&1 && continue
+    # A claude-* id is a hit too: your own server does not serve Anthropic's
+    # ids, so that pin is create's fallback (or a seat moved here from a Claude
+    # login), never a choice that works here. The DIVE-8608 e2e seat sat on
+    # claude-haiku-4-5.
+    hit=0
+    [[ "$cur" == claude-* ]] && hit=1
+    for old in "$@"; do [[ "$cur" == "$old" ]] && { hit=1; break; }; done
+    (( hit )) || continue
+    step "Moving agent '$agent' to model ${want} (was ${cur})"
+    if ( write_runtime_model claude "$agent" "$want" ) >&2 2>&1; then
+      if jq -e --arg n "$agent" '.agents[$n] | has("model")' <<<"$reg" >/dev/null 2>&1; then
+        registry_read | jq --arg n "$agent" --arg m "$want" '.agents[$n].model = $m' | registry_write
+      fi
+    else
+      warn "agent '$agent' is still set to ${cur}, which the new server may not have. Fix: sudo 5dive agent config ${agent} set model=${want}"
+    fi
+  done <<<"$seats"
+}
+
 # `account add <name> --provider=custom ...` (cmd_account_add hands over here).
 cmd_account_add_custom() {
   local name="" provider="" url="" model="" harness="" key="" replace=0
@@ -142,7 +181,22 @@ cmd_account_add_custom() {
   if [[ -n "$had_url" ]] && (( ! replace )); then
     fail "$E_CONFLICT" "account '$name' already points at ${had_url}. Re-run with --replace to move it (every agent on it moves on its next restart)."
   fi
+  # DIVE-8610: the ids the account served BEFORE this save. A claude seat pins
+  # its model in its own settings.json (create starts it on the account's id),
+  # and Claude Code asks the server for that pin, not for the account's map. So
+  # a move to another model left every seat asking for the old one: the server
+  # 404s, the office chat sat on "Working…". Read them before the save
+  # overwrites them.
+  local -a _old_ids=()
+  if [[ -n "$had_url" ]]; then
+    local _v _k
+    for _k in FIVEDIVE_CUSTOM_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL; do
+      _v=$(profile_env_value "$name" "$_k")
+      [[ -n "$_v" ]] && _old_ids+=("$_v")
+    done
+  fi
   custom_ai_save "$name" "$harness" "$url" "$model" "$key"
+  _custom_ai_repin_claude_seats "$name" "$model" ${_old_ids[@]+"${_old_ids[@]}"}
   # Seats already on the account pick the new address up on restart. An
   # operator park (desiredState=="stopped", written only by `5dive agent stop`)
   # survives the move: `systemctl restart` on a stopped unit STARTS it (DIVE-4399),
