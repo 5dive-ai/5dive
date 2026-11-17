@@ -121,8 +121,9 @@ ACCTCUSTOM
 _custom_ai_repin_claude_seats() {
   local acct="$1" want="$2"; shift 2
   (( $# )) || return 0
-  local reg agent cur old hit
+  local reg seats agent cur old hit
   reg=$(registry_read)
+  seats=$(jq -r --arg p "$acct" '.agents | to_entries[] | select(.value.authProfile == $p and ((.value.type // "claude") == "claude")) | .key' <<<"$reg") || seats=""
   while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue
     cur=$(resolve_agent_model claude "$agent") || cur=""
@@ -144,7 +145,7 @@ _custom_ai_repin_claude_seats() {
     else
       warn "agent '$agent' is still set to ${cur}, which the new server may not have. Fix: sudo 5dive agent config ${agent} set model=${want}"
     fi
-  done < <(jq -r --arg p "$acct" '.agents | to_entries[] | select(.value.authProfile == $p and ((.value.type // "claude") == "claude")) | .key' <<<"$reg")
+  done <<<"$seats"
 }
 
 # `account add <name> --provider=custom ...` (cmd_account_add hands over here).
