@@ -452,6 +452,37 @@ _owner_ask_gate_bind() {
   printf 'browser ask %s is on this gate: the owner'"'"'s yes approves it, once, and you are told to re-run with --approved=%s\n' "$OA_ID" "$OA_ID"
 }
 
+# DIVE-8643 — AN ANSWER THAT CANNOT APPROVE THE ASK STILL REACHES THE OWNER.
+# The owner typed «да» to the seat's Telegram; the seat cited it (channel-session),
+# the gate read answered, and the ask stayed open by design (Y9: a cited chat must
+# never approve a payment). The seat's re-run then hit "approval has not been
+# given", the owner had nothing left to tap, and the row sat until the 30-minute
+# page-read window let the send through on its own (box report 1096). Now the
+# refusal hands the owner the ask's own Approve / Decline buttons (`owner-ask
+# browser`: a fresh nonce, the same card a stop sends), so one tap settles it and
+# wakes the seat, and the seat is told which of the two happened. Nothing is
+# approved here: only the owner's tap, carrying that nonce, does. The gate's proof
+# is dropped either way: a re-sent card replaced its hash, and a re-filed gate
+# binds a fresh one.
+_owner_ask_gate_card() { # <gate file> <ident> <ask id> <seat> <why the answer did not count>
+  local f="$1" ident="$2" ask="$3" seat="$4" why="$5" d out msg name="${4#agent-}"
+  rm -f -- "$f"
+  [[ "$ask" =~ ^agent-[a-z0-9][a-z0-9._-]*-[0-9a-f]{12}$ && "$seat" == agent-* ]] || return 0
+  d=$(_owner_ask_dir_of "$seat") || return 0
+  # A subshell: owner-ask browser `fail`s (exits) on an ask that is gone.
+  out=$( JSON_MODE=0; _owner_ask_browser "$d/$ask.json" 2>&1 ) || out="not sent to the owner: ${out##*$'\n'}"
+  if [[ "$out" == "sent to the owner"* ]]; then
+    step "$ident: the answer did not approve browser ask $ask ($why), so the owner was sent its Approve / Decline buttons"
+    msg="The owner's answer on ${ident} did not approve browser ask ${ask} (${why}). They were just sent its Approve / Decline buttons: their tap wakes you. Do not re-run the act or file another gate for it before then."
+  else
+    out="${out#not sent to the owner: }"
+    warn "$ident: browser ask $ask is still open and nothing reached the owner to tap (${out##*$'\n'})"
+    msg="The owner's answer on ${ident} did not approve browser ask ${ask} (${why}), and nothing reached them to tap (${out##*$'\n'}). Put it back on the row: 5dive task need ${ident} --type=approval --browser-ask=${ask} --ask=\"<what it will send or pay, and to whom>?\" and ask them to press Approve on that card: a typed reply does not approve a browser step."
+  fi
+  _owner_ask_wake "$name" "$msg" || warn "could not wake ${name}"
+  return 0
+}
+
 # _owner_ask_gate_settle <task id> <ident> <answer> — run by `task answer` after
 # the answer is stored. Silent when the gate carries no browser ask.
 _owner_ask_gate_settle() {
@@ -474,10 +505,12 @@ _owner_ask_gate_settle() {
   ask=$(jq -r '.ask // ""' "$f" 2>/dev/null); seat=$(jq -r '.seat // ""' "$f" 2>/dev/null); nonce=$(jq -r '.nonce // ""' "$f" 2>/dev/null)
   if [[ "$by" != human:* || ! "+${ev}+" =~ \+(nonce|sudo-uid|drop-link)\+ ]]; then
     warn "$ident: browser ask $ask was NOT approved — only the owner's own answer approves a browser step (this one: ${by:-unrecorded}, evidence ${ev:-none}). The ask stays open: sudo 5dive browser approve $ask"
+    [[ "$verdict" == deny ]] || _owner_ask_gate_card "$f" "$ident" "$ask" "$seat" "it came as ${ev:-an answer with no proof}, which approves no browser step"
     return 0
   fi
   if [[ -z "$verdict" ]]; then
     warn "$ident: the answer is neither a yes nor a no, so browser ask $ask was left as it was. The owner approves it with: sudo 5dive browser approve $ask"
+    _owner_ask_gate_card "$f" "$ident" "$ask" "$seat" "it was neither a yes nor a no"
     return 0
   fi
   local -a deny=()
