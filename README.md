@@ -18,6 +18,7 @@
   <a href="https://github.com/5dive-ai/5dive/releases"><img src="https://img.shields.io/github/v/release/5dive-ai/5dive" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <a href="https://play.google.com/store/apps/details?id=ai.fivedive.app&amp;referrer=utm_source%3Dgithub%26utm_medium%3Downed%26utm_campaign%3D5dive-readme"><img src="https://img.shields.io/badge/Android-Google_Play-3DDC84?logo=android&amp;logoColor=white" alt="Android app on Google Play"></a>
+  <a href="https://github.com/5dive-ai/5dive/releases/latest/download/5dive.dmg"><img src="https://img.shields.io/badge/Mac-Download_.dmg-000000?logo=apple&amp;logoColor=white" alt="5dive for Mac: download the .dmg"></a>
 </p>
 
 ```sh
