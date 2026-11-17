@@ -44,30 +44,32 @@ dst() { # dst <path-file-suffix> <tag> <assets json>
 run() { : > "$TMP/calls"; out="$(bash "$SCRIPT" "$@" 2>&1)"; rc=$?; }
 uploads() { grep -c '^release upload' "$TMP/calls"; }
 
-echo "1. fresh nightly Latest with no Mac files: both are copied onto IT"
+echo "1. fresh nightly Latest with no Mac files: only the dmg is copied onto IT (DIVE-8659: no zip)"
 src sha256:aaa sha256:zzz
 dst latest v0.135.0 '[{"name":"5dive","size":1}]'
 run
 [[ $rc -eq 0 ]] && ok "exit 0" || no "exit 0" "rc=$rc out=$out"
-[[ "$(uploads)" == 2 ]] && ok "two uploads" || no "two uploads" "$(cat "$TMP/calls")"
+[[ "$(uploads)" == 1 ]] && ok "one upload" || no "one upload" "$(cat "$TMP/calls")"
 grep -q '^release upload v0.135.0 -R 5dive-ai/5dive .*/5dive.dmg --clobber' "$TMP/calls" \
   && ok "dmg uploaded onto this repo's Latest tag" || no "dmg upload target" "$(cat "$TMP/calls")"
-grep -q '^release download v0.2.0 -R 5dive-ai/5dive-desktop -p 5dive-mac.zip' "$TMP/calls" \
-  && ok "zip read from 5dive-desktop's latest tag" || no "zip source" "$(cat "$TMP/calls")"
+grep -q '^release download v0.2.0 -R 5dive-ai/5dive-desktop -p 5dive.dmg' "$TMP/calls" \
+  && ok "dmg read from 5dive-desktop's latest tag" || no "dmg source" "$(cat "$TMP/calls")"
+! grep -q '5dive-mac.zip' "$TMP/calls" \
+  && ok "zip neither downloaded nor uploaded, even when the source still has one" || no "zip ignored" "$(cat "$TMP/calls")"
 
-echo "2. second run, same digests: no-op (the hourly run costs nothing)"
+echo "2. second run, same digest: no-op (the hourly run costs nothing)"
 dst latest v0.135.0 '[{"name":"5dive.dmg","size":10,"digest":"sha256:aaa"},{"name":"5dive-mac.zip","size":20,"digest":"sha256:zzz"}]'
 run
 [[ $rc -eq 0 && "$(uploads)" == 0 ]] && ok "nothing uploaded" || no "idempotent" "rc=$rc $(cat "$TMP/calls")"
 
-echo "3. new desktop build (dmg digest moved): only the dmg is replaced"
-src sha256:bbb sha256:zzz
+echo "3. new desktop build (dmg digest moved), source has no zip: only the dmg is replaced"
+src sha256:bbb
 run
 [[ $rc -eq 0 && "$(uploads)" == 1 ]] && grep -q 'upload .*5dive.dmg' "$TMP/calls" \
-  && ok "dmg replaced, zip kept" || no "replace changed file" "rc=$rc $(cat "$TMP/calls")"
+  && ok "dmg replaced, old zip left alone" || no "replace changed file" "rc=$rc $(cat "$TMP/calls")"
 
 echo "4. no digest on one side: same size counts as same file"
-dst latest v0.135.0 '[{"name":"5dive.dmg","size":10},{"name":"5dive-mac.zip","size":20}]'
+dst latest v0.135.0 '[{"name":"5dive.dmg","size":10}]'
 run
 [[ $rc -eq 0 && "$(uploads)" == 0 ]] && ok "size fallback" || no "size fallback" "rc=$rc $(cat "$TMP/calls")"
 
@@ -77,12 +79,17 @@ run v0.134.0
 grep -q '^api repos/5dive-ai/5dive/releases/tags/v0.134.0' "$TMP/calls" && grep -q '^release upload v0.134.0 ' "$TMP/calls" \
   && ok "named tag" || no "named tag" "rc=$rc $(cat "$TMP/calls")"
 
-echo "6. desktop release without the zip: refuse, upload nothing"
-src sha256:bbb
+echo "6. MAC_APP_FILES still names extra files: a release missing one is refused, nothing copied"
 dst latest v0.135.0 '[]'
-run
+: > "$TMP/calls"; out="$(MAC_APP_FILES="5dive.dmg 5dive-mac.zip" bash "$SCRIPT" 2>&1)"; rc=$?
 [[ $rc -ne 0 && "$(uploads)" == 0 ]] && grep -q 'has no 5dive-mac.zip' <<< "$out" \
   && ok "missing source file is an error, nothing copied" || no "missing source" "rc=$rc out=$out"
+
+echo "7. desktop release without the dmg: refuse, upload nothing"
+printf '{"tag_name":"v0.2.0","assets":[]}' > "$TMP/api/repos_5dive-ai_5dive-desktop_releases_latest.json"
+run
+[[ $rc -ne 0 && "$(uploads)" == 0 ]] && grep -q 'has no 5dive.dmg' <<< "$out" \
+  && ok "missing dmg is an error" || no "missing dmg" "rc=$rc out=$out"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

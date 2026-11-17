@@ -19,12 +19,13 @@
 # Usage: mirror-mac-app.sh [<tag in this repo>]
 # Env:   GH_TOKEN, GITHUB_REPOSITORY (default 5dive-ai/5dive),
 #        MAC_APP_SRC_REPO (default 5dive-ai/5dive-desktop),
-#        MAC_APP_FILES (default "5dive.dmg 5dive-mac.zip")
+#        MAC_APP_FILES (default "5dive.dmg"; the .zip was dropped in DIVE-8659:
+#        nothing used it, there is no auto-updater)
 set -euo pipefail
 
 dst_repo="${GITHUB_REPOSITORY:-5dive-ai/5dive}"
 src_repo="${MAC_APP_SRC_REPO:-5dive-ai/5dive-desktop}"
-read -r -a files <<< "${MAC_APP_FILES:-5dive.dmg 5dive-mac.zip}"
+read -r -a files <<< "${MAC_APP_FILES:-5dive.dmg}"
 
 if [[ -n "${1:-}" ]]; then
   dst_path="repos/${dst_repo}/releases/tags/${1}"
