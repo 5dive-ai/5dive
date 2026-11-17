@@ -668,8 +668,12 @@ address in the office's own DNS. Give the firm's certificate with `--cert=<file>
 (the full chain, the key without a password) and browsers open it with no warning; without one the
 box makes a self-signed certificate that names the domain. A certificate for another name, an
 expired one or a key that does not match is refused before anything changes, and a later
-`local serve` keeps your certificate. Renew it by running the same command with the new files;
-`5dive local status` shows when it runs out. People sign in by pairing their device with a one-time
+`local serve` keeps your certificate. Renewals come in by themselves: the box remembers where the
+files are (give certbot's `live/` paths as they are) and checks them every day, and right after a
+certbot renewal; a renewed pair that passes the same checks replaces the old one and the chat
+restarts on it. The files must be root's and not writable by anyone else, or they are not followed.
+From 14 days before it runs out, the server's login message, `5dive local status` and the owner's
+panel say so, with the date. People sign in by pairing their device with a one-time
 code (`sudo 5dive local pair`), not with a 5dive or Microsoft account. `--domain=none` goes back to
 the office address.
 

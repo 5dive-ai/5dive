@@ -40,6 +40,18 @@
 # 1024, so the unit gives the never-root user only CAP_NET_BIND_SERVICE.
 # Sign-in stays the paired-device code (no 5dive or Clerk account).
 #
+# DIVE-8611: RENEWALS. The certificate is COPIED in (the never-root unit reads
+# it as a credential), and a copy goes stale: when IT renewed it (Let's Encrypt
+# every 60-90 days, any authority yearly) the chat served the old copy until it
+# ran out, then every browser refused the page. Now serve also keeps where the
+# files came from (CERT_SRC/KEY_SRC: the path as given, so certbot's live/ links
+# keep pointing at each new file) and `local _cert-sync` — a daily timer, plus
+# certbot's deploy hook when certbot is on the box — takes a changed pair after
+# the same checks serve does and restarts the chat on it. A renewal that fails
+# them is not taken (the old one stays, the reason is logged). 14 days before
+# the served one runs out it warns: the server's login message, `local
+# status`, the timer's journal and the owner's panel.
+#
 # Test seams: FIVE_LOCAL_CHAT_ROOT prefixes every path this file writes;
 # systemctl/useradd/runuser/openssl/ip are looked up on PATH.
 _lc_root()   { printf '%s' "${FIVE_LOCAL_CHAT_ROOT:-}"; }
@@ -204,6 +216,7 @@ cmd_local() {
     status)  _lc_status "$@" ;;
     _agents) _lc_agents_write ;;
     _restage) _lc_restage ;;       # DIVE-7579 (D6): install.sh --upgrade runs it
+    _cert-sync) _lc_cert_sync ;;   # DIVE-8611: the daily timer and certbot's deploy hook run it
     _panel-update-run) _lp_update_run ;;   # DIVE-7579 (D4): the panel's transient update unit
     panel-exec) _lp_exec "$@" ;;   # DIVE-7576: the panel's one root entry (src/cmd_local_panel.sh)
     ""|-h|--help|help) _lc_usage ;;
@@ -253,6 +266,8 @@ _lc_restage() {
     [[ "$(_lp_service_text)" == "$(cat "$(_lp_service_unit)" 2>/dev/null)" ]] \
       || { _lp_service_text >"$(_lp_service_unit)" && sock_changed=1; }
   fi
+  # DIVE-8611: a box set up before the daily certificate check gets it here.
+  _lc_cert_watch_install
   (( changed || sock_changed )) && { systemctl daemon-reload >/dev/null 2>&1 || true; }
   (( sock_changed )) && { systemctl restart 5dive-local-panel.socket >/dev/null 2>&1 || warn "office panel: could not restart 5dive-local-panel.socket"; }
   if (( changed )); then
@@ -315,6 +330,183 @@ _lc_cert_check_own() {
   b=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | sha256sum | cut -d' ' -f1)
   [[ -n "$a" && "$a" == "$b" && "$b" != e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ]] \
     || fail "$E_VALIDATION" "local chat: that key does not belong to that certificate (or is protected by a password; give the key without one)."
+}
+
+# ── DIVE-8611: renewals and the expiry warning (see the header) ───────────────
+LC_CERT_WARN_DAYS=14
+_lc_cert_svc_unit()   { printf '%s/etc/systemd/system/5dive-local-chat-cert.service' "$(_lc_root)"; }
+_lc_cert_timer_unit() { printf '%s/etc/systemd/system/5dive-local-chat-cert.timer' "$(_lc_root)"; }
+_lc_certbot_hooks()   { printf '%s/etc/letsencrypt/renewal-hooks/deploy' "$(_lc_root)"; }
+_lc_cert_motd()       { printf '%s/etc/motd.d/5dive-office-chat-certificate' "$(_lc_root)"; }
+
+# _lc_cert_days <pem> — whole days until it runs out, negative once it has.
+_lc_cert_days() {
+  local end e now
+  [[ -s "$1" ]] || return 1
+  end=$(openssl x509 -in "$1" -noout -enddate 2>/dev/null) || return 1
+  e=$(date -d "${end#notAfter=}" +%s 2>/dev/null) || return 1
+  now=$(date +%s)
+  if (( e >= now )); then printf '%s' $(( (e - now) / 86400 )); else printf '%s' $(( -((now - e + 86399) / 86400) )); fi
+}
+
+# _lc_cert_warning — one plain sentence when the served certificate is the
+# firm's and runs out within LC_CERT_WARN_DAYS days (or already has); else nothing.
+_lc_cert_warning() {
+  [[ "$(_lc_conf_get CERT)" == own ]] || return 0
+  local f d on src; f="$(_lc_etc)/cert.pem"
+  d=$(_lc_cert_days "$f") || return 0
+  (( d <= LC_CERT_WARN_DAYS )) || return 0
+  on=$(openssl x509 -in "$f" -noout -enddate 2>/dev/null) || on=""
+  on=$(date -u -d "${on#notAfter=}" +%Y-%m-%d 2>/dev/null) || on="${on#notAfter=}"
+  src=$(_lc_conf_get CERT_SRC)
+  if (( d < 0 )) || ! openssl x509 -in "$f" -noout -checkend 0 >/dev/null 2>&1; then
+    printf "The office chat's certificate ran out on %s. Phones and laptops refuse the chat until your IT renews it%s" "$on" \
+      "$([[ -n "$src" ]] && printf ' at %s.' "$src" || printf ' and runs: sudo 5dive local serve --cert=<file> --key=<file>')"
+  else
+    printf "The office chat's certificate runs out in %s day%s, on %s. Ask your IT to renew it%s" "$d" "$([[ $d == 1 ]] || printf s)" "$on" \
+      "$([[ -n "$src" ]] && printf ' at %s: the chat takes the new one by itself.' "$src" || printf ', then run: sudo 5dive local serve --cert=<file> --key=<file>')"
+  fi
+}
+
+# _lc_cert_json — the same for the owner's panel: {mine, until, daysLeft, renewsBySelf, warning}.
+_lc_cert_json() {
+  local mine=false until="" d="" f; f="$(_lc_etc)/cert.pem"
+  [[ "$(_lc_conf_get CERT)" == own ]] && mine=true
+  d=$(_lc_cert_days "$f") || d=""
+  until=$(openssl x509 -in "$f" -noout -enddate 2>/dev/null) && until=$(date -u -d "${until#notAfter=}" +%Y-%m-%d 2>/dev/null) || until=""
+  jq -cn --argjson m "$mine" --arg u "$until" --arg d "$d" --argjson r "$([[ $mine == true && -n "$(_lc_conf_get CERT_SRC)" ]] && echo true || echo false)" \
+    --arg w "$(_lc_cert_warning)" \
+    '{mine:$m, until:$u, daysLeft:(if $d == "" then null else ($d | tonumber) end), renewsBySelf:$r, warning:$w}'
+}
+
+# _lc_cert_src_ok <file> — a renewal is only followed from a file root owns that
+# no other user can change (nor its folder): else a user who can write there
+# could put their own certificate on the office chat's name.
+_lc_cert_src_ok() {
+  local f d st
+  f=$(readlink -f -- "$1" 2>/dev/null) || return 1
+  [[ -f "$f" ]] || return 1
+  d=$(dirname -- "$f")
+  for st in "$(stat -c '%u %a' -- "$f" 2>/dev/null)" "$(stat -c '%u %a' -- "$d" 2>/dev/null)"; do
+    # (the test seam names its own user only under the test root)
+    [[ "${st%% *}" == "$([[ -n "$(_lc_root)" ]] && printf '%s' "${LC_CERT_SRC_UID:-0}" || printf 0)" ]] || return 1
+    (( (8#${st##* } & 8#022) == 0 )) || return 1
+  done
+}
+
+# _lc_cert_take — take a renewed pair from CERT_SRC/KEY_SRC when it changed and
+# passes serve's checks; copies first, checks the COPIES, then swaps them in.
+# Prints what it did; never fails (a timer has no one to read an exit code).
+_lc_cert_take() {
+  [[ "$(_lc_conf_get CERT)" == own ]] || return 0
+  local etc src ksrc domain msg; etc=$(_lc_etc)
+  src=$(_lc_conf_get CERT_SRC); ksrc=$(_lc_conf_get KEY_SRC); domain=$(_lc_conf_get DOMAIN)
+  [[ -n "$src" && -n "$ksrc" && -n "$domain" ]] || return 0
+  if cmp -s -- "$src" "$etc/cert.pem" && cmp -s -- "$ksrc" "$etc/key.pem"; then return 0; fi
+  if ! _lc_cert_src_ok "$src" || ! _lc_cert_src_ok "$ksrc"; then
+    warn "local chat: a new certificate at ${src} was NOT taken: it (or its key, or their folder) is missing or can be changed by a user other than root."
+    return 0
+  fi
+  rm -f -- "$etc/.cert.new" "$etc/.key.new"
+  if ! ( umask 077; install -m 0644 -- "$src" "$etc/.cert.new" && install -m 0600 -- "$ksrc" "$etc/.key.new" ) 2>/dev/null; then
+    rm -f -- "$etc/.cert.new" "$etc/.key.new"
+    warn "local chat: could not read the new certificate at ${src}; still serving the old one."; return 0
+  fi
+  if ! msg=$( (_lc_cert_check_own "$etc/.cert.new" "$etc/.key.new" "$domain") 2>&1 ); then
+    rm -f -- "$etc/.cert.new" "$etc/.key.new"
+    msg=$(sed -e 's/^error: //' -e "s#$etc/\.cert\.new#${src}#g" <<<"$msg" | tail -n 1)
+    warn "local chat: the new certificate at ${src} was NOT taken; still serving the old one. ${msg#local chat: }"
+    return 0
+  fi
+  mv -f -- "$etc/.key.new" "$etc/key.pem" && mv -f -- "$etc/.cert.new" "$etc/cert.pem" \
+    || { warn "local chat: could not swap in the new certificate."; return 0; }
+  systemctl try-restart "$(_lc_svc)" >/dev/null 2>&1 \
+    || warn "local chat: took the new certificate, but the chat did not restart on it (journalctl -u $(_lc_svc))."
+  printf 'local chat: took the renewed certificate from %s, valid until %s.\n' "$src" \
+    "$(openssl x509 -in "$etc/cert.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+}
+
+# _lc_cert_warn_refresh — the server's login message carries the warning while
+# it holds (pam_motd reads /etc/motd.d), and is cleared once a new one is in.
+_lc_cert_warn_refresh() {
+  local w m; m=$(_lc_cert_motd)
+  w=$(_lc_cert_warning)
+  if [[ -n "$w" ]]; then
+    warn "$w"
+    { install -d -m 0755 -- "$(dirname -- "$m")" && printf '\n⚠️  5dive: %s\n\n' "$w" >"$m.tmp" && chmod 0644 -- "$m.tmp" && mv -f -- "$m.tmp" "$m"; } 2>/dev/null \
+      || warn "local chat: could not write the login message $m"
+  else
+    rm -f -- "$m"
+  fi
+  return 0
+}
+
+# `local _cert-sync` (root): what the daily timer and certbot's hook run.
+_lc_cert_sync() {
+  require_root
+  [[ -f "$(_lc_unit)" ]] || { printf '%s\n' "the office chat is not set up on this server"; return 0; }
+  _lc_cert_take
+  _lc_cert_warn_refresh
+  return 0
+}
+
+_lc_cert_svc_text() {
+  printf '%s\n' \
+    "# DIVE-8611: written by \`sudo 5dive local serve\`. Do not edit; re-run it." \
+    "[Unit]" \
+    "Description=5dive office chat: take a renewed certificate, warn before it runs out" \
+    "" \
+    "[Service]" \
+    "Type=oneshot" \
+    "ExecStart=/usr/local/bin/5dive local _cert-sync"
+}
+_lc_cert_timer_text() {
+  printf '%s\n' \
+    "# DIVE-8611: written by \`sudo 5dive local serve\`. Do not edit; re-run it." \
+    "[Unit]" \
+    "Description=5dive office chat: daily certificate check" \
+    "" \
+    "[Timer]" \
+    "OnCalendar=daily" \
+    "RandomizedDelaySec=1h" \
+    "Persistent=true" \
+    "" \
+    "[Install]" \
+    "WantedBy=timers.target"
+}
+_lc_certbot_hook_text() {
+  printf '%s\n' "#!/bin/sh" \
+    "# DIVE-8611: written by \`sudo 5dive local serve\`: the office chat takes the renewed certificate now." \
+    "exec /usr/local/bin/5dive local _cert-sync"
+}
+
+# The daily timer on every office chat (a no-op on a self-signed one), and
+# certbot's deploy hook when the firm's files are followed and certbot is here.
+# Rewrites only what changed; never fails the caller.
+_lc_cert_watch_install() {
+  local changed=0 hooks hook
+  [[ "$(_lc_cert_svc_text)" == "$(cat "$(_lc_cert_svc_unit)" 2>/dev/null)" ]] || { _lc_cert_svc_text >"$(_lc_cert_svc_unit)" && changed=1; }
+  [[ "$(_lc_cert_timer_text)" == "$(cat "$(_lc_cert_timer_unit)" 2>/dev/null)" ]] || { _lc_cert_timer_text >"$(_lc_cert_timer_unit)" && changed=1; }
+  if (( changed )); then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now 5dive-local-chat-cert.timer >/dev/null 2>&1 \
+      || warn "local chat: could not start the daily certificate check (5dive-local-chat-cert.timer)"
+  fi
+  hooks=$(_lc_certbot_hooks); hook="$hooks/5dive-office-chat"
+  if [[ "$(_lc_conf_get CERT)" == own && -n "$(_lc_conf_get CERT_SRC)" && -d "$(dirname -- "$hooks")" ]]; then
+    if [[ "$(_lc_certbot_hook_text)" != "$(cat "$hook" 2>/dev/null)" ]]; then
+      { install -d -m 0755 -- "$hooks" && _lc_certbot_hook_text >"$hook" && chmod 0755 -- "$hook"; } 2>/dev/null \
+        || warn "local chat: could not add certbot's renewal hook ($hook); the daily check still takes renewals"
+    fi
+  else
+    rm -f -- "$hook"
+  fi
+  return 0
+}
+
+_lc_cert_watch_remove() {
+  systemctl disable --now 5dive-local-chat-cert.timer >/dev/null 2>&1 || true
+  rm -f -- "$(_lc_cert_svc_unit)" "$(_lc_cert_timer_unit)" "$(_lc_certbot_hooks)/5dive-office-chat" "$(_lc_cert_motd)"
 }
 
 # DIVE-8565: who already holds <port>? Prints the process name, rc 0 when taken
@@ -418,6 +610,10 @@ _lc_serve() {
     [[ -n "$cert" && -n "$key" ]] || fail "$E_USAGE" "local chat: give the certificate and its key together: --cert=<file> --key=<file>."
     [[ -n "$domain" ]] || fail "$E_USAGE" "local chat: a certificate needs the name it is for: --domain=team.yourfirm.com"
     _lc_cert_check_own "$cert" "$key" "$domain"
+    # DIVE-8611: kept as given (absolute, links NOT resolved), so a renewal at
+    # the same path is found. One config line each, so no newline in it.
+    [[ "$cert$key" != *$'\n'* ]] || fail "$E_VALIDATION" "local chat: a file name with a line break is not supported."
+    cert=$(realpath -s -m -- "$cert"); key=$(realpath -s -m -- "$key")
   }
   # A new name on this call without --port: the standard https port, so the
   # address is just https://<name>.
@@ -434,8 +630,10 @@ _lc_serve() {
 
   install -d -m 0755 -- "$(_lc_etc)" || fail "$E_GENERIC" "local chat: cannot create $(_lc_etc)."
   local tokf; tokf=$(_lc_token_file) || fail "$E_GENERIC" "local chat: could not make the chat's access key (openssl)."
-  local certmode; certmode=$(_lc_conf_get CERT)
-  printf 'LAN_ADDR=%s\nLAN_PORT=%s\nLOOP_PORT=%s\nTOKEN_FILE=%s\nDOMAIN=%s\nCERT=%s\n' "$addr" "$port" "$loop" "$tokf" "$domain" "$certmode" >"$(_lc_conf)"
+  local certmode csrc ksrc; certmode=$(_lc_conf_get CERT); csrc=$(_lc_conf_get CERT_SRC); ksrc=$(_lc_conf_get KEY_SRC)
+  [[ -n "$cert" ]] && { csrc="$cert"; ksrc="$key"; }
+  printf 'LAN_ADDR=%s\nLAN_PORT=%s\nLOOP_PORT=%s\nTOKEN_FILE=%s\nDOMAIN=%s\nCERT=%s\nCERT_SRC=%s\nKEY_SRC=%s\n' \
+    "$addr" "$port" "$loop" "$tokf" "$domain" "$certmode" "$csrc" "$ksrc" >"$(_lc_conf)"
   getent passwd "$(_lc_user)" >/dev/null 2>&1 \
     || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$(_lc_user)" \
     || fail "$E_GENERIC" "local chat: could not create the $(_lc_user) system user."
@@ -446,6 +644,7 @@ _lc_serve() {
     _lc_conf_set CERT own
   fi
   _lc_cert "$addr" "$domain"
+  _lc_cert_watch_install
   _lc_agents_write
   _lc_unit_text "$bun" "$addr" "$port" "$loop" "$tokf" >"$(_lc_unit)" || fail "$E_GENERIC" "local chat: cannot write $(_lc_unit)."
   _lp_install
@@ -462,8 +661,10 @@ _lc_serve() {
     "Restart each agent once so its chat moves here: sudo 5dive agent restart <name>"
   [[ -n "$domain" ]] && printf '%s\n' \
     "Your IT points ${domain} at ${addr} in the office's own DNS." \
-    "$([[ "$(_lc_conf_get CERT)" == own ]] && printf 'Certificate: yours, valid until %s.' "$(openssl x509 -in "$(_lc_etc)/cert.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')" \
+    "$([[ "$(_lc_conf_get CERT)" == own ]] && printf 'Certificate: yours, valid until %s.%s' "$(openssl x509 -in "$(_lc_etc)/cert.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')" \
+        "$([[ -n "$(_lc_conf_get CERT_SRC)" ]] && printf ' When IT renews it at %s, the chat takes the new one by itself (checked daily).' "$(_lc_conf_get CERT_SRC)")" \
       || printf 'Certificate: self-signed, so browsers warn once. For no warning: sudo 5dive local serve --cert=<file> --key=<file>')"
+  _lc_cert_warn_refresh
   return 0
 }
 
@@ -471,6 +672,7 @@ _lc_serve_stop() {
   systemctl disable --now "$(_lc_svc)" >/dev/null 2>&1 || true
   rm -f -- "$(_lc_unit)"
   _lp_remove
+  _lc_cert_watch_remove
   systemctl daemon-reload >/dev/null 2>&1 || true
   # Put the API base back only if it is the one serve wrote.
   local f; f=$(five_api_base_file)
@@ -568,19 +770,26 @@ _lc_devices() {
 }
 
 _lc_status() {
-  local url state base domain cmode until=""
-  url=$(_lc_url); domain=$(_lc_conf_get DOMAIN); cmode=$(_lc_conf_get CERT)
+  local url state base domain cmode until="" days="" csrc warnmsg
+  url=$(_lc_url); domain=$(_lc_conf_get DOMAIN); cmode=$(_lc_conf_get CERT); csrc=$(_lc_conf_get CERT_SRC)
+  days=$(_lc_cert_days "$(_lc_etc)/cert.pem") || days=""
+  warnmsg=$(_lc_cert_warning)
   [[ -s "$(_lc_etc)/cert.pem" ]] && until=$(openssl x509 -in "$(_lc_etc)/cert.pem" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')
   state=$(systemctl is-active "$(_lc_svc)" 2>/dev/null) || true
   base=$(five_api_base)
   if (( JSON_MODE )); then
     jq -cn --arg s "${state:-inactive}" --arg u "$url" --arg b "$base" --arg d "$domain" --arg c "${cmode:-self}" --arg x "$until" \
-      '{ok:true, data:{state:$s, url:$u, apiBase:$b, domain:$d, certificate:(if $c == "own" then "own" else "self-signed" end), certificateUntil:$x}}'
+      --arg n "$days" --arg r "$([[ "$cmode" == own ]] && printf '%s' "$csrc")" --arg w "$warnmsg" \
+      '{ok:true, data:{state:$s, url:$u, apiBase:$b, domain:$d, certificate:(if $c == "own" then "own" else "self-signed" end), certificateUntil:$x,
+        certificateDaysLeft:(if $n == "" then null else ($n | tonumber) end), certificateRenewsFrom:$r, certificateWarning:$w}}'
     return 0
   fi
   if [[ "$state" == active ]]; then
     printf '%s\n' "Office chat: on — ${url}" "Agents' chat goes to: ${base}"
     [[ -n "$until" ]] && printf '%s\n' "Certificate: $([[ "$cmode" == own ]] && printf 'yours' || printf 'self-signed'), valid until ${until}"
+    [[ "$cmode" == own && -n "$csrc" ]] && printf '%s\n' "Renewals: taken from ${csrc} by themselves (checked daily)"
+    [[ "$cmode" == own && -z "$csrc" ]] && printf '%s\n' "Renewals: not followed. Give the files once more so they are: sudo 5dive local serve --cert=<file> --key=<file>"
+    [[ -n "$warnmsg" ]] && printf '⚠️  %s\n' "$warnmsg"
   else
     printf '%s\n' "Office chat: off${url:+ (set up for ${url}; start: sudo 5dive local serve)}"
   fi
