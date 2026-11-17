@@ -1,0 +1,57 @@
+name: mac-app-mirror
+
+# DIVE-8626: every "Download for Mac" link points at
+#   https://github.com/5dive-ai/5dive/releases/latest/download/5dive.dmg
+# so a visitor lands on this repo (the one with the stars), as Opensteer does.
+# 5dive-ai/5dive-desktop stays the source: its v* tags build the .dmg. This
+# copies that release's 5dive.dmg and 5dive-mac.zip onto THIS repo's Latest
+# release (scripts/mirror-mac-app.sh, idempotent by sha256 digest).
+#
+# Triggers:
+# - workflow_run on release-cut: each nightly CLI tag becomes the new Latest
+#   with no Mac files, so the copy follows every cut within minutes.
+#   (release-cut publishes with github.token, which fires no `release` event;
+#   workflow_run is the one trigger that does follow it.)
+# - hourly: picks up a new 5dive-desktop release (that repo has no token to
+#   push here, and does not need one), and retries a failed copy.
+# - dispatch: by hand, optionally onto a named tag.
+on:
+  workflow_run:
+    workflows: [release-cut]
+    types: [completed]
+  schedule:
+    - cron: "41 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag in this repo to attach the Mac app to (empty = Latest).'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mac-app-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/mirror-mac-app.sh
+          sparse-checkout-cone-mode: false
+      - name: Copy the Mac app onto the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: bash scripts/mirror-mac-app.sh "${TAG:-}"
+      - name: Prove the public link serves the .dmg
+        if: inputs.tag == ''
+        run: |
+          code="$(curl -sIL -o /dev/null -w '%{http_code}' https://github.com/${{ github.repository }}/releases/latest/download/5dive.dmg)"
+          echo "latest/download/5dive.dmg -> HTTP ${code}"
+          [ "$code" = 200 ]
