@@ -62,7 +62,15 @@ H="$SWITCH_HOME_ROOT/agent-theo"
 TOKEN_B='7000000001:AAbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 L='Always answer in Portuguese — owner-written line L.'
 mkdir -p "$H/.claude/channels/telegram" "$H/.claude/projects/-home-claude-projects/memory" \
-         "$H/.claude/skills/clicker" "$H/.claude/skills/5dive-cli"
+         "$H/.claude/skills/clicker/refs" "$H/.claude/skills/5dive-cli" "$H/.claude/skills/notify-user"
+# DIVE-8667: a skill the owner added (clicker, with a nested file and its
+# provenance) and two 5dive installs per harness (a default skill, notify-user).
+printf -- '---\nname: clicker\ndescription: clicks things\n---\nClick.\n' >"$H/.claude/skills/clicker/SKILL.md"
+printf 'ref\n' >"$H/.claude/skills/clicker/refs/one.md"
+printf '{"clicker":{"source":"acme/skills","resolved_sha":"","content_sha256":"x","installed_at":"2026-11-01T00:00:00Z"}}\n' \
+  >"$H/.claude/skills/.skills-manifest.json"
+printf -- '---\nname: 5dive-cli\n---\nclaude-side body\n' >"$H/.claude/skills/5dive-cli/SKILL.md"
+printf -- '---\nname: notify-user\n---\nclaude-side body\n' >"$H/.claude/skills/notify-user/SKILL.md"
 { cat "$TELEGRAM_AGENT_CLAUDE_MD"; printf '\n'; cat "$MODEL_TIERING_CLAUDE_MD"; printf '\n'; cat "$OPERATIONAL_COMMS_CLAUDE_MD"
   printf '\n%s\n' "$L"; } >"$H/.claude/CLAUDE.md"
 printf '{}\n' >"$H/.claude/settings.json"
@@ -79,7 +87,10 @@ REG0='{"agents":{"theo":{"type":"claude","channels":"telegram","authProfile":"cl
 printf '%s' "$REG0" >"$TMP/reg"
 
 # ------------------------------------------------------------------ shims
-sudo() { while [[ "${1:-}" == -* ]]; do case "$1" in -u) shift 2 ;; *) shift ;; esac; done
+sudo() { local _u="" _h=0
+         while [[ "${1:-}" == -* ]]; do case "$1" in -u) _u="$2"; shift 2 ;; -H) _h=1; shift ;; *) shift ;; esac; done
+         # -H: the seat's own HOME, as real sudo gives it (the skill manifest writer resolves through it).
+         if (( _h )) && [[ -n "$_u" ]]; then ( export HOME="$SWITCH_HOME_ROOT/$_u"; sudo "$@" ); return; fi
          while [[ "${1:-}" == *=* ]]; do export "$1"; shift; done; [[ "${1:-}" == env ]] && shift
          while [[ "${1:-}" == *=* ]]; do export "$1"; shift; done; "$@"; }
 install() { local -a a=(); while [[ $# -gt 0 ]]; do case "$1" in -o|-g) shift 2 ;; *) a+=("$1"); shift ;; esac; done; command install "${a[@]}"; }
@@ -191,10 +202,22 @@ grep -q 'owner-likes-mornings' "$AG" && grep -q '5dive memory search' "$AG" \
 grep -qF "$L" "$H/.claude/CLAUDE.md" && [[ -f "$H/.claude/settings.json" ]] \
   && ok_t "W8 the Claude side's files are kept (switching back is instant)" \
   || bad_t "W8 claude side changed" ""
-jq -e '.data.dropped | index("clicker") and index("telegram lite profile (Codex'"'"'s bridge has no lite mode)")' "$TMP/out" >/dev/null 2>&1 \
+jq -e '.data.dropped == ["5dive-cli","notify-user","telegram lite profile (Codex'"'"'s bridge has no lite mode)"]' "$TMP/out" >/dev/null 2>&1 \
   && jq -e '.data.telegram.tokenKept == true and .data.from == "claude" and .data.to == "codex"' "$TMP/out" >/dev/null \
-  && ok_t "W9 the result lists what did not carry (a claude-only skill, the lite bot profile)" \
+  && ok_t "W9 the result lists what did not carry (the per-harness 5dive skills, the lite bot profile) and no longer the owner's skill" \
   || bad_t "W9 dropped list" "$(<"$TMP/out")"
+CS="$H/.agents/skills"
+[[ -f "$CS/clicker/SKILL.md" && "$(cat "$CS/clicker/refs/one.md" 2>/dev/null)" == ref ]] \
+  && cmp -s "$CS/clicker/SKILL.md" "$H/.claude/skills/clicker/SKILL.md" && [[ -f "$H/.claude/skills/clicker/SKILL.md" ]] \
+  && jq -e '.data.copied == ["clicker"]' "$TMP/out" >/dev/null 2>&1 \
+  && ok_t "W11 a skill the owner added on Claude is copied, whole, into Codex's skills dir and listed as copied; the Claude copy stays (RED on main: only listed)" \
+  || bad_t "W11 skill not carried" "$(ls -R "$CS" 2>&1) out=$(<"$TMP/out")"
+[[ ! -e "$CS/5dive-cli" && ! -e "$CS/notify-user" ]] \
+  && ok_t "W12 a skill 5dive installs per harness (a default skill, notify-user) is NOT copied across" \
+  || bad_t "W12 per-harness skill duplicated" "$(ls "$CS")"
+jq -e '.clicker.source == "acme/skills"' "$CS/.skills-manifest.json" >/dev/null 2>&1 \
+  && ok_t "W13 the copied skill keeps where it came from (its manifest entry is written on the Codex side)" \
+  || bad_t "W13 provenance" "$(cat "$CS/.skills-manifest.json" 2>&1)"
 [[ -f "$TMP/active" ]] && jq -e '.data.running == true' "$TMP/out" >/dev/null \
   && ok_t "W10 the unit is started again and reported running" || bad_t "W10 not restarted" "$(<"$TMP/out")"
 
@@ -225,6 +248,9 @@ grep -q 'Codex-era owner line' "$CM" && [[ "$(grep -c '5dive:carried-instruction
   || bad_t "B5 claude bridge" "$(cat "$TMP/calls")"
 ! grep -q '^preseed' "$TMP/calls" \
   && ok_t "B6 the kept Claude settings (model) are not re-preseeded" || bad_t "B6 preseed ran" "$(cat "$TMP/calls")"
+jq -e '.data.copied == []' "$TMP/out" >/dev/null 2>&1 && [[ "$(ls "$H/.claude/skills" | tr '\n' ' ')" == "5dive-cli clicker notify-user " ]] \
+  && ok_t "B7 switching back copies nothing: the skill is already on the Claude side, no duplicate" \
+  || bad_t "B7 back copied" "$(ls "$H/.claude/skills") out=$(<"$TMP/out")"
 
 # =========================================================== R: more refusals
 snap_reg=$(sha256sum <"$TMP/reg")
@@ -360,6 +386,8 @@ DH="$SWITCH_HOME_ROOT/agent-dude"; DMEM="$DH/.claude/projects/-home-claude-proje
 TOKEN_D='7000000002:AAddddddddddddddddddddddddddddddddd'
 LD='Dude signs every reply with a dog emoji — owner-written line LD.'
 mkdir -p "$DH/.grok/channels/telegram" "$DH/.grok/skills/grok-only" "$DMEM"
+printf -- '---\nname: grok-only\n---\nGrok-side skill.\n' >"$DH/.grok/skills/grok-only/SKILL.md"
+mkdir -p "$DH/.grok/skills/no-body"   # a folder with no SKILL.md is not a skill: not copied
 printf '# Dude\n\n%s\n' "$LD" >"$DH/.claude/CLAUDE.md"
 printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN_D" >"$DH/.grok/channels/telegram/.env"
 printf '{"dmPolicy":"allowlist","allowFrom":["555"],"groups":{},"pending":{}}\n' >"$DH/.grok/channels/telegram/access.json"
@@ -398,8 +426,9 @@ grep -q "^channel claude telegram dude $TOKEN_D  555$" "$TMP/calls" \
   && grep -q "$SWITCH_HANDOFF_FILE" "$DH/.claude/CLAUDE.md" \
   && ok_t "G4 grok -> claude: the shared CLAUDE.md keeps LD exactly once, one block pointing at the handoff, no memory copy (Claude loads MEMORY.md)" \
   || bad_t "G4 CLAUDE.md" "$(cat "$DH/.claude/CLAUDE.md")"
-[[ -f "$DMEM/project_dude_ships_fridays.md" ]] && jq -e '.data.memory.direction == "grok->claude" and .data.memory.atoms == 1 and .data.from == "grok" and (.data.dropped | index("grok-only"))' "$TMP/out" >/dev/null \
-  && ok_t "G5 grok -> claude: the memory atoms stay where both read them; the result lists the Grok-only skill that did not carry" \
+[[ -f "$DMEM/project_dude_ships_fridays.md" ]] && jq -e '.data.memory.direction == "grok->claude" and .data.memory.atoms == 1 and .data.from == "grok" and (.data.copied == ["grok-only"]) and (.data.dropped == ["no-body"])' "$TMP/out" >/dev/null \
+  && [[ -f "$DH/.claude/skills/grok-only/SKILL.md" && ! -e "$DH/.claude/skills/no-body" ]] \
+  && ok_t "G5 grok -> claude: the memory atoms stay where both read them; the Grok-side skill is copied to Claude, a bodiless folder is listed as not carried" \
   || bad_t "G5 memory/result" "$(<"$TMP/out")"
 
 # claude -> grok, owner's switch off, then on

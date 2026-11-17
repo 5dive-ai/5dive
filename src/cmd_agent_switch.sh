@@ -372,18 +372,49 @@ print(len(allow))
 PY
 }
 
-# Skill names on <from> that the seat does not have on <to> after the switch.
-_switch_dropped_skills() { # <name> <from> <to>
-  local home a b s out=()
-  home=$(_switch_home "$1")
+# DIVE-8667: a skill 5dive itself installs PER HARNESS — the default skills
+# (installed per type by install_default_skill_for_agent, backfilled nightly by
+# 5dive-refresh-skills.sh) and notify-user (each channel plugin ships its own).
+# Copying the <from> side's body across would plant one harness's version on the
+# other, so these are never copied; the target gets its own the usual way.
+_switch_harness_owned_skill() { # <skill>
+  [[ "$1" == notify-user ]] && return 0
+  skill_default_source "$1" >/dev/null 2>&1
+}
+
+# Carry the seat's skills to the target harness: every skill folder on <from>
+# that <to> lacks is copied into <to>'s skills dir (DIVE-8667; DIVE-5501 only
+# listed them). The <from> copy stays, so a switch back reuses it. Prints one
+# line per skill that was missing on <to>: "copied <skill>" or "dropped <skill>".
+#   - a harness-owned skill (above) is dropped, not copied;
+#   - the copy runs AS THE SEAT, so it can only read what the seat could already
+#     read and only write where the seat could already write (a link inside the
+#     skill is followed with the seat's rights, never root's);
+#   - something that is not a folder already at the target name is left alone.
+_switch_carry_skills() { # <name> <from> <to>
+  local home user a b s src
+  home=$(_switch_home "$1"); user="agent-$1"
   a="$home/$(skills_install_dir "$2")"; b="$home/$(skills_install_dir "$3")"
-  [[ -d "$a" ]] || return 0
+  [[ -d "$a" && "$a" != "$b" ]] || return 0
   for s in "$a"/*/; do
     [[ -d "$s" ]] || continue
     s=$(basename "$s")
-    [[ -d "$b/$s" ]] || out+=("$s")
+    [[ -d "$b/$s" ]] && continue
+    if [[ -e "$b/$s" || -L "$b/$s" ]] || _switch_harness_owned_skill "$s" \
+       || ! valid_skill_id "$s" || [[ ! -f "$a/$s/SKILL.md" ]]; then
+      printf 'dropped %s\n' "$s"; continue
+    fi
+    if agent_owned_dir "$user" "$home" "$b" \
+       && sudo -u "$user" cp -RL -- "$a/$s" "$b/$s" >/dev/null 2>&1; then
+      src=$(jq -r --arg k "$s" '.[$k].source // empty' "$a/.skills-manifest.json" 2>/dev/null || true)
+      [[ -z "$src" ]] || _skill_manifest_note "$user" "$home" "$(skills_install_dir "$3")" "$s" "$src"
+      printf 'copied %s\n' "$s"
+    else
+      # Nothing was at $b/$s before the copy, so whatever is there now is ours.
+      sudo -u "$user" rm -rf -- "$b/$s" >/dev/null 2>&1 || true
+      printf 'dropped %s\n' "$s"
+    fi
   done
-  printf '%s\n' ${out[@]+"${out[@]}"}
 }
 
 _switch_tg_token() { # <home> <type>
@@ -685,6 +716,11 @@ _agent_switch_apply() {
   fi
   rm -f "$tmpdoc" ${memidx:+"$memidx"} ${kept_block:+"$kept_block"}
 
+  # Skills, before the unit starts so the target harness loads them on boot.
+  local skill_lines copied_json
+  skill_lines=$(_switch_carry_skills "$name" "$from" "$to")
+  copied_json=$(sed -n 's/^copied //p' <<<"$skill_lines" | jq -R . | jq -cs 'map(select(length > 0))')
+
   # ---- 5. registry, env, account ----
   reg=$(registry_read)
   reg=$(jq --arg n "$name" --arg t "$to" --arg f "$from" --arg p "$account" --arg ts "$(date -Iseconds)" '
@@ -719,13 +755,16 @@ _agent_switch_apply() {
   fi
 
   local dropped_json
-  dropped_json=$( { _switch_dropped_skills "$name" "$from" "$to"; if [[ -n "$tg_note" ]]; then printf '%s\n' "$tg_note"; fi; } \
+  dropped_json=$( { sed -n 's/^dropped //p' <<<"$skill_lines"; if [[ -n "$tg_note" ]]; then printf '%s\n' "$tg_note"; fi; } \
     | jq -R . | jq -cs 'map(select(length > 0))')
-  ok "agent '$name' switched from $(_switch_label "$from") to $(_switch_label "$to") (account ${account:-default}); $state_note" \
-     '{name:$n, from:$f, to:$t, account:$a, warning:$w, handoff:$h, memory:$m, telegram:{tokenKept:($tk == 1), allowFrom:$al}, dropped:$d, running:$up, parked:$pk}' \
+  local skills_note=""
+  [[ "$copied_json" == "[]" ]] || skills_note="; skills copied: $(jq -r 'join(", ")' <<<"$copied_json")"
+  [[ "$dropped_json" == "[]" ]] || skills_note+="; not carried: $(jq -r 'join(", ")' <<<"$dropped_json")"
+  ok "agent '$name' switched from $(_switch_label "$from") to $(_switch_label "$to") (account ${account:-default}); $state_note$skills_note" \
+     '{name:$n, from:$f, to:$t, account:$a, warning:$w, handoff:$h, memory:$m, telegram:{tokenKept:($tk == 1), allowFrom:$al}, copied:$c, dropped:$d, running:$up, parked:$pk}' \
      --arg n "$name" --arg f "$from" --arg t "$to" --arg a "${account:-default}" --arg w "$warning" \
      --arg h "$handoff_state" --argjson m "$mem_json" --argjson tk "$([[ -n "$token" ]] && echo 1 || echo 0)" \
-     --argjson al "${allow_n:-0}" --argjson d "$dropped_json" --argjson up "$up" --argjson pk "$parked"
+     --argjson al "${allow_n:-0}" --argjson c "$copied_json" --argjson d "$dropped_json" --argjson up "$up" --argjson pk "$parked"
 }
 
 # `agent config <n> set auth-profile=<p> --switch-harness` and
