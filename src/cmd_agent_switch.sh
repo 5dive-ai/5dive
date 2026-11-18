@@ -568,14 +568,16 @@ _switch_source_tg_token() { # <home> <type>
       tok=$(jq -r '[.channels.telegram.botToken, .channels.telegram.accounts.default.botToken]
                    | map(select(type == "string" and length > 0)) | first // empty' <<<"$conf" 2>/dev/null)
       if [[ -z "$tok" ]]; then
+        local tfiles
+        tfiles=$(jq -r '.channels.telegram.tokenFile, .channels.telegram.accounts.default.tokenFile
+                        | select(type == "string" and length > 0)' <<<"$conf" 2>/dev/null)
         while IFS= read -r f; do
           [[ -n "$f" ]] || continue
           f="${f/#\~/$home}"
           [[ "$f" == /* ]] || f="$home/.openclaw/$f"
           tok=$(_switch_read_seat_file "$home" "$f" | head -1 | tr -d '[:space:]')
           [[ -n "$tok" ]] && break
-        done < <(jq -r '.channels.telegram.tokenFile, .channels.telegram.accounts.default.tokenFile
-                        | select(type == "string" and length > 0)' <<<"$conf" 2>/dev/null)
+        done <<<"$tfiles"
       fi
       [[ -n "$tok" ]] || tok=$(_switch_env_value "$home" "$home/.openclaw/.env" TELEGRAM_BOT_TOKEN) ;;
   esac
@@ -834,7 +836,9 @@ _switch_skill_dirs() { # <home> <type>
 # has its own tools for that, so it is not copied, and it is counted, not named.
 _switch_source_builtin_skill() { # <home> <type> <skill>
   [[ "$2" == hermes ]] || return 1
-  _switch_read_seat_file "$1" "$1/.hermes/skills/.bundled_manifest" | cut -d: -f1 | grep -qxF -- "$3"
+  local m
+  m=$(_switch_read_seat_file "$1" "$1/.hermes/skills/.bundled_manifest")
+  grep -qxF -- "$3" <<<"$(cut -d: -f1 <<<"$m")"
 }
 
 # ======================================================================
@@ -863,7 +867,7 @@ _switch_source_builtin_skill() { # <home> <type> <skill>
 
 # The env names each harness reads a provider's key from (hermes_cli/auth.py
 # api_key_env_vars; openclaw takes the same names), keyed by canonical id.
-declare -A SWITCH_PROVIDER_KEY_VARS=(
+declare -gA SWITCH_PROVIDER_KEY_VARS=(
   [deepseek]="DEEPSEEK_API_KEY"
   [moonshot]="KIMI_API_KEY MOONSHOT_API_KEY"
   [openrouter]="OPENROUTER_API_KEY"
