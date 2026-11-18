@@ -120,6 +120,17 @@ t "T5 floor: publishing"           "widens" "$(w "Write a table." "Publish the t
 t "T5 floor: a term already there" "fine"   "$(w "Email the price table to me." "Email the price table to me, sorted.")"
 t "T5 floor: a plain improvement"  "fine"   "$(w "Check 5 shops" "Check 12 shops")"
 t "T5 floor: a NEW floor term"     "widens" "$(w "Check 5 shops" "Check 5 shops and email it")"
+# The floor also reads what a change REMOVES: taking a limit away widens the loop.
+w3() { _loop_improve_widens "$1" "$2" "$3" >/dev/null && echo widens || echo fine; }
+NB="Check 5 shops. Never post the table publicly. Do not email customers. Never buy anything."
+t "T5 floor: drops a 'never' (reversal)"  "widens" "$(w3 "$NB" "Post the table publicly." "Never post the table publicly.")"
+t "T5 floor: drops a 'do not'"            "widens" "$(w3 "$NB" "Email customers." "Do not email customers.")"
+t "T5 floor: deletes a limit outright"    "widens" "$(w3 "$NB" "Keep it brief." "Never buy anything.")"
+t "T5 floor: drops one of two limits"     "widens" "$(w3 "Do not post. Do not email." "Do not post. Email." "Do not post. Do not email.")"
+t "T5 floor: curly-quote don’t"           "widens" "$(w3 "Don’t email anyone." "Email everyone." "Don’t email anyone.")"
+t "T5 floor: prints what was removed"     '"never" removed' "$(_loop_improve_widens "$NB" "Post the table publicly." "Never post the table publicly.")"
+t "T5 floor: a limit kept is fine"        "fine"   "$(w3 "$NB" "Never post the table or its rows publicly." "Never post the table publicly.")"
+t "T5 floor: a plain edit is still fine"  "fine"   "$(w3 "$NB" "Check 12 shops" "Check 5 shops")"
 
 # T6 — not small, and not in the text: refused.
 ai "{\"criteria\":[{\"name\":\"Coverage\",\"score\":70}],\"overall\":66,\"proposal\":{\"change\":\"Rewrites it\",\"reason\":\"x\",\"target\":\"Coverage\",\"find\":\"\",\"replace\":\"$(printf 'x%.0s' {1..400})\"}}"
@@ -211,6 +222,66 @@ printf '#!/usr/bin/env bash\nprintf "%%s " "$@" >"%s/kick.args"\n' "$TMP" >"$TMP
 ( FIVEDIVE_LOOP_IMPROVE_SYNC=0 FIVEDIVE_SELF="$TMP/self.sh" _loop_improve_kick "$L" "$R17" )
 for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$TMP/kick.args" ]] && break; sleep 0.3; done
 t "T15 detached kick runs the tick verb" "task loop improve $L tick --run=$R17 " "$(cat "$TMP/kick.args" 2>/dev/null)"
+
+# T17 — undo while a tick is mid-grade (a slow model): the undo stands (text,
+# log, bar), and the tick, whose score belongs to text that is gone, records the
+# run only.
+printf '#!/usr/bin/env bash\nsleep "${SLOW_S:-3}"\nexec "%s/ai.sh"\n' "$TMP" >"$TMP/slow.sh"; chmod +x "$TMP/slow.sh"
+mk_done() { db "INSERT INTO tasks (title, body, assignee, created_by, kind, from_template_id, status, result)
+                SELECT title, body, assignee, created_by, 'standard', id, 'done', 'ran' FROM tasks WHERE ident='$L';
+                SELECT ident FROM tasks WHERE id=last_insert_rowid();"; }
+ntrying() { logj | jq '[.entries[] | select(.status=="trying")] | length'; }
+cmd_task_loop_improve "$L" on >/dev/null
+ai '{"criteria":[{"name":"Coverage","score":50}],"overall":50,"proposal":{"change":"Checks 7 shops","reason":"x","target":"Coverage","find":"Check 5 shops","replace":"Check 7 shops"}}'
+R19=$(mk_run); close_run "$R19"
+ai '{"criteria":[{"name":"Coverage","score":70}],"overall":70,"proposal":null}'
+R20=$(mk_run); close_run "$R20"
+t "T17 #11 kept 50 -> 70" "kept|50|70" "$(entry 11 '"\(.status)|\(.score_before)|\(.score_after)"')"
+ai '{"criteria":[{"name":"Coverage","score":60}],"overall":60,"proposal":{"change":"Sorts by price","reason":"x","target":"Coverage","find":"Write a short table","replace":"Write a short table sorted by price"}}'
+R21=$(mk_done)
+( FIVEDIVE_LOOP_IMPROVE_AI="$TMP/slow.sh" cmd_task_loop_improve "$L" tick --run="$R21" >"$TMP/race.out" 2>&1 ) & TPID=$!
+sleep 1; ( cmd_task_loop_improve "$L" undo 11 ) >/dev/null 2>&1; wait "$TPID"
+t "T17 undo mid-tick: #11 stays undone" "undone" "$(entry 11 .status)"
+t "T17 undo mid-tick: text is the undo's, exactly" "same" "$([[ "$(body)" == "$ORIG" ]] && echo same || echo differs)"
+t "T17 undo mid-tick: no change started on the stale grade" "0" "$(ntrying)"
+t "T17 undo mid-tick: bar is the undo's (50), the run is recorded" "50|$R21" "$(logj | jq -r '"\(.score_now)|\(.runs[-1].run)"')"
+t "T17 undo mid-tick: the tick says nothing was decided" "1" "$(grep -c 'nothing decided' "$TMP/race.out")"
+
+# T16 — off while a tick is mid-grade (a slow model): the tick re-checks the
+# switch under the lock off holds, and applies nothing. A clean slate, so this
+# arm stands on its own whatever T17 left.
+_loop_pref_del "loop.improve.log.$L"; _loop_pref_del "loop.improve.state.$L"
+db "UPDATE tasks SET body=$(sqlq "$ORIG") WHERE ident='$L';"; cmd_task_loop_improve "$L" on >/dev/null
+ai '{"criteria":[{"name":"Coverage","score":60}],"overall":60,"proposal":{"change":"Checks 12 shops","reason":"x","target":"Coverage","find":"Check 5 shops","replace":"Check 12 shops"}}'
+R18=$(mk_done); ENT0=$(logj | jq '.entries|length')
+( FIVEDIVE_LOOP_IMPROVE_AI="$TMP/slow.sh" cmd_task_loop_improve "$L" tick --run="$R18" >"$TMP/race.out" 2>&1 ) & TPID=$!
+sleep 1; cmd_task_loop_improve "$L" off >/dev/null; wait "$TPID"
+t "T16 off mid-tick: switch stays off" "false" "$(logj | jq -r .self_improving)"
+t "T16 off mid-tick: text unchanged" "same" "$([[ "$(body)" == "$ORIG" ]] && echo same || echo differs)"
+t "T16 off mid-tick: no trying entry, nothing logged" "0|$ENT0" "$(ntrying)|$(logj | jq '.entries|length')"
+t "T16 off mid-tick: the tick says it applied nothing" "1" "$(grep -c 'nothing applied' "$TMP/race.out")"
+
+# T19 — off landing INSIDE the tick's write window waits for the lock, then
+# takes back the trial the tick just started: off is never lost.
+_loop_pref_del "loop.improve.log.$L"; _loop_pref_del "loop.improve.state.$L"
+db "UPDATE tasks SET body=$(sqlq "$ORIG") WHERE ident='$L';"; cmd_task_loop_improve "$L" on >/dev/null
+ai '{"criteria":[{"name":"Coverage","score":60}],"overall":60,"proposal":{"change":"Checks 12 shops","reason":"x","target":"Coverage","find":"Check 5 shops","replace":"Check 12 shops"}}'
+R23=$(mk_done)
+( FIVEDIVE_LOOP_IMPROVE_COMMIT_HOLD=2 cmd_task_loop_improve "$L" tick --run="$R23" >"$TMP/race.out" 2>&1 ) & TPID=$!
+sleep 1; cmd_task_loop_improve "$L" off >/dev/null; wait "$TPID"
+t "T19 off in the write window: the tick's trial was taken back" "dropped|same|0" "$(entry 1 .status)|$([[ "$(body)" == "$ORIG" ]] && echo same || echo differs)|$(ntrying)"
+
+# T18 — end to end: a proposal that reverses a limit is refused, never applied.
+_loop_pref_del "loop.improve.log.$L"; _loop_pref_del "loop.improve.state.$L"
+cmd_task_loop_improve "$L" on >/dev/null
+LIMITED="${ORIG}
+Never post the table publicly."
+db "UPDATE tasks SET body=$(sqlq "$LIMITED") WHERE ident='$L';"
+ai '{"criteria":[{"name":"Reach","score":40}],"overall":40,"proposal":{"change":"Shares the table","reason":"x","target":"Reach","find":"Never post the table publicly.","replace":"Post the table publicly."}}'
+R22=$(mk_run); close_run "$R22"
+t "T18 reversal refused, names the limit" 'refused|would widen what the loop may do: "never" removed' "$(logj | jq -r '.entries[-1] | "\(.status)|\(.note)"')"
+t "T18 text unchanged" "same" "$([[ "$(body)" == "$LIMITED" ]] && echo same || echo differs)"
+db "UPDATE tasks SET body=$(sqlq "$ORIG") WHERE ident='$L';"
 
 # T13 — an outcome loop refuses the switch (its next lane is the owner's call).
 _loop_pref_set "loop.outcome.$L" '{"cmd":"echo 1"}'
