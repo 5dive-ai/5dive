@@ -318,6 +318,9 @@ Agents:
                                                      # unix user, bot, tasks and grants; memory + instructions converted,
                                                      # the old side's files kept so switching back is instant (DIVE-5501).
                                                      # To Grok is refused after 5dive grok disable (DIVE-7414)
+                                                     # A Hermes or OpenClaw agent: --to=claude only (DIVE-8672);
+                                                     # --keep-model keeps its own DeepSeek, Kimi, Qwen, GLM or
+                                                     # OpenRouter key and model instead of the Claude plan (DIVE-8675)
 
 Default workdir: ${DEFAULT_WORKDIR}
 

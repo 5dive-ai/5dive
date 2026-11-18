@@ -97,14 +97,17 @@ _switch_grok_on() { [[ ! -e "${FIVE_GROK_OFF_MARKER:-/etc/5dive/arm/grok-off}" ]
 
 # The plain sentence every surface shows before a switch. One string, so the
 # CLI refusal, the Mini App and the dashboard cannot drift apart.
-switch_harness_warning() { # <name> <from> <to>
+switch_harness_warning() { # <name> <from> <to> [kept-provider]
   local plan
   case "$3" in codex) plan="ChatGPT" ;; grok) plan="Grok" ;; *) plan="Claude" ;; esac
+  # DIVE-8675: --keep-model is not a plan, it is the seat's own key.
+  local onto="your $plan plan"
+  [[ -n "${4:-}" ]] && onto="$(_switch_label "$3") on its own ${BYO_PROVIDER_LABEL[$4]:-$4} model"
   # DIVE-8672: off Hermes/OpenClaw is one way for now, so it never promises a way back.
   local back='You can switch back any time.'
   _switch_is_source "$2" && back="Its own scheduled jobs do not move, and there is no switching back to $(_switch_label "$2") yet."
-  printf 'Moving %s to your %s plan switches it from %s to %s. Its memory and instructions are converted; this chat'"'"'s history is not. %s' \
-    "$1" "$plan" "$(_switch_label "$2")" "$(_switch_label "$3")" "$back"
+  printf 'Moving %s to %s switches it from %s to %s. Its memory and instructions are converted; this chat'"'"'s history is not. %s' \
+    "$1" "$onto" "$(_switch_label "$2")" "$(_switch_label "$3")" "$back"
 }
 
 # The harnesses an account signs in for, among those this verb moves between,
@@ -587,8 +590,11 @@ _switch_source_tg_allow() { # <home> <type>
     hermes) raw=$(_switch_env_value "$home" "$home/.hermes/.env" TELEGRAM_ALLOWED_USERS | tr ',' '\n') ;;
     openclaw) raw=$(_switch_openclaw_conf "$home" | jq -r '(.channels.telegram.allowFrom // [])[] | tostring' 2>/dev/null) ;;
   esac
+  # DIVE-8675: `|| true` — no numeric id at all (a seat with no allowlist) is
+  # an empty list, not a failure: under pipefail the grep's 1 ended the whole
+  # switch silently, after the source gateway was already down.
   sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\(telegram\|tg\)://' <<<"$raw" \
-    | grep -E '^-?[0-9]+$' | awk '!seen[$0]++' | paste -sd, -
+    | { grep -E '^-?[0-9]+$' || true; } | awk '!seen[$0]++' | paste -sd, -
 }
 
 # Scheduled jobs the source harness ran itself. They are NOT carried: the owner
@@ -831,22 +837,191 @@ _switch_source_builtin_skill() { # <home> <type> <skill>
   _switch_read_seat_file "$1" "$1/.hermes/skills/.bundled_manifest" | cut -d: -f1 | grep -qxF -- "$3"
 }
 
+# ======================================================================
+# DIVE-8675: --keep-model. A Hermes or OpenClaw seat on DeepSeek, Kimi, Qwen,
+# GLM or OpenRouter moves to Claude Code on ITS OWN provider, key and model
+# instead of the owner's Claude plan. Claude Code reaches those five through
+# their Anthropic-format endpoints (CLAUDE_PROVIDER_BASEURL), so the seat gets
+# its own account written by the same writer as `agent create --provider=`
+# (_apply_byo_claude). A provider with no such endpoint (plain OpenAI, Google)
+# is refused before anything changes.
+#
+# Where each harness keeps the three facts (seat home first, then the account
+# the seat was bound to, which its unit also loads as env):
+#   provider  hermes   ~/.hermes/config.yaml model.provider (a native id:
+#                      kimi, alibaba, ... — HERMES_PROVIDER_ID reversed)
+#             openclaw openclaw.json agents.defaults.model.primary, first
+#                      segment ("deepseek/deepseek-v4-pro")
+#   model     hermes   model.default · openclaw the rest of primary
+#   key       hermes   auth.json credential_pool.<native>[].access_token, else
+#                      the provider's *_API_KEY in ~/.hermes/.env
+#             openclaw the authProfiles.store row of its sqlite state
+#                      (DIVE-7101 ~/.openclaw/state/openclaw.sqlite; DIVE-3489
+#                      agents/main/agent/openclaw-agent.sqlite), else the
+#                      provider's *_API_KEY in ~/.openclaw/.env
+# ======================================================================
+
+# The env names each harness reads a provider's key from (hermes_cli/auth.py
+# api_key_env_vars; openclaw takes the same names), keyed by canonical id.
+declare -A SWITCH_PROVIDER_KEY_VARS=(
+  [deepseek]="DEEPSEEK_API_KEY"
+  [moonshot]="KIMI_API_KEY MOONSHOT_API_KEY"
+  [openrouter]="OPENROUTER_API_KEY"
+  [zai]="GLM_API_KEY ZAI_API_KEY Z_AI_API_KEY"
+  [qwen]="DASHSCOPE_API_KEY ALIBABA_CODING_PLAN_API_KEY QWEN_API_KEY"
+  [openai]="OPENAI_API_KEY"
+  [google]="GEMINI_API_KEY GOOGLE_API_KEY"
+)
+
+# A hermes native provider id -> canonical. Hermes renames kimi to kimi-coding
+# itself and has a coding-plan id for Alibaba, neither in HERMES_PROVIDER_ID.
+_switch_hermes_canonical() { # <native>
+  case "$1" in
+    kimi-coding|kimi-coding-cn) echo moonshot ;;
+    alibaba-coding-plan) echo qwen ;;
+    glm|z-ai|zhipu) echo zai ;;
+    *) resolve_canonical_provider_hermes "$1" ;;
+  esac
+}
+
+_switch_openclaw_canonical() { # <native>
+  local c
+  for c in "${!OPENCLAW_PROVIDER_ID[@]}"; do
+    [[ -n "${OPENCLAW_PROVIDER_ID[$c]}" && "${OPENCLAW_PROVIDER_ID[$c]}" == "$1" ]] && { echo "$c"; return 0; }
+  done
+  echo ""
+}
+
+# One key out of the seat's model: block of a hermes config.yaml. A bare
+# `model: <id>` (older configs) answers `default`.
+_switch_hermes_model_field() { # <home> <provider|default>
+  _switch_read_seat_file "$1" "$1/.hermes/config.yaml" | awk -v k="$2" '
+    function unq(s) { sub(/[[:space:]]+#.*$/, "", s); gsub(/^["'\'']|["'\'']$/, "", s); return s }
+    /^model:[[:space:]]*[^[:space:]#]/ { if (k == "default") { s=$0; sub(/^model:[[:space:]]*/, "", s); print unq(s) } exit }
+    /^model:/ { m=1; next }
+    m && /^[^[:space:]]/ { exit }
+    m && $0 ~ "^[[:space:]]+" k ":" { s=$0; sub("^[[:space:]]+" k ":[[:space:]]*", "", s); print unq(s); exit }'
+}
+
+# The first non-empty value of any of <vars> in an env file under the seat home.
+_switch_env_first() { # <home> <env-file> <var...>
+  local home="$1" file="$2" v; shift 2
+  for v in "$@"; do
+    v=$(_switch_env_value "$home" "$file" "$v")
+    [[ -n "$v" ]] && { printf '%s\n' "$v"; return 0; }
+  done
+  return 0
+}
+
+# The api-key profile for <native> in an openclaw sqlite state db, read from a
+# copy (the seat owns the file; root never opens it in place).
+_switch_openclaw_db_key() { # <home> <db> <native>
+  local home="$1" db="$2" native="$3" tmp k=""
+  [[ -f "$db" ]] || return 0
+  _switch_no_symlink "$db" "$home" 2>/dev/null || return 0
+  tmp=$(mktemp -d)
+  cat -- "$db" >"$tmp/s.sqlite" 2>/dev/null
+  [[ -f "$db-wal" && ! -L "$db-wal" ]] && cat -- "$db-wal" >"$tmp/s.sqlite-wal" 2>/dev/null
+  k=$(python3 -I -c '
+import json, sqlite3, sys
+try:
+    r = sqlite3.connect(sys.argv[1]).execute(
+        "SELECT value_json FROM config_machine_state WHERE state_key = ?", ("authProfiles.store",)).fetchone()
+    prof = (json.loads(r[0]) or {}).get("profiles") or {} if r else {}
+except Exception:
+    prof = {}
+for pid, p in sorted(prof.items()):
+    if isinstance(p, dict) and p.get("provider") == sys.argv[2] and p.get("type", "api_key") == "api_key":
+        k = p.get("key") or p.get("apiKey") or ""
+        if isinstance(k, str) and k:
+            print(k); break' "$tmp/s.sqlite" "$native" 2>/dev/null) || k=""
+  rm -rf "$tmp"
+  printf '%s\n' "$k"
+}
+
+# switch_source_ai <home> <type> [account] — what the seat runs on, as
+# SWITCH_SRC_{PROVIDER,MODEL,KEY} (canonical id, the model id as the provider's
+# own API names it, the key). Any of the three may come back empty; the caller
+# refuses on what is missing.
+switch_source_ai() {
+  local home="$1" type="$2" acct="${3:-}" native="" model="" key="" canonical="" v vars
+  SWITCH_SRC_PROVIDER="" SWITCH_SRC_MODEL="" SWITCH_SRC_KEY=""
+  case "$type" in
+    hermes)
+      native=$(_switch_hermes_model_field "$home" provider)
+      model=$(_switch_hermes_model_field "$home" default)
+      [[ -n "$native" ]] && canonical=$(_switch_hermes_canonical "$native")
+      if [[ -n "$native" ]]; then
+        key=$(_switch_read_seat_file "$home" "$home/.hermes/auth.json" | jq -r --arg p "$native" '
+          (.credential_pool[$p] // []) | if type == "array" then . else [] end
+          | map(select((.auth_type // "api_key") == "api_key" and ((.access_token // "") | length) > 0))
+          | sort_by(.priority // 0) | first | .access_token // empty' 2>/dev/null) || key=""
+      fi
+      vars="${SWITCH_PROVIDER_KEY_VARS[$canonical]:-}"
+      # shellcheck disable=SC2086  # a list of names
+      [[ -n "$key" || -z "$vars" ]] || key=$(_switch_env_first "$home" "$home/.hermes/.env" $vars) ;;
+    openclaw)
+      v=$(_switch_openclaw_conf "$home" | jq -r '.agents.defaults.model
+          | if type == "object" then .primary elif type == "string" then . else empty end
+          | select(type == "string")' 2>/dev/null) || v=""
+      if [[ "$v" == */* ]]; then
+        native="${v%%/*}"; model="${v#*/}"
+        canonical=$(_switch_openclaw_canonical "$native")
+      fi
+      if [[ -n "$native" ]]; then
+        key=$(_switch_openclaw_db_key "$home" "$home/.openclaw/state/openclaw.sqlite" "$native")
+        [[ -n "$key" ]] || key=$(_switch_openclaw_db_key "$home" "$home/.openclaw/agents/main/agent/openclaw-agent.sqlite" "$native")
+      fi
+      vars="${SWITCH_PROVIDER_KEY_VARS[$canonical]:-}"
+      # shellcheck disable=SC2086
+      [[ -n "$key" || -z "$vars" ]] || key=$(_switch_env_first "$home" "$home/.openclaw/.env" $vars) ;;
+  esac
+  # The account the seat was bound to: its combined.env is in the seat's unit
+  # env, which is where both harnesses also look for a provider key.
+  if [[ -z "$key" && -n "$acct" && -n "$vars" ]]; then
+    for v in $vars; do
+      key=$(profile_env_value "$acct" "$v"); [[ -n "$key" ]] && break
+    done
+  fi
+  SWITCH_SRC_PROVIDER="$canonical" SWITCH_SRC_MODEL="$model" SWITCH_SRC_KEY="$key"
+}
+
+# The account a --keep-model seat gets: its own, named after it and the vendor,
+# so no other seat's account is rewritten and the source side's stays as it was.
+switch_keep_account_name() { # <name> <canonical>
+  local p="${1}-${2}"
+  valid_profile_name "$p" || p="keep-$(printf '%s' "$1" | cksum | cut -d' ' -f1)-${2}"
+  printf '%s\n' "${p:0:32}"
+}
+
+# Pin settings.json's model on a seat that ran Claude Code before (a fresh one
+# is preseeded with it). The rest of the file is kept as the seat left it.
+switch_set_claude_model() { # <home> <user> <model>
+  local f="$1/.claude/settings.json" tmp
+  _switch_no_symlink "$f" "$1" || return 1
+  tmp=$(mktemp)
+  jq --arg m "$3" '.model = $m' "$f" >"$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  _switch_install_file "$2" "$tmp" "$f" "$(stat -c %a "$f" 2>/dev/null || echo 644)" "$1"; local rc=$?
+  rm -f "$tmp"; return "$rc"
+}
+
 cmd_agent_switch() {
   require_root "agent switch"
-  local name="" to="" account="" account_set=0 handoff_wait=90 handoff=1
+  local name="" to="" account="" account_set=0 handoff_wait=90 handoff=1 keep_model=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --to=*)           to="${1#--to=}" ;;
       --account=*)      account="${1#--account=}"; account_set=1 ;;
       --handoff-wait=*) handoff_wait="${1#--handoff-wait=}" ;;
       --no-handoff)     handoff=0 ;;
+      --keep-model)     keep_model=1 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *)  [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
   [[ -n "$name" && -n "$to" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent switch <name> --to=claude|codex|grok [--account=<account|default>] [--no-handoff] [--handoff-wait=<seconds>]  (a hermes or openclaw agent: --to=claude)"
+    || fail "$E_USAGE" "usage: 5dive agent switch <name> --to=claude|codex|grok [--account=<account|default>] [--no-handoff] [--handoff-wait=<seconds>]  (a hermes or openclaw agent: --to=claude [--keep-model])"
   [[ "$handoff_wait" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--handoff-wait must be a number of seconds"
   _switch_is_type "$to" \
     || fail "$E_VALIDATION" "--to must be claude, codex or grok (got '$to')"
@@ -870,6 +1045,14 @@ cmd_agent_switch() {
     _switch_is_type "$from" \
       || fail "$E_VALIDATION" "agent '$name' is type $from — switch moves between claude, codex and grok, and from hermes or openclaw to claude"
   fi
+  # DIVE-8675: --keep-model is the Hermes/OpenClaw seat's own key and model,
+  # so it names its own account; --account would be a second answer to that.
+  if (( keep_model )); then
+    (( src_only )) \
+      || fail "$E_VALIDATION" "--keep-model is for a Hermes or OpenClaw agent moving to Claude Code; '$name' runs $(_switch_label "$from") — use --account=<account> to pick what it runs on"
+    (( account_set )) \
+      && fail "$E_USAGE" "--keep-model keeps the AI key '$name' already runs on, so it takes no --account= (drop one of the two)"
+  fi
   [[ "$from" != "$to" ]] || fail "$E_VALIDATION" "agent '$name' already runs $(_switch_label "$to")"
   # The owner's own opt-out, the one `agent create --type=grok` respects.
   if [[ "$to" == grok ]] && ! _switch_grok_on; then
@@ -889,12 +1072,35 @@ cmd_agent_switch() {
            "agent '$name' uses the $ch channel, which $(_switch_label "$to") does not have — remove it first (5dive agent config $name set channels=…)" ;;
     esac
   done
-  (( account_set )) || account="$prev_profile"
+  local home user token=""
+  home=$(_switch_home "$name"); user="agent-${name}"
+  local keep_provider="" keep_model_id="" keep_key="" keep_url=""
+  if (( keep_model )); then
+    switch_source_ai "$home" "$from" "$prev_profile"
+    keep_provider="$SWITCH_SRC_PROVIDER" keep_model_id="$SWITCH_SRC_MODEL" keep_key="$SWITCH_SRC_KEY"
+    [[ -n "$keep_provider" ]] \
+      || fail "$E_VALIDATION" "could not tell which AI provider '$name' runs on in its $(_switch_label "$from") settings, so its model cannot be kept — switch without --keep-model to move it onto your Claude plan; nothing was changed"
+    keep_url="${CLAUDE_PROVIDER_BASEURL[$keep_provider]:-}"
+    [[ -n "$keep_url" ]] \
+      || fail "$E_VALIDATION" "'$name' runs on ${BYO_PROVIDER_LABEL[$keep_provider]:-$keep_provider}, which Claude Code cannot talk to (it only reaches DeepSeek, Kimi, Qwen, GLM and OpenRouter that way). Switch without --keep-model to move it onto your Claude plan; moving it to Codex on its own key is not built yet. Nothing was changed"
+    [[ -n "$keep_key" ]] && valid_api_key "$keep_key" \
+      || fail "$E_VALIDATION" "found no ${BYO_PROVIDER_LABEL[$keep_provider]:-$keep_provider} key for '$name' in its $(_switch_label "$from") files, so its model cannot be kept — switch without --keep-model to use your Claude plan, or set its key again first; nothing was changed"
+    [[ -z "$keep_model_id" ]] || valid_model "$keep_model_id" \
+      || fail "$E_VALIDATION" "'$name' names its model as '$keep_model_id', which is not a model id 5dive can carry — set it to a plain id first; nothing was changed"
+    account=$(switch_keep_account_name "$name" "$keep_provider")
+    # An account by that name that is not on this vendor already is someone's;
+    # the writer would re-point it (or refuse it), so refuse here, unchanged.
+    local _kp_url
+    _kp_url=$(profile_env_value "$account" ANTHROPIC_BASE_URL)
+    [[ -z "$_kp_url" || "$_kp_url" == "$keep_url" ]] \
+      || fail "$E_CONFLICT" "an account named '$account' already exists on another AI provider ($_kp_url) — rename or remove it, then switch again; nothing was changed"
+  fi
+  (( account_set || keep_model )) || account="$prev_profile"
   # A Hermes/OpenClaw seat's own account is usually an API key for that harness
   # (or a BYO provider). The move is onto the Claude PLAN: keep the seat's
   # account only when it is a Claude sign-in that is not a BYO endpoint,
   # otherwise use the box default.
-  if (( src_only && ! account_set )) && [[ -n "$account" ]]; then
+  if (( src_only && ! account_set && ! keep_model )) && [[ -n "$account" ]]; then
     if [[ ! -f "${AUTH_PROFILES_DIR}/${account}/combined.env" ]] \
        || grep -q '^ANTHROPIC_BASE_URL=.' "${AUTH_PROFILES_DIR}/${account}/combined.env" 2>/dev/null \
        || ! switch_account_serves "$account" claude; then
@@ -902,12 +1108,12 @@ cmd_agent_switch() {
     fi
   fi
   [[ "$account" == default ]] && account=""
-  if [[ -n "$account" ]]; then
+  if [[ -n "$account" ]] && (( ! keep_model )); then
     valid_profile_name "$account" || fail "$E_VALIDATION" "invalid account name '$account'"
     [[ -f "${AUTH_PROFILES_DIR}/${account}/combined.env" ]] \
       || fail "$E_NOT_FOUND" "account '$account' is not configured"
   fi
-  if ! switch_account_serves "$account" "$to"; then
+  if (( ! keep_model )) && ! switch_account_serves "$account" "$to"; then
     if (( src_only )); then
       fail "$E_VALIDATION" "moving '$name' to Claude Code needs a Claude plan sign-in on this server, and account '${account:-default}' has none — sign in first (sudo 5dive agent auth start claude), then switch again; nothing was changed"
     fi
@@ -916,8 +1122,6 @@ cmd_agent_switch() {
     fi
     fail "$E_VALIDATION" "agent '$name' is on account '${account:-default}', which has no $(_switch_label "$to") sign-in — pass --account=<an account signed in to $(_switch_label "$to")>"
   fi
-  local home user token=""
-  home=$(_switch_home "$name"); user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
   if channel_in_list telegram "$channels"; then
     if (( src_only )); then
@@ -949,16 +1153,18 @@ cmd_agent_switch() {
     [[ "$delay" =~ ^[0-9]+$ ]] || delay=20
     t_now=$(date +%s)
     su="5dive-switch-${name}-${t_now}-$$"
+    local -a again=(--account="${account:-default}")
+    (( keep_model )) && again=(--keep-model)
     systemd-run --unit="$su" --collect --on-active="$delay" --timer-property=AccuracySec=100ms \
         -p KillMode=process --setenv=PATH="$PATH" \
         --setenv=FIVEDIVE_SWITCH_DETACHED=1 --setenv=FIVEDIVE_SWITCH_T0="$t_now" \
-        -- "$self_bin" agent switch "$name" --to="$to" --account="${account:-default}" >&2 \
+        -- "$self_bin" agent switch "$name" --to="$to" "${again[@]}" >&2 \
       || fail "$E_GENERIC" "could not start the switch outside $name's own session — nothing switched; ask the owner to switch $name from the dashboard"
     local next_msg="switching $name to $(_switch_label "$to") (account ${account:-default}) in ${delay}s: this session stops then, and $name is back on $(_switch_label "$to") about a minute later. Write anything the next session needs into ~/${SWITCH_HANDOFF_FILE} now; it reads that file first. Progress: journalctl -u $su"
     ok "$next_msg" \
        '{name:$n, from:$f, to:$t, account:$a, warning:$w, detached:true, unit:$u, startsInSeconds:$d, next:$x}' \
        --arg x "$next_msg" \
-       --arg n "$name" --arg f "$from" --arg t "$to" --arg a "${account:-default}" --arg w "$(switch_harness_warning "$name" "$from" "$to")" \
+       --arg n "$name" --arg f "$from" --arg t "$to" --arg a "${account:-default}" --arg w "$(switch_harness_warning "$name" "$from" "$to" "${keep_provider}")" \
        --arg u "$su" --argjson d "$delay"
     return 0
   fi
@@ -971,7 +1177,7 @@ cmd_agent_switch() {
   fi
 
   local warning
-  warning=$(switch_harness_warning "$name" "$from" "$to")
+  warning=$(switch_harness_warning "$name" "$from" "$to" "$keep_provider")
   step "$warning"
 
   # ---- 1. handoff: ask the running seat for a note, then stop it ----
@@ -1021,6 +1227,16 @@ _agent_switch_apply() {
   [[ "$_now" == "$from" ]] \
     || fail "$E_CONFLICT" "agent '$name' changed type while the handoff ran (now '$_now') — nothing switched; the unit is stopped, start it with: 5dive agent start $name"
 
+  # DIVE-8675: the seat's own account, written first by the same writer as
+  # `agent create --provider=` (base URL, key, the model on the opus+sonnet
+  # tiers, the vendor's cheap one on haiku). A refusal here leaves the source
+  # side exactly as it was.
+  if (( keep_model )); then
+    step "Writing account '$account': ${BYO_PROVIDER_LABEL[$keep_provider]:-$keep_provider} at $keep_url${keep_model_id:+, model $keep_model_id}"
+    ( _apply_byo_claude "$keep_provider" "$keep_key" "$account" "$keep_model_id" ) >&2 \
+      || fail "$E_GENERIC" "could not write account '$account' for '$name' — nothing switched; the unit is stopped, start it with: 5dive agent start $name"
+  fi
+
   # DIVE-8672: the source harness's own poller goes down before anything is
   # converted, so a stuck one leaves the seat exactly as it was (plus stopped).
   if (( src_only )); then
@@ -1058,13 +1274,21 @@ _agent_switch_apply() {
     carry_src="$src_doc"
   fi
 
+  # DIVE-8675: a kept model is pinned by id. An Anthropic id left in
+  # settings.json is NOT translated by the account's tier map (only the aliases
+  # are, DIVE-5127), and OpenRouter would serve it as real Claude.
+  local keep_start=""
+  (( keep_model )) && keep_start="${keep_model_id:-${CLAUDE_PROVIDER_OPUS_MODEL[$keep_provider]:-}}"
   if [[ "$to" == claude ]]; then
     if [[ ! -f "$home/.claude/settings.json" ]]; then
       local _m
-      _m=$(claude_create_start_model "" "" "" "$account")
+      _m=$(claude_create_start_model "$keep_start" "" "" "$account")
       model_latest "$_m" >/dev/null 2>&1 && _m=$(resolve_model_for_profile "$_m" "$account")
       step "Preseeding Claude Code for $user (first time on this harness)"
       preseed_claude_agent "$name" "$channels" "$_m" high
+    elif [[ -n "$keep_start" ]]; then
+      switch_set_claude_model "$home" "$user" "$keep_start" \
+        || warn "could not pin model $keep_start in $home/.claude/settings.json"
     fi
   fi
 
@@ -1211,8 +1435,15 @@ _agent_switch_apply() {
   [[ "$copied_json" == "[]" ]] || skills_note="; skills copied: $(jq -r 'join(", ")' <<<"$copied_json")"
   [[ "$dropped_json" == "[]" ]] || skills_note+="; not carried: $(jq -r 'join(", ")' <<<"$dropped_json")"
   [[ -z "$jobs_note" ]] || skills_note+=" — those jobs no longer run; set them up again on Claude Code"
-  ok "agent '$name' switched from $(_switch_label "$from") to $(_switch_label "$to") (account ${account:-default}); $state_note$skills_note" \
-     '{name:$n, from:$f, to:$t, account:$a, warning:$w, handoff:$h, memory:$m, telegram:{tokenKept:($tk == 1), allowFrom:$al}, copied:$c, dropped:$d, scheduledJobs:$jobs, running:$up, parked:$pk}' \
+  local keep_json=null keep_note=""
+  if (( keep_model )); then
+    keep_json=$(jq -cn --arg p "$keep_provider" --arg m "$keep_start" --arg u "$keep_url" \
+      '{provider:$p, model:$m, baseUrl:$u}')
+    keep_note=" on its own ${BYO_PROVIDER_LABEL[$keep_provider]:-$keep_provider} model ${keep_start}"
+  fi
+  ok "agent '$name' switched from $(_switch_label "$from") to $(_switch_label "$to")${keep_note} (account ${account:-default}); $state_note$skills_note" \
+     '{name:$n, from:$f, to:$t, account:$a, warning:$w, handoff:$h, memory:$m, telegram:{tokenKept:($tk == 1), allowFrom:$al}, copied:$c, dropped:$d, scheduledJobs:$jobs, running:$up, parked:$pk, keptModel:$keep}' \
+     --argjson keep "$keep_json" \
      --arg n "$name" --arg f "$from" --arg t "$to" --arg a "${account:-default}" --arg w "$warning" \
      --arg h "$handoff_state" --argjson m "$mem_json" --argjson tk "$([[ -n "$token" ]] && echo 1 || echo 0)" \
      --argjson al "${allow_n:-0}" --argjson c "$copied_json" --argjson d "$dropped_json" --argjson up "$up" --argjson pk "$parked" \

@@ -15,6 +15,9 @@
 #   B1-B6  and back: type claude, L unchanged in CLAUDE.md, M still there plus the
 #          codex memory converted to atoms, no stacked carried blocks.
 #   C*/M*  the pure pieces (carry, memory conversion, access merge) on their own.
+#   K1-K10 (DIVE-8675) --keep-model: a Hermes/OpenClaw seat on DeepSeek, OpenRouter
+#          or Kimi moves on its own key + model (the account names the vendor's
+#          Anthropic-format URL and the model); plain OpenAI is refused.
 #
 # `sudo`, `install -o`, `chown` and `id` are runas-stripping shims; systemd and the
 # channel installers are recorded, not run. The writers under test are the real ones.
@@ -715,6 +718,125 @@ printf 'TELEGRAM_BOT_TOKEN=333:root\n' >"$TMP/rootfile"; rm -f "$P/.openclaw/.en
 [[ -z "$(_switch_source_tg_token "$P" openclaw)" ]] \
   && ok_t "O7 a symlinked credential file is refused (root never reads a file the seat points it at)" \
   || bad_t "O7 symlink followed" "$(_switch_source_tg_token "$P" openclaw)"
+
+# =========================================================== K: --keep-model (DIVE-8675)
+# An OpenClaw seat on DeepSeek (key in its sqlite auth store), one on OpenRouter
+# (key in ~/.openclaw/.env, a Claude Code side left from before) and a Hermes
+# seat on Kimi move with `--keep-model`: each answers on its OWN provider, key
+# and model — the seat's account names the vendor's Anthropic-format base URL
+# and the model — and the box needs no Claude plan sign-in for it.
+mk_oc_seat() { # <name> <primary> [token]
+  local h="$SWITCH_HOME_ROOT/agent-$1"
+  mkdir -p "$h/.openclaw/state" "$h/.openclaw/workspace"
+  jq -n --arg p "$2" --arg t "${3:-7000000009:AAkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk}" \
+    '{gateway:{mode:"local"}, agents:{defaults:{model:{primary:$p}}}, channels:{telegram:{botToken:$t, allowFrom:["1234567890"]}}}' \
+    >"$h/.openclaw/openclaw.json"
+}
+oc_db_key() { # <name> <provider> <key>
+  python3 -I -c 'import json,sqlite3,sys
+c=sqlite3.connect(sys.argv[1]); c.execute("CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT, updated_at_ms INTEGER)")
+c.execute("INSERT INTO config_machine_state VALUES (?,?,3)", ("authProfiles.store", json.dumps({"version":1,"profiles":{"anthropic:x":{"type":"token","provider":"anthropic","token":"nope"}, sys.argv[2]+":manual":{"type":"api_key","provider":sys.argv[2],"key":sys.argv[3]}}})))
+c.commit()' "$SWITCH_HOME_ROOT/agent-$1/.openclaw/state/openclaw.sqlite" "$2" "$3"
+}
+mk_oc_seat ocds deepseek/deepseek-v4-pro; oc_db_key ocds deepseek sk-ds-oc-keep-1234
+mk_oc_seat ocor openrouter/deepseek/deepseek-v4.1-flash
+printf 'OPENROUTER_API_KEY=sk-or-v1-keep-5678\n' >"$SWITCH_HOME_ROOT/agent-ocor/.openclaw/.env"
+mkdir -p "$SWITCH_HOME_ROOT/agent-ocor/.claude"
+printf '{"model":"claude-opus-5-5","theme":"dark"}\n' >"$SWITCH_HOME_ROOT/agent-ocor/.claude/settings.json"
+mk_oc_seat ocoai openai/gpt-5.5; oc_db_key ocoai openai sk-openai-keep-9999
+mk_oc_seat ocnokey deepseek/deepseek-v4-pro
+KH="$SWITCH_HOME_ROOT/agent-hkimi"; mkdir -p "$KH/.hermes"
+printf 'TELEGRAM_BOT_TOKEN=7000000010:AAkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\nKIMI_API_KEY=sk-kimi-keep-4321\n' >"$KH/.hermes/.env"
+printf 'model:\n  provider: kimi-coding   # set by 5dive\n  default: "kimi-k2.5"\nterminal:\n  default: bash\n' >"$KH/.hermes/config.yaml"
+jq '.agents.ocds = {"type":"openclaw","channels":"telegram","isolation":"standard"}
+  | .agents.ocor = {"type":"openclaw","channels":"telegram","isolation":"standard"}
+  | .agents.ocoai = {"type":"openclaw","channels":"telegram","isolation":"standard"}
+  | .agents.ocnokey = {"type":"openclaw","channels":"telegram","isolation":"standard"}
+  | .agents.hkimi = {"type":"hermes","channels":"telegram","isolation":"standard"}' "$TMP/reg" >"$TMP/reg.t" && mv "$TMP/reg.t" "$TMP/reg"
+penv() { sed -n "s/^$2=//p" "$AUTH_PROFILES_DIR/$1/combined.env" 2>/dev/null | tail -1; }
+# No Claude plan on the box: --keep-model must not need one.
+TYPE_AUTH[claude]="$TMP/no-such-cred"
+
+# ---- refusals: each changes nothing
+hreset; snap_reg=$(sha256sum <"$TMP/reg")
+rc=$(run cmd_agent_switch ocoai --to=claude --keep-model)
+[[ "$rc" != 0 ]] && grep -q 'OpenAI, which Claude Code cannot talk to' "$TMP/err" && grep -q 'without --keep-model' "$TMP/err" \
+  && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" && -f "$TMP/active" && ! -s "$TMP/gw" && ! -e "$AUTH_PROFILES_DIR/ocoai-openai" ]] \
+  && ok_t "K1 an OpenClaw seat on plain OpenAI (no Anthropic-format endpoint) is refused with the way out, nothing changed" \
+  || bad_t "K1 openai refused" "rc=$rc err=$(<"$TMP/err")"
+rc=$(run cmd_agent_switch ocnokey --to=claude --keep-model)
+[[ "$rc" != 0 ]] && grep -q 'found no DeepSeek key' "$TMP/err" && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" && -f "$TMP/active" ]] \
+  && ok_t "K2 a seat whose key cannot be found is refused before anything stops" \
+  || bad_t "K2 no key" "rc=$rc err=$(<"$TMP/err")"
+rc=$(run cmd_agent_switch ocds --to=claude --keep-model --account=claudeacct)
+rc2=$(run cmd_agent_switch theo --to=codex --keep-model)
+[[ "$rc" != 0 && "$rc2" != 0 ]] && grep -q 'Hermes or OpenClaw agent' "$TMP/err" && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] \
+  && ok_t "K3 --keep-model with --account=, or on a Claude/Codex seat, is refused" \
+  || bad_t "K3 flag misuse" "rc=$rc rc2=$rc2 err=$(<"$TMP/err")"
+
+# ---- openclaw on DeepSeek, key in the sqlite store, first time on Claude Code
+hreset
+rc=$(run cmd_agent_switch ocds --to=claude --keep-model)
+[[ "$rc" == 0 ]] || bad_t "K0 ocds keep-model must succeed" "rc=$rc err=$(tail -5 "$TMP/err") out=$(<"$TMP/out")"
+[[ "$(jq -r .agents.ocds.type "$TMP/reg")" == claude && "$(jq -r .agents.ocds.authProfile "$TMP/reg")" == ocds-deepseek ]] \
+  && grep -q '^AGENT_AUTH_PROFILE=ocds-deepseek$' "$ENV_DIR/ocds.env" \
+  && [[ "$(readlink "$ENV_DIR/ocds-auth.env")" == "$AUTH_PROFILES_DIR/ocds-deepseek/combined.env" ]] \
+  && ok_t "K4 the OpenClaw seat is Claude Code on its own account (ocds-deepseek), bound in the registry, env and unit link" \
+  || bad_t "K4 registry/env" "$(jq -c .agents.ocds "$TMP/reg") env=$(cat "$ENV_DIR/ocds.env" 2>/dev/null)"
+[[ "$(penv ocds-deepseek ANTHROPIC_BASE_URL)" == https://api.deepseek.com/anthropic \
+   && "$(penv ocds-deepseek ANTHROPIC_AUTH_TOKEN)" == sk-ds-oc-keep-1234 \
+   && "$(penv ocds-deepseek ANTHROPIC_DEFAULT_OPUS_MODEL)" == deepseek-v4-pro \
+   && "$(penv ocds-deepseek ANTHROPIC_DEFAULT_SONNET_MODEL)" == deepseek-v4-pro \
+   && -n "$(penv ocds-deepseek ANTHROPIC_DEFAULT_HAIKU_MODEL)" ]] \
+  && grep -q '^CLAUDE_CODE_OAUTH_TOKEN=$' "$AUTH_PROFILES_DIR/ocds-deepseek/combined.env" \
+  && grep -q '^preseed ocds telegram deepseek-v4-pro high$' "$TMP/calls" \
+  && ok_t "K5 its env names DeepSeek's Anthropic-format URL, its own key and model deepseek-v4-pro; Claude Code starts on that model, not Opus" \
+  || bad_t "K5 deepseek env" "$(cat "$AUTH_PROFILES_DIR/ocds-deepseek/combined.env" 2>&1) calls=$(cat "$TMP/calls")"
+jq -e '.data.keptModel == {provider:"deepseek", model:"deepseek-v4-pro", baseUrl:"https://api.deepseek.com/anthropic"} and (.data.warning | test("own DeepSeek model")) and .data.running == true' "$TMP/out" >/dev/null \
+  && ok_t "K6 the result names the kept provider, model and base URL, and the warning says 'own DeepSeek model', not 'your Claude plan'" \
+  || bad_t "K6 result" "$(<"$TMP/out")"
+
+# ---- openclaw on OpenRouter, key in ~/.openclaw/.env, seat ran Claude Code before
+hreset
+rc=$(run cmd_agent_switch ocor --to=claude --keep-model)
+[[ "$rc" == 0 ]] \
+  && [[ "$(penv ocor-openrouter ANTHROPIC_BASE_URL)" == https://openrouter.ai/api \
+     && "$(penv ocor-openrouter ANTHROPIC_AUTH_TOKEN)" == sk-or-v1-keep-5678 \
+     && "$(penv ocor-openrouter ANTHROPIC_DEFAULT_OPUS_MODEL)" == deepseek/deepseek-v4.1-flash \
+     && "$(penv ocor-openrouter CLAUDE_CODE_MAX_OUTPUT_TOKENS)" == 16000 ]] \
+  && jq -e '.model == "deepseek/deepseek-v4.1-flash" and .theme == "dark"' "$SWITCH_HOME_ROOT/agent-ocor/.claude/settings.json" >/dev/null \
+  && ok_t "K7 OpenRouter: openclaw's 'openrouter/<slug>' becomes the slug; a settings.json left at claude-opus-5-5 is re-pinned (OpenRouter would serve real Opus), the rest kept" \
+  || bad_t "K7 openrouter" "rc=$rc err=$(tail -3 "$TMP/err") env=$(cat "$AUTH_PROFILES_DIR/ocor-openrouter/combined.env" 2>&1) set=$(cat "$SWITCH_HOME_ROOT/agent-ocor/.claude/settings.json")"
+
+# ---- hermes on Kimi (hermes renames kimi to kimi-coding; key in ~/.hermes/.env).
+# It has NO Telegram allowlist: on the DIVE-8672 tree that alone ended the
+# switch silently under pipefail, after its gateway was already stopped.
+hreset
+rc=$(run cmd_agent_switch hkimi --to=claude --keep-model)
+[[ "$rc" == 0 && "$(jq -r .agents.hkimi.authProfile "$TMP/reg")" == hkimi-moonshot ]] \
+  && [[ "$(penv hkimi-moonshot ANTHROPIC_BASE_URL)" == https://api.moonshot.ai/anthropic \
+     && "$(penv hkimi-moonshot ANTHROPIC_AUTH_TOKEN)" == sk-kimi-keep-4321 \
+     && "$(penv hkimi-moonshot ANTHROPIC_DEFAULT_OPUS_MODEL)" == kimi-k2.5 ]] \
+  && grep -q '^hermes gateway uninstall$' "$TMP/gw" \
+  && ok_t "K8 a Hermes seat on Kimi with no allowlist keeps Kimi: model.provider kimi-coding + KIMI_API_KEY -> Moonshot's Anthropic URL, model kimi-k2.5" \
+  || bad_t "K8 hermes kimi" "rc=$rc out=$(<"$TMP/out") gw=$(cat "$TMP/gw" 2>&1) err=$(tail -3 "$TMP/err") env=$(cat "$AUTH_PROFILES_DIR/hkimi-moonshot/combined.env" 2>&1)"
+
+# ---- the reader on its own: hermes credential pool, lowest priority wins, oauth skipped
+P="$TMP/hpool"; mkdir -p "$P/.hermes"
+printf 'model:\n  provider: deepseek\n  default: deepseek-v4-pro\n' >"$P/.hermes/config.yaml"
+printf '{"credential_pool":{"deepseek":[{"access_token":"sk-second-xxxxxx","priority":1},{"access_token":"tok-oauth-xxxxxx","auth_type":"oauth","priority":0},{"access_token":"sk-first-xxxxxxx","priority":0}]}}\n' >"$P/.hermes/auth.json"
+printf 'DEEPSEEK_API_KEY=sk-env-xxxxxxxx\n' >"$P/.hermes/.env"
+switch_source_ai "$P" hermes
+[[ "$SWITCH_SRC_PROVIDER/$SWITCH_SRC_MODEL/$SWITCH_SRC_KEY" == deepseek/deepseek-v4-pro/sk-first-xxxxxxx ]] \
+  && ok_t "K9 Hermes's auth.json credential pool is read first (lowest priority, api-key entries only), before ~/.hermes/.env" \
+  || bad_t "K9 hermes pool" "$SWITCH_SRC_PROVIDER/$SWITCH_SRC_MODEL/$SWITCH_SRC_KEY"
+rm -f "$P/.hermes/auth.json"; ln -s "$TMP/hpool-root.json" "$P/.hermes/auth.json"
+printf '{"credential_pool":{"deepseek":[{"access_token":"sk-ROOT-xxxxxxx"}]}}\n' >"$TMP/hpool-root.json"
+switch_source_ai "$P" hermes
+[[ "$SWITCH_SRC_KEY" == sk-env-xxxxxxxx ]] \
+  && ok_t "K10 a symlinked auth.json is not followed (root reads only the seat's own files)" \
+  || bad_t "K10 symlink" "$SWITCH_SRC_KEY"
+TYPE_AUTH[claude]="$DEFAULT_CLAUDE_CRED"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
