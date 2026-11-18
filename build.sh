@@ -152,6 +152,7 @@ LAZY_FILES=(
   src/task/status.sh
   src/lib/pace.sh
   src/task/loops.sh
+  src/task/improve.sh
   src/task/need.sh
   src/task/notify.sh
   src/task/inbox.sh

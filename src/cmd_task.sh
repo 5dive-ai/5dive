@@ -34,6 +34,7 @@ declare -F _task_resolve_coordinator >/dev/null 2>&1 || . "$_task_src_dir/task/r
 declare -F cmd_task_add >/dev/null 2>&1 || . "$_task_src_dir/task/crud.sh"
 declare -F _task_guard_result_over_closed >/dev/null 2>&1 || . "$_task_src_dir/task/status.sh"
 declare -F cmd_task_loops >/dev/null 2>&1 || . "$_task_src_dir/task/loops.sh"
+declare -F cmd_task_loop_improve >/dev/null 2>&1 || . "$_task_src_dir/task/improve.sh"
 declare -F cmd_task_precedent >/dev/null 2>&1 || . "$_task_src_dir/task/need.sh"
 declare -F _task_agent_channel >/dev/null 2>&1 || . "$_task_src_dir/task/notify.sh"
 declare -F cmd_task_coordinator >/dev/null 2>&1 || . "$_task_src_dir/task/inbox.sh"

@@ -506,6 +506,15 @@ _loop_tpl_resolve() {
   _LOOP_TID="$RESOLVED_TASK_ID"
 }
 
+# DIVE-8692: loops.sh calls into src/task/improve.sh BY NAME, through this, and
+# never at a literal call site. build.sh's preload scan (lazy_calls in
+# scripts/lib/lazy-dispatch.sh) reads a literal call as a loops -> improve edge,
+# and an edge means every load of loops.sh (each `heartbeat ls`, `task ls`) also
+# parses the 650-line engine: CI measured `heartbeat ls` at 118% of the eager
+# control with it in loops.sh, against a 110% cap. The autoload stub still
+# resolves the call; only that preload bet is skipped.
+_loop_improve_call() { local fn="$1"; shift; "$fn" "$@"; }
+
 # Called from _task_cascade_unblock on EVERY close; acts only when a run of a
 # loop just closed. Best-effort.
 #   - an outcome loop (DIVE-5777): a run that went done is scored by its number;
@@ -527,6 +536,9 @@ _loop_score_request() {
   fi
   _loop_signals_sweep "$tid" || true
   ( cmd_task_loop_review ) >/dev/null 2>&1 || true
+  # DIVE-8692: the switch is read HERE, so a run of a loop with self-improvement
+  # off never loads src/task/improve.sh (a lazy module; see its header).
+  [[ "$(_loop_pref_get "loop.improve.${tident}")" != "on" ]] || _loop_improve_call _loop_improve_kick "$tident" "$rident" || true
   return 0
 }
 
@@ -1236,6 +1248,7 @@ cmd_task_loop() {
     suggest)        cmd_task_loop_suggest "$@" ;;
     apply|dismiss|revert) cmd_task_loop_decide "$sub" "$@" ;;
     auto)           cmd_task_loop_auto "$@" ;;
+    improve)        _loop_improve_call cmd_task_loop_improve "$@" ;;
     outcome)        cmd_task_loop_outcome "$@" ;;
     resume)         cmd_task_loop_resume "$@" ;;
     -h|--help|help) cat <<'HELP'
@@ -1252,6 +1265,13 @@ DIVE-5564 loop scores (a loop = a scheduled task):
   loop suggest <loop> --body-file=<path> [--reason=]   record suggested instructions
   loop apply|dismiss|revert <loop>              act on the suggestion; revert undoes the last apply
   loop auto <loop> on|off                       self-improvement: apply suggestions unasked (off by default)
+DIVE-8692 self-improving loops (off by default, per loop):
+  loop improve <loop> on|off                    after each run: grade it 0-100, try ONE small change aimed at
+                                                the lowest criterion, keep it only if the next run scores higher
+                                                (else the text goes back by itself). Never widens what the loop
+                                                may do (no spend, posting, new recipients or tools)
+  loop improve <loop> log [--json]              every change tried: kept, dropped, refused, undone; per-run AI cost
+  loop improve <loop> undo <id>                 put the text back exactly as it was before change <id>
 DIVE-5777 outcome loops (score by a number, not an opinion):
   loop outcome <loop> --cmd="<command>"         after each run, run it as the loop's seat (in its home);
                                                 the ONE number it prints is the run's score. No rise in
@@ -1261,7 +1281,7 @@ DIVE-5777 outcome loops (score by a number, not an opinion):
   loop resume <loop>                            restart a paused loop with a fresh 3 days (Apply does too)
 HELP
     ;;
-    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|feedback|rate|review|suggest|apply|dismiss|revert|auto|outcome|resume)" ;;
+    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|feedback|rate|review|suggest|apply|dismiss|revert|auto|improve|outcome|resume)" ;;
   esac
 }
 
