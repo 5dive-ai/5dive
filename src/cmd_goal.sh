@@ -615,9 +615,16 @@ _goal_finish_with_plan() {
     fi
     local reason="over checkpoint (${GOAL_TASK_COUNT}>${checkpoint})"
     # DIVE-985 gap B: a T2-carrying plan gates as a HARD tier-2 gate (never
-    # 48h-auto-applied, never quietly agent-cleared into a materialize). A
-    # count-only checkpoint stays the default agent-clearable tier-1 decision.
-    local -a tier_arg=()
+    # 48h-auto-applied, never quietly agent-cleared into a materialize).
+    # DIVE-8721: so does a COUNT-ONLY checkpoint. It used to stay a tier-1
+    # decision, and since DIVE-4415 a tier-1 decision routes to the org lead BY
+    # KIND — but `--from-gate` builds only on a HUMAN approve (DIVE-916, above), so
+    # on any box with a lead the plan's one possible answerer was never asked and
+    # the lead's answer could not build it: the app's card sat at "planning" and
+    # the partner's Start answered 409 for every goal over the checkpoint. A gate
+    # only a human can clear is filed where a human reads it; the reason text is
+    # what still tells the two cases apart.
+    local -a tier_arg=(--tier=2 --needs=human_tap)
     # DIVE-2848: DECLARE the capability, do not just pin the tier. A plan carrying a
     # Tier-2 task materializes money/publish/secret/destructive work, which is a
     # person's call on an irreversible choice — that is human_tap by the DIVE-2241
@@ -625,7 +632,7 @@ _goal_finish_with_plan() {
     # outright, because from its side "--tier=2 with a --recommend" is exactly the
     # rubber-stamp shape; with it, the gate is hard-human by declaration and is also
     # no longer misroutable to the anchor task's verifier.
-    if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task"; tier_arg=(--tier=2 --needs=human_tap); fi
+    [[ "$GOAL_HAS_T2" == "1" ]] && reason="carries a Tier-2 task"
     # DIVE-1930: this used to capture the gate envelope into `gate_json` and never
     # read it. A capture that is never inspected reads at review time like a
     # checked result and is not one — which is why the empty-envelope bug could

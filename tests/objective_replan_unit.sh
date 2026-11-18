@@ -80,11 +80,14 @@ built=$(db "SELECT COUNT(*) FROM tasks WHERE originated_by_objective=$OID;")
   && ok_t "all-low create over checkpoint 0 -> ONE gate, nothing built (anchor $anchor)" \
   || bad_t "origination gate" "gated=$gated anchor=$anchor built=$built :: $r"
 
-# the gate is a decision (tier 1 — count-only), on the anchor
+# the gate is a decision on the anchor, filed HUMAN-bound even though it is
+# count-only (DIVE-8721): --from-gate applies only on a human approve (T9), so a
+# tier-1 decision — which routes to the org lead by kind — could never be applied.
 gtype=$(db "SELECT need_type FROM tasks WHERE ident=$(sqlq "$anchor");")
 gtier=$(db "SELECT COALESCE(tier,'') FROM tasks WHERE ident=$(sqlq "$anchor");")
-[[ "$gtype" == "decision" && "$gtier" == "1" ]] \
-  && ok_t "count-only origination gates at tier 1 decision" || bad_t "gate tier" "type=$gtype tier=$gtier"
+gcap=$(db "SELECT COALESCE(needs_capability,'') FROM tasks WHERE ident=$(sqlq "$anchor");")
+[[ "$gtype" == "decision" && "$gtier" == "2" && "$gcap" == "human_tap" ]] \
+  && ok_t "count-only origination gates as a tier-2 human_tap decision (DIVE-8721)" || bad_t "gate tier" "type=$gtype tier=$gtier cap=$gcap"
 
 # --- T3: create with --yes -> materialized + provenance stamped
 r=$(run replan "steer-signups" --diff="$DIFF_ONE" --yes)

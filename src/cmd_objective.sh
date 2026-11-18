@@ -806,8 +806,9 @@ _objective_no_progress() {
 
 # Is there a still-pending approval gate this objective already filed in a prior
 # cycle? Echoes "<ident>|<tier>" (empty if none). ANY unresolved own-gate — a
-# Tier-2 HARD gate awaiting a human, OR a Tier-1 count-checkpoint awaiting a
-# lead/precedent clear — means the loop must WAIT: planning again would stack a
+# Tier-2 HARD gate awaiting a human (since DIVE-8721 the count checkpoint is filed
+# that way too), or an older Tier-1 checkpoint still open from before that change —
+# means the loop must WAIT: planning again would stack a
 # fresh proposal on top of one still awaiting a decision. (Tier is reported so the
 # caller can name a hard gate specifically; the gate's filed tier is decided by
 # cmd_task_need's own risk classifier, so detection must not hinge on it.)
@@ -1006,11 +1007,15 @@ _objective_file_gate() {
   else
     anchor_ident=$(db "SELECT ident FROM tasks WHERE id=${anchor_id};")
   fi
-  # T2 create -> HARD tier-2 gate (never --yes-waived, never auto-cleared). Else a
-  # count-only checkpoint stays the default agent-clearable tier-1 decision.
-  local reason="create ${OBJ_N_CREATE}, reprioritize ${OBJ_N_REPRI}, cancel ${OBJ_N_CANCEL}"; local -a tier_arg=()
+  # T2 create -> HARD tier-2 gate (never --yes-waived, never auto-cleared).
+  # DIVE-8721: a count-only checkpoint gates the same way. `--from-gate` applies
+  # only on a HUMAN approve, so a tier-1 decision — which routes to the org lead
+  # by kind (DIVE-4415) — could never be applied on a box with a lead. See the
+  # twin in cmd_goal.sh.
+  local reason="create ${OBJ_N_CREATE}, reprioritize ${OBJ_N_REPRI}, cancel ${OBJ_N_CANCEL}"
   # DIVE-2848: declare human_tap alongside the pin — see the twin in cmd_goal.sh.
-  if [[ "$GOAL_HAS_T2" == "1" ]]; then reason="carries a Tier-2 task — ${reason}"; tier_arg=(--tier=2 --needs=human_tap); fi
+  local -a tier_arg=(--tier=2 --needs=human_tap)
+  [[ "$GOAL_HAS_T2" == "1" ]] && reason="carries a Tier-2 task — ${reason}"
   JSON_MODE=1 cmd_task_need "$anchor_id" --type=decision --options="approve|revise" --recommend="approve" "${tier_arg[@]}" ${from:+--from="$from"} \
     --ask="Approve objective '${oname}' re-plan cycle ${cycle_no}? (${reason}) Full diff in the task body." >/dev/null \
     || fail "$E_GENERIC" "objective replan: could not file the plan gate"
@@ -1184,8 +1189,8 @@ cmd_objective_replan() {
     fi
 
     # (b) GATE in flight: a prior cycle filed a gate still awaiting a decision.
-    # Wait; do not stack a fresh proposal on top of one not yet approved. A Tier-2
-    # gate needs a human; a Tier-1 checkpoint needs a lead/precedent clear.
+    # Wait; do not stack a fresh proposal on top of one not yet approved. Every plan
+    # gate needs a human approve to apply (DIVE-916; DIVE-8721 files them tier 2).
     local pend_row pend_gate pend_tier
     pend_row=$(_objective_pending_gate "$obj_id")
     if [[ -n "$pend_row" ]]; then
