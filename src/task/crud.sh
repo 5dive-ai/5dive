@@ -1264,6 +1264,13 @@ cmd_task_ls() {
     # surfaces cannot disagree. Still absent on a NULL row, like every column here.
     # NB: no inline SQL `--` comments in this string —
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
+    # DIVE-8692: a loop's self-improving switch and its current score (the
+    # score of the last run on its kept text), for the app's Tasks screens.
+    local _ri_cols="" _ri_jq="."
+    if (( recurring )); then
+      _ri_cols=", CASE WHEN (SELECT value FROM task_prefs WHERE key='loop.improve.'||tasks.ident)='on' THEN 1 ELSE 0 END AS self_improving, (SELECT json_extract(value,'\$.kept_score') FROM task_prefs WHERE key='loop.improve.state.'||tasks.ident AND json_valid(value)) AS score"
+      _ri_jq='map(.self_improving = (.self_improving == 1) | .score = (.score // null))'
+    fi
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, need_expires_at, need_quote, need_quote_file, gate_pinged_at, tier, gate_mode, kind, schedule, schedule_tz, last_fired_at, last_skipped_at, last_skip_reason, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier, review_mode,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
                   THEN CASE WHEN handoff_ack_at IS NOT NULL THEN 'reviewing' ELSE 'delivered' END
@@ -1273,7 +1280,7 @@ cmd_task_ls() {
              CASE WHEN ${_gate_open} THEN 1 ELSE 0 END AS gate_live,
              CASE WHEN ${_gate_open} AND ( ${_gate_human} ) THEN 1 ELSE 0 END AS needs_human,
              CASE WHEN verify_unavailable = 1 AND verifier IS NULL AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END AS verify_unavailable,
-             CASE WHEN kind='recurring' THEN CASE WHEN COALESCE(on_overlap,'skip')='spawn' THEN (SELECT CASE WHEN COUNT(*) >= COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) THEN 'bound '||COUNT(*)||'/'||COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) ELSE NULL END FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled')) ELSE (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) END ELSE NULL END AS blocked_by
+             CASE WHEN kind='recurring' THEN CASE WHEN COALESCE(on_overlap,'skip')='spawn' THEN (SELECT CASE WHEN COUNT(*) >= COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) THEN 'bound '||COUNT(*)||'/'||COALESCE(tasks.overlap_bound, ${TASKS_OVERLAP_BOUND_DEFAULT:-3}) ELSE NULL END FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled')) ELSE (SELECT i.ident FROM tasks i WHERE i.from_template_id=tasks.id AND i.status NOT IN ('done','cancelled') ORDER BY i.id LIMIT 1) END ELSE NULL END AS blocked_by${_ri_cols}
            FROM tasks WHERE ${where} ${order};")
     [[ -n "$rows" ]] || rows="[]"
     # Feed rows via stdin, not --argjson: a big board (179+ tasks w/ bodies)
@@ -1303,11 +1310,11 @@ cmd_task_ls() {
                             | .dispatch_fix = (if .dispatch_reason == null then null
                                                else ($fix[.dispatch_reason] // "undispatchable") end))'
     if (( no_body == 1 )); then
-      printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(map(del(.body, .result)) | ${_dispatch_jq})}}"
+      printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(map(del(.body, .result)) | ${_dispatch_jq} | ${_ri_jq})}}"
     elif (( no_body == 2 )); then
-      printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(map(del(.body)) | ${_dispatch_jq})}}"
+      printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(map(del(.body)) | ${_dispatch_jq} | ${_ri_jq})}}"
     else
-      printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(. | ${_dispatch_jq})}}"
+      printf '%s' "$rows" | jq -c --argjson fix "$_fixmap" "{ok:true, data:{tasks:(. | ${_dispatch_jq} | ${_ri_jq})}}"
     fi
   elif (( recurring )); then
     # DIVE-2237: last_fired alone cannot distinguish SUPPRESSED from BROKEN.

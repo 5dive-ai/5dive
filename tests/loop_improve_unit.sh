@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# DIVE-8692 isolated unit harness for self-improving loops: `task loop improve
+# <loop> on|off|log|undo|tick`. After each run of a loop with the switch on, the
+# run is graded, ONE small change is tried, and it is kept only if the next run
+# scores higher than the last kept one; otherwise the text goes back by itself.
+# Kept changes undo exactly. A change that widens what the loop may do is refused.
+# The model call is a seam (FIVEDIVE_LOOP_IMPROVE_AI): a stub that replays a
+# canned answer and counts its calls. Throwaway STATE_DIR — never touches the
+# live tasks.db. Run: bash tests/loop_improve_unit.sh
+# TIER: nightly — 25.1s measured on poke-two (agent-dev seat, 2026-11-18, worktree cli-8692): ~17 real
+# task-done closes through the whole close path; does not fit the 300s PR core. The PR runs it
+# anyway as a changed harness, and the nightly sweep after that.
+set -uo pipefail
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
+trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
+cd "$(dirname "$0")/.."
+SRC=src
+TMP="$(mktemp -d /tmp/loop-improve-unit.XXXXXX)"
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
+         lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
+         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_project.sh cmd_loop.sh; do
+  # shellcheck source=/dev/null
+  source "$SRC/$f"
+done
+STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"; JSON_MODE=1
+mkdir -p "$TASKS_DIR"
+cmd_send() { :; }
+set +e
+PASS=0; FAIL=0
+t() { if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); printf 'ok   - %s\n' "$1"; else FAIL=$((FAIL+1)); printf 'FAIL - %s\n   want: %s\n   got:  %s\n' "$1" "$2" "$3"; fi; }
+tasks_db_init
+
+# The AI stub: saves each prompt, counts calls, answers with $TMP/ai.out wrapped
+# in the `claude --print --output-format json` envelope (cost 0.012).
+cat >"$TMP/ai.sh" <<'EOF'
+#!/usr/bin/env bash
+n=$(( $(cat "$AI_DIR/calls" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$AI_DIR/calls"
+cat >"$AI_DIR/prompt.$n"
+jq -cn --rawfile r "$AI_DIR/ai.out" '{type:"result", result:$r, total_cost_usd:0.012}'
+EOF
+chmod +x "$TMP/ai.sh"
+export AI_DIR="$TMP" FIVEDIVE_LOOP_IMPROVE_AI="$TMP/ai.sh" FIVEDIVE_LOOP_IMPROVE_SYNC=1
+calls() { cat "$TMP/calls" 2>/dev/null || echo 0; }
+ai() { printf '%s' "$1" >"$TMP/ai.out"; }
+
+ORIG="Check 5 shops for the cheapest price of the coffee grinder.
+Write a short table: shop, price, link.
+
+— installed loop: price-watch (5dive marketplace). runs on '0 9 * * *'."
+L=$(db "INSERT INTO tasks (title, body, assignee, created_by, kind, schedule, status)
+        VALUES ('Price watch', $(sqlq "$ORIG"), 'scout', 'owner', 'recurring', '0 9 * * *', 'todo');
+        SELECT ident FROM tasks WHERE id=last_insert_rowid();")
+P=$(db "INSERT INTO tasks (title, body, assignee, created_by, status) VALUES ('One-off', 'Not a loop.', 'scout', 'owner', 'todo');
+        SELECT ident FROM tasks WHERE id=last_insert_rowid();")
+body() { db "SELECT body FROM tasks WHERE ident='$L';"; }
+mk_run() { db "INSERT INTO tasks (title, body, assignee, created_by, kind, from_template_id, status, created_at)
+               SELECT title, body, assignee, created_by, 'standard', id, 'in_progress', ${2:-datetime('now')} FROM tasks WHERE ident='$L';
+               SELECT ident FROM tasks WHERE id=last_insert_rowid();"; }
+close_run() { ( AGENT_NAME=scout cmd_task_done "$1" --result="${2:-ran}" ) >/dev/null 2>"$TMP/done.err"; }
+logj() { cmd_task_loop_improve "$L" log --json | jq -c .data; }
+entry() { logj | jq -r ".entries[] | select(.id==$1) | $2"; }
+
+# T1 — the switch: off by default, a closed run makes no call; on/off; refusals.
+R0=$(mk_run); close_run "$R0"
+t "T1 off by default: no AI call on a closed run" "0" "$(calls)"
+t "T1 ls --recurring --json: self_improving false" "false|null" "$(JSON_MODE=1 cmd_task_ls --recurring | jq -r ".data.tasks[]|select(.ident==\"$L\")|\"\(.self_improving)|\(.score)\"")"
+( cmd_task_loop_improve "$P" on ) >/dev/null 2>&1; t "T1 a one-off task is refused" "1" "$([[ $? -ne 0 ]] && echo 1)"
+out=$(cmd_task_loop_improve "$L" on); t "T1 on" "true" "$(jq -r .data.self_improving <<<"$out")"
+
+# T2 — first run: graded, criteria derived from the loop's text and kept, one
+# change tried on the template (the next run's text), cost recorded.
+ai '{"criteria":[{"name":"Coverage","score":40,"reason":"5 shops only"},{"name":"Accuracy","score":84,"reason":"ok"}],"overall":62,
+     "proposal":{"change":"Checks 12 shops, not 5","reason":"coverage was lowest","target":"Coverage","find":"Check 5 shops","replace":"Check 12 shops"}}'
+R1=$(mk_run); close_run "$R1" "5 shops, table attached"
+t "T2 one AI call" "1" "$(calls)"
+t "T2 prompt carried the run's report" "1" "$(grep -c '5 shops, table attached' "$TMP/prompt.1")"
+t "T2 prompt asked to derive criteria" "1" "$(grep -c 'Derive 3 to 5 short criteria' "$TMP/prompt.1")"
+t "T2 template text now carries the change" "1" "$(body | grep -c 'Check 12 shops')"
+t "T2 change #1 is on trial, score_before 62" "trying|null|62|Checks 12 shops, not 5" "$(entry 1 '"\(.status)|\(.kept)|\(.score_before)|\(.change)"')"
+t "T2 criteria kept for later runs" '["Coverage","Accuracy"]' "$(logj | jq -c .criteria)"
+t "T2 per-run cost recorded" "0.012" "$(logj | jq -r ".runs[-1].cost_usd")"
+t "T2 ls --recurring --json: self_improving true, score 62" "true|62" "$(JSON_MODE=1 cmd_task_ls --recurring | jq -r ".data.tasks[]|select(.ident==\"$L\")|\"\(.self_improving)|\(.score)\"")"
+AFTER1=$(body)
+
+# T3 — the next run scores higher: #1 KEPT; the same call's proposal starts #2.
+ai '{"criteria":[{"name":"Coverage","score":75},{"name":"Accuracy","score":70}],"overall":70,
+     "proposal":{"change":"Notes the date checked","reason":"accuracy","target":"Accuracy","find":"","replace":"Note the date you checked each price."}}'
+R2=$(mk_run); close_run "$R2"
+t "T3 prompt reused the stored criteria" "1" "$(grep -c '^- Coverage$' "$TMP/prompt.2")"
+t "T3 #1 kept 62 -> 70" "kept|true|62|70" "$(entry 1 '"\(.status)|\(.kept)|\(.score_before)|\(.score_after)"')"
+t "T3 #2 on trial from 70" "trying|70" "$(entry 2 '"\(.status)|\(.score_before)"')"
+t "T3 text has both changes" "2" "$(( $(body | grep -c 'Check 12 shops') + $(body | grep -c 'Note the date') ))"
+
+# T4 — the next run scores LOWER: #2 DROPPED, text back exactly to after-#1;
+# its proposal is discarded (written against the text taken back).
+ai '{"criteria":[{"name":"Coverage","score":70},{"name":"Accuracy","score":60}],"overall":65,
+     "proposal":{"change":"Should not apply","reason":"x","target":"Accuracy","find":"","replace":"Something else."}}'
+R3=$(mk_run); close_run "$R3"
+t "T4 #2 dropped 70 -> 65, not kept" "dropped|false|65" "$(entry 2 '"\(.status)|\(.kept)|\(.score_after)"')"
+t "T4 text restored exactly to after #1" "same" "$([[ "$(body)" == "$AFTER1" ]] && echo same || echo differs)"
+t "T4 no change started on a dropping tick" "2" "$(logj | jq '.entries|length')"
+t "T4 improved count = kept only" "1|62|70" "$(logj | jq -r '"\(.improved)|\(.score_start)|\(.score_now)"')"
+
+# T5 — the floor: a change that widens what the loop may do is refused, never applied.
+ai '{"criteria":[{"name":"Coverage","score":70}],"overall":68,
+     "proposal":{"change":"Posts results to Telegram","reason":"x","target":"Coverage","find":"","replace":"Post the table to the Telegram channel."}}'
+R4=$(mk_run); close_run "$R4"
+t "T5 widening change refused" "refused|false" "$(entry 3 '"\(.status)|\(.kept)"')"
+t "T5 refusal names the term" "1" "$(entry 3 .note | grep -c 'would widen')"
+t "T5 text unchanged" "same" "$([[ "$(body)" == "$AFTER1" ]] && echo same || echo differs)"
+t "T5 no trial run: the run set the new bar" "68" "$(logj | jq -r .score_now)"
+w() { _loop_improve_widens "$1" "$2" >/dev/null && echo widens || echo fine; }
+t "T5 floor: new spend"            "widens" "$(w "Check 5 shops." "Buy the cheapest one.")"
+t "T5 floor: a dollar amount"      "widens" "$(w "Check prices." "Check prices up to \$50.")"
+t "T5 floor: a new recipient"      "widens" "$(w "Write a table." "Write a table and copy boss@example.com.")"
+t "T5 floor: a new link"           "widens" "$(w "Check 5 shops." "Check https://shop.example too.")"
+t "T5 floor: a new tool"           "widens" "$(w "Check 5 shops." "Install a scraper plugin first.")"
+t "T5 floor: publishing"           "widens" "$(w "Write a table." "Publish the table.")"
+t "T5 floor: a term already there" "fine"   "$(w "Email the price table to me." "Email the price table to me, sorted.")"
+t "T5 floor: a plain improvement"  "fine"   "$(w "Check 5 shops" "Check 12 shops")"
+t "T5 floor: a NEW floor term"     "widens" "$(w "Check 5 shops" "Check 5 shops and email it")"
+
+# T6 — not small, and not in the text: refused.
+ai "{\"criteria\":[{\"name\":\"Coverage\",\"score\":70}],\"overall\":66,\"proposal\":{\"change\":\"Rewrites it\",\"reason\":\"x\",\"target\":\"Coverage\",\"find\":\"\",\"replace\":\"$(printf 'x%.0s' {1..400})\"}}"
+R5=$(mk_run); close_run "$R5"
+t "T6 over-long change refused" "refused" "$(entry 4 .status)"
+ai '{"criteria":[{"name":"Coverage","score":70}],"overall":66,"proposal":{"change":"Fix","reason":"x","target":"Coverage","find":"not in the text","replace":"y"}}'
+R6=$(mk_run); close_run "$R6"
+t "T6 find not in the text refused" "refused" "$(entry 5 .status)"
+a() { _loop_improve_apply_change "$1" "$2" "$3" || echo REFUSED; }
+t "T6 apply: replaces the one match" "Check 12 shops." "$(a "Check 5 shops." "5 shops" "12 shops")"
+t "T6 apply: a phrase found twice is ambiguous, refused" "REFUSED" "$(a "shop a, shop b" "shop" "store")"
+t "T6 apply: empty find appends a paragraph" "$(printf 'A.\n\nB.')" "$(a "A." "" "B.")"
+t "T6 text still unchanged" "same" "$([[ "$(body)" == "$AFTER1" ]] && echo same || echo differs)"
+
+# T7 — idempotent per run; a run created BEFORE a change applied does not judge it.
+n=$(calls); out=$(cmd_task_loop_improve "$L" tick --run="$R6" | jq -r .data.message)
+t "T7 second tick on a graded run: no call" "$n|1" "$(calls)|$(grep -c 'already graded' <<<"$out")"
+ai '{"criteria":[{"name":"Coverage","score":60}],"overall":60,"proposal":{"change":"Sorts by price","reason":"x","target":"Coverage","find":"Write a short table","replace":"Write a short table sorted by price"}}'
+OLD=$(mk_run "" "datetime('now','-1 hour')")      # opened before the change below
+R7=$(mk_run); close_run "$R7"
+t "T7 #6 on trial" "trying" "$(entry 6 .status)"
+ai '{"criteria":[{"name":"Coverage","score":10}],"overall":10,"proposal":null}'
+close_run "$OLD"
+t "T7 a run from before the change leaves the trial open" "trying" "$(entry 6 .status)"
+
+# T8 — a trial run that did not finish (cancelled): dropped, and no model call.
+R8=$(mk_run); n=$(calls)
+( AGENT_NAME=scout cmd_task_cancel "$R8" --result="seat died" ) >/dev/null 2>&1
+t "T8 cancelled run: no AI call" "$n" "$(calls)"
+t "T8 cancelled trial run drops the change" "dropped" "$(entry 6 .status)"
+t "T8 text back to after #1" "same" "$([[ "$(body)" == "$AFTER1" ]] && echo same || echo differs)"
+
+# T9 — garbage from the model: the tick fails loudly and changes nothing.
+ai 'sorry, I cannot help with that'
+R9=$(mk_run); before=$(logj)
+( AGENT_NAME=scout cmd_task_done "$R9" --result="ran" ) >/dev/null 2>&1
+( cmd_task_loop_improve "$L" tick --run="$R9" ) >/dev/null 2>&1; rc=$?
+t "T9 unusable answer: tick exits non-zero" "1" "$([[ $rc -ne 0 ]] && echo 1)"
+t "T9 unusable answer: nothing recorded" "same" "$([[ "$(logj)" == "$before" ]] && echo same || echo differs)"
+
+# T10 — a trial whose text was hand-edited meanwhile is dropped WITHOUT
+# overwriting the owner's edit.
+ai '{"criteria":[{"name":"Coverage","score":70}],"overall":69,"proposal":{"change":"Adds a total","reason":"x","target":"Coverage","find":"","replace":"End with the lowest price in bold."}}'
+R10=$(mk_run); close_run "$R10"
+t "T10 #7 on trial" "trying" "$(entry 7 .status)"
+db "UPDATE tasks SET body=body||'
+Owner note.' WHERE ident='$L';"; HAND=$(body)
+ai '{"criteria":[{"name":"Coverage","score":50}],"overall":50,"proposal":null}'
+R11=$(mk_run); close_run "$R11"
+t "T10 dropped, owner's edit kept" "dropped|same" "$(entry 7 .status)|$([[ "$(body)" == "$HAND" ]] && echo same || echo differs)"
+db "UPDATE tasks SET body=$(sqlq "$AFTER1") WHERE ident='$L';"
+
+# T11 — undo: a kept change goes back EXACTLY; a change kept after it goes too.
+ai '{"criteria":[{"name":"Coverage","score":70}],"overall":71,"proposal":{"change":"Sorts by price","reason":"x","target":"Coverage","find":"Write a short table","replace":"Write a short table sorted by price"}}'
+R12=$(mk_run); close_run "$R12"
+ai '{"criteria":[{"name":"Coverage","score":90}],"overall":80,"proposal":null}'
+R13=$(mk_run); close_run "$R13"
+t "T11 #8 kept 71 -> 80" "kept|71|80" "$(entry 8 '"\(.status)|\(.score_before)|\(.score_after)"')"
+out=$(cmd_task_loop_improve "$L" undo 1)
+t "T11 undo #1 restores the ORIGINAL text exactly" "same" "$([[ "$(body)" == "$ORIG" ]] && echo same || echo differs)"
+t "T11 undo #1 also undid #8 (built on it)" "[8]" "$(jq -c .data.also_undone <<<"$out")"
+t "T11 #1 and #8 are undone, not kept" "undone|false|undone|false" "$(entry 1 '"\(.status)|\(.kept)"')|$(entry 8 '"\(.status)|\(.kept)"')"
+( cmd_task_loop_improve "$L" undo 2 ) >/dev/null 2>&1; t "T11 undo of a dropped change refused" "1" "$([[ $? -ne 0 ]] && echo 1)"
+( cmd_task_loop_improve "$L" undo 99 ) >/dev/null 2>&1; t "T11 undo of an unknown id refused" "1" "$([[ $? -ne 0 ]] && echo 1)"
+t "T11 log entries carry the app's fields" "true" "$(logj | jq '[.entries[] | has("id") and has("at") and has("change") and has("score_before") and has("score_after") and has("kept")] | all')"
+t "T11 log --json never ships the instruction bodies" "false" "$(logj | jq '[.entries[] | has("body_before") or has("body_after")] | any')"
+
+# T12 — off with a change on trial: the change is taken back; the switch is off.
+ai '{"criteria":[{"name":"Coverage","score":60}],"overall":60,"proposal":{"change":"Checks 8 shops","reason":"x","target":"Coverage","find":"Check 5 shops","replace":"Check 8 shops"}}'
+R14=$(mk_run); close_run "$R14"
+t "T12 #9 on trial" "trying" "$(entry 9 .status)"
+cmd_task_loop_improve "$L" off >/dev/null
+t "T12 off drops the trial and restores the text" "dropped|same" "$(entry 9 .status)|$([[ "$(body)" == "$ORIG" ]] && echo same || echo differs)"
+n=$(calls); R15=$(mk_run); close_run "$R15"
+t "T12 off: no more AI calls" "$n" "$(calls)"
+
+# T14 — a tie is not better: the change is dropped.
+cmd_task_loop_improve "$L" on >/dev/null
+ai '{"criteria":[{"name":"Coverage","score":60}],"overall":60,"proposal":{"change":"Checks 9 shops","reason":"x","target":"Coverage","find":"Check 5 shops","replace":"Check 9 shops"}}'
+R16=$(mk_run); close_run "$R16"
+t "T14 #10 on trial from 60" "trying|60" "$(entry 10 '"\(.status)|\(.score_before)"')"
+ai '{"criteria":[{"name":"Coverage","score":60}],"overall":60,"proposal":null}'
+R17=$(mk_run); close_run "$R17"
+t "T14 equal score 60 -> 60: dropped" "dropped|same" "$(entry 10 .status)|$([[ "$(body)" == "$ORIG" ]] && echo same || echo differs)"
+
+# T15 — outside the harness the tick runs DETACHED, so closing a run never
+# waits on the model: the kick launches `5dive task loop improve <loop> tick`.
+printf '#!/usr/bin/env bash\nprintf "%%s " "$@" >"%s/kick.args"\n' "$TMP" >"$TMP/self.sh"; chmod +x "$TMP/self.sh"
+( FIVEDIVE_LOOP_IMPROVE_SYNC=0 FIVEDIVE_SELF="$TMP/self.sh" _loop_improve_kick "$L" "$R17" )
+for _ in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$TMP/kick.args" ]] && break; sleep 0.3; done
+t "T15 detached kick runs the tick verb" "task loop improve $L tick --run=$R17 " "$(cat "$TMP/kick.args" 2>/dev/null)"
+
+# T13 — an outcome loop refuses the switch (its next lane is the owner's call).
+_loop_pref_set "loop.outcome.$L" '{"cmd":"echo 1"}'
+( cmd_task_loop_improve "$L" on ) >/dev/null 2>&1; t "T13 outcome loop refuses self-improving" "1" "$([[ $? -ne 0 ]] && echo 1)"
+
+printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
+(( FAIL == 0 ))

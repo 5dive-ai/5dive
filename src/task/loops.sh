@@ -527,6 +527,7 @@ _loop_score_request() {
   fi
   _loop_signals_sweep "$tid" || true
   ( cmd_task_loop_review ) >/dev/null 2>&1 || true
+  _loop_improve_kick "$tident" "$rident" || true   # DIVE-8692
   return 0
 }
 
@@ -1031,6 +1032,429 @@ cmd_task_loop_auto() {
      --arg t "$tident" --arg s "$state" --arg a "$applied"
 }
 
+# ───────────── DIVE-8692 self-improving loops: try one change per run, keep it only if it scores better ─────────────
+# lodar 2026-11-18: "self-improving for loops". A switch per scheduled loop, off
+# by default. With it on, after each run of the loop:
+#   1. the run is GRADED 0-100 against what the loop is for: its acceptance
+#      criteria, or (none set) 3-5 criteria the grader derives from the loop's
+#      own text ONCE and that are then kept fixed, so every run is scored on the
+#      same scale. A run that did not end done is not sent to the model: it
+#      scores what the runtime gives it (DIVE-5815), and costs nothing;
+#   2. a change is on TRIAL (applied before this run was created): this run's
+#      score decides it. Higher than the last kept score → KEPT. Otherwise the
+#      loop's text goes back to what it was before the change → DROPPED (logged
+#      as tried and dropped, never shown as a kept change). Only a run created
+#      AFTER the change was applied judges it: a run that was already open ran
+#      on the old text;
+#   3. no trial open, the score has room (under 90), and this tick did not just
+#      drop one: write ONE small change (one find/replace, or one appended
+#      sentence, each at most ${_LOOP_IMPROVE_MAX_CHARS} characters) that targets
+#      the lowest criterion, and apply it to the loop's text. The next run
+#      tries it.
+# THE FLOOR. A change may never widen what the loop may do. Any term in the new
+# text that the old text did not carry, from the Tier-2 floor `goal add` uses
+# (_GATE_T2_FLOOR_RX: spend, publish, email customers, secrets, delete…) or the
+# reach list below (post, send, message, a recipient, a link, a tool, a plugin,
+# install, buy…), refuses the change. A refused change is logged as refused and
+# never applied.
+# UNDO. Every kept change can be undone: the loop's text goes back EXACTLY to
+# what it was before that change. Kept changes made after it were built on top
+# of it, so they are undone with it (the log says which).
+# COST. One model call per run (grade + the change together), on the seat that
+# closed the run: the loop owner's own AI, headless, no tools, no MCP. Each run's
+# grade records what the call cost (total_cost_usd), and `log` shows it.
+# State (task_prefs):
+#   loop.improve.<tpl ident>        "on" | absent
+#   loop.improve.state.<tpl ident>  {"criteria":[…], "kept_score", "first_score",
+#                                    "next_id", "graded":{<run>:1}, "runs":[last 20 grades]}
+#   loop.improve.log.<tpl ident>    [ {id, at, change, reason, target, status:
+#                                    trying|kept|dropped|refused|undone, kept,
+#                                    score_before, score_after, run, cost_usd,
+#                                    body_before, body_after, applied_at,
+#                                    decided_at, undone_at, note} … ]
+_LOOP_IMPROVE_ROOM=90         # a run scoring at or above this needs no change
+_LOOP_IMPROVE_MAX_CHARS=300   # "small": the find and the replace, each
+_LOOP_IMPROVE_RUNS_KEPT=20
+_LOOP_IMPROVE_REACH_RX='post|posts|posted|posting|tweet|tweets|reply|replies|comment|comments|send|sends|sent|sending|email|emails|e-mail|mail|message|messages|dm|dms|notify|notifies|telegram|slack|discord|whatsapp|sms|text them|call|phone|recipient|recipients|cc|bcc|forward|share|shares|tool|tools|plugin|plugins|mcp|install|installs|api|apis|webhook|sudo|ssh|buy|buys|purchase|purchases|pay|pays|paid|order|orders|book|subscribe|sign up|signup|register|account|accounts|login|log in'
+_LOOP_IMPROVE_PROMPT_HEAD='You improve a recurring agent job one small step at a time. Grade its last run, then propose at most ONE small change to its instructions.'
+
+_loop_improve_on() { [[ "$(_loop_pref_get "loop.improve.${1}")" == "on" ]]; }
+_loop_improve_state() { local s; s=$(_loop_pref_get "loop.improve.state.${1}"); jq -e 'type=="object"' <<<"$s" >/dev/null 2>&1 && printf '%s' "$s" || printf '{}'; }
+_loop_improve_log() { local s; s=$(_loop_pref_get "loop.improve.log.${1}"); jq -e 'type=="array"' <<<"$s" >/dev/null 2>&1 && printf '%s' "$s" || printf '[]'; }
+
+# _loop_improve_widens <loop's current text> <new text> -> prints the first
+# floor term the new text carries that the loop's text does not (rc 0), or
+# nothing (rc 1). A term the loop already carries is already in its scope
+# ("price" in a price-watch loop), so repeating it widens nothing.
+_loop_improve_widens() {
+  local old="${1,,}" new="${2,,}" rx term n o
+  for rx in "$_GATE_T2_FLOOR_RX" "$_LOOP_IMPROVE_REACH_RX"; do
+    [[ -n "$rx" ]] || continue
+    while read -r n term; do
+      [[ -n "$term" ]] || continue
+      o=$(grep -oiwE -- "$rx" <<<"$old" 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -cxF -- "$term" 2>/dev/null) || o=0
+      if (( o == 0 )); then printf '%s' "$term"; return 0; fi
+    done < <(grep -oiwE -- "$rx" <<<"$new" 2>/dev/null | tr '[:upper:]' '[:lower:]' | sort | uniq -c)
+  done
+  # A recipient or a link is reach whatever word introduces it.
+  local r
+  for r in '[[:alnum:]._%+-]+@[[:alnum:].-]+' '@[[:alnum:]_]{3,}' 'https?://[^[:space:]]+' '\+?[0-9][0-9 ()-]{7,}[0-9]'; do
+    while read -r term; do
+      [[ -n "$term" ]] || continue
+      grep -qF -- "$term" <<<"$old" || { printf '%s' "$term"; return 0; }
+    done < <(grep -oE -- "$r" <<<"$new" 2>/dev/null)
+  done
+  return 1
+}
+
+# _loop_improve_apply_change <body> <find> <replace> -> prints the new body, or
+# rc 1 when the change does not land exactly once.
+_loop_improve_apply_change() {
+  local body="$1" find="$2" repl="$3"
+  if [[ -z "$find" ]]; then
+    printf '%s\n\n%s' "$body" "$repl"; return 0
+  fi
+  local rest="${body#*"$find"}"
+  [[ "$rest" != "$body" ]] || return 1
+  [[ "${rest#*"$find"}" == "$rest" ]] || return 1   # more than once: ambiguous
+  printf '%s%s%s' "${body%%"$find"*}" "$repl" "$rest"
+}
+
+# The model call. A seam: FIVEDIVE_LOOP_IMPROVE_AI is a command that reads the
+# prompt on stdin and prints either the `claude --print --output-format json`
+# envelope or the bare JSON answer (the harness injects a stub). Default: a
+# headless claude on THIS seat, no tools, no MCP, no session left on disk.
+_loop_improve_ai() {
+  local cmd="${FIVEDIVE_LOOP_IMPROVE_AI:-}"
+  if [[ -z "$cmd" ]]; then
+    local _cl; _cl=$(command -v claude 2>/dev/null) || return 3
+    cmd="$_cl --print --output-format json --strict-mcp-config --max-turns 1 --model ${FIVEDIVE_LOOP_IMPROVE_MODEL:-haiku}"
+    local _help; _help="$("$_cl" --help </dev/null 2>/dev/null)" || true
+    grep -qF -- '--no-session-persistence' <<<"$_help" && cmd+=" --no-session-persistence"
+  fi
+  # A seat's tool shell does not carry the sign-in its unit started with (systemd
+  # gives it to the seat's Claude Code, which keeps it out of the commands it
+  # runs), so a bare `claude --print` there answers "Not logged in". Read the
+  # auth lines from the SAME files the seat's unit loads, in its order (later
+  # wins), into the child's ENV, never its argv (wiki:
+  # a-headless-seat-turn-passes-env-as-environ-and-reads-is-error).
+  (
+    if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}" ]]; then
+      local seat="${AGENT_NAME:-$(id -un 2>/dev/null)}" f line
+      seat="${seat#agent-}"
+      for f in "${CONNECTORS_DIR:-/etc/5dive/connectors}/anthropic.env" \
+               "/var/lib/5dive/agents.d/${seat}.env" "/var/lib/5dive/agents.d/${seat}-auth.env"; do
+        [[ -r "$f" ]] || continue
+        while IFS= read -r line; do
+          [[ "$line" =~ ^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL)=(.*)$ ]] || continue
+          local v="${BASH_REMATCH[2]}"; v="${v#\"}"; v="${v%\"}"; v="${v#\'}"; v="${v%\'}"
+          export "${BASH_REMATCH[1]}=$v"
+        done <"$f"
+      done
+    fi
+    timeout "${FIVEDIVE_LOOP_IMPROVE_TIMEOUT:-180}" bash -c "$cmd" 2>/dev/null
+  )
+}
+
+# _loop_improve_parse <raw> -> {"answer":{…},"cost_usd":N} or rc 1.
+_loop_improve_parse() {
+  local raw="$1" inner cost=0
+  # `claude --print` exits 0 logged out: the envelope's is_error is the signal.
+  jq -e 'type=="object" and .is_error == true' <<<"$raw" >/dev/null 2>&1 && return 1
+  if jq -e 'type=="object" and (.result|type)=="string"' <<<"$raw" >/dev/null 2>&1; then
+    cost=$(jq -r '.total_cost_usd // .cost_usd // 0 | numbers | . * 1000000 | round / 1000000' <<<"$raw" 2>/dev/null); [[ -n "$cost" ]] || cost=0
+    inner=$(jq -r .result <<<"$raw")
+  else
+    inner="$raw"
+  fi
+  # Tolerate a fence or a sentence around the object: take the outermost {…}.
+  inner=$(python3 -c 'import sys,re;t=sys.stdin.read();a=t.find("{");b=t.rfind("}");print(t[a:b+1] if a>=0 and b>a else "")' <<<"$inner" 2>/dev/null)
+  jq -e 'type=="object" and (.overall|type)=="number"' <<<"$inner" >/dev/null 2>&1 || return 1
+  jq -cn --argjson a "$inner" --argjson c "$cost" '{answer:$a, cost_usd:$c}'
+}
+
+# _loop_improve_prompt <instructions> <criteria json|[]> <run result> <want change 0|1>
+_loop_improve_prompt() {
+  local body="$1" crit="$2" work="$3" want="$4"
+  printf '%s\n\n' "$_LOOP_IMPROVE_PROMPT_HEAD"
+  printf 'THE JOB'"'"'S INSTRUCTIONS (what every run is told to do):\n<<<\n%s\n>>>\n\n' "$body"
+  if [[ "$(jq 'length' <<<"$crit")" -gt 0 ]]; then
+    printf 'CRITERIA (grade each, use these exact names):\n%s\n\n' "$(jq -r '.[] | "- \(.)"' <<<"$crit")"
+  else
+    printf 'CRITERIA: none are set. Derive 3 to 5 short criteria from the instructions (what a good run of this job delivers). They will be reused for every later run.\n\n'
+  fi
+  printf 'WHAT THE LAST RUN REPORTED:\n<<<\n%s\n>>>\n\n' "${work:-(nothing reported)}"
+  if (( want )); then
+    cat <<EOF
+Then propose ONE small change to the instructions that would raise the LOWEST criterion next run.
+- It is either a replacement (find: an exact phrase copied from the instructions, at most ${_LOOP_IMPROVE_MAX_CHARS} characters, that appears once; replace: its new wording, at most ${_LOOP_IMPROVE_MAX_CHARS} characters) or one added sentence (find: "", replace: the sentence).
+- It must NOT widen what the job may do: no new spending or buying, no posting or publishing, no new people or places to send anything to, no new tools, accounts or installs. Make the job do its existing work better.
+- "change" is a label the owner reads on a phone: at most 8 plain words, e.g. "Checks 12 shops, not 5".
+- No good small change: set "proposal" to null.
+EOF
+  else
+    printf 'Do not propose a change: set "proposal" to null.\n'
+  fi
+  cat <<'EOF'
+
+Reply with ONLY this JSON, no prose:
+{"criteria":[{"name":"…","score":0-100,"reason":"one line"}],"overall":0-100,
+ "proposal":{"change":"…","reason":"one line","target":"<criterion name>","find":"…","replace":"…"} or null}
+Be strict: a criterion with no evidence in the report scores low.
+EOF
+}
+
+_loop_improve_log_put() { _loop_pref_set "loop.improve.log.${1}" "$2"; }
+_loop_improve_state_put() { _loop_pref_set "loop.improve.state.${1}" "$2"; }
+
+# _loop_improve_tick <tpl ident> [<run ident>] — grade the newest closed,
+# ungraded run of the loop (or the one named), then keep/drop the trial, then
+# maybe start the next one. Single-flight per loop. Idempotent per run.
+_loop_improve_tick() {
+  local tident="$1" want_run="${2:-}" tid
+  tid=$(db "SELECT id FROM tasks WHERE ident=$(sqlq "$tident") AND ${_LOOP_TPL_PRED};")
+  [[ -n "$tid" ]] || { printf 'not a loop: %s\n' "$tident"; return 1; }
+  _loop_improve_on "$tident" || { printf 'self-improvement is off for %s\n' "$tident"; return 0; }
+  local lockf="${TASKS_DIR:-/tmp}/.loop-improve.${tident}.lock"
+  { exec 207>"$lockf"; } 2>/dev/null || true
+  if command -v flock >/dev/null 2>&1; then flock -w 30 207 || { printf 'another tick holds %s\n' "$tident"; return 0; }; fi
+
+  local state log; state=$(_loop_improve_state "$tident"); log=$(_loop_improve_log "$tident")
+  local run_sql="r.from_template_id=${tid} AND r.status IN ('done','cancelled')"
+  [[ -n "$want_run" ]] && run_sql+=" AND r.ident=$(sqlq "$want_run")"
+  local row rid rident rst rcreated rbody rwork
+  row=$(db "SELECT r.id||x'1f'||r.ident||x'1f'||r.status||x'1f'||r.created_at FROM tasks r WHERE ${run_sql} ORDER BY r.id DESC LIMIT 1;")
+  [[ -n "$row" ]] || { printf 'no closed run of %s to grade\n' "$tident"; return 0; }
+  IFS=$'\x1f' read -r rid rident rst rcreated <<<"$row"
+  if jq -e --arg r "$rident" '(.graded // {})[$r] != null' <<<"$state" >/dev/null 2>&1; then
+    printf '%s already graded\n' "$rident"; return 0
+  fi
+  rbody=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${rid};")
+  rwork=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${rid};")
+
+  # Which criteria. The loop's own, else the ones derived on the first tick.
+  local crit accept
+  accept=$(db "SELECT COALESCE(acceptance_criteria,'') FROM tasks WHERE id=${tid};")
+  if [[ -n "${accept//[[:space:]]/}" ]]; then
+    crit=$(jq -Rn --arg a "$accept" '[$a | split("\n")[] | sub("^[-*0-9.) ]+";"") | select(length>0)]')
+  else
+    crit=$(jq -c '.criteria // []' <<<"$state")
+  fi
+
+  # Is a trial open, and does THIS run judge it (created after it applied)?
+  local trial tri_id="" judges=0
+  trial=$(jq -c '[.[] | select(.status=="trying")] | last // empty' <<<"$log")
+  if [[ -n "$trial" ]]; then
+    tri_id=$(jq -r .id <<<"$trial")
+    [[ "$(db "SELECT julianday($(sqlq "$rcreated")) >= julianday($(sqlq "$(jq -r .applied_at <<<"$trial")"));")" == "1" ]] && judges=1
+  fi
+  local kept_score; kept_score=$(jq -r '.kept_score // empty' <<<"$state")
+
+  # Grade. A run that did not end done is scored by the runtime, at no cost.
+  # Ask for a change too when one may follow this run: no trial open, or this
+  # run decides it (a kept change is built on; a dropped one's proposal is
+  # discarded, since it was written against the text being taken back).
+  local score cost=0 answer='{}' want=0
+  if [[ -z "$trial" ]] || (( judges )); then want=1; fi
+  if [[ "$rst" != "done" ]]; then
+    [[ -n "$(_loop_pref_get "loop.score.${rident}")" ]] || _loop_first_score "$rid"
+    score=$(_loop_pref_get "loop.score.${rident}" | jq -r '.score // 0')
+    want=0
+  else
+    local raw parsed
+    raw=$(_loop_improve_prompt "$rbody" "$(jq -c '[.[] | if type=="object" then .name else . end]' <<<"$crit")" "$rwork" "$want" | _loop_improve_ai) || raw=""
+    if ! parsed=$(_loop_improve_parse "$raw"); then
+      printf 'could not grade %s: the AI gave no usable answer (%s)\n' "$rident" "$(_loop_clip "${raw:-no output}")"
+      return 1
+    fi
+    answer=$(jq -c .answer <<<"$parsed"); cost=$(jq -r .cost_usd <<<"$parsed")
+    score=$(jq -r '.overall | if . < 0 then 0 elif . > 100 then 100 else (.|round) end' <<<"$answer")
+    if [[ "$(jq 'length' <<<"$crit")" == "0" ]]; then
+      crit=$(jq -c '[.criteria[]? | .name | strings | select(length>0)] | .[0:5]' <<<"$answer")
+      state=$(jq -c --argjson c "$crit" '.criteria = $c' <<<"$state")
+    fi
+  fi
+
+  local now; now=$(db "SELECT datetime('now');")
+  local verdict="graded"
+  # Decide the trial.
+  if [[ -n "$trial" ]] && (( judges )); then
+    local base; base=$(jq -r '.score_before // empty' <<<"$trial")
+    if [[ -n "$base" ]] && (( score > base )); then
+      log=$(jq -c --argjson i "$tri_id" --argjson s "$score" --arg r "$rident" --arg at "$now" \
+        'map(if .id == $i then .status="kept" | .kept=true | .score_after=$s | .run=$r | .decided_at=$at else . end)' <<<"$log")
+      state=$(jq -c --argjson s "$score" '.kept_score = $s' <<<"$state")
+      verdict="kept #${tri_id} (${base} → ${score})"
+    else
+      local cur after note="reverted"
+      cur=$(db "SELECT body FROM tasks WHERE id=${tid};")
+      after=$(jq -r .body_after <<<"$trial")
+      if [[ "$cur" == "$after" ]]; then
+        db "UPDATE tasks SET body=$(sqlq "$(jq -r .body_before <<<"$trial")") WHERE id=${tid};"
+      else
+        note="instructions were changed by hand meanwhile; left as they are"
+      fi
+      log=$(jq -c --argjson i "$tri_id" --argjson s "$score" --arg r "$rident" --arg at "$now" --arg n "$note" \
+        'map(if .id == $i then .status="dropped" | .kept=false | .score_after=$s | .run=$r | .decided_at=$at | .note=$n else . end)' <<<"$log")
+      verdict="dropped #${tri_id} (${base:-?} → ${score}, ${note})"
+      want=0   # the next run re-measures the restored text first
+    fi
+    trial=""
+  elif [[ -z "$trial" ]]; then
+    # No trial: this run measured the kept text. It is the new bar.
+    state=$(jq -c --argjson s "$score" '.kept_score = $s' <<<"$state")
+  fi
+  state=$(jq -c --argjson s "$score" '.first_score = (.first_score // $s)' <<<"$state")
+  [[ -n "$(jq -r '.kept_score // empty' <<<"$state")" ]] && kept_score=$(jq -r .kept_score <<<"$state")
+
+  # Maybe start the next trial.
+  local proposal; proposal=$(jq -c '.proposal // empty | objects' <<<"$answer")
+  if (( want )) && [[ -z "$trial" && -n "$proposal" ]] && (( score < _LOOP_IMPROVE_ROOM )); then
+    local find repl change reason target cur new widened id
+    find=$(jq -r '.find // ""' <<<"$proposal"); repl=$(jq -r '.replace // ""' <<<"$proposal")
+    change=$(jq -r '.change // ""' <<<"$proposal"); reason=$(jq -r '.reason // ""' <<<"$proposal")
+    target=$(jq -r '.target // ""' <<<"$proposal")
+    id=$(jq -r '.next_id // 1' <<<"$state"); state=$(jq -c '.next_id = ((.next_id // 1) + 1)' <<<"$state")
+    cur=$(db "SELECT body FROM tasks WHERE id=${tid};")
+    local status="trying" why=""
+    if [[ -z "${repl//[[:space:]]/}" || -z "${change//[[:space:]]/}" ]]; then status="refused"; why="empty change"
+    elif (( ${#find} > _LOOP_IMPROVE_MAX_CHARS || ${#repl} > _LOOP_IMPROVE_MAX_CHARS )); then status="refused"; why="not a small change (over ${_LOOP_IMPROVE_MAX_CHARS} characters)"
+    elif widened=$(_loop_improve_widens "$cur" "$repl"); then status="refused"; why="would widen what the loop may do: \"${widened}\""
+    elif ! new=$(_loop_improve_apply_change "$cur" "$find" "$repl"); then status="refused"; why="the text to change is not in the instructions exactly once"
+    elif [[ "$new" == "$cur" ]]; then status="refused"; why="no change"
+    fi
+    if [[ "$status" == "trying" ]]; then
+      db "UPDATE tasks SET body=$(sqlq "$new") WHERE id=${tid};"
+      verdict+="; trying #${id}: ${change}"
+    else
+      new=""; verdict+="; refused a change (${why})"
+    fi
+    log=$(jq -c --argjson i "$id" --arg at "$now" --arg c "${change:0:80}" --arg rs "$reason" --arg tg "$target" \
+          --arg st "$status" --argjson sb "${kept_score:-$score}" --arg r "$rident" --argjson cost "$cost" \
+          --arg bb "$cur" --arg ba "$new" --arg n "$why" \
+      '. + [{id:$i, at:$at, change:$c, reason:$rs, target:$tg, status:$st, kept:(if $st=="trying" then null else false end),
+             score_before:$sb, score_after:null, from_run:$r, cost_usd:$cost,
+             body_before:$bb, body_after:(if $st=="trying" then $ba else null end),
+             applied_at:(if $st=="trying" then $at else null end)} + (if $n != "" then {note:$n} else {} end)]' <<<"$log")
+  fi
+
+  local crit_scores; crit_scores=$(jq -c '[.criteria[]? | {name, score}]' <<<"$answer" 2>/dev/null) || crit_scores='[]'
+  state=$(jq -c --arg r "$rident" --arg at "$now" --argjson s "$score" --argjson c "$cost" --argjson cs "${crit_scores:-[]}" \
+          --arg st "$rst" --argjson keep "$_LOOP_IMPROVE_RUNS_KEPT" \
+    '.graded = ((.graded // {}) + {($r):1})
+     | .runs = (((.runs // []) + [{run:$r, at:$at, status:$st, score:$s, criteria:$cs, cost_usd:$c}]) | .[-$keep:])' <<<"$state")
+  _loop_improve_state_put "$tident" "$state"
+  _loop_improve_log_put "$tident" "$log"
+  printf '%s: %s scored %s/100 (AI cost $%s); %s\n' "$tident" "$rident" "$score" "$cost" "$verdict"
+}
+
+# Called from _loop_score_request when a run of a loop closes. The tick makes a
+# model call, so it runs detached: closing the run never waits on it.
+_loop_improve_kick() {
+  local tident="$1" rident="$2"
+  _loop_improve_on "$tident" || return 0
+  if [[ "${FIVEDIVE_LOOP_IMPROVE_SYNC:-0}" == "1" ]]; then
+    ( _loop_improve_tick "$tident" "$rident" ) >/dev/null 2>&1 || true
+    return 0
+  fi
+  local self="${FIVEDIVE_SELF:-$(command -v 5dive || echo /usr/local/bin/5dive)}"
+  ( setsid nohup "$self" task loop improve "$tident" tick --run="$rident" \
+      >>"${TASKS_DIR:-/tmp}/loop-improve.log" 2>&1 </dev/null & ) 2>/dev/null || true
+  return 0
+}
+
+# _loop_improve_undo <tpl id> <tpl ident> <entry id>
+_loop_improve_undo() {
+  local tid="$1" tident="$2" eid="$3" log state entry now
+  log=$(_loop_improve_log "$tident"); state=$(_loop_improve_state "$tident")
+  entry=$(jq -c --argjson i "$eid" '.[] | select(.id == $i)' <<<"$log")
+  [[ -n "$entry" ]] || fail "$E_NOT_FOUND" "${tident} has no change #${eid}"
+  [[ "$(jq -r .status <<<"$entry")" == "kept" ]] \
+    || fail "$E_VALIDATION" "change #${eid} on ${tident} is $(jq -r .status <<<"$entry"), not kept: nothing to undo"
+  now=$(db "SELECT datetime('now');")
+  db "UPDATE tasks SET body=$(sqlq "$(jq -r .body_before <<<"$entry")") WHERE id=${tid};"
+  # Everything kept or on trial after it was built on the text it changed.
+  local also
+  also=$(jq -c --argjson i "$eid" '[.[] | select(.id > $i and (.status=="kept" or .status=="trying")) | .id]' <<<"$log")
+  log=$(jq -c --argjson i "$eid" --arg at "$now" '
+    map(if .id == $i then .status="undone" | .kept=false | .undone_at=$at
+        elif .id > $i and .status=="kept" then .status="undone" | .kept=false | .undone_at=$at | .note="undone with #\($i), which it was built on"
+        elif .id > $i and .status=="trying" then .status="dropped" | .kept=false | .decided_at=$at | .note="stopped: #\($i) was undone"
+        else . end)' <<<"$log")
+  state=$(jq -c --argjson s "$(jq '.score_before' <<<"$entry")" '.kept_score = $s' <<<"$state")
+  _loop_improve_log_put "$tident" "$log"
+  _loop_improve_state_put "$tident" "$state"
+  UNDO_ALSO="$also"
+}
+
+# `task loop improve <loop> on|off|log [--json]|undo <id>|tick [--run=<run>]`
+cmd_task_loop_improve() {
+  tasks_db_init
+  local ref="${1:-}" verb="${2:-}"
+  [[ -n "$ref" && -n "$verb" ]] || fail "$E_USAGE" "usage: 5dive task loop improve <loop> on|off|log|undo <id>|tick [--run=<run>]"
+  shift 2
+  local tid tident
+  _loop_tpl_resolve "$ref"; tid="$_LOOP_TID"; tident="$_LOOP_TIDENT"
+  case "$verb" in
+    on)
+      [[ -z "$(_loop_pref_get "loop.outcome.${tident}")" ]] \
+        || fail "$E_VALIDATION" "${tident} is scored by its outcome, and its next lane is the owner's call: self-improvement stays off (DIVE-5777)"
+      _loop_pref_set "loop.improve.${tident}" on
+      ok "self-improving on for ${tident}: after each run it grades the run, tries one small change, and keeps it only if the next run scores higher" \
+         '{loop:$t, self_improving:true}' --arg t "$tident" ;;
+    off)
+      _loop_pref_del "loop.improve.${tident}"
+      # A change still on trial has no run left to judge it: put the text back.
+      local log trial; log=$(_loop_improve_log "$tident")
+      trial=$(jq -c '[.[] | select(.status=="trying")] | last // empty' <<<"$log")
+      if [[ -n "$trial" ]]; then
+        [[ "$(db "SELECT body FROM tasks WHERE id=${tid};")" == "$(jq -r .body_after <<<"$trial")" ]] \
+          && db "UPDATE tasks SET body=$(sqlq "$(jq -r .body_before <<<"$trial")") WHERE id=${tid};"
+        _loop_improve_log_put "$tident" "$(jq -c --argjson i "$(jq .id <<<"$trial")" --arg at "$(db "SELECT datetime('now');")" \
+          'map(if .id == $i then .status="dropped" | .kept=false | .decided_at=$at | .note="stopped: self-improving turned off" else . end)' <<<"$log")"
+      fi
+      ok "self-improving off for ${tident}; kept changes stay (undo any with: 5dive task loop improve ${tident} undo <id>)" \
+         '{loop:$t, self_improving:false}' --arg t "$tident" ;;
+    log)
+      local json=$JSON_MODE
+      [[ "${1:-}" == "--json" ]] && json=1
+      local log state view; log=$(_loop_improve_log "$tident"); state=$(_loop_improve_state "$tident")
+      view=$(jq -cn --arg t "$tident" --argjson on "$(_loop_improve_on "$tident" && echo true || echo false)" \
+             --argjson l "$log" --argjson s "$state" '
+        {loop:$t, self_improving:$on,
+         improved:([$l[] | select(.status=="kept")] | length),
+         score_start:($s.first_score // null), score_now:($s.kept_score // null),
+         criteria:($s.criteria // []),
+         entries:[$l[] | {id, at, change, reason, target, status, kept, score_before, score_after, cost_usd}
+                         + (if .note then {note} else {} end)],
+         runs:[($s.runs // [])[] | {run, at, status, score, cost_usd}]}')
+      if (( json )); then
+        jq -c '{ok:true, data:.}' <<<"$view"
+      else
+        jq -r '"\(.loop)  self-improving: \(if .self_improving then "on" else "off" end)  ·  improved itself \(.improved) times  ·  score \(.score_start // "-") → \(.score_now // "-")",
+               (.entries | reverse[] | "  #\(.id)  \(.at[0:16])  \(.status)\(if .kept then "" else "" end)  \(.change)  (score \(.score_before // "-") → \(.score_after // "…"))\(if .note then "  — \(.note)" else "" end)"),
+               (if (.runs|length) > 0 then "  runs:" else empty end),
+               (.runs | reverse[] | "    \(.run)  \(.score)/100  AI cost $\(.cost_usd)")' <<<"$view"
+      fi ;;
+    undo)
+      local eid="${1:-}"
+      [[ "$eid" =~ ^[0-9]+$ ]] || fail "$E_USAGE" "usage: 5dive task loop improve <loop> undo <id>  (the id from: task loop improve ${tident} log)"
+      UNDO_ALSO="[]"
+      _loop_improve_undo "$tid" "$tident" "$((10#$eid))"
+      local n_also; n_also=$(jq 'length' <<<"$UNDO_ALSO")
+      ok "undid change #${eid} on ${tident}: its instructions are back to what they were before it$( (( n_also > 0 )) && printf ' (also undid %s, made on top of it)' "$(jq -r 'map("#\(.)")|join(", ")' <<<"$UNDO_ALSO")")" \
+         '{loop:$t, undone:($i|tonumber), also_undone:$a}' --arg t "$tident" --arg i "$eid" --argjson a "$UNDO_ALSO" ;;
+    tick)
+      local run=""
+      [[ "${1:-}" == --run=* ]] && run="${1#--run=}"
+      local out rc=0
+      out=$(_loop_improve_tick "$tident" "$run") || rc=$?
+      (( rc == 0 )) || fail "$E_GENERIC" "$out"
+      ok "$out" '{loop:$t, message:$m}' --arg t "$tident" --arg m "$out" ;;
+    *) fail "$E_USAGE" "usage: 5dive task loop improve <loop> on|off|log [--json]|undo <id>|tick [--run=<run>]" ;;
+  esac
+}
+
 # ───────────── DIVE-5777 an outcome command replaces the opinion score ─────────────
 # An opinion score grades ACTIVITY: the chill-gorge distribution team's runs did
 # their job every day for 8 days and its lane produced 0 sign-ups (wiki:
@@ -1236,6 +1660,7 @@ cmd_task_loop() {
     suggest)        cmd_task_loop_suggest "$@" ;;
     apply|dismiss|revert) cmd_task_loop_decide "$sub" "$@" ;;
     auto)           cmd_task_loop_auto "$@" ;;
+    improve)        cmd_task_loop_improve "$@" ;;
     outcome)        cmd_task_loop_outcome "$@" ;;
     resume)         cmd_task_loop_resume "$@" ;;
     -h|--help|help) cat <<'HELP'
@@ -1252,6 +1677,13 @@ DIVE-5564 loop scores (a loop = a scheduled task):
   loop suggest <loop> --body-file=<path> [--reason=]   record suggested instructions
   loop apply|dismiss|revert <loop>              act on the suggestion; revert undoes the last apply
   loop auto <loop> on|off                       self-improvement: apply suggestions unasked (off by default)
+DIVE-8692 self-improving loops (off by default, per loop):
+  loop improve <loop> on|off                    after each run: grade it 0-100, try ONE small change aimed at
+                                                the lowest criterion, keep it only if the next run scores higher
+                                                (else the text goes back by itself). Never widens what the loop
+                                                may do (no spend, posting, new recipients or tools)
+  loop improve <loop> log [--json]              every change tried: kept, dropped, refused, undone; per-run AI cost
+  loop improve <loop> undo <id>                 put the text back exactly as it was before change <id>
 DIVE-5777 outcome loops (score by a number, not an opinion):
   loop outcome <loop> --cmd="<command>"         after each run, run it as the loop's seat (in its home);
                                                 the ONE number it prints is the run's score. No rise in
@@ -1261,7 +1693,7 @@ DIVE-5777 outcome loops (score by a number, not an opinion):
   loop resume <loop>                            restart a paused loop with a fresh 3 days (Apply does too)
 HELP
     ;;
-    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|feedback|rate|review|suggest|apply|dismiss|revert|auto|outcome|resume)" ;;
+    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|feedback|rate|review|suggest|apply|dismiss|revert|auto|improve|outcome|resume)" ;;
   esac
 }
 
