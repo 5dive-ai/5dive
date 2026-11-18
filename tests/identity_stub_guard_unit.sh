@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 11.1s measured on ubuntu-latest by the core/pristine-confirm runner
+# TIER: nightly — 23.0s measured (CI installed-host-s3, run 44130804783; header-drift window 2026-11-18, max of the nightly runs it named, DIVE-8747; was 11.1s on the core/pristine-confirm runner)
 # itself (run 31554029604, 2026-08-12, the tier report's own top-10 line; 8.2s on the
 # faster core/pristine box in the same run). Demoted under the MUTATION-HARNESS RULE
 # (DIVE-2867): a mutant-killing grader re-scans a corpus once per mutant, so its cost is

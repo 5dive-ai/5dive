@@ -3,7 +3,7 @@
 # budget: the tier resolver (tests/lib/tier.sh) and the budgeted runner
 # (scripts/run-harnesses.sh).
 #
-# TIER: nightly — 41.4s measured (GitHub Actions ubuntu-latest, core/pristine job,
+# TIER: nightly — 78.0s measured (CI installed-host-s3, run 44130804783; header-drift window 2026-11-18, max of the nightly runs it named, DIVE-8747; was 41.4s on the core/pristine job,
 # run 30988600395, 2026-08-05). This is a META-harness: it grades the tier resolver
 # and the budgeted runner, so NO product path a customer reaches runs through it —
 # the standard nightly criterion. It costs 14% of the 300s core budget it is itself
