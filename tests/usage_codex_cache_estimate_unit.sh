@@ -43,10 +43,10 @@ rollout() { # <agent> <model> — the audit's own call: 145,871 in, 140,672 cach
     "{\"type\":\"event_msg\",\"timestamp\":\"$TS\",\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":{\"input_tokens\":145871,\"cached_input_tokens\":140672,\"cache_write_input_tokens\":0,\"output_tokens\":653}},\"rate_limits\":{\"primary\":{\"used_percent\":19},\"secondary\":{\"used_percent\":29}}}}" \
     > "$d/rollout-a.jsonl"
 }
-rollout sol gpt-6.1-sol
+rollout sol gpt-6.2-sol
 rollout odd gpt-9-unknown
-rollout pro gpt-6.1-sol-pro
-rollout snap gpt-6.1-sol-2026-09-30
+rollout pro gpt-6.2-sol-pro
+rollout snap gpt-6.2-sol-2026-09-30
 printf '{"agents":{"sol":{"type":"codex"},"odd":{"type":"codex"},"pro":{"type":"codex"},"snap":{"type":"codex"}}}' > "$TMP/reg.json"
 # shellcheck source=../src/lib/models.sh
 source src/lib/models.sh
@@ -60,8 +60,8 @@ ODD="$(jq -c '.agents[] | select(.name=="odd")' <<<"$OUT" 2>/dev/null)"
   || bad_t "E1 split" "$(jq -c '.codexEstimate' <<<"$SOL" 2>/dev/null) $(head -c 300 "$TMP/err")"
 
 # credits = (5199*50 + 140672*2.5 + 653*250)/1e6 = 0.77488; api = (5199*2 + 140672*0.10 + 653*10)/1e6 = 0.0309952
-[[ "$(jq -r '.codexEstimate | [.model,.ratesFor,.credits,.apiUsd,.ratesAsOf] | @csv' <<<"$SOL" 2>/dev/null)" == '"gpt-6.1-sol","gpt-6.1-sol",0.77,0.031,"2026-10-04"' ]] \
-  && ok_t "E2 credits 0.77 and API \$0.031 at OpenAI's published gpt-6.1-sol rates (cached at 1/20)" \
+[[ "$(jq -r '.codexEstimate | [.model,.ratesFor,.credits,.apiUsd,.ratesAsOf] | @csv' <<<"$SOL" 2>/dev/null)" == '"gpt-6.2-sol","gpt-6.2-sol",0.77,0.031,"2026-11-18"' ]] \
+  && ok_t "E2 credits 0.77 and API \$0.031 at OpenAI's published gpt-6.2-sol rates (cached at 1/20)" \
   || bad_t "E2 estimate" "$(jq -c '.codexEstimate' <<<"$SOL" 2>/dev/null)"
 
 [[ "$(jq -r '.codexEstimate | [.model, (.credits|tostring), (.apiUsd|tostring)] | @csv' <<<"$ODD" 2>/dev/null)" == '"gpt-9-unknown","null","null"' ]] \
@@ -91,7 +91,7 @@ ensure_state()  { :; }
 VIEW="$(usage_render_agent "$OUT" sol 24h 2>&1)"
 grep -qF "Plan window used (provider-reported): 5h 19% · 7d 29%" <<<"$VIEW" \
   && grep -qF "Codex input: 145.8k = 5.1k uncached + 140.6k cached (96% cached) · output 653" <<<"$VIEW" \
-  && grep -qF "Codex credits (estimate, OpenAI Standard rates for gpt-6.1-sol, 2026-10-04): 0.77 · API-equivalent: \$0.031" <<<"$VIEW" \
+  && grep -qF "Codex credits (estimate, OpenAI Standard rates for gpt-6.2-sol, 2026-11-18): 0.77 · API-equivalent: \$0.031" <<<"$VIEW" \
   && ! grep -qiE "QUOTA[^\n]*%" <<<"$(grep -i quota <<<"$VIEW")" \
   && ok_t "E6 the per-agent view labels each basis; no token count is shown as a percentage" \
   || bad_t "E6 view" "$VIEW"
@@ -103,7 +103,7 @@ grep -qF "no published rate for gpt-9-unknown" <<<"$VIEW_ODD" \
 PRO="$(jq -c '.agents[] | select(.name=="pro") | .codexEstimate' <<<"$OUT" 2>/dev/null)"
 SNAP="$(jq -c '.agents[] | select(.name=="snap") | .codexEstimate' <<<"$OUT" 2>/dev/null)"
 if [[ "$(jq -r '[(.ratesFor|tostring), (.credits|tostring)] | @csv' <<<"$PRO")" == '"null","null"' \
-   && "$(jq -r '[.ratesFor, .credits] | @csv' <<<"$SNAP")" == '"gpt-6.1-sol",0.77' \
+   && "$(jq -r '[.ratesFor, .credits] | @csv' <<<"$SNAP")" == '"gpt-6.2-sol",0.77' \
    && "$(grep -cF 'CODEX_RATES_MODEL="$(codex_model_default' "$SRC_DIR/cmd_usage.sh")" == 1 ]]; then
   ok_t "E7 rates key off codex_model_default: its dated snapshot priced, -pro left unpriced"
 else

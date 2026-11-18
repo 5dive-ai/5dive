@@ -102,7 +102,7 @@ fi
 # in their config.toml; only a new seat's FIRST start reads the seed. `5dive
 # usage` prices Codex tokens at this id's rates (CODEX_RATES in cmd_usage.sh):
 # re-check them on a bump; tests/usage_codex_cache_estimate_unit.sh goes red until you do.
-codex_model_default() { printf '%s' "gpt-6.1-sol"; }
+codex_model_default() { printf '%s' "gpt-6.2-sol"; }
 
 # resolve_model_alias <alias-or-id> -> full resolved id on stdout.
 # A known family alias resolves to its current id; anything else (a full id, a
