@@ -181,7 +181,7 @@ _s=$(bash "$SM" steps codex)
 eq_t "smoke: codex picks OpenRouter" "OpenRouter" "$(jq -r '.[1].pick' <<<"$_s")"
 eq_t "smoke: codex types the key at init's openrouter prompt" "true" "$(jq -r '.[] | select(.wait | test("openrouter")) | .secret' <<<"$_s")"
 eq_t "smoke: codex answers the model question with gpt-6-luna" "openai/gpt-6-luna" "$(jq -r '.[] | select(.wait | startswith("Model")) | .send | rtrimstr("\n")' <<<"$_s")"
-printf '  › Model [openai/gpt-6.1-sol]: ' | grep -qP "$(jq -r '.[] | select(.wait | startswith("Model")) | .wait' <<<"$_s")" \
+printf '  › Model [openai/gpt-6.2-sol]: ' | grep -qP "$(jq -r '.[] | select(.wait | startswith("Model")) | .wait' <<<"$_s")" \
   && ok_t "smoke: the model wait matches init's prompt" || bad_t "smoke: the model wait does not match init's prompt"
 for c in hermes-sandboxed hermes-standard; do
   _s=$(bash "$SM" steps "$c")

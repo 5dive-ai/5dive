@@ -48,7 +48,8 @@ registry = os.environ["REGISTRY"]
 task_db  = os.environ["TASK_DB"]
 
 # DIVE-5504: OpenAI's published per-million rates, by model (codex audit,
-# 2026-10-04: learn.chatgpt.com/docs/pricing and the GPT-6.1 Sol API page).
+# 2026-10-04: learn.chatgpt.com/docs/pricing and the GPT-6.1 Sol API page;
+# re-checked 2026-11-18 for GPT-6.2 Sol, DIVE-8741: same credits and USD).
 # Codex credits charge cached input at 1/20 of uncached and have no separate
 # cache-write charge; the API bills a cache write at its own rate. These price
 # TOKENS; OpenAI says they do not determine how much of an included plan's
@@ -57,7 +58,7 @@ task_db  = os.environ["TASK_DB"]
 # CODEX_RATES_MODEL): a bump in models.sh re-prices, and
 # tests/usage_codex_cache_estimate_unit.sh pins which id these numbers were
 # published for, so the bump goes red there until the rates are re-checked.
-CODEX_RATES_AS_OF = "2026-10-04"
+CODEX_RATES_AS_OF = "2026-11-18"
 CODEX_RATES = {}
 if os.environ.get("CODEX_RATES_MODEL"):
     CODEX_RATES[os.environ["CODEX_RATES_MODEL"].lower()] = {
