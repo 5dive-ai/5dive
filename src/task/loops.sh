@@ -1130,8 +1130,29 @@ _loop_improve_sentence_end() {   # <body> <i> -> rc 0 when a sentence ends at ch
   [[ -n "$w" && "$w" =~ $_LOOP_IMPROVE_ABBR_RX ]] && return 1
   return 0
 }
+# A unit that introduces what follows it (quinn, DIVE-8692 it5): text ending in
+# ':' ("Never email these customers:") or a markdown heading line. It does NOT
+# end at the blank line after it: markdown normally puts one before a list, and
+# the list IS the limit. It carries the whole next block (the lines up to the
+# following blank line), and list blocks that follow one another are one unit
+# too, so a loose list ("- Acme", blank, "- Globex") is never split item by item.
+_LOOP_IMPROVE_LIST_RX='^([[:blank:]]+[^[:space:]]|[[:blank:]]*([-*+•>|]|[0-9]+[.)])([[:blank:]]|$))'
+_loop_improve_intro() {   # <text> -> rc 0 when it introduces the block after it
+  local t="$1" last
+  t="${t%"${t##*[![:space:]]}"}"
+  [[ "$t" == *: ]] && return 0
+  last="${t##*$'\n'}"
+  [[ "$last" =~ ^[[:blank:]]*# ]]
+}
+_loop_improve_listline() { [[ "$1" =~ $_LOOP_IMPROVE_LIST_RX ]]; }
+_loop_improve_block_break() {   # <body> <i> -> rc 0 when char i is a newline that opens a blank line
+  local b="$1" i="$2" nx
+  [[ "${b:i:1}" == $'\n' ]] || return 1
+  nx="${b:i+1}"; nx="${nx%%$'\n'*}"
+  [[ -z "${nx//[[:blank:]]/}" ]]
+}
 _loop_improve_sentence() {
-  local body="$1" find="$2" pre s e i n
+  local body="$1" find="$2" pre s e i n k p q gap unit line nfirst carried=0
   [[ -n "$find" && "$body" == *"$find"* ]] || { printf '%s' "$find"; return 0; }
   pre="${body%%"$find"*}"; s=${#pre}; e=$(( s + ${#find} )); n=${#body}
   # Left: just after the last sentence end before the find.
@@ -1140,8 +1161,54 @@ _loop_improve_sentence() {
   # Right: through the first sentence end at or after the find's last char.
   for (( i = e - 1; i < n; i++ )); do _loop_improve_sentence_end "$body" "$i" && break; done
   (( i >= n )) && i=$(( n - 1 ))
-  local out="${body:s:i-s+1}"
-  printf '%s' "${out#"${out%%[![:space:]]*}"}"
+  e=$i
+  # Carry LEFT across blank lines: the block before joins when it introduces
+  # this one, or when both are list blocks.
+  while :; do
+    # p: the start of the block s sits in (a sentence end mid-block is no stop:
+    # an intro carries its WHOLE next block, "Acme. Initech too." included).
+    for (( p = s - 1; p >= 0; p-- )); do _loop_improve_block_break "$body" "$p" && break; done
+    p=$(( p + 1 )); while (( p < n )) && [[ "${body:p:1}" == [[:space:]] ]]; do p=$(( p + 1 )); done
+    k=$(( p - 1 )); while (( k >= 0 )) && [[ "${body:k:1}" == [[:space:]] ]]; do k=$(( k - 1 )); done
+    (( k >= 0 )) || break
+    gap="${body:k+1:p-k-1}"; gap="${gap//[^$'\n']/}"
+    (( ${#gap} >= 2 )) || break                       # not at a block start
+    for (( q = k; q >= 0; q-- )); do _loop_improve_block_break "$body" "$q" && break; done
+    q=$(( q + 1 ))                                    # start of the block before
+    unit="${body:q:k-q+1}"; line="${unit##*$'\n'}"
+    nfirst="${body:p}"; nfirst="${nfirst%%$'\n'*}"
+    if _loop_improve_intro "$unit" || { _loop_improve_listline "$line" && _loop_improve_listline "$nfirst"; }; then
+      s=$q; carried=1; continue
+    fi
+    break
+  done
+  # Once a carry joined blocks, the unit is whole blocks: the rest of the block
+  # the find sits in comes with it ("The list:", blank, "Acme. Initech. Never Globex.").
+  if (( carried )); then
+    for (( q = e; q < n; q++ )); do _loop_improve_block_break "$body" "$q" && break; done
+    (( q >= n )) && q=$n
+    e=$(( q - 1 ))
+  fi
+  # Carry RIGHT the same way: an intro takes the whole next block; a list block
+  # takes the list block after it.
+  while :; do
+    k=$e; while (( k >= s )) && [[ "${body:k:1}" == [[:space:]] ]]; do k=$(( k - 1 )); done
+    p=$(( k + 1 )); while (( p < n )) && [[ "${body:p:1}" == [[:space:]] ]]; do p=$(( p + 1 )); done
+    (( p < n )) || break
+    gap="${body:k+1:p-k-1}"; gap="${gap//[^$'\n']/}"
+    (( ${#gap} >= 2 )) || break                       # the unit ended at a sentence end, mid-block
+    unit="${body:s:k-s+1}"; line="${unit##*$'\n'}"
+    nfirst="${body:p}"; nfirst="${nfirst%%$'\n'*}"
+    if _loop_improve_intro "$unit" || { _loop_improve_listline "$line" && _loop_improve_listline "$nfirst"; }; then
+      for (( q = p; q < n; q++ )); do _loop_improve_block_break "$body" "$q" && break; done
+      (( q >= n )) && q=$n
+      e=$(( q - 1 )); continue
+    fi
+    break
+  done
+  local out="${body:s:e-s+1}"
+  out="${out#"${out%%[![:space:]]*}"}"
+  printf '%s' "${out%"${out##*[![:space:]]}"}"
 }
 
 # _loop_improve_widens <loop's current text> <new text> [<the text it replaces>]
@@ -1156,27 +1223,29 @@ _loop_improve_sentence() {
 #    the loop is NOT scope: in "Draft a reply. Do not send it." the word "send" is
 #    there BECAUSE it is forbidden (quinn, DIVE-8692 it2).
 _loop_improve_widens() {
-  local cur="$1" new="${2,,}" gone="${3:-}" rx term n o
+  local cur="$1" new="${2,,}" gone="${3:-}" rx term terms n o
   new="${new//’/\'}"
   if [[ -n "${gone//[[:space:]]/}" ]]; then
     gone=$(_loop_improve_sentence "$cur" "$gone"); gone="${gone,,}"; gone="${gone//’/\'}"
     for rx in "$_LOOP_IMPROVE_LIMIT_RX" "$_GATE_T2_FLOOR_RX" "$_LOOP_IMPROVE_REACH_RX" "$_LOOP_IMPROVE_OVERRIDE_RX"; do
       [[ -n "$rx" ]] || continue
+      terms=$(_loop_improve_terms "$rx" "$gone") || terms=""
       while read -r n term; do
         [[ -n "$term" ]] || continue
         [[ "$term" =~ ^(price|prices|pricing)$ ]] && continue
         printf '"%s" is in the sentence it would rewrite (limit text is read-only)' "$term"; return 0
-      done < <(_loop_improve_terms "$rx" "$gone")
+      done <<<"$terms"
     done
     # A recipient or a link in the rewritten sentence is reach too.
     local r0
     for r0 in '[[:alnum:]._%+-]+@[[:alnum:].-]+' '@[[:alnum:]_]{3,}' 'https?://[^[:space:]]+'; do
-      term=$(grep -oE -- "$r0" <<<"$gone" 2>/dev/null | head -n1)
+      term=$(grep -oE -- "$r0" <<<"$gone" 2>/dev/null | head -n1) || term=""
       [[ -n "$term" ]] && { printf '"%s" is in the sentence it would rewrite (limit text is read-only)' "$term"; return 0; }
     done
   fi
   for rx in "$_GATE_T2_FLOOR_RX" "$_LOOP_IMPROVE_REACH_RX" "$_LOOP_IMPROVE_OVERRIDE_RX"; do
     [[ -n "$rx" ]] || continue
+    terms=$(_loop_improve_terms "$rx" "$new") || terms=""
     while read -r n term; do
       [[ -n "$term" ]] || continue
       # "price" names a thing a watch loop READS; it grants no spend. Every spend
@@ -1185,12 +1254,12 @@ _loop_improve_widens() {
       # "Then buy the cheapest one." is.
       [[ "$term" =~ ^(price|prices|pricing)$ ]] && continue
       printf '"%s" added' "$term"; return 0
-    done < <(_loop_improve_terms "$rx" "$new")
+    done <<<"$terms"
   done
   # A recipient or a link is reach whatever word introduces it.
   local r
   for r in '[[:alnum:]._%+-]+@[[:alnum:].-]+' '@[[:alnum:]_]{3,}' 'https?://[^[:space:]]+' '\+?[0-9][0-9 ()-]{7,}[0-9]'; do
-    term=$(grep -oE -- "$r" <<<"$new" 2>/dev/null | head -n1)
+    term=$(grep -oE -- "$r" <<<"$new" 2>/dev/null | head -n1) || term=""
     [[ -n "$term" ]] && { printf '"%s" added' "$term"; return 0; }
   done
   return 1

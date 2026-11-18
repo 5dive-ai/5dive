@@ -17,3 +17,8 @@ m4() { sed -i 's/^_LOOP_IMPROVE_OVERRIDE_RX=.*/_LOOP_IMPROVE_OVERRIDE_RX=""/' sr
 # m5: a sentence ends at any bare . ! ? or newline again (it4's splitter) ->
 # the decimal / e.g. / list arms and T22 red.
 m5() { sed -i 's/^  \[\[ -z "\$nx" || "\$nx" == \[\[:space:\]\] \]\] || return 1$/  :/; s/^    \[\[ -z "\${nx\/\/\[\[:blank:\]\]\/}" \]\]; return$/    return 0/; s/^  \[\[ -n "\$w" \&\& "\$w" =~ \$_LOOP_IMPROVE_ABBR_RX \]\] \&\& return 1$/  :/' src/task/loops.sh; }
+# m6: a ':' line no longer carries the block after a blank line (it5's rule) ->
+# the blank-line list arms and T23 red.
+m6() { sed -i 's/^  \[\[ "\$t" == \*: \]\] && return 0$/  return 1/' src/task/loops.sh; }
+# m7: list blocks no longer join each other -> the loose-list arm red.
+m7() { sed -i 's/^_loop_improve_listline() { .*/_loop_improve_listline() { return 1; }/' src/task/loops.sh; }

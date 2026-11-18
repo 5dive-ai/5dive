@@ -168,6 +168,20 @@ t "T5 sentence: the unit it reads, decimal case"       "Spend at most \$5.00 per
 t "T5 sentence: the unit it reads, list case"          "$LI" "$(_loop_improve_sentence "$LI" "- Globex")"
 t "T5 sentence: a blank line still ends one"           "fine" "$(w3 $'Never buy anything\n\nWrite one line' "Write two lines" "Write one line")"
 t "T5 sentence: the sentence after a decimal is its own" "fine" "$(w3 "Spend at most \$5.00 per run. Write one line." "Write two lines." "Write one line.")"
+# A ':' line or a heading carries the block after it across a blank line, and
+# list blocks that follow one another are one unit (quinn it5).
+LB=$'Never email these customers:\n\n- Acme\n- Globex'
+t "T5 carry: a list a blank line under a ':' limit"    "widens" "$(w3 "$LB" "- Globe" "- Globex")"
+t "T5 carry: the unit it reads, blank-line list"        "$LB" "$(_loop_improve_sentence "$LB" "- Globex")"
+LL=$'Never email these customers:\n\n- Acme\n\n- Globex\n\nWrite one line.'
+t "T5 carry: a loose list (blank between items)"        "widens" "$(w3 "$LL" "- Globe" "- Globex")"
+t "T5 carry: the loose list ends at the next paragraph" "fine" "$(w3 "$LL" "Write two lines." "Write one line.")"
+t "T5 carry: a ':' block's later sentence, blank lines, spaces" "widens" "$(w3 $'Do not contact:  \n\n\nAcme and Globex. Initech too.' "Initech maybe." "Initech too.")"
+t "T5 carry: a heading over a blank line"               "widens" "$(w3 $'## Never email\n\nAcme\nGlobex' "Globe" "Globex")"
+t "T5 carry: editing the ':' line itself reads the list" "widens" "$(w3 $'The list:\n\n- never Acme' "The full list:" "The list:")"
+t "T5 carry: a carried block comes whole, not to the sentence" "widens" "$(w3 $'The list:\n\nAcme. Initech. Never Globex.' "Initech Ltd." "Initech.")"
+t "T5 carry: a blank line after a normal sentence ends it" "fine" "$(w3 $'Never buy anything.\n\n- Acme\n- Globex' "- Globe" "- Globex")"
+t "T5 carry: a term-free ':' line takes only the next block" "fine" "$(w3 $'Shops:\n\n- Acme\n\nNever buy anything.\n\nWrite one line.' "Write two lines." "Write one line.")"
 
 # T6 — not small, and not in the text: refused.
 ai "{\"criteria\":[{\"name\":\"Coverage\",\"score\":70}],\"overall\":66,\"proposal\":{\"change\":\"Rewrites it\",\"reason\":\"x\",\"target\":\"Coverage\",\"find\":\"\",\"replace\":\"$(printf 'x%.0s' {1..400})\"}}"
@@ -353,6 +367,18 @@ ai '{"criteria":[{"name":"Coverage","score":40}],"overall":40,"proposal":{"chang
 R26=$(mk_run); close_run "$R26"
 t "T22 decimal split refused as read-only" 'refused|1' "$(logj | jq -r '.entries[-1] | "\(.status)|\(.note|test("read-only")|if . then 1 else 0 end)"')"
 t "T22 text unchanged, nothing on trial" "same|0" "$([[ "$(body)" == "$SPEND" ]] && echo same || echo differs)|$(ntrying)"
+db "UPDATE tasks SET body=$(sqlq "$ORIG") WHERE ident='$L';"
+
+# T23 — end to end: a list a blank line under a ':' limit is not editable
+# (Globex off the do-not-email list is a wider recipient set) (quinn it5).
+BLIST=$'Check the inbox.\n\nNever email these customers:\n\n- Acme\n- Globex'
+_loop_pref_del "loop.improve.log.$L"; _loop_pref_del "loop.improve.state.$L"
+cmd_task_loop_improve "$L" on >/dev/null
+db "UPDATE tasks SET body=$(sqlq "$BLIST") WHERE ident='$L';"
+ai '{"criteria":[{"name":"Coverage","score":40}],"overall":40,"proposal":{"change":"Fix a name","reason":"x","target":"Coverage","find":"- Globex","replace":"- Globe"}}'
+R27=$(mk_run); close_run "$R27"
+t "T23 blank-line list refused as read-only" 'refused|1' "$(logj | jq -r '.entries[-1] | "\(.status)|\(.note|test("read-only")|if . then 1 else 0 end)"')"
+t "T23 text unchanged, nothing on trial" "same|0" "$([[ "$(body)" == "$BLIST" ]] && echo same || echo differs)|$(ntrying)"
 db "UPDATE tasks SET body=$(sqlq "$ORIG") WHERE ident='$L';"
 
 # T13 — an outcome loop refuses the switch (its next lane is the owner's call).
