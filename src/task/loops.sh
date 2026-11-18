@@ -1093,10 +1093,14 @@ _loop_improve_terms() {
 }
 
 # _loop_improve_widens <loop's current text> <new text> [<the text it replaces>]
-# -> prints what widens (rc 0), or nothing (rc 1). Two directions:
-#  - ADDS: a floor or reach term the new text carries that the loop's text does
-#    not. A term the loop already carries is already in its scope ("price" in a
-#    price-watch loop), so repeating it widens nothing.
+# -> prints what widens (rc 0), or nothing (rc 1). Both directions are COUNTED
+# against the replaced text, never against the whole loop:
+#  - ADDS: a floor or reach term (or a recipient/link) the new text carries MORE
+#    often than the text it replaces. An append replaces nothing, so any such
+#    term in it is refused. Presence elsewhere in the loop is NOT scope: in
+#    "Draft a reply. Do not send it." the word "send" is there BECAUSE it is
+#    forbidden, and "Send the reply when ready." appended next to it is the
+#    widest change of all (quinn, DIVE-8692 it2).
 #  - REMOVES: a floor, reach or limit term the replaced text carries more often
 #    than its replacement ("Never buy" -> "Keep it brief" takes the limit away).
 _loop_improve_widens() {
@@ -1106,8 +1110,13 @@ _loop_improve_widens() {
     [[ -n "$rx" ]] || continue
     while read -r n term; do
       [[ -n "$term" ]] || continue
-      o=$(grep -oiwE -- "$rx" <<<"$old" 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -cxF -- "$term" 2>/dev/null) || o=0
-      if (( o == 0 )); then printf '"%s" added' "$term"; return 0; fi
+      # "price" names a thing a watch loop READS; it grants no spend. Every spend
+      # ACT (buy, pay, purchase, order, charge, subscribe, a $ amount) is still
+      # counted, so "End with the lowest price in bold." is not refused while
+      # "Then buy the cheapest one." is.
+      [[ "$term" =~ ^(price|prices|pricing)$ ]] && continue
+      o=$(grep -oiwE -- "$rx" <<<"$gone" 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -cxF -- "$term" 2>/dev/null) || o=0
+      if (( n > o )); then printf '"%s" added' "$term"; return 0; fi
     done < <(_loop_improve_terms "$rx" "$new")
   done
   if [[ -n "${gone//[[:space:]]/}" ]]; then
@@ -1120,13 +1129,16 @@ _loop_improve_widens() {
       done < <(_loop_improve_terms "$rx" "$gone")
     done
   fi
-  # A recipient or a link is reach whatever word introduces it.
+  # A recipient or a link is reach whatever word introduces it. Counted against
+  # the replaced text too: "Do not write to boss@x.com" names the address only
+  # to forbid it.
   local r
   for r in '[[:alnum:]._%+-]+@[[:alnum:].-]+' '@[[:alnum:]_]{3,}' 'https?://[^[:space:]]+' '\+?[0-9][0-9 ()-]{7,}[0-9]'; do
-    while read -r term; do
+    while read -r n term; do
       [[ -n "$term" ]] || continue
-      grep -qF -- "$term" <<<"$old" || { printf '"%s" added' "$term"; return 0; }
-    done < <(grep -oE -- "$r" <<<"$new" 2>/dev/null)
+      o=$(grep -oE -- "$r" <<<"$gone" 2>/dev/null | grep -cxF -- "$term" 2>/dev/null) || o=0
+      if (( n > o )); then printf '"%s" added' "$term"; return 0; fi
+    done < <(grep -oE -- "$r" <<<"$new" 2>/dev/null | sort | uniq -c)
   done
   return 1
 }

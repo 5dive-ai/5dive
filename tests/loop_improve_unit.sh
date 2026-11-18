@@ -117,7 +117,7 @@ t "T5 floor: a new recipient"      "widens" "$(w "Write a table." "Write a table
 t "T5 floor: a new link"           "widens" "$(w "Check 5 shops." "Check https://shop.example too.")"
 t "T5 floor: a new tool"           "widens" "$(w "Check 5 shops." "Install a scraper plugin first.")"
 t "T5 floor: publishing"           "widens" "$(w "Write a table." "Publish the table.")"
-t "T5 floor: a term already there" "fine"   "$(w "Email the price table to me." "Email the price table to me, sorted.")"
+t "T5 floor: a term the find already carries" "fine" "$(_loop_improve_widens "Email the price table to me." "Email the price table to me, sorted." "Email the price table to me." >/dev/null && echo widens || echo fine)"
 t "T5 floor: a plain improvement"  "fine"   "$(w "Check 5 shops" "Check 12 shops")"
 t "T5 floor: a NEW floor term"     "widens" "$(w "Check 5 shops" "Check 5 shops and email it")"
 # The floor also reads what a change REMOVES: taking a limit away widens the loop.
@@ -131,6 +131,16 @@ t "T5 floor: curly-quote don’t"           "widens" "$(w3 "Don’t email anyone
 t "T5 floor: prints what was removed"     '"never" removed' "$(_loop_improve_widens "$NB" "Post the table publicly." "Never post the table publicly.")"
 t "T5 floor: a limit kept is fine"        "fine"   "$(w3 "$NB" "Never post the table or its rows publicly." "Never post the table publicly.")"
 t "T5 floor: a plain edit is still fine"  "fine"   "$(w3 "$NB" "Check 12 shops" "Check 5 shops")"
+# The ADD side counts against the replaced text, not the whole loop: a term the
+# loop carries only to FORBID it is not in its scope (quinn, it2).
+t "T5 floor: append a reach the loop forbids"   "widens" "$(w "Draft a reply to the email. Do not send it." "Send the reply when ready.")"
+t "T5 floor: edit in a reach the loop forbids"  "widens" "$(w3 "Draft a reply to the email. Do not send it." "Draft a reply to the email and send it." "Draft a reply to the email.")"
+t "T5 floor: append a spend the loop forbids"   "widens" "$(w "Check 5 shops. Never buy anything." "Then buy the cheapest one.")"
+t "T5 floor: append an address the loop forbids" "widens" "$(w "Never write to boss@example.com." "Send a copy to boss@example.com.")"
+t "T5 floor: a term the find carries, once more" "widens" "$(w3 "Email me the table." "Email me the table, then email it again." "Email me the table.")"
+t "T5 floor: same term count is fine"            "fine"   "$(w3 "Check the price." "Check the price twice." "Check the price.")"
+t "T5 floor: 'price' is read, not spend"         "fine"   "$(w "Check 5 shops." "End with the lowest price in bold.")"
+t "T5 floor: a spend act still counts"           "widens" "$(w "Check 5 shops for the price." "Pay the lowest price.")"
 
 # T6 — not small, and not in the text: refused.
 ai "{\"criteria\":[{\"name\":\"Coverage\",\"score\":70}],\"overall\":66,\"proposal\":{\"change\":\"Rewrites it\",\"reason\":\"x\",\"target\":\"Coverage\",\"find\":\"\",\"replace\":\"$(printf 'x%.0s' {1..400})\"}}"
@@ -281,6 +291,18 @@ ai '{"criteria":[{"name":"Reach","score":40}],"overall":40,"proposal":{"change":
 R22=$(mk_run); close_run "$R22"
 t "T18 reversal refused, names the limit" 'refused|would widen what the loop may do: "never" removed' "$(logj | jq -r '.entries[-1] | "\(.status)|\(.note)"')"
 t "T18 text unchanged" "same" "$([[ "$(body)" == "$LIMITED" ]] && echo same || echo differs)"
+db "UPDATE tasks SET body=$(sqlq "$ORIG") WHERE ident='$L';"
+
+# T20 — end to end: an APPEND that grants a reach the loop forbids by name is
+# refused, never applied (quinn it2: presence of "send" is not scope).
+_loop_pref_del "loop.improve.log.$L"; _loop_pref_del "loop.improve.state.$L"
+cmd_task_loop_improve "$L" on >/dev/null
+FORBIDS="Draft a reply to the email. Do not send it."
+db "UPDATE tasks SET body=$(sqlq "$FORBIDS") WHERE ident='$L';"
+ai '{"criteria":[{"name":"Reach","score":40}],"overall":40,"proposal":{"change":"Sends the reply","reason":"x","target":"Reach","find":"","replace":"Send the reply when ready."}}'
+R24=$(mk_run); close_run "$R24"
+t "T20 append of a forbidden reach refused, names it" 'refused|would widen what the loop may do: "reply" added' "$(logj | jq -r '.entries[-1] | "\(.status)|\(.note)"')"
+t "T20 text unchanged, nothing on trial" "same|0" "$([[ "$(body)" == "$FORBIDS" ]] && echo same || echo differs)|$(ntrying)"
 db "UPDATE tasks SET body=$(sqlq "$ORIG") WHERE ident='$L';"
 
 # T13 — an outcome loop refuses the switch (its next lane is the owner's call).
