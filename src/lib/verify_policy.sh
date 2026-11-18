@@ -186,6 +186,40 @@ review_mode_cost_note() {  # <mode>
   esac
 }
 
+# `review_mode_closed_note <mode> <status> <delivered> <graded>` — DIVE-8700.
+# What the review line says on a CLOSED row that carries no recorded grade.
+#
+# review_mode_cost_note is FILING-TIME text — what the mode will cost — and on a
+# done/cancelled row it read as a fact: "seat:researcher — graded by researcher
+# in its own session" on a row `task done` closed under verify=delivered-only
+# with no delivery bound and no grade ever run (exact-swallow 2026-11-18, sig
+# 4e4e25019237; teal-fox 2026-10-12, sig 668472907a5e, `--review=check`). A seat
+# nearly deployed on it.
+#
+# Prints the replacement and exits 0 ONLY for a closed row with no grade; exits 1
+# (prints nothing) when the cost note still holds: an open row, a graded row, a
+# `none` mode (its cost note already says nobody grades it) or an unknown mode.
+#   delivered = 1 when a delivery was ever bound or handed to a grader
+#               (delivery_ref or handoff_delivered_at set).
+#   graded    = 1 when a grade is recorded (graded_verdict or the legacy graded_at).
+# A delivered-but-ungraded close says "no grade recorded", NOT "not graded": a
+# verifier may close a delivered row with `task done` and a prose PASS, which
+# writes no verdict column, so the store cannot tell that apart from no review.
+review_mode_closed_note() {  # <mode> <status> <delivered> <graded>
+  local mode="${1:-}" st="${2:-}" delivered="${3:-0}" graded="${4:-0}" how
+  case "$st" in done) how="task done" ;; cancelled) how="task cancel" ;; *) return 1 ;; esac
+  [[ "$graded" == "1" ]] && return 1
+  case "$(review_mode_kind "$mode" 2>/dev/null)" in
+    check|rubric|temp|seat) ;;
+    *) return 1 ;;
+  esac
+  if [[ "$delivered" == "1" ]]; then
+    printf 'no grade recorded (closed by %s after a delivery; the close wrote no verdict)' "$how"
+  else
+    printf 'not graded (closed by %s, no delivery bound)' "$how"
+  fi
+}
+
 # ── DIVE-4623: A CHECK THAT CANNOT FAIL IS NOT A GRADE ───────────────────────
 #
 # `check` was never trusted as a DEFAULT, and the reason was not that a command
