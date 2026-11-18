@@ -381,6 +381,31 @@ _loop_improve_tick() {
   return "$rc"
 }
 
+# DIVE-8718: what the RUNTIME knows about a run that its own report cannot be
+# trusted to say. Today one case: an agent's "Check in with you" loop, whose
+# grade must carry how the owner took the last message it sent before this run
+# (acted on it / said not now / no answer), read from `agent proactive`'s log,
+# not from the run's text. Prints '' for every other loop.
+_loop_improve_runtime_note() {
+  local tident="$1" rcreated="$2" name entry
+  name=$(_loop_pref_get "proactive.tpl.${tident}")
+  [[ -n "$name" ]] || return 0
+  entry=$(_loop_pref_get "proactive.log.${name}")
+  jq -e 'type=="array"' <<<"$entry" >/dev/null 2>&1 || entry='[]'
+  entry=$(jq -c --arg c "$rcreated" '[.[] | select(.at < $c)] | last // empty' <<<"$entry")
+  printf '\n\nFROM THE RUNTIME (not the run): '
+  if [[ -z "$entry" ]]; then
+    printf 'no check-in message was sent before this run.'
+    return 0
+  fi
+  local r at; r=$(jq -r '.reaction // ""' <<<"$entry"); at=$(jq -r .at <<<"$entry")
+  case "$r" in
+    acted)   printf 'the owner ACTED ON the last check-in message (sent %s UTC).' "$at" ;;
+    not-now) printf 'the owner said NOT NOW to the last check-in message (sent %s UTC).' "$at" ;;
+    *)       printf 'the owner has NOT ANSWERED the last check-in message (sent %s UTC).' "$at" ;;
+  esac
+}
+
 # Phase 1: read a snapshot and grade the run (the model call), holding only the
 # tick lock. Phase 2 (_loop_improve_commit) writes under the state lock.
 _loop_improve_tick_locked() {
@@ -398,6 +423,7 @@ _loop_improve_tick_locked() {
   fi
   rbody=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${rid};")
   rwork=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${rid};")
+  rwork+=$(_loop_improve_runtime_note "$tident" "$rcreated")
 
   # Which criteria. The loop's own, else the ones derived on the first tick.
   local crit accept derived=""
