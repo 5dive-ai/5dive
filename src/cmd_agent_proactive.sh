@@ -306,8 +306,8 @@ HELP
   fi
   case "$verb" in
     ""|status)          _proactive_status "$name" ;;
-    off|little|more)    _proactive_set "$name" "$verb" ;;
-    a-little)           _proactive_set "$name" little ;;
+    off|more)           _proactive_set "$name" "$verb" ;;
+    little|a-little)    _proactive_set "$name" little ;;
     claim)              _proactive_claim "$name" "${rest[@]}" ;;
     reaction)           _proactive_reaction "$name" "${rest[@]}" ;;
     *) fail "$E_USAGE" "unknown: $verb (try: off|little|more|claim|reaction, or nothing for the status)" ;;
