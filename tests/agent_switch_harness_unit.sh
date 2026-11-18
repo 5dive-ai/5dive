@@ -553,5 +553,168 @@ rc=$(SWITCH_SELF_CGROUP_FILE="$CG_KOS" FIVEDIVE_SWITCH_DETACHED=1 FIVEDIVE_SWITC
   && ok_t "D7 the detached child does the real switch (stop, convert, start), never re-detaches or asks, and reads the self-written note" \
   || bad_t "D7 detached child" "rc=$rc sdrun=$(cat "$TMP/sdrun" 2>/dev/null) sends=$(cat "$TMP/sends" 2>/dev/null) out=$(<"$TMP/out") err=$(tail -3 "$TMP/err")"
 
+# =========================================================== H/O: Hermes and OpenClaw -> Claude Code (DIVE-8672)
+# X is a hermes seat (or an openclaw seat) with a Telegram bot B2, an owner line
+# in its instructions, a memory entry, an owner skill and a scheduled job. After
+# `agent switch X --to=claude`: the SAME bot token is on the claude bridge, the
+# harness's own poller was stopped first, the memory is atoms `5dive memory
+# search` finds, and the result says the scheduled jobs did not move.
+TOKEN_H='7000000002:AAhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh'
+TOKEN_O='7000000003:AAoooooooooooooooooooooooooooooooooo'
+HH="$SWITCH_HOME_ROOT/agent-herm"; OH="$SWITCH_HOME_ROOT/agent-ocl"
+mkdir -p "$HH/.hermes/memories" "$HH/.hermes/skills/research/arxiv" "$HH/.hermes/skills/my-notes" "$HH/.hermes/cron"
+printf 'TELEGRAM_BOT_TOKEN=%s\nTELEGRAM_ALLOWED_USERS=1234567890,555\nDEEPSEEK_API_KEY=sk-ds\n' "$TOKEN_H" >"$HH/.hermes/.env"
+HSOUL_DEFAULT="$TMP/hermes-agent/hermes_cli/default_soul.py"; mkdir -p "$(dirname "$HSOUL_DEFAULT")"
+printf 'DEFAULT_SOUL_MD = (\n    "You are Hermes Agent, a helpful assistant.\\n"\n    "Be concise.\\n"\n)\n' >"$HSOUL_DEFAULT"
+export HERMES_AGENT_DIR="$TMP/hermes-agent"
+printf 'You are Hermes Agent, a helpful assistant.\nBe concise.\n\nHermes owner line: always cite the source.\n' >"$HH/.hermes/SOUL.md"
+printf 'The staging DB is on port 5544.\n§\nDeploys happen on Fridays only.\n' >"$HH/.hermes/memories/MEMORY.md"
+printf 'Owner prefers short answers.\n' >"$HH/.hermes/memories/USER.md"
+printf -- '---\nname: arxiv\n---\nbundled\n' >"$HH/.hermes/skills/research/arxiv/SKILL.md"
+printf -- '---\nname: my-notes\ndescription: owner skill\n---\nNotes.\n' >"$HH/.hermes/skills/my-notes/SKILL.md"
+printf 'arxiv:abc123\n' >"$HH/.hermes/skills/.bundled_manifest"
+printf '{"jobs":[{"id":"daily"},{"id":"weekly"}]}\n' >"$HH/.hermes/cron/jobs.json"
+
+mkdir -p "$OH/.openclaw/workspace/memory" "$OH/.openclaw/workspace/skills/ocskill" "$OH/.openclaw/secrets"
+printf '%s' "$TOKEN_O" >"$OH/.openclaw/secrets/telegram-bot-token"
+cat >"$OH/.openclaw/openclaw.json" <<JSON
+{"gateway":{"mode":"local"},"channels":{"telegram":{"tokenFile":"$OH/.openclaw/secrets/telegram-bot-token","allowFrom":["telegram:1234567890","*"]}}}
+JSON
+printf '# AGENTS\n\nOpenClaw owner line: never touch prod.\n' >"$OH/.openclaw/workspace/AGENTS.md"
+printf 'Soul: dry humour.\n' >"$OH/.openclaw/workspace/SOUL.md"
+printf '# Memory\n\n## Billing\n\nInvoices go out on the 1st.\n\n## Infra\n\nThe VPN is wg0.\n' >"$OH/.openclaw/workspace/MEMORY.md"
+printf '# 2026-11-17\n\nShipped the landing page.\n' >"$OH/.openclaw/workspace/memory/2026-11-17.md"
+printf -- '---\nname: ocskill\n---\nOC.\n' >"$OH/.openclaw/workspace/skills/ocskill/SKILL.md"
+
+jq '.agents.herm = {"type":"hermes","channels":"telegram","authProfile":"byods","isolation":"standard"}
+  | .agents.ocl = {"type":"openclaw","channels":"telegram","isolation":"standard"}
+  | .agents.oclx = {"type":"openclaw","channels":"telegram,discord","isolation":"standard"}' "$TMP/reg" >"$TMP/reg.t" && mv "$TMP/reg.t" "$TMP/reg"
+mkdir -p "$AUTH_PROFILES_DIR/byods"; printf 'DEEPSEEK_API_KEY=sk-ds\n' >"$AUTH_PROFILES_DIR/byods/combined.env"
+# The box default holds a Claude plan sign-in (the profile layer's default path).
+DEFAULT_CLAUDE_CRED="$TMP/default-claude-cred.json"; printf '{"claudeAiOauth":{"accessToken":"x"}}\n' >"$DEFAULT_CLAUDE_CRED"
+TYPE_AUTH[claude]="$DEFAULT_CLAUDE_CRED"
+# The source pollers: a recorded uninstall and a process table the stop must empty.
+TYPE_BIN[hermes]="$TMP/hermes-bin"; printf '#!/bin/sh\necho "hermes $*" >>%s\n' "$TMP/gw" >"$TMP/hermes-bin"; chmod +x "$TMP/hermes-bin"
+pkill() { printf 'pkill %s\n' "$*" >>"$TMP/gw"; [[ -f "$TMP/gw-stuck" ]] || rm -f "$TMP/gw-alive"; return 0; }
+pgrep() { [[ -f "$TMP/gw-alive" ]]; }
+sleep() { :; }
+systemctl() { printf '%s\n' "$*" >>"$TMP/sysctl"
+  case "$1" in is-active) [[ -f "$TMP/active" ]] ;; stop) rm -f "$TMP/active" ;; start) : >"$TMP/active"; [[ ! -f "$TMP/gw-alive" ]] || printf 'START-WHILE-POLLING\n' >>"$TMP/gw" ;; esac; return 0; }
+FIVEDIVE_SELF=/bin/false
+unset SUDO_USER; export SWITCH_SELF_CGROUP_FILE="$TMP/cg-outside"
+hreset() { : >"$TMP/active"; : >"$TMP/gw-alive"; rm -f "$TMP/gw" "$TMP/sysctl" "$TMP/gw-stuck"; : >"$TMP/calls"; }
+
+# ---- refusals first: each changes nothing
+hreset; snap_reg=$(sha256sum <"$TMP/reg")
+rc=$(run cmd_agent_switch herm --to=codex)
+[[ "$rc" != 0 ]] && grep -q 'Claude Code only' "$TMP/err" && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] && [[ -f "$TMP/active" ]] \
+  && ok_t "H1 a Hermes agent moves to Claude Code only (codex is a later row): refused, nothing changed" \
+  || bad_t "H1 hermes -> codex refused" "rc=$rc err=$(<"$TMP/err")"
+TYPE_AUTH[claude]="$TMP/no-such-cred"
+rc=$(run cmd_agent_switch herm --to=claude)
+[[ "$rc" != 0 ]] && grep -q 'needs a Claude plan sign-in' "$TMP/err" && grep -q '5dive agent auth' "$TMP/err" \
+  && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" && -f "$TMP/active" && ! -s "$TMP/gw" ]] \
+  && ok_t "H2 no Claude plan sign-in on the box: refused, naming '5dive agent auth', before anything stops" \
+  || bad_t "H2 no-claude pre-flight" "rc=$rc err=$(<"$TMP/err") gw=$(cat "$TMP/gw" 2>/dev/null)"
+TYPE_AUTH[claude]="$DEFAULT_CLAUDE_CRED"
+rc=$(run cmd_agent_switch oclx --to=claude)
+[[ "$rc" != 0 ]] && grep -q 'discord channel' "$TMP/err" && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" ]] \
+  && ok_t "H3 a channel the move does not carry (discord) is refused up front" \
+  || bad_t "H3 discord refused" "rc=$rc err=$(<"$TMP/err")"
+hreset; touch "$TMP/gw-stuck"
+rc=$(run cmd_agent_switch herm --to=claude)
+[[ "$rc" != 0 ]] && grep -q 'would not stop' "$TMP/err" && grep -q '409' "$TMP/err" \
+  && [[ "$(jq -r .agents.herm.type "$TMP/reg")" == hermes && ! -e "$HH/.claude/channels/telegram/.env" ]] \
+  && ok_t "H4 a Hermes poller that will not die fails the switch before anything is converted (no double poll)" \
+  || bad_t "H4 stuck gateway" "rc=$rc err=$(tail -3 "$TMP/err") type=$(jq -r .agents.herm.type "$TMP/reg")"
+
+# ---- hermes -> claude
+hreset
+rc=$(run cmd_agent_switch herm --to=claude)
+[[ "$rc" == 0 ]] || bad_t "H0 hermes -> claude must succeed" "rc=$rc err=$(tail -5 "$TMP/err") out=$(<"$TMP/out")"
+[[ "$(jq -r .agents.herm.type "$TMP/reg")" == claude && "$(jq -r '.agents.herm.authProfile // "default"' "$TMP/reg")" == default ]] \
+  && grep -q '^AGENT_TYPE=claude$' "$ENV_DIR/herm.env" \
+  && ok_t "H5 the SAME agent is now Claude Code on the box's Claude plan (its DeepSeek key account is not kept)" \
+  || bad_t "H5 registry/env" "$(jq -c .agents.herm "$TMP/reg") env=$(cat "$ENV_DIR/herm.env" 2>/dev/null)"
+grep -q "^channel claude telegram herm $TOKEN_H  1234567890,555$" "$TMP/calls" \
+  && [[ "$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$HH/.claude/channels/telegram/.env")" == "$TOKEN_H" ]] \
+  && ok_t "H6 the claude bridge gets Hermes's OWN bot token and its allowlist (same bot answers)" \
+  || bad_t "H6 token" "$(cat "$TMP/calls")"
+grep -q '^hermes gateway uninstall$' "$TMP/gw" && ! grep -q 'START-WHILE-POLLING' "$TMP/gw" \
+  && ok_t "H7 Hermes's own gateway is uninstalled and gone BEFORE the Claude unit starts (no Telegram 409)" \
+  || bad_t "H7 gateway order" "$(cat "$TMP/gw" 2>/dev/null)"
+HMEM="$HH/.claude/projects/-home-claude-projects/memory"
+grep -lq 'staging DB is on port 5544' "$HMEM"/hermes-mem-*.md 2>/dev/null \
+  && grep -lq 'Fridays only' "$HMEM"/hermes-mem-*.md && grep -lq 'type: user' "$HMEM"/hermes-user-*.md \
+  && [[ $(ls "$HMEM"/hermes-mem-*.md | wc -l) == 2 ]] \
+  && grep -q '5dive:hermes-memory:begin' "$HMEM/MEMORY.md" && grep -q 'hermes-mem-the-staging-db' "$HMEM/MEMORY.md" \
+  && jq -e '.data.memory.added == 3 and .data.memory.direction == "hermes->claude"' "$TMP/out" >/dev/null \
+  && ok_t "H8 each Hermes memory entry is a 5dive atom (USER.md typed user), indexed in MEMORY.md for memory search" \
+  || bad_t "H8 memory" "$(ls "$HMEM" 2>&1) $(cat "$HMEM/MEMORY.md" 2>/dev/null) out=$(<"$TMP/out")"
+grep -q 'Hermes owner line: always cite the source.' "$HH/.claude/CLAUDE.md" \
+  && grep -q '5dive:carried-instructions:begin from=hermes' "$HH/.claude/CLAUDE.md" \
+  && ! grep -q 'You are Hermes Agent' "$HH/.claude/CLAUDE.md" \
+  && ok_t "H9 SOUL.md's owner text is in CLAUDE.md's carried block; Hermes's default SOUL text is not" \
+  || bad_t "H9 instructions" "$(cat "$HH/.claude/CLAUDE.md" 2>/dev/null)"
+[[ -f "$HH/.claude/skills/my-notes/SKILL.md" && ! -e "$HH/.claude/skills/arxiv" ]] \
+  && jq -e '.data.copied == ["my-notes"] and (.data.dropped | index("1 built-in Hermes skills (Claude Code has its own)"))' "$TMP/out" >/dev/null \
+  && ok_t "H10 the owner's Hermes skill is copied to ~/.claude/skills; Hermes's bundled ones are counted, not copied" \
+  || bad_t "H10 skills" "$(ls "$HH/.claude/skills" 2>&1) out=$(<"$TMP/out")"
+jq -e '.data.scheduledJobs == {carried:false, count:2} and .data.running == true' "$TMP/out" >/dev/null \
+  && jq -e '.data.dropped | index("Hermes'"'"'s own scheduled jobs (2)")' "$TMP/out" >/dev/null \
+  && ok_t "H11 the result lists Hermes's own scheduled jobs (2) as not carried (scheduledJobs.carried=false), and the seat is running" \
+  || bad_t "H11 jobs note" "$(<"$TMP/out")"
+[[ -f "$HH/.hermes/SOUL.md" && -f "$HH/.hermes/memories/MEMORY.md" && -f "$HH/.hermes/.env" ]] \
+  && ok_t "H12 the Hermes side's files are kept as they were" || bad_t "H12 hermes side touched" ""
+
+# Re-running the conversion is idempotent, and an edited entry replaces its atom.
+printf 'The staging DB is on port 6000.\n§\nDeploys happen on Fridays only.\n' >"$HH/.hermes/memories/MEMORY.md"
+printf -- '---\nname: owner-own\ndescription: "mine"\nmetadata:\n  type: user\n---\n\nmine\n' >"$HMEM/hermes-mem-owner-own.md"
+counts=$(switch_harness_memory_to_atoms hermes "$HH" "$HMEM" "" 2>/dev/null)
+[[ "$counts" == "1 0 1 2" ]] && ! grep -lq 'port 5544' "$HMEM"/hermes-mem-*.md && [[ -f "$HMEM/hermes-mem-owner-own.md" ]] \
+  && [[ $(grep -c '5dive:hermes-memory:begin' "$HMEM/MEMORY.md") == 1 ]] \
+  && ok_t "H13 a re-run rewrites only what changed, removes the stale atom, keeps an atom it did not write, one index block" \
+  || bad_t "H13 idempotence" "counts=$counts $(ls "$HMEM")"
+
+# ---- openclaw -> claude
+hreset
+rc=$(run cmd_agent_switch ocl --to=claude)
+[[ "$rc" == 0 ]] || bad_t "O0 openclaw -> claude must succeed" "rc=$rc err=$(tail -5 "$TMP/err") out=$(<"$TMP/out")"
+[[ "$(jq -r .agents.ocl.type "$TMP/reg")" == claude ]] \
+  && grep -q "^channel claude telegram ocl $TOKEN_O  1234567890$" "$TMP/calls" \
+  && [[ "$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$OH/.claude/channels/telegram/.env")" == "$TOKEN_O" ]] \
+  && ok_t "O1 an OpenClaw seat is Claude Code with the SAME bot (token read through openclaw.json's tokenFile; 'telegram:' ids kept, '*' not)" \
+  || bad_t "O1 openclaw token" "type=$(jq -r .agents.ocl.type "$TMP/reg") calls=$(cat "$TMP/calls")"
+grep -q 'openclaw-gateway.service' "$TMP/sysctl" && grep -q 'pkill -u agent-ocl -f openclaw.*gateway' "$TMP/gw" \
+  && ! grep -q 'START-WHILE-POLLING' "$TMP/gw" \
+  && ok_t "O2 OpenClaw's own gateway (user unit and stray process) is down before Claude starts" \
+  || bad_t "O2 openclaw gateway" "sysctl=$(cat "$TMP/sysctl") gw=$(cat "$TMP/gw" 2>/dev/null)"
+OMEM="$OH/.claude/projects/-home-claude-projects/memory"
+grep -lq 'Invoices go out on the 1st' "$OMEM"/openclaw-mem-billing-*.md 2>/dev/null \
+  && grep -lq 'wg0' "$OMEM"/openclaw-mem-infra-*.md && grep -lq 'Shipped the landing page' "$OMEM"/openclaw-note-2026-11-17-*.md \
+  && grep -q '5dive:openclaw-memory:begin' "$OMEM/MEMORY.md" \
+  && ok_t "O3 OpenClaw's MEMORY.md sections and daily notes are atoms, indexed for memory search" \
+  || bad_t "O3 openclaw memory" "$(ls "$OMEM" 2>&1)"
+grep -q 'OpenClaw owner line: never touch prod.' "$OH/.claude/CLAUDE.md" && grep -q 'Soul: dry humour.' "$OH/.claude/CLAUDE.md" \
+  && [[ -f "$OH/.claude/skills/ocskill/SKILL.md" ]] \
+  && jq -e '(.data.dropped | index("OpenClaw'"'"'s own scheduled jobs")) and .data.scheduledJobs.carried == false' "$TMP/out" >/dev/null \
+  && ok_t "O4 workspace AGENTS.md + SOUL.md are carried into CLAUDE.md, its skill is copied, and the jobs note is there" \
+  || bad_t "O4 openclaw instructions/skills" "$(cat "$OH/.claude/CLAUDE.md" 2>/dev/null) out=$(<"$TMP/out")"
+
+# Pure readers: the token ladder and a planted symlink.
+P="$TMP/ocpure"; mkdir -p "$P/.openclaw"
+printf '{\n  // edited by hand\n  "channels": {"telegram": {"botToken": "111:inline",}},\n}\n' >"$P/.openclaw/openclaw.json"
+[[ "$(_switch_source_tg_token "$P" openclaw)" == "111:inline" ]] \
+  && ok_t "O5 an inline botToken in a hand-edited (JSON5) openclaw.json is read" \
+  || bad_t "O5 json5 token" "$(_switch_source_tg_token "$P" openclaw)"
+printf '{}' >"$P/.openclaw/openclaw.json"; printf 'TELEGRAM_BOT_TOKEN="222:env"\n' >"$P/.openclaw/.env"
+[[ "$(_switch_source_tg_token "$P" openclaw)" == "222:env" ]] \
+  && ok_t "O6 OpenClaw's env fallback (~/.openclaw/.env TELEGRAM_BOT_TOKEN) is read" \
+  || bad_t "O6 env token" "$(_switch_source_tg_token "$P" openclaw)"
+printf 'TELEGRAM_BOT_TOKEN=333:root\n' >"$TMP/rootfile"; rm -f "$P/.openclaw/.env"; ln -s "$TMP/rootfile" "$P/.openclaw/.env"
+[[ -z "$(_switch_source_tg_token "$P" openclaw)" ]] \
+  && ok_t "O7 a symlinked credential file is refused (root never reads a file the seat points it at)" \
+  || bad_t "O7 symlink followed" "$(_switch_source_tg_token "$P" openclaw)"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

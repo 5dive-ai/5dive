@@ -36,6 +36,15 @@
 # copied, the carried block only points at the handoff (and, to Grok, which
 # loads no MEMORY.md, the memory index). Grok is on by default (DIVE-7802); to
 # Grok is refused only after the owner's `5dive grok disable`, like create.
+#
+# DIVE-8672: Hermes and OpenClaw -> Claude Code, one way (switching back is a
+# later row). Same verb, same seven steps; per source harness a small converter
+# reads the bot token and allowlist, the instructions (SOUL.md / workspace
+# AGENTS.md+SOUL.md+IDENTITY.md, minus the harness's own template text), the
+# memory (into atoms + an index block, like codex) and the skills, and stops the
+# harness's own Telegram poller first (one token polled twice = Telegram 409).
+# The move is onto the owner's Claude plan: pre-flight refuses without a Claude
+# sign-in, and the result says the harness's own scheduled jobs did not move.
 
 SWITCH_CARRY_MARKER="5dive:carried-instructions"
 SWITCH_CODEX_MEM_MARKER="5dive:codex-memory"
@@ -56,10 +65,18 @@ SWITCH_INSTR_BUDGET="${FIVEDIVE_SWITCH_INSTR_BUDGET:-15000}"
 _switch_home() { printf '%s/agent-%s\n' "${SWITCH_HOME_ROOT:-/home}" "$1"; }
 
 _switch_label() {
-  case "$1" in claude) printf 'Claude Code' ;; codex) printf 'Codex' ;; grok) printf 'Grok' ;; *) printf '%s' "$1" ;; esac
+  case "$1" in
+    claude) printf 'Claude Code' ;; codex) printf 'Codex' ;; grok) printf 'Grok' ;;
+    hermes) printf 'Hermes' ;; openclaw) printf 'OpenClaw' ;; *) printf '%s' "$1" ;;
+  esac
 }
 
 _switch_is_type() { [[ " ${SWITCH_TYPES[*]} " == *" ${1:-} "* ]]; }
+
+# DIVE-8672: harnesses an agent can move OFF, one way, onto Claude Code (and so
+# onto the owner's Claude plan). Never a target: switching back is a later row.
+SWITCH_SOURCES=(hermes openclaw)
+_switch_is_source() { [[ " ${SWITCH_SOURCES[*]} " == *" ${1:-} "* ]]; }
 
 # DIVE-8371: is this switch running INSIDE the seat it switches? An agent that
 # runs `sudo 5dive agent switch <itself>` lives in 5dive-agent@<itself>.service,
@@ -83,8 +100,11 @@ _switch_grok_on() { [[ ! -e "${FIVE_GROK_OFF_MARKER:-/etc/5dive/arm/grok-off}" ]
 switch_harness_warning() { # <name> <from> <to>
   local plan
   case "$3" in codex) plan="ChatGPT" ;; grok) plan="Grok" ;; *) plan="Claude" ;; esac
-  printf 'Moving %s to your %s plan switches it from %s to %s. Its memory and instructions are converted; this chat'"'"'s history is not. You can switch back any time.' \
-    "$1" "$plan" "$(_switch_label "$2")" "$(_switch_label "$3")"
+  # DIVE-8672: off Hermes/OpenClaw is one way for now, so it never promises a way back.
+  local back='You can switch back any time.'
+  _switch_is_source "$2" && back="Its own scheduled jobs do not move, and there is no switching back to $(_switch_label "$2") yet."
+  printf 'Moving %s to your %s plan switches it from %s to %s. Its memory and instructions are converted; this chat'"'"'s history is not. %s' \
+    "$1" "$plan" "$(_switch_label "$2")" "$(_switch_label "$3")" "$back"
 }
 
 # The harnesses an account signs in for, among those this verb moves between,
@@ -293,25 +313,36 @@ switch_codex_memory_to_atoms() { # <codex-memories-dir> <memdir> [user] [home]
 # Keep MEMORY.md's codex block in step with the codex-* atoms (budgeted; the
 # seat's own index outside the block is untouched).
 _switch_index_codex_atoms() { # <memdir> [user] [home]
-  local mdir="$1" idx="$1/MEMORY.md" user="${2:-}" home="${3:-}" tmp lines="" f nm d n=0 more=0
+  _switch_index_prefixed_atoms "$1" "$SWITCH_CODEX_MEM_MARKER" Codex codex "${2:-}" "${3:-}" \
+    codex-tg- codex-profile- codex-thread-
+}
+
+# One harness's converted atoms (named <prefix>*) indexed in their own marker
+# block of MEMORY.md; DIVE-8672 shares it between codex, hermes and openclaw.
+_switch_index_prefixed_atoms() { # <memdir> <marker> <label> <short> <user> <home> <prefix...>
+  local mdir="$1" marker="$2" label="$3" short="$4" user="$5" home="$6" idx="$1/MEMORY.md"
+  local tmp lines="" f nm d n=0 more=0 pfx
+  shift 6
   # Checked before the READ too: root must not copy a linked file into the seat.
   _switch_no_symlink "$idx" "$home" || return 0
-  for f in "$mdir"/codex-tg-*.md "$mdir"/codex-profile-*.md "$mdir"/codex-thread-*.md; do
-    [[ -f "$f" && ! -L "$f" ]] || continue
-    n=$((n + 1))
-    nm=$(basename "$f" .md)
-    d=$(sed -n 's/^description: *"\{0,1\}\(.*\)"\{0,1\}$/\1/p' "$f" | head -1 | sed 's/"$//')
-    if (( ${#lines} < 4000 )); then lines+="- [${nm}](${nm}.md) — ${d}"$'\n'; else more=$((more + 1)); fi
+  for pfx in "$@"; do
+    for f in "$mdir/$pfx"*.md; do
+      [[ -f "$f" && ! -L "$f" ]] || continue
+      n=$((n + 1))
+      nm=$(basename "$f" .md)
+      d=$(sed -n 's/^description: *"\{0,1\}\(.*\)"\{0,1\}$/\1/p' "$f" | head -1 | sed 's/"$//')
+      if (( ${#lines} < 4000 )); then lines+="- [${nm}](${nm}.md) — ${d}"$'\n'; else more=$((more + 1)); fi
+    done
   done
   tmp=$(mktemp) || return 1
-  if [[ -f "$idx" ]]; then _switch_strip_block "$SWITCH_CODEX_MEM_MARKER" <"$idx" >"$tmp"
+  if [[ -f "$idx" ]]; then _switch_strip_block "$marker" <"$idx" >"$tmp"
   else printf '# Memory Index\n' >"$tmp"; fi
   if (( n > 0 )); then
     {
-      printf '\n<!-- %s:begin -->\n## Converted from Codex memory (%s atoms)\n\n' "$SWITCH_CODEX_MEM_MARKER" "$n"
+      printf '\n<!-- %s:begin -->\n## Converted from %s memory (%s atoms)\n\n' "$marker" "$label" "$n"
       printf '%s' "$lines"
-      (( more > 0 )) && printf -- '- …and %s more codex-* atoms: `5dive memory search`\n' "$more"
-      printf '<!-- %s:end -->\n' "$SWITCH_CODEX_MEM_MARKER"
+      (( more > 0 )) && printf -- '- …and %s more %s-* atoms: `5dive memory search`\n' "$more" "$short"
+      printf '<!-- %s:end -->\n' "$marker"
     } >>"$tmp"
   fi
   _switch_install_file "$user" "$tmp" "$idx" 644 "$home"; rm -f "$tmp"
@@ -385,27 +416,29 @@ _switch_harness_owned_skill() { # <skill>
 # Carry the seat's skills to the target harness: every skill folder on <from>
 # that <to> lacks is copied into <to>'s skills dir (DIVE-8667; DIVE-5501 only
 # listed them). The <from> copy stays, so a switch back reuses it. Prints one
-# line per skill that was missing on <to>: "copied <skill>" or "dropped <skill>".
+# line per skill that was missing on <to>: "copied <skill>" or "dropped <skill>",
+# and, for a harness that ships its own set (Hermes), one "builtin <count>".
 #   - a harness-owned skill (above) is dropped, not copied;
 #   - the copy runs AS THE SEAT, so it can only read what the seat could already
 #     read and only write where the seat could already write (a link inside the
 #     skill is followed with the seat's rights, never root's);
 #   - something that is not a folder already at the target name is left alone.
 _switch_carry_skills() { # <name> <from> <to>
-  local home user a b s src
+  local home user a b s sd src builtin=0
   home=$(_switch_home "$1"); user="agent-$1"
-  a="$home/$(skills_install_dir "$2")"; b="$home/$(skills_install_dir "$3")"
-  [[ -d "$a" && "$a" != "$b" ]] || return 0
-  for s in "$a"/*/; do
-    [[ -d "$s" ]] || continue
-    s=$(basename "$s")
+  b="$home/$(skills_install_dir "$3")"
+  while IFS= read -r sd; do
+    [[ -n "$sd" && -d "$sd" ]] || continue
+    a=$(dirname "$sd"); s=$(basename "$sd")
+    [[ "$a" != "$b" ]] || continue
     [[ -d "$b/$s" ]] && continue
+    if _switch_source_builtin_skill "$home" "$2" "$s"; then builtin=$((builtin + 1)); continue; fi
     if [[ -e "$b/$s" || -L "$b/$s" ]] || _switch_harness_owned_skill "$s" \
-       || ! valid_skill_id "$s" || [[ ! -f "$a/$s/SKILL.md" ]]; then
+       || ! valid_skill_id "$s" || [[ ! -f "$sd/SKILL.md" ]]; then
       printf 'dropped %s\n' "$s"; continue
     fi
     if agent_owned_dir "$user" "$home" "$b" \
-       && sudo -u "$user" cp -RL -- "$a/$s" "$b/$s" >/dev/null 2>&1; then
+       && sudo -u "$user" cp -RL -- "$sd" "$b/$s" >/dev/null 2>&1; then
       src=$(jq -r --arg k "$s" '.[$k].source // empty' "$a/.skills-manifest.json" 2>/dev/null || true)
       [[ -z "$src" ]] || _skill_manifest_note "$user" "$home" "$(skills_install_dir "$3")" "$s" "$src"
       printf 'copied %s\n' "$s"
@@ -414,7 +447,9 @@ _switch_carry_skills() { # <name> <from> <to>
       sudo -u "$user" rm -rf -- "$b/$s" >/dev/null 2>&1 || true
       printf 'dropped %s\n' "$s"
     fi
-  done
+  done < <(_switch_skill_dirs "$home" "$2")
+  (( builtin == 0 )) || printf 'builtin %s\n' "$builtin"
+  return 0
 }
 
 _switch_tg_token() { # <home> <type>
@@ -451,6 +486,351 @@ _switch_install_file() { # <user> <content-file> <path> [mode] [base]
   install ${own[@]+"${own[@]}"} -m "$mode" "$content" "$path"
 }
 
+# ======================================================================
+# DIVE-8672: Hermes / OpenClaw -> Claude Code, in place.
+#
+# Where each harness keeps what moves, read from its own code (Hermes at the
+# pinned install, hermes_cli/ + tools/memory_tool.py; OpenClaw 2026.11.5's
+# docs/channels/telegram.md, docs/concepts/memory.md, docs/tools/skills.md) and
+# from 5dive's own writers (install_channel_for_{hermes,openclaw}_agent):
+#   bot token     hermes   ~/.hermes/.env TELEGRAM_BOT_TOKEN
+#                 openclaw ~/.openclaw/openclaw.json channels.telegram.botToken
+#                          or .tokenFile (5dive writes ~/.openclaw/secrets/
+#                          telegram-bot-token), the same under accounts.default,
+#                          else TELEGRAM_BOT_TOKEN in ~/.openclaw/.env
+#   allowlist     hermes   TELEGRAM_ALLOWED_USERS in ~/.hermes/.env
+#                 openclaw channels.telegram.allowFrom
+#   instructions  hermes   ~/.hermes/SOUL.md
+#                 openclaw workspace AGENTS.md + SOUL.md + IDENTITY.md
+#   memory        hermes   ~/.hermes/memories/{MEMORY,USER}.md, entries split by
+#                          a line holding only "§"
+#                 openclaw workspace MEMORY.md, USER.md, memory/**/*.md
+#   skills        hermes   ~/.hermes/skills/[<category>/]<skill>/SKILL.md; its
+#                          own bundled ones are listed in skills/.bundled_manifest
+#                 openclaw workspace skills/, ~/.openclaw/skills/
+#   gateway       hermes   its own systemd --user unit (`hermes gateway install`)
+#                 openclaw `openclaw gateway run` inside the 5dive unit, or its
+#                          own user unit when the owner installed one
+# Nothing here is written back to the source side: switching back reuses it.
+# ======================================================================
+
+_switch_hermes_dir() { printf '%s\n' "${HERMES_AGENT_DIR:-/home/claude/.hermes/hermes-agent}"; }
+
+# The OpenClaw package dir (holds docs/reference/templates), from its launcher.
+_switch_openclaw_pkg() {
+  local b
+  b=$(readlink -f "${TYPE_BIN[openclaw]:-/home/claude/.local/bin/openclaw}" 2>/dev/null) || return 1
+  [[ -n "$b" && -f "$b" ]] || return 1
+  printf '%s\n' "$(dirname "$b")"
+}
+
+# Read one regular file under the seat's home as root, or nothing: a symlink at
+# it or above it is refused (the seat plants everything under its home).
+_switch_read_seat_file() { # <home> <path>
+  [[ -f "$2" ]] || return 0
+  _switch_no_symlink "$2" "$1" 2>/dev/null || return 0
+  cat -- "$2" 2>/dev/null || true
+}
+
+_switch_env_value() { # <home> <env-file> <KEY> -> the last value, quotes stripped
+  _switch_read_seat_file "$1" "$2" | sed -n "s/^$3=//p" | tail -1 \
+    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/"
+}
+
+# openclaw.json is JSON5 when a person edited it; what 5dive's `config set` and
+# `channels add` write is plain JSON. Comments and trailing commas are dropped
+# before parsing; anything still unparsable reads as {}.
+_switch_openclaw_conf() { # <home>
+  _switch_read_seat_file "$1" "$1/.openclaw/openclaw.json" | python3 -c '
+import json, re, sys
+t = sys.stdin.read()
+try:
+    print(json.dumps(json.loads(t)))
+except Exception:
+    t = re.sub(r"(?m)^\s*//.*$", "", t)
+    t = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+    t = re.sub(r",(\s*[}\]])", r"\1", t)
+    try:
+        print(json.dumps(json.loads(t)))
+    except Exception:
+        print("{}")'
+}
+
+_switch_source_tg_token() { # <home> <type>
+  local home="$1" tok="" conf f
+  case "$2" in
+    hermes) tok=$(_switch_env_value "$home" "$home/.hermes/.env" TELEGRAM_BOT_TOKEN) ;;
+    openclaw)
+      conf=$(_switch_openclaw_conf "$home")
+      tok=$(jq -r '[.channels.telegram.botToken, .channels.telegram.accounts.default.botToken]
+                   | map(select(type == "string" and length > 0)) | first // empty' <<<"$conf" 2>/dev/null)
+      if [[ -z "$tok" ]]; then
+        while IFS= read -r f; do
+          [[ -n "$f" ]] || continue
+          f="${f/#\~/$home}"
+          [[ "$f" == /* ]] || f="$home/.openclaw/$f"
+          tok=$(_switch_read_seat_file "$home" "$f" | head -1 | tr -d '[:space:]')
+          [[ -n "$tok" ]] && break
+        done < <(jq -r '.channels.telegram.tokenFile, .channels.telegram.accounts.default.tokenFile
+                        | select(type == "string" and length > 0)' <<<"$conf" 2>/dev/null)
+      fi
+      [[ -n "$tok" ]] || tok=$(_switch_env_value "$home" "$home/.openclaw/.env" TELEGRAM_BOT_TOKEN) ;;
+  esac
+  printf '%s\n' "$tok"
+}
+
+# The source side's Telegram allowlist as a CSV of numeric ids (what the claude
+# installer takes). OpenClaw writes some entries as "telegram:<id>".
+_switch_source_tg_allow() { # <home> <type>
+  local home="$1" raw=""
+  case "$2" in
+    hermes) raw=$(_switch_env_value "$home" "$home/.hermes/.env" TELEGRAM_ALLOWED_USERS | tr ',' '\n') ;;
+    openclaw) raw=$(_switch_openclaw_conf "$home" | jq -r '(.channels.telegram.allowFrom // [])[] | tostring' 2>/dev/null) ;;
+  esac
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^\(telegram\|tg\)://' <<<"$raw" \
+    | grep -E '^-?[0-9]+$' | awk '!seen[$0]++' | paste -sd, -
+}
+
+# Scheduled jobs the source harness ran itself. They are NOT carried: the owner
+# is told, with a count where the store is readable ("" = unknown).
+_switch_source_job_count() { # <home> <type>
+  local f
+  case "$2" in
+    hermes) f="$1/.hermes/cron/jobs.json" ;;
+    openclaw) f="$1/.openclaw/cron/jobs.json" ;;
+    *) return 0 ;;
+  esac
+  _switch_read_seat_file "$1" "$f" | jq -r 'if type == "array" then length elif (.jobs|type) == "array" then (.jobs|length) else empty end' 2>/dev/null || true
+}
+
+# Stop the source harness's own Telegram poller BEFORE the Claude bridge starts:
+# the same token polled twice gets Telegram 409 and one side goes deaf. The 5dive
+# unit is already stopped (that ends an OpenClaw gateway run inside it); this
+# takes down the poller that lives in the seat's own user manager, disabled so
+# linger does not bring it back at boot. Returns 1 when one still runs.
+_switch_stop_source_gateway() { # <name> <type>
+  local user="agent-$1" pat i
+  case "$2" in
+    hermes)
+      sudo -u "$user" -H "${TYPE_BIN[hermes]}" gateway uninstall </dev/null >/dev/null 2>&1 || true
+      systemctl --user -M "${user}@" disable --now hermes-gateway.service >/dev/null 2>&1 || true
+      pat='hermes.*gateway' ;;
+    openclaw)
+      systemctl --user -M "${user}@" disable --now openclaw-gateway.service >/dev/null 2>&1 || true
+      pat='openclaw.*gateway' ;;
+    *) return 0 ;;
+  esac
+  pkill -u "$user" -f "$pat" >/dev/null 2>&1 || true
+  for i in 1 2 3 4 5; do
+    pgrep -u "$user" -f "$pat" >/dev/null 2>&1 || return 0
+    sleep 1
+  done
+  pkill -KILL -u "$user" -f "$pat" >/dev/null 2>&1 || true
+  sleep 1
+  ! pgrep -u "$user" -f "$pat" >/dev/null 2>&1
+}
+
+# The harness's own boilerplate, written out as fragments that switch_carry_doc
+# removes verbatim: Hermes's default SOUL.md (read off its source as a literal,
+# never executed) and OpenClaw's workspace templates (front matter dropped, the
+# way OpenClaw seeds them). Prints one file per line, made in <dir>.
+_switch_source_frags() { # <type> <dir>
+  local t="$1" d="$2" pkg f
+  case "$t" in
+    hermes)
+      f="$(_switch_hermes_dir)/hermes_cli/default_soul.py"
+      [[ -f "$f" ]] || return 0
+      python3 - "$f" >"$d/frag-hermes-soul.md" 2>/dev/null <<'PY' || return 0
+import ast, sys
+for n in ast.walk(ast.parse(open(sys.argv[1]).read())):
+    if isinstance(n, ast.Assign) and any(getattr(x, "id", "") == "DEFAULT_SOUL_MD" for x in n.targets):
+        sys.stdout.write(ast.literal_eval(n.value)); break
+PY
+      [[ -s "$d/frag-hermes-soul.md" ]] && printf '%s\n' "$d/frag-hermes-soul.md" ;;
+    openclaw)
+      pkg=$(_switch_openclaw_pkg) || return 0
+      for f in AGENTS SOUL IDENTITY USER; do
+        [[ -f "$pkg/docs/reference/templates/$f.md" ]] || continue
+        awk 'NR == 1 && /^---[[:space:]]*$/ { fm = 1; next } fm && /^---[[:space:]]*$/ { fm = 0; next } !fm' \
+          "$pkg/docs/reference/templates/$f.md" >"$d/frag-openclaw-$f.md"
+        printf '%s\n' "$d/frag-openclaw-$f.md"
+      done ;;
+  esac
+}
+
+# The source side's standing instructions as one document (OpenClaw splits them
+# over three workspace files; Hermes keeps one).
+_switch_source_instructions() { # <home> <type> <out>
+  local home="$1" f first=1
+  : >"$3"
+  case "$2" in
+    hermes) _switch_read_seat_file "$home" "$home/${TYPE_PERSONA_FILE[hermes]}" >"$3" ;;
+    openclaw)
+      for f in AGENTS.md SOUL.md IDENTITY.md; do
+        [[ -f "$home/.openclaw/workspace/$f" ]] || continue
+        (( first )) || printf '\n' >>"$3"
+        _switch_read_seat_file "$home" "$home/.openclaw/workspace/$f" >>"$3"
+        first=0
+      done ;;
+  esac
+}
+
+# Hermes / OpenClaw memory -> atoms in <memdir>, the way codex -> claude does it:
+# only this harness's atoms are rewritten (and only when changed), ones no longer
+# produced are removed, every other atom is kept, and MEMORY.md gets a budgeted
+# index block. Prints "added updated removed unchanged".
+#   hermes   every §-entry is one atom (USER.md entries typed user)
+#   openclaw MEMORY.md is split at its "## " headings, USER.md is one user atom,
+#            each memory/**/*.md note is one atom
+# Atom names carry a content hash, so an edited entry replaces its old atom.
+switch_harness_memory_to_atoms() { # <type> <home> <memdir> [user] [frag...]
+  local t="$1" home="$2" mdir="$3" user="${4:-}" stage insrc f rel base a=0 u=0 r=0 s=0
+  shift 4 2>/dev/null || shift $#
+  _switch_no_symlink "$mdir" "$home" || return 1
+  stage=$(mktemp -d) || return 1
+  insrc="$stage/.src"; mkdir -p "$insrc"
+  # A private copy of the regular files only: root never reads a link into
+  # atoms the seat then owns.
+  case "$t" in
+    hermes)
+      for f in MEMORY.md USER.md; do
+        _switch_read_seat_file "$home" "$home/.hermes/memories/$f" >"$insrc/$f"
+      done ;;
+    openclaw)
+      local ws="$home/.openclaw/workspace"
+      for f in MEMORY.md USER.md; do _switch_read_seat_file "$home" "$ws/$f" >"$insrc/$f"; done
+      if [[ -d "$ws/memory" ]] && _switch_no_symlink "$ws/memory" "$home" 2>/dev/null; then
+        mkdir -p "$insrc/memory"
+        while IFS= read -r -d '' f; do
+          rel="${f#"$ws/memory/"}"
+          mkdir -p "$insrc/memory/$(dirname "$rel")"
+          cat -- "$f" >"$insrc/memory/$rel" 2>/dev/null || true
+        done < <(find -P "$ws/memory" -maxdepth 3 -type f -name '*.md' -print0 2>/dev/null)
+      fi ;;
+    *) rm -rf "$stage"; return 1 ;;
+  esac
+  python3 - "$t" "$insrc" "$stage" "$@" <<'PY' || true
+import hashlib, os, re, sys
+kind, src, out, frags = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
+boiler = []
+for f in frags:
+    try:
+        b = open(f).read().strip()
+    except OSError:
+        continue
+    if b:
+        boiler.append(b)
+
+def clean(text):
+    for b in boiler:
+        text = text.replace(b, "")
+    return text.strip()
+
+def slug(text, n=6):
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return "-".join(s.split("-")[:n])[:48].strip("-")
+
+def desc(text):
+    for line in text.splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line:
+            return (line[:137] + "...") if len(line) > 140 else line
+    return ""
+
+def emit(prefix, label, body, typ, srcname):
+    body = body.strip()
+    if not body:
+        return
+    h = hashlib.sha1(body.encode()).hexdigest()[:8]
+    s = slug(label)
+    name = f"{prefix}-{s}-{h}" if s else f"{prefix}-{h}"
+    d = desc(label) or desc(body)
+    d = d.replace("\\", "\\\\").replace('"', '\\"')
+    with open(os.path.join(out, name + ".md"), "w") as fh:
+        fh.write(f'---\nname: {name}\ndescription: "{d}"\nmetadata:\n  type: {typ}\n  source: {kind}/{srcname}\n---\n\n{body}\n')
+
+def read(rel):
+    try:
+        return open(os.path.join(src, rel)).read()
+    except OSError:
+        return ""
+
+if kind == "hermes":
+    for fname, prefix, typ in (("MEMORY.md", "hermes-mem", "project"), ("USER.md", "hermes-user", "user")):
+        for entry in re.split(r"\n[ \t]*§[ \t]*\n", "\n" + read(fname) + "\n"):
+            emit(prefix, entry, entry, typ, fname)
+else:
+    text = clean(read("MEMORY.md"))
+    parts = re.split(r"(?m)^(?=## )", text)
+    if len(parts) == 1:
+        emit("openclaw-mem", "", text, "project", "MEMORY.md")
+    else:
+        for p in parts:
+            emit("openclaw-mem", p.splitlines()[0] if p.startswith("## ") else "", p, "project", "MEMORY.md")
+    emit("openclaw-user", "", clean(read("USER.md")), "user", "USER.md")
+    mroot = os.path.join(src, "memory")
+    for dp, _, files in os.walk(mroot):
+        for fn in sorted(files):
+            rel = os.path.relpath(os.path.join(dp, fn), mroot)
+            emit("openclaw-note", rel[:-3], read(os.path.join("memory", rel)), "project", "memory/" + rel)
+PY
+  mkdir -p "$mdir"
+  for f in "$stage"/"$t"-*.md; do
+    [[ -f "$f" ]] || continue
+    base=$(basename "$f")
+    if [[ -L "$mdir/$base" ]]; then warn "refusing to write through a symlink: $mdir/$base"
+    elif [[ ! -f "$mdir/$base" ]]; then _switch_install_file "$user" "$f" "$mdir/$base" 644 "$home" && a=$((a + 1))
+    elif ! cmp -s "$f" "$mdir/$base"; then _switch_install_file "$user" "$f" "$mdir/$base" 644 "$home" && u=$((u + 1))
+    else s=$((s + 1)); fi
+  done
+  # Removed only when it is one of OURS: the prefix and the source line both say so.
+  for f in "$mdir/$t"-mem-*.md "$mdir/$t"-user-*.md "$mdir/$t"-note-*.md; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    [[ -f "$stage/$(basename "$f")" ]] && continue
+    grep -q "^  source: $t/" "$f" 2>/dev/null || continue
+    rm -f "$f"; r=$((r + 1))
+  done
+  rm -rf "$stage"
+  _switch_index_prefixed_atoms "$mdir" "5dive:$t-memory" "$(_switch_label "$t")" "$t" "$user" "$home" "$t-mem-" "$t-user-" "$t-note-"
+  printf '%s %s %s %s\n' "$a" "$u" "$r" "$s"
+}
+
+# Every skill folder the <type> side holds, one path per line, first name wins.
+_switch_skill_dirs() { # <home> <type>
+  local home="$1" t="$2" d f seen=" "
+  local -a roots=()
+  case "$t" in
+    hermes)
+      d="$home/.hermes/skills"
+      [[ -d "$d" ]] && _switch_no_symlink "$d" "$home" 2>/dev/null || return 0
+      while IFS= read -r -d '' f; do
+        f=$(dirname "$f")
+        [[ "${f#"$d"/}" == .* || "${f#"$d"/}" == */.* ]] && continue
+        [[ "$seen" == *" $(basename "$f") "* ]] && continue
+        seen+="$(basename "$f") "; printf '%s\n' "$f"
+      done < <(find -P "$d" -mindepth 2 -maxdepth 3 -type f -name SKILL.md -print0 2>/dev/null | sort -z)
+      return 0 ;;
+    openclaw) roots=("$home/.openclaw/workspace/skills" "$home/.openclaw/skills" "$home/$(skills_install_dir openclaw)") ;;
+    *) roots=("$home/$(skills_install_dir "$t")") ;;
+  esac
+  for d in "${roots[@]}"; do
+    [[ -d "$d" ]] || continue
+    for f in "$d"/*/; do
+      [[ -d "$f" ]] || continue
+      f="${f%/}"
+      [[ "$seen" == *" $(basename "$f") "* ]] && continue
+      seen+="$(basename "$f") "; printf '%s\n' "$f"
+    done
+  done
+}
+
+# A skill the source harness ships itself (Hermes's bundled set): the target
+# has its own tools for that, so it is not copied, and it is counted, not named.
+_switch_source_builtin_skill() { # <home> <type> <skill>
+  [[ "$2" == hermes ]] || return 1
+  _switch_read_seat_file "$1" "$1/.hermes/skills/.bundled_manifest" | cut -d: -f1 | grep -qxF -- "$3"
+}
+
 cmd_agent_switch() {
   require_root "agent switch"
   local name="" to="" account="" account_set=0 handoff_wait=90 handoff=1
@@ -466,7 +846,7 @@ cmd_agent_switch() {
     shift
   done
   [[ -n "$name" && -n "$to" ]] \
-    || fail "$E_USAGE" "usage: 5dive agent switch <name> --to=claude|codex|grok [--account=<account|default>] [--no-handoff] [--handoff-wait=<seconds>]"
+    || fail "$E_USAGE" "usage: 5dive agent switch <name> --to=claude|codex|grok [--account=<account|default>] [--no-handoff] [--handoff-wait=<seconds>]  (a hermes or openclaw agent: --to=claude)"
   [[ "$handoff_wait" =~ ^[0-9]+$ ]] || fail "$E_VALIDATION" "--handoff-wait must be a number of seconds"
   _switch_is_type "$to" \
     || fail "$E_VALIDATION" "--to must be claude, codex or grok (got '$to')"
@@ -480,8 +860,16 @@ cmd_agent_switch() {
   workdir=$(jq -r --arg n "$name" '.agents[$n].workdir // empty' <<<"$reg")
   prev_profile=$(jq -r --arg n "$name" '.agents[$n].authProfile // ""' <<<"$reg")
   isolation=$(jq -r --arg n "$name" '.agents[$n].isolation // "standard"' <<<"$reg")
-  _switch_is_type "$from" \
-    || fail "$E_VALIDATION" "agent '$name' is type $from — switch moves between claude, codex and grok only"
+  # DIVE-8672: a Hermes or OpenClaw agent moves one way, onto Claude Code.
+  local src_only=0
+  if _switch_is_source "$from"; then
+    src_only=1
+    [[ "$to" == claude ]] \
+      || fail "$E_VALIDATION" "agent '$name' runs $(_switch_label "$from"), which can move to Claude Code only for now (--to=claude)"
+  else
+    _switch_is_type "$from" \
+      || fail "$E_VALIDATION" "agent '$name' is type $from — switch moves between claude, codex and grok, and from hermes or openclaw to claude"
+  fi
   [[ "$from" != "$to" ]] || fail "$E_VALIDATION" "agent '$name' already runs $(_switch_label "$to")"
   # The owner's own opt-out, the one `agent create --type=grok` respects.
   if [[ "$to" == grok ]] && ! _switch_grok_on; then
@@ -493,11 +881,26 @@ cmd_agent_switch() {
   for ch in ${channels//,/ }; do
     case "$ch" in
       none|telegram|dashboard) ;;
-      *) [[ "$to" != claude ]] && fail "$E_VALIDATION" \
+      # Only the Telegram token is read off a Hermes/OpenClaw seat; another
+      # bot would come up on Claude with no credential.
+      *) (( src_only )) && fail "$E_VALIDATION" \
+           "agent '$name' uses the $ch channel, which this move does not carry from $(_switch_label "$from") yet — remove it first (5dive agent config $name set channels=…), then switch"
+         [[ "$to" != claude ]] && fail "$E_VALIDATION" \
            "agent '$name' uses the $ch channel, which $(_switch_label "$to") does not have — remove it first (5dive agent config $name set channels=…)" ;;
     esac
   done
   (( account_set )) || account="$prev_profile"
+  # A Hermes/OpenClaw seat's own account is usually an API key for that harness
+  # (or a BYO provider). The move is onto the Claude PLAN: keep the seat's
+  # account only when it is a Claude sign-in that is not a BYO endpoint,
+  # otherwise use the box default.
+  if (( src_only && ! account_set )) && [[ -n "$account" ]]; then
+    if [[ ! -f "${AUTH_PROFILES_DIR}/${account}/combined.env" ]] \
+       || grep -q '^ANTHROPIC_BASE_URL=.' "${AUTH_PROFILES_DIR}/${account}/combined.env" 2>/dev/null \
+       || ! switch_account_serves "$account" claude; then
+      account=""
+    fi
+  fi
   [[ "$account" == default ]] && account=""
   if [[ -n "$account" ]]; then
     valid_profile_name "$account" || fail "$E_VALIDATION" "invalid account name '$account'"
@@ -505,6 +908,9 @@ cmd_agent_switch() {
       || fail "$E_NOT_FOUND" "account '$account' is not configured"
   fi
   if ! switch_account_serves "$account" "$to"; then
+    if (( src_only )); then
+      fail "$E_VALIDATION" "moving '$name' to Claude Code needs a Claude plan sign-in on this server, and account '${account:-default}' has none — sign in first (sudo 5dive agent auth start claude), then switch again; nothing was changed"
+    fi
     if (( account_set )); then
       fail "$E_VALIDATION" "account '${account:-default}' has no $(_switch_label "$to") sign-in — sign in first (5dive agent auth start $to --auth-profile=<account>), then pass it with --account="
     fi
@@ -514,7 +920,11 @@ cmd_agent_switch() {
   home=$(_switch_home "$name"); user="agent-${name}"
   id -u "$user" &>/dev/null || fail "$E_GENERIC" "agent user missing: $user"
   if channel_in_list telegram "$channels"; then
-    token=$(_switch_tg_token "$home" "$from")
+    if (( src_only )); then
+      token=$(_switch_source_tg_token "$home" "$from")
+    else
+      token=$(_switch_tg_token "$home" "$from")
+    fi
     [[ -n "$token" ]] || token=$(_switch_tg_token "$home" "$to")
     [[ -n "$token" ]] || fail "$E_VALIDATION" "agent '$name' has channels=telegram but no bot token on disk — reconnect the bot first"
     if [[ "$to" == codex ]]; then
@@ -611,6 +1021,14 @@ _agent_switch_apply() {
   [[ "$_now" == "$from" ]] \
     || fail "$E_CONFLICT" "agent '$name' changed type while the handoff ran (now '$_now') — nothing switched; the unit is stopped, start it with: 5dive agent start $name"
 
+  # DIVE-8672: the source harness's own poller goes down before anything is
+  # converted, so a stuck one leaves the seat exactly as it was (plus stopped).
+  if (( src_only )); then
+    step "Stopping $(_switch_label "$from")'s own gateway for $user"
+    _switch_stop_source_gateway "$name" "$from" \
+      || fail "$E_GENERIC" "$(_switch_label "$from")'s own Telegram gateway for $user would not stop, and two pollers on one bot make Telegram drop one (409) — nothing switched; the unit is stopped, start it with: 5dive agent start $name"
+  fi
+
   # ---- 2-4. side files for the target harness ----
   local carry_from carry_to memidx="" tmpdoc mem_json='{}'
   local pf_from="${TYPE_PERSONA_FILE[$from]:-}" pf_to="${TYPE_PERSONA_FILE[$to]:-}"
@@ -628,8 +1046,16 @@ _agent_switch_apply() {
     carry_src="$kept_block"
   fi
   local -a frags=()
+  local fragdir="" src_doc=""
   if [[ "$from" == claude || "$from" == grok ]]; then
     frags=("$TELEGRAM_AGENT_CLAUDE_MD" "$MODEL_TIERING_CLAUDE_MD" "$OPERATIONAL_COMMS_CLAUDE_MD")
+  elif (( src_only )); then
+    # The harness's own boilerplate is not carried; the owner's text is.
+    fragdir=$(mktemp -d)
+    mapfile -t frags < <(_switch_source_frags "$from" "$fragdir")
+    src_doc=$(mktemp)
+    _switch_source_instructions "$home" "$from" "$src_doc"
+    carry_src="$src_doc"
   fi
 
   if [[ "$to" == claude ]]; then
@@ -648,6 +1074,7 @@ _agent_switch_apply() {
     local sa="$home/.$from/channels/telegram/access.json" da="$home/.$to/channels/telegram/access.json"
     local allow_csv
     allow_csv=$(jq -r '(.allowFrom // []) | join(",")' "$sa" 2>/dev/null || true)
+    (( src_only )) && allow_csv=$(_switch_source_tg_allow "$home" "$from")
     if [[ "$to" == claude && -d "$home/.claude/plugins/cache/5dive-plugins/telegram" ]]; then
       # Kept from the last time this seat ran Claude: refresh the token line
       # only, so the claude side's settings.json and CLAUDE.md stay as they were.
@@ -695,6 +1122,15 @@ _agent_switch_apply() {
     read -r _a _u _r _s <<<"$counts"
     mem_json=$(jq -cn --arg d "$mdir" --arg dir "codex->$to" --argjson a "${_a:-0}" --argjson u "${_u:-0}" --argjson r "${_r:-0}" --argjson s "${_s:-0}" \
       '{direction:$dir, memdir:$d, added:$a, updated:$u, removed:$r, unchanged:$s}')
+  elif (( src_only )); then
+    local mdir counts _a _u _r _s
+    mdir=$(switch_claude_memdir "$name" "$workdir")
+    counts=$(switch_harness_memory_to_atoms "$from" "$home" "$mdir" "$user" ${frags[@]+"${frags[@]}"}) \
+      || warn "the $(_switch_label "$from") memory was NOT converted: $mdir is reached through a symlink"
+    chown -R "$user:$user" "$home/.claude/projects" 2>/dev/null || true
+    read -r _a _u _r _s <<<"$counts"
+    mem_json=$(jq -cn --arg d "$mdir" --arg dir "$from->$to" --argjson a "${_a:-0}" --argjson u "${_u:-0}" --argjson r "${_r:-0}" --argjson s "${_s:-0}" \
+      '{direction:$dir, memdir:$d, added:$a, updated:$u, removed:$r, unchanged:$s, store:"5dive (memory search)"}')
   else
     atoms=$({ find "$home"/.claude/projects/*/memory -maxdepth 1 -name '*.md' ! -name MEMORY.md 2>/dev/null || true; } | wc -l)
     mem_json=$(jq -cn --arg dir "$from->$to" --argjson n "$atoms" --argjson c "$([[ "$to" == claude ]] && echo false || echo true)" \
@@ -714,7 +1150,8 @@ _agent_switch_apply() {
   else
     warn "instructions NOT carried: $carry_from or $carry_to is reached through a symlink"
   fi
-  rm -f "$tmpdoc" ${memidx:+"$memidx"} ${kept_block:+"$kept_block"}
+  rm -f "$tmpdoc" ${memidx:+"$memidx"} ${kept_block:+"$kept_block"} ${src_doc:+"$src_doc"}
+  [[ -z "$fragdir" ]] || rm -rf "$fragdir"
 
   # Skills, before the unit starts so the target harness loads them on boot.
   local skill_lines copied_json
@@ -754,17 +1191,32 @@ _agent_switch_apply() {
     state_note="unit active: $up"
   fi
 
+  # DIVE-8672: what a Hermes/OpenClaw seat had that does not come along: the
+  # harness's own built-in skills, and every job its own scheduler ran. Said in
+  # the result, so the owner is not left waiting on a job that no longer runs.
+  local builtin_n jobs_n="" jobs_note="" jobs_json=null
+  builtin_n=$(sed -n 's/^builtin //p' <<<"$skill_lines" | head -1)
+  if (( src_only )); then
+    jobs_n=$(_switch_source_job_count "$home" "$from")
+    jobs_note="$(_switch_label "$from")'s own scheduled jobs${jobs_n:+ ($jobs_n)}"
+    jobs_json=$(jq -cn --arg n "$jobs_n" '{carried:false, count:(if $n == "" then null else ($n|tonumber) end)}')
+  fi
   local dropped_json
-  dropped_json=$( { sed -n 's/^dropped //p' <<<"$skill_lines"; if [[ -n "$tg_note" ]]; then printf '%s\n' "$tg_note"; fi; } \
+  dropped_json=$( { sed -n 's/^dropped //p' <<<"$skill_lines"
+                    if [[ -n "$builtin_n" ]]; then printf '%s built-in %s skills (Claude Code has its own)\n' "$builtin_n" "$(_switch_label "$from")"; fi
+                    if [[ -n "$tg_note" ]]; then printf '%s\n' "$tg_note"; fi
+                    if [[ -n "$jobs_note" ]]; then printf '%s\n' "$jobs_note"; fi; } \
     | jq -R . | jq -cs 'map(select(length > 0))')
   local skills_note=""
   [[ "$copied_json" == "[]" ]] || skills_note="; skills copied: $(jq -r 'join(", ")' <<<"$copied_json")"
   [[ "$dropped_json" == "[]" ]] || skills_note+="; not carried: $(jq -r 'join(", ")' <<<"$dropped_json")"
+  [[ -z "$jobs_note" ]] || skills_note+=" — those jobs no longer run; set them up again on Claude Code"
   ok "agent '$name' switched from $(_switch_label "$from") to $(_switch_label "$to") (account ${account:-default}); $state_note$skills_note" \
-     '{name:$n, from:$f, to:$t, account:$a, warning:$w, handoff:$h, memory:$m, telegram:{tokenKept:($tk == 1), allowFrom:$al}, copied:$c, dropped:$d, running:$up, parked:$pk}' \
+     '{name:$n, from:$f, to:$t, account:$a, warning:$w, handoff:$h, memory:$m, telegram:{tokenKept:($tk == 1), allowFrom:$al}, copied:$c, dropped:$d, scheduledJobs:$jobs, running:$up, parked:$pk}' \
      --arg n "$name" --arg f "$from" --arg t "$to" --arg a "${account:-default}" --arg w "$warning" \
      --arg h "$handoff_state" --argjson m "$mem_json" --argjson tk "$([[ -n "$token" ]] && echo 1 || echo 0)" \
-     --argjson al "${allow_n:-0}" --argjson c "$copied_json" --argjson d "$dropped_json" --argjson up "$up" --argjson pk "$parked"
+     --argjson al "${allow_n:-0}" --argjson c "$copied_json" --argjson d "$dropped_json" --argjson up "$up" --argjson pk "$parked" \
+     --argjson jobs "$jobs_json"
 }
 
 # `agent config <n> set auth-profile=<p> --switch-harness` and
