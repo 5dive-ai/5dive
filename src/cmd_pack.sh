@@ -682,6 +682,42 @@ _persona_card_ensure() {
   { printf '\n'; _persona_card_section "$persona"; } >>"$stage/CLAUDE.md"
 }
 
+# DIVE-8723: does the pack carry its OWN instructions? A pack with a CLAUDE.md is
+# installed from that text, persona.yaml or not, exactly as a catalogue hire is
+# (pack text, then the card, then the seat's own blocks). persona.yaml renders the
+# doc only for a pack that has none (a bare persona bundle, --from-persona's
+# synth). Before this, any persona.yaml won: a partner or shared pack that carried
+# both landed as a persona render, and every rule its CLAUDE.md kept was gone.
+_pack_has_own_doc() {
+  [[ -f "$1/CLAUDE.md" ]] && grep -q '[^[:space:]]' "$1/CLAUDE.md"
+}
+
+# _pack_cut_seat_tail <file> — an exported instructions file is the WHOLE installed
+# file: the pack's section, then the blocks this CLI starts every seat with (the
+# telegram, model-choice and working-comms blocks, see _PACK_TAIL_MARKERS). The
+# receiving box writes its own, so carried along they would be installed twice
+# (persona_install_doc prepends the doc above the new seat's blocks). Cut the file
+# at the first of them that opens a paragraph, the boundary pack-sync's reclaim
+# already trusts. A file that STARTS with one has no section of its own: removed.
+# No marker (a pack's own doc, an export from before this CLI wrote them): kept.
+# Called on export, and on import for the packs already exported whole.
+_pack_cut_seat_tail() {
+  local f="$1" off tmp
+  [[ -f "$f" ]] || return 0
+  off=$(_pack_tail_offset "$f")
+  [[ "$off" =~ ^[0-9]+$ ]] || return 0
+  tmp=$(mktemp "${f}.XXXXXX") || return 1
+  if ! head -c "$off" "$f" | awk 'BEGIN { RS = "\0" } { sub(/\n+$/, "\n"); printf "%s", $0 }' >"$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  if grep -q '[^[:space:]]' "$tmp"; then
+    mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+  else
+    rm -f "$tmp" "$f"
+  fi
+  return 0
+}
+
 # Render an OpenAgent persona file into a CLAUDE.md identity doc. SINGLE source of
 # truth for persona -> identity rendering (DIVE-656), shared by `agent import
 # --from-persona`, the synth path above, and `agent import <pack>` when the pack
@@ -1349,7 +1385,7 @@ _pack_disclosure_json() {
   # bundle a private signing key the imported agent would adopt (own its identity).
   local renders=false adopts=false
   if [[ -f "$stage/persona.yaml" ]]; then
-    renders=true
+    _pack_has_own_doc "$stage" || renders=true   # DIVE-8723: a pack's own CLAUDE.md wins
     grep -qF "signing_key" "$stage/persona.yaml" && adopts=true
   fi
   jq -n --argjson m "$(cat "$mf")" --argjson r "$renders" --argjson a "$adopts" \
@@ -3062,6 +3098,8 @@ cmd_export() {
   # Per-agent instructions (the identity doc) — copied verbatim if present.
   if [[ -f "$cdir/CLAUDE.md" ]]; then
     cp "$cdir/CLAUDE.md" "$stage/CLAUDE.md"
+    # DIVE-8723: only the agent's own section travels; the seat blocks are re-made.
+    _pack_cut_seat_tail "$stage/CLAUDE.md" || warn "could not trim the seat's own blocks from CLAUDE.md — exporting it whole"
   fi
   # Avatar (set on import/onboarding, DIVE-494) — carry it so the persona's
   # face.ref="avatar.png" round-trips and the gallery has a portrait.
@@ -3667,12 +3705,17 @@ cmd_import() {
     fail "$E_VALIDATION" "refusing to import: a file in the pack looks like it holds a secret (file:line: rule above). A pack never carries one — remove it and re-export."
   fi
 
-  # DIVE-656: if the pack carries an OpenAgent persona.yaml it is the CANONICAL
-  # identity source — (re)render CLAUDE.md from it so the imported agent's identity
-  # is spec-driven, not a stale hand-edited doc. Falls back to the packed CLAUDE.md
-  # if the persona is unreadable. Runs before the rename below so the name swap
-  # still applies to the rendered doc.
-  if [[ -f "$stage/persona.yaml" ]]; then
+  # DIVE-8723: a pack exported (or shared) before export trimmed it carries the
+  # source seat's own blocks under its section; they are re-made on this seat.
+  _pack_cut_seat_tail "$stage/CLAUDE.md" || true
+
+  # DIVE-656 + DIVE-8723: a pack's OpenAgent persona.yaml renders CLAUDE.md only
+  # when the pack carries no CLAUDE.md of its own. A pack that has one (a partner
+  # or marketplace-shaped pack, a share, an export) is installed from that text as
+  # a catalogue hire is; the persona still lands at ~/.claude/persona.yaml below
+  # for the card, the voice and the avatar. Runs before the rename below so the
+  # name swap still applies to the rendered doc.
+  if [[ -f "$stage/persona.yaml" ]] && ! _pack_has_own_doc "$stage"; then
     if _persona_render_claudemd "$stage/persona.yaml" "$stage/CLAUDE.md.oa.$$" 2>/dev/null; then
       mv "$stage/CLAUDE.md.oa.$$" "$stage/CLAUDE.md"
       step "Identity sourced from the pack's OpenAgent persona.yaml"
@@ -4556,7 +4599,9 @@ _pack_sync_render_identity() {
     [[ -e "$stage/.signing_key" ]] && { shred -u "$stage/.signing_key" 2>/dev/null || rm -f "$stage/.signing_key"; }
     (( rc == 0 || rc == 9 )) || return 2
     grep -qF "signing_key" "$stage/persona.yaml" && return 2
-    if _persona_render_claudemd "$stage/persona.yaml" "$stage/CLAUDE.md.oa" 2>/dev/null; then
+    _pack_cut_seat_tail "$stage/CLAUDE.md" || true      # DIVE-8723, as cmd_import does
+    if ! _pack_has_own_doc "$stage" \
+       && _persona_render_claudemd "$stage/persona.yaml" "$stage/CLAUDE.md.oa" 2>/dev/null; then
       mv "$stage/CLAUDE.md.oa" "$stage/CLAUDE.md"
     else
       rm -f "$stage/CLAUDE.md.oa"
