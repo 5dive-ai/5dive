@@ -14,3 +14,6 @@ m2() { sed -i 's/^    gone=\$(_loop_improve_sentence "\$cur" "\$gone");/    gone
 m3() { sed -i 's/approv\[a-z\]\*/approve/; s/review\[a-z\]\*/review/; s/wait\[a-z\]\*/wait/; s/confirm\[a-z\]\*/confirm/' src/task/loops.sh; }
 # m4: the override list is gone -> 'Ignore the rule above.' appended red.
 m4() { sed -i 's/^_LOOP_IMPROVE_OVERRIDE_RX=.*/_LOOP_IMPROVE_OVERRIDE_RX=""/' src/task/loops.sh; }
+# m5: a sentence ends at any bare . ! ? or newline again (it4's splitter) ->
+# the decimal / e.g. / list arms and T22 red.
+m5() { sed -i 's/^  \[\[ -z "\$nx" || "\$nx" == \[\[:space:\]\] \]\] || return 1$/  :/; s/^    \[\[ -z "\${nx\/\/\[\[:blank:\]\]\/}" \]\]; return$/    return 0/; s/^  \[\[ -n "\$w" \&\& "\$w" =~ \$_LOOP_IMPROVE_ABBR_RX \]\] \&\& return 1$/  :/' src/task/loops.sh; }

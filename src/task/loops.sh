@@ -1100,16 +1100,48 @@ _loop_improve_terms() {
 }
 
 # _loop_improve_sentence <body> <find> -> the whole sentence(s) of <body> that
-# <find> touches (find widened out to the nearest . ! ? or newline each side), or
-# <find> itself when it does not occur. "it." in "Do not send it." touches the
-# limit sentence even though "it." carries no limit word.
+# <find> touches, or <find> itself when it does not occur. "it." in "Do not send
+# it." touches the limit sentence even though "it." carries no limit word.
+# Where a sentence ENDS is read on the whole body, never on the find alone
+# (quinn, DIVE-8692 it4): only at . ! ? followed by whitespace or the end of the
+# text, so "$5.00", "v2.1" or a URL never cuts one; never after an abbreviation
+# or a lone letter ("e.g. Bob and Ann" stays with the limit it names); and at a
+# newline only when it opens a blank line, so a limit written as a list ("Never
+# email these customers:" then "- Acme" / "- Globex") or hard-wrapped over lines
+# is one unit. Every rule errs toward a LONGER unit: merging two sentences only
+# makes more text read-only, splitting one makes limit text editable.
+_LOOP_IMPROVE_ABBR_RX='^([a-z]|e\.g|i\.e|etc|vs|approx|incl|excl|esp|cf|ca|no|nr|nos|mr|mrs|ms|dr|st|inc|ltd|co|corp|jr|sr|min|max|fig|ref|dept|est|appt|tel)$'
+_loop_improve_sentence_end() {   # <body> <i> -> rc 0 when a sentence ends at char i
+  local b="$1" i="$2" c nx w j
+  c="${b:i:1}"
+  if [[ "$c" == $'\n' ]]; then
+    # The newline that opens a blank line (only spaces/tabs until the next newline or the end).
+    nx="${b:i+1}"; nx="${nx%%$'\n'*}"
+    [[ -z "${nx//[[:blank:]]/}" ]]; return
+  fi
+  [[ "$c" == [.!?] ]] || return 1
+  nx="${b:i+1:1}"
+  [[ -z "$nx" || "$nx" == [[:space:]] ]] || return 1
+  [[ "$c" == "." ]] || return 0
+  # The word the dot closes, dots inside it kept ("e.g", "i.e").
+  j=$i; w=""
+  while (( j > 0 )) && [[ "${b:j-1:1}" == [[:alpha:].] ]]; do w="${b:j-1:1}$w"; ((j--)); done
+  w="${w,,}"; w="${w%.}"
+  [[ -n "$w" && "$w" =~ $_LOOP_IMPROVE_ABBR_RX ]] && return 1
+  return 0
+}
 _loop_improve_sentence() {
-  local body="$1" find="$2" nl=$'\n' pre post lead trail
+  local body="$1" find="$2" pre s e i n
   [[ -n "$find" && "$body" == *"$find"* ]] || { printf '%s' "$find"; return 0; }
-  pre="${body%%"$find"*}"; post="${body#*"$find"}"
-  lead="${pre##*[.!?${nl}]}"
-  if [[ "$find" == *[.!?${nl}] ]]; then trail=""; else trail="${post%%[.!?${nl}]*}"; fi
-  printf '%s%s%s' "$lead" "$find" "$trail"
+  pre="${body%%"$find"*}"; s=${#pre}; e=$(( s + ${#find} )); n=${#body}
+  # Left: just after the last sentence end before the find.
+  for (( i = s - 1; i >= 0; i-- )); do _loop_improve_sentence_end "$body" "$i" && break; done
+  s=$(( i + 1 ))
+  # Right: through the first sentence end at or after the find's last char.
+  for (( i = e - 1; i < n; i++ )); do _loop_improve_sentence_end "$body" "$i" && break; done
+  (( i >= n )) && i=$(( n - 1 ))
+  local out="${body:s:i-s+1}"
+  printf '%s' "${out#"${out%%[![:space:]]*}"}"
 }
 
 # _loop_improve_widens <loop's current text> <new text> [<the text it replaces>]
