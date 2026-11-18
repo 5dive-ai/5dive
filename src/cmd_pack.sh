@@ -689,7 +689,9 @@ _persona_card_ensure() {
 # synth). Before this, any persona.yaml won: a partner or shared pack that carried
 # both landed as a persona render, and every rule its CLAUDE.md kept was gone.
 _pack_has_own_doc() {
-  [[ -f "$1/CLAUDE.md" ]] && grep -q '[^[:space:]]' "$1/CLAUDE.md"
+  [[ -f "$1/CLAUDE.md" ]] || return 1
+  if grep -q '[^[:space:]]' "$1/CLAUDE.md"; then return 0; fi
+  return 1
 }
 
 # _pack_cut_seat_tail <file> — an exported instructions file is the WHOLE installed
