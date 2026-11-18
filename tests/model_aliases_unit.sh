@@ -35,7 +35,7 @@ source "$ROOT/src/lib/models.sh"
 echo "== 1. alias -> current id =="
 is "opus resolves"        "$(resolve_model_alias opus)"    "claude-opus-5-5"
 is "sonnet resolves"      "$(resolve_model_alias sonnet)"  "claude-sonnet-5-5"
-is "fable resolves"       "$(resolve_model_alias fable)"   "claude-fable-5-1"
+is "fable resolves"       "$(resolve_model_alias fable)"   "claude-fable-5-2"
 is "haiku resolves"       "$(resolve_model_alias haiku)"   "claude-haiku-5-5"
 
 echo "== 2. pass-through for non-aliases =="
@@ -55,7 +55,7 @@ j=$(models_json)
 if command -v jq >/dev/null 2>&1; then
   echo "$j" | jq -e . >/dev/null 2>&1 && ok "models_json parses" || no "models_json is not valid JSON: $j"
   is "json opus"   "$(echo "$j" | jq -r .opus)"   "claude-opus-5-5"
-  is "json fable"  "$(echo "$j" | jq -r .fable)"  "claude-fable-5-1"
+  is "json fable"  "$(echo "$j" | jq -r .fable)"  "claude-fable-5-2"
   is "json keys"   "$(echo "$j" | jq -r 'keys_unsorted|join(",")')" "opus,sonnet,fable,haiku"
 else
   echo "  skip jq assertions (jq not installed)"
@@ -89,6 +89,7 @@ echo "== 6b. old defaults are recognised; nothing else is (DIVE-6788) =="
 is "previous sonnet"      "$(model_default_family claude-sonnet-5)"            "sonnet"
 is "previous haiku"       "$(model_default_family claude-haiku-4-5-20251001)"  "haiku"
 is "previous opus"        "$(model_default_family claude-opus-4-8)"            "opus"
+is "previous fable"       "$(model_default_family claude-fable-5-1)"           "fable"
 is "current fable"        "$(model_default_family "$(model_latest fable)")"    "fable"
 is "a chosen id is not a default" "$(model_default_family claude-sonnet-4-5)"  ""
 is "a bare alias is not a default" "$(model_default_family sonnet)"            ""
@@ -147,8 +148,8 @@ if [[ -x "$ROOT/5dive" ]] && command -v jq >/dev/null 2>&1; then
   env_out=$(bash "$ROOT/5dive" models --json 2>/dev/null)
   is "envelope ok"    "$(echo "$env_out" | jq -r .ok)"           "true"
   is "envelope opus"  "$(echo "$env_out" | jq -r .data.opus)"    "claude-opus-5-5"
-  is "envelope fable" "$(echo "$env_out" | jq -r .data.fable)"   "claude-fable-5-1"
-  is "text form"      "$(bash "$ROOT/5dive" models 2>/dev/null | awk '$1=="fable"{print $2}')" "claude-fable-5-1"
+  is "envelope fable" "$(echo "$env_out" | jq -r .data.fable)"   "claude-fable-5-2"
+  is "text form"      "$(bash "$ROOT/5dive" models 2>/dev/null | awk '$1=="fable"{print $2}')" "claude-fable-5-2"
 else
   echo "  skip envelope assertions (no built ./5dive or no jq)"
 fi
