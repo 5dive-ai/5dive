@@ -11,6 +11,17 @@
 # devin_install_setup_login_unit.sh). curl is stubbed to fail like the 403
 # (curl -f exits 22 and pipes nothing, so `| bash` reports 0), and nvm.sh + npm
 # are stubbed so each arm picks whether npm can install.
+#
+# Every arm runs the recipe the way production does: cmd_install and doctor hand
+# it to `sudo -u claude -i bash -lc <recipe>`, and sudo -i backslash-escapes
+# every character but [A-Za-z0-9_$-] before the login shell runs it, so that
+# OUTER shell expands any bare $var first. Iteration 1 ran the recipe through a
+# plain `bash -c`, read $_cc bare, went green here and linked nothing on box 640
+# (main's live arm). sudo_i() reproduces the escaping; S1/S2 below prove it is
+# the step that tells the two recipes apart, and the real sudo agrees with it
+# (checked on poke-two, sudo 1.9.15p5: `_x=1; echo [$_x] [${_x}]` -> `[] [1]`
+# both ways). The inner shell is `bash -c`, not `-lc`, so no profile resets the
+# stubbed PATH; the login flag does not touch the escaping.
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -29,10 +40,13 @@ fails=0
 ok_()  { echo "ok   $1"; }
 bad_() { echo "FAIL $1" >&2; fails=$((fails+1)); }
 
-# run_recipe <recipe> <native: 403|works> <npm: works|fails> <binary: present|absent>
+# sudo_i <recipe>: the command string sudo -i hands its login shell's -c.
+sudo_i() { printf 'bash -c %s' "$(printf '%s' "$1" | sed -z 's/[^A-Za-z0-9_$-]/\\&/g')"; }
+
+# run_recipe <recipe> <native: 403|works> <npm: works|fails> <binary: present|absent> [via: sudo-i|plain]
 # Prints "rc=<n> curl=<0|1> npm=<0|1> bin=<exec|none>".
 run_recipe() {
-  local recipe="$1" native="$2" npm="$3" binary="$4"
+  local recipe="$1" native="$2" npm="$3" binary="$4" via="${5:-sudo-i}"
   local fake; fake=$(mktemp -d) || return 99
   local home="$fake/home/claude" prefix="$fake/nvm-node"
   mkdir -p "$home/.nvm" "$fake/stubs" "$prefix/bin"
@@ -67,9 +81,10 @@ NPM
     mkdir -p "$home/.local/bin"
     printf '#!/bin/sh\necho 2.1.300\n' > "$home/.local/bin/claude"; chmod +x "$home/.local/bin/claude"
   fi
-  local rc=0
+  local rc=0 cmd="${recipe//\/home\/claude/$home}"
+  [[ "$via" == sudo-i ]] && cmd=$(sudo_i "$cmd")
   ( cd "$fake" && HOME="$home" PATH="$fake/stubs:/usr/bin:/bin" \
-      /usr/bin/env bash -c "${recipe//\/home\/claude/$home}" >/dev/null 2>&1 ) || rc=$?
+      /usr/bin/env bash -c "$cmd" >/dev/null 2>&1 ) || rc=$?
   local called=0 npmc=0 bin=none
   [[ -e "$fake/curl.called" ]] && called=1
   [[ -e "$fake/npm.called" ]] && npmc=1
@@ -107,6 +122,30 @@ got=$(run_recipe "$MUTANT" 403 works absent)
 got=$(run_recipe "$PRE_FIX" 403 works absent)
 [[ "$got" == "rc=0 curl=1 npm=0 bin=none" ]] && ok_ "N1 negative control: the pre-fix recipe says success and leaves no binary ($got)" \
   || bad_ "N1 negative control: want rc=0 curl=1 npm=0 bin=none, got $got"
+
+# S1/S2: the iteration-1 recipe (the fallback read $_cc bare). Through sudo -i
+# it runs npm and links nothing, as it did live on box 640; through a plain
+# bash -c it links, which is why the iteration-1 arms went green.
+BARE="${RECIPE//'${_cc}'/'$_cc'}"
+[[ "$BARE" != "$RECIPE" ]] || bad_ "S0 could not build the bare-\$_cc recipe (no \${_cc} in the shipped recipe)"
+got=$(run_recipe "$BARE" 403 works absent sudo-i)
+[[ "$got" == rc=[1-9]*" curl=1 npm=1 bin=none" ]] && ok_ "S1 bare \$_cc through sudo -i: npm runs, nothing linked, install fails ($got)" \
+  || bad_ "S1 bare \$_cc through sudo -i: want rc!=0 curl=1 npm=1 bin=none, got $got"
+got=$(run_recipe "$BARE" 403 works absent plain)
+[[ "$got" == "rc=0 curl=1 npm=1 bin=exec" ]] && ok_ "S2 the same recipe through a plain bash -c links (the blind spot S1 closes) ($got)" \
+  || bad_ "S2 bare \$_cc through plain bash -c: want rc=0 curl=1 npm=1 bin=exec, got $got"
+
+# S3: no install recipe reads a bare $name. Under sudo -i the outer login
+# shell expands it before the recipe runs, so a variable the recipe assigns is
+# always empty (antigravity's $p had the same defect: its fallback symlink was
+# never written).
+bare_vars=""
+for t in "${!TYPE_INSTALL[@]}"; do
+  v=$(grep -oE '[$][A-Za-z_][A-Za-z0-9_]*' <<<"${TYPE_INSTALL[$t]}" | sort -u | tr '\n' ' ') || true
+  [[ -n "$v" ]] && bare_vars+="$t: $v; "
+done
+[[ -z "$bare_vars" ]] && ok_ "S3 no TYPE_INSTALL recipe reads a bare \$var (sudo -i would expand it early)" \
+  || bad_ "S3 recipes read bare \$vars, which sudo -i's outer shell expands to empty: $bare_vars"
 
 echo "$fails arm(s) failed"
 exit $(( fails > 0 ))

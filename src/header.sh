@@ -460,7 +460,13 @@ HERMES_SDK_STEP="{ (cd /home/claude/.hermes/hermes-agent && ./venv/bin/python -c
 # cannot download on (see TYPE_INSTALL[claude]). nvm's own npm, Node 24 only if
 # nvm has no node at all; the link target is asked of the npm that installed it
 # (`npm prefix -g`, the DIVE-2596 lesson). Never runs when the binary is there.
-CLAUDE_NPM_FALLBACK="{ echo 'claude: the native installer left no /home/claude/.local/bin/claude; installing it from npm instead' >&2; . /home/claude/.nvm/nvm.sh; { command -v npm >/dev/null 2>&1 || nvm install 24 >/dev/null; } && npm install -g @anthropic-ai/claude-code && _cc=\"\$(npm prefix -g)/bin/claude\" && [[ -x \"\$_cc\" ]] && mkdir -p /home/claude/.local/bin && ln -sfn \"\$_cc\" /home/claude/.local/bin/claude; }"
+# Every variable the recipe assigns is read BRACED (${_cc}, never $_cc): the
+# recipe runs through `sudo -u claude -i bash -lc`, and sudo -i backslash-escapes
+# every character except [A-Za-z0-9_$-], so the OUTER login shell expands a bare
+# $_cc (still unset there) before the inner bash assigns it. `{` is escaped, so
+# ${_cc} reaches the inner shell intact. Live on box 640 the bare form ran npm
+# and then linked nothing (main, DIVE-8669 iteration 1).
+CLAUDE_NPM_FALLBACK="{ echo 'claude: the native installer left no /home/claude/.local/bin/claude; installing it from npm instead' >&2; . /home/claude/.nvm/nvm.sh; { command -v npm >/dev/null 2>&1 || nvm install 24 >/dev/null; } && npm install -g @anthropic-ai/claude-code && _cc=\"\$(npm prefix -g)/bin/claude\" && [[ -x \"\${_cc}\" ]] && mkdir -p /home/claude/.local/bin && ln -sfn \"\${_cc}\" /home/claude/.local/bin/claude; }"
 
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
@@ -616,7 +622,7 @@ declare -A TYPE_INSTALL=(
   # DIVE-5424: antigravity.google's frontend cache answers gzip whether or not
   # the client asked (9 of 12 plain fetches on 2026-10-03), so a bare
   # `curl | bash` feeds bash compressed bytes. --compressed makes curl decode it.
-  [antigravity]="[ -x /home/claude/.local/bin/agy ] || curl -fsSL --compressed https://antigravity.google/cli/install.sh | bash; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\$p\" ] && ln -sf \"\$p\" /home/claude/.local/bin/agy; }"
+  [antigravity]="[ -x /home/claude/.local/bin/agy ] || curl -fsSL --compressed https://antigravity.google/cli/install.sh | bash; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\${p}\" ] && ln -sf \"\${p}\" /home/claude/.local/bin/agy; }"
   # grok's installer drops the binary at ~/.grok/bin/grok but only creates the
   # ~/.local/bin/grok symlink *opportunistically* (its line 328 requires
   # ~/.local/bin already on PATH and ~/.grok/bin not on PATH). On a fresh VM
