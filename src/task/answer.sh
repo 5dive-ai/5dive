@@ -849,6 +849,16 @@ cmd_task_answer() {
   nt=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL THEN need_type ELSE '' END FROM tasks WHERE id=${id};")
   [[ -n "$nt" ]] || fail "$E_CONFLICT" "$ident has no pending human gate (nothing to answer)"
 
+  # DIVE-8709 — A NO TO A KEY ASK. The app's Skip answers an ask "won't do it",
+  # and a secret gate had no way to say that: it refused any --value, and once it
+  # named a store it refused to close until the key was in it, so the only exits
+  # were pasting a key or leaving the agent stuck. `--value=declined` (the one
+  # word, any case) on a secret gate closes it with NOTHING saved: it skips the
+  # "has the key landed" checks below, stores the word, and tells the seat the
+  # owner said no. It grants nothing, so every provenance check still applies.
+  local _declined=0
+  [[ "$nt" == "secret" && "${value,,}" == "declined" ]] && _declined=1
+
   # DIVE-5465 — WHAT WAS APPROVED IS WHAT POSTS. A gate filed with
   # `--quote-file=<draft>` pinned the draft's sha256 at filing time, and the ping
   # showed that text. If the draft was edited since, an approval now would
@@ -916,7 +926,7 @@ cmd_task_answer() {
   # normally (that is the legitimate "I ran `5dive secret write` myself" case), and
   # an explicitly out-of-band gate still answers, because its ask NAMED where the
   # value goes. Only "asks for a credential, names nowhere" is refused.
-  if [[ "$nt" == "secret" ]]; then
+  if [[ "$nt" == "secret" ]] && (( ! _declined )); then
     local _paths; _paths=$(db "SELECT COALESCE(secret_key,'')||COALESCE(connector,'')||COALESCE(secret_oob,'') FROM tasks WHERE id=${id};")
     [[ -n "$_paths" ]] || fail "$E_CONFLICT" "$ident is a secret gate that names NO delivery path, so nothing can have landed — re-file it with one: --secret-key=<ENV> --connector=<stem>, or --out-of-band=\"<where>\""
   fi
@@ -1781,7 +1791,7 @@ cmd_task_answer() {
   # A store this process cannot read refuses too: unread is not saved. Placed
   # after every provenance check and before the write: who may answer is decided
   # first, and a refused answer never moves the row.
-  if [[ "$nt" == "secret" ]]; then
+  if [[ "$nt" == "secret" ]] && (( ! _declined )); then
     local _sk _sc _landed=0
     _sk=$(db "SELECT COALESCE(secret_key,'') FROM tasks WHERE id=${id};")
     _sc=$(db "SELECT COALESCE(connector,'') FROM tasks WHERE id=${id};")
@@ -1804,8 +1814,13 @@ cmd_task_answer() {
   # key into this group-claude-readable db is a plaintext-secret-at-rest leak.
   # We only stamp need_answered_at (the "provided" signal); the agent loads the
   # key out-of-band. decision/approval/manual store the value in need_answer.
-  if [[ "$nt" == "secret" ]]; then
-    (( value_set )) && fail "$E_USAGE" "$ident is a secret gate — do not pass --value; run: 5dive task answer $ident"
+  if [[ "$nt" == "secret" ]] && (( _declined )); then
+    # DIVE-8709: the word is not a secret, and it is how the seat (and `task
+    # show`) tells a no from a key that landed. The signed payload stays "" for
+    # every secret gate, as inbox.sh's verifier expects.
+    db "UPDATE tasks SET need_answer='declined', need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
+  elif [[ "$nt" == "secret" ]]; then
+    (( value_set )) && fail "$E_USAGE" "$ident is a secret gate — do not pass --value (except --value=declined, to say no); run: 5dive task answer $ident"
     db "UPDATE tasks SET need_answered_at=$(sqlq "$_ts"), need_answered_by=$(sqlq "$answered_by"), need_answered_uid=${_uidsql}, need_answer_sig=$(sqlq "$_sig") WHERE id=${id};"
   else
     (( value_set )) || fail "$E_USAGE" "--value is required (the human's answer)"
@@ -2246,6 +2261,9 @@ cmd_task_answer() {
     local pingmsg
     if [[ -n "${_esc_pingmsg:-}" ]]; then
       pingmsg="$_esc_pingmsg"
+    elif [[ "$nt" == "secret" ]] && (( _declined )); then
+      local _dk; _dk=$(db "SELECT COALESCE(secret_key,'') FROM tasks WHERE id=${id};")
+      pingmsg="${ident} secret gate DECLINED — your owner said no${_dk:+ to ${_dk//,/, }}, so nothing was saved. Do not ask for it again: carry on without it, or close the task and say what it needed."
     elif [[ "$nt" == "secret" ]]; then
       # DIVE-5319: say WHERE when the gate named it. The owner may have pasted it
       # from the dashboard or the Mini App, so "where you expected it" is now a
@@ -2310,8 +2328,8 @@ cmd_task_answer() {
     _frame_note=" — account frame: filer=${_frame_filer}, answerer=${_frame_answerer}; second-person terms in the selected filer-authored option refer to ${_frame_answerer}"
   fi
   ok "$ident answered ($nt) — now ${newstatus}${note}${_frame_note}${_tap_note}" \
-     '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1"), owner_busy_on:(($bo|select(length>0)) // null), option_account_frame:(if $af=="1" then {filer:$gf, answerer:$ga, second_person_refers_to:$ga} else null end), tap_logged:(if $tl=="" then null else ($tl=="1") end), tap_log_reason:(if $tl=="0" then $tw else null end)}' \
-     --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged" --arg bo "$_busy_on" \
+     '{id:($i|tonumber), status:$st, need_type:$nt, provided:true, declined:($dc=="1"), need_answer:(if $nt=="secret" then null else $v end), owner:(($o|select(length>0)) // null), pinged:($p=="1"), owner_busy_on:(($bo|select(length>0)) // null), option_account_frame:(if $af=="1" then {filer:$gf, answerer:$ga, second_person_refers_to:$ga} else null end), tap_logged:(if $tl=="" then null else ($tl=="1") end), tap_log_reason:(if $tl=="0" then $tw else null end)}' \
+     --arg i "$id" --arg st "$newstatus" --arg nt "$nt" --arg v "$value" --arg o "$owner" --arg p "$pinged" --arg bo "$_busy_on" --arg dc "$_declined" \
      --arg af "$_account_frame" --arg gf "$_frame_filer" --arg ga "$_frame_answerer" \
      --arg tl "$_tap_logged" --arg tw "${TASK_TAP_LOG_WHY:-}"
 }
