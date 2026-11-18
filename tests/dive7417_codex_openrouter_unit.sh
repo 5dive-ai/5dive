@@ -188,8 +188,22 @@ for c in hermes-sandboxed hermes-standard; do
   eq_t "smoke: $c picks OpenRouter" "OpenRouter" "$(jq -r '.[1].pick' <<<"$_s")"
 done
 eq_t "smoke: claude keeps its Anthropic steps" "Anthropic API key" "$(bash "$SM" steps claude | jq -r '.[1].pick')"
-grep -qE "grep -qiE '[^']*insufficient credits" "$SM" \
-  && ok_t "smoke: an empty OpenRouter balance is a skip, like Anthropic's" || bad_t "smoke: OpenRouter's out-of-credit reply is not recognised"
+# DIVE-8705: the credit words live in CREDIT_RE, matched against the ask's output
+# AND the seat's pane. The lines below are verbatim from the 11-17/11-18 nightly
+# panes (codex 403 monthly cap, hermes' box) plus the older 402 wording.
+_cre=$(sed -n "s/^CREDIT_RE='\(.*\)'\$/\1/p" "$SM")
+for _l in "Insufficient credits" \
+  "■ unexpected status 403 Forbidden: Key limit exceeded (monthly limit). Manage it" \
+  " ─ ⚡ Out of credits ─────" \
+  " OpenRouter reported that billing, credits, or account entitlement is exhausted" \
+  "Credit balance is too low"; do
+  [[ -n "$_cre" ]] && grep -qiE "$_cre" <<<"$_l" \
+    && ok_t "smoke: out-of-credit recognised: ${_l:0:40}" || bad_t "smoke: out-of-credit NOT recognised: $_l"
+done
+grep -qiE "$_cre" <<<"OpenClaw could not answer just now. Try again in a minute." \
+  && bad_t "smoke: a product failure reads as out-of-credit" || ok_t "smoke: a product failure stays red"
+grep -qF 'grep -qiE "$CREDIT_RE" <<<"$pane"' "$SM" \
+  && ok_t "smoke: the credit check reads the seat's pane" || bad_t "smoke: the credit check never reads the pane"
 
 # Hermes web chat with no per-user service manager: the seat runs the gateway itself.
 AS=bin/5dive-agent-start

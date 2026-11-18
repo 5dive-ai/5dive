@@ -113,6 +113,11 @@ seat_up() {
   return 1
 }
 
+# What an AI account says when the test key has no money left (DIVE-7355,
+# DIVE-7417, DIVE-8705): Anthropic, OpenRouter's 402, OpenRouter's monthly key
+# cap (403), and Hermes' own wording of either.
+CREDIT_RE='credit balance is too low|insufficient credits|requires more credits|key limit exceeded|out of credits|credits, or account entitlement is exhausted'
+
 show_seat() {
   echo "--- pane (agent-$NAME) ---"
   sudo -u "agent-${NAME}" tmux capture-pane -p -t "agent-${NAME}" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -30 || true
@@ -550,7 +555,13 @@ run_arm() {
   # skip (neutral, like no key) until it is topped up. Anything else stays red.
   # DIVE-7417: OpenRouter says it as a 402, "Insufficient credits" or
   # "requires more credits" (the $5-capped test key).
-  if grep -qiE 'credit balance is too low|insufficient credits|requires more credits' <<<"$out"; then
+  # DIVE-8705: a capped OpenRouter key past its monthly limit answers 403 "Key
+  # limit exceeded"; Codex and Hermes print that (or Hermes' "Out of credits"
+  # box) in the seat's pane only, never in the ask's output. Two nights of 6
+  # red cells were this. Read the pane too.
+  local pane
+  pane=$(sudo -u "agent-${NAME}" tmux capture-pane -p -t "agent-${NAME}" -S -200 2>/dev/null || true)
+  if grep -qiE "$CREDIT_RE" <<<"$out" || grep -qiE "$CREDIT_RE" <<<"$pane"; then
     DETAIL="the $(cell_key "$CELL") test key is out of credit (the seat's AI account refused the turn): install, init and pin ran; the reply was not graded"
     show_seat
     if cell_has_readme "$CELL" "$OS"; then
