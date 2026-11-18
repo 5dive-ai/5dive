@@ -561,7 +561,7 @@ run_arm() {
   # red cells were this. Read the pane too.
   local pane
   pane=$(sudo -u "agent-${NAME}" tmux capture-pane -p -t "agent-${NAME}" -S -200 2>/dev/null || true)
-  if grep -qiE "$CREDIT_RE" <<<"$out" || grep -qiE "$CREDIT_RE" <<<"$pane"; then
+  if grep -qiE "$CREDIT_RE" <<<"$out"$'\n'"$pane"; then
     DETAIL="the $(cell_key "$CELL") test key is out of credit (the seat's AI account refused the turn): install, init and pin ran; the reply was not graded"
     show_seat
     if cell_has_readme "$CELL" "$OS"; then

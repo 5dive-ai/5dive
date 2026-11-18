@@ -202,7 +202,7 @@ for _l in "Insufficient credits" \
 done
 grep -qiE "$_cre" <<<"OpenClaw could not answer just now. Try again in a minute." \
   && bad_t "smoke: a product failure reads as out-of-credit" || ok_t "smoke: a product failure stays red"
-grep -qF 'grep -qiE "$CREDIT_RE" <<<"$pane"' "$SM" \
+grep -qF 'grep -qiE "$CREDIT_RE" <<<"$out"$'"'"'\n'"'"'"$pane"' "$SM" \
   && ok_t "smoke: the credit check reads the seat's pane" || bad_t "smoke: the credit check never reads the pane"
 
 # Hermes web chat with no per-user service manager: the seat runs the gateway itself.

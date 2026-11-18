@@ -34,10 +34,14 @@ recipe="${TYPE_INSTALL[openclaw]}"
 # The bad-version check, run for real against package.json files.
 bad_re=$(sed -n "s/.*grep -qE '\([^']*\)' .*/\1/p" <<<"$recipe")
 [[ -n "$bad_re" ]]
-printf '{\n  "name": "openclaw",\n  "version": "2026.11.5",\n' | grep -qE "$bad_re"
-if printf '{\n  "name": "openclaw",\n  "version": "%s",\n' "$OPENCLAW_PIN_VERSION" | grep -qE "$bad_re"; then echo "FAIL: bad-version check matched: pin" >&2; exit 1; fi
-if printf '{\n  "version": "2026.11.50",\n' | grep -qE "$bad_re"; then echo "FAIL: bad-version check matched: 2026.11.50" >&2; exit 1; fi
-if printf '{\n  "version": "2026x11y5",\n' | grep -qE "$bad_re"; then echo "FAIL: bad-version check matched: 2026x11y5" >&2; exit 1; fi
+printf -v pkg '{\n  "name": "openclaw",\n  "version": "2026.11.5",\n'
+grep -qE "$bad_re" <<<"$pkg"
+printf -v pkg '{\n  "name": "openclaw",\n  "version": "%s",\n' "$OPENCLAW_PIN_VERSION"
+if grep -qE "$bad_re" <<<"$pkg"; then echo "FAIL: bad-version check matched: pin" >&2; exit 1; fi
+printf -v pkg '{\n  "version": "2026.11.50",\n'
+if grep -qE "$bad_re" <<<"$pkg"; then echo "FAIL: bad-version check matched: 2026.11.50" >&2; exit 1; fi
+printf -v pkg '{\n  "version": "2026x11y5",\n'
+if grep -qE "$bad_re" <<<"$pkg"; then echo "FAIL: bad-version check matched: 2026x11y5" >&2; exit 1; fi
 [[ "$recipe" != *'https://openclaw.ai/install.sh'* ]]
 [[ "$recipe" == *'ln -sfn "$(npm prefix -g)/bin/openclaw" /home/claude/.local/bin/openclaw'* ]]
 [[ "$recipe" == *'&& [[ -x /home/claude/.local/bin/openclaw ]]'* ]]
