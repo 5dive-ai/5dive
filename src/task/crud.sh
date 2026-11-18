@@ -1652,6 +1652,18 @@ cmd_task_show() {
       elif [[ "$_sh_pol" == "delivered-only" && "$_sh_src" == "box default" ]]; then
         _sh_eff="no grader yet — one is attached when a delivery is bound (task deliver --pr=…)"
       else _sh_eff="no grader; 'task done' closes it outright"; fi
+      # DIVE-8700: on a CLOSED row the lines below say what HAPPENED, not what
+      # filing promised. "no grader yet — one is attached when…" on a done row
+      # reads as a pending grade that will never come.
+      local _sh_cst _sh_dlv _sh_grd
+      IFS=$'\x1f' read -r _sh_cst _sh_dlv _sh_grd < <(db "SELECT COALESCE(status,'')||x'1f'||
+             CASE WHEN COALESCE(delivery_ref,'')<>'' OR COALESCE(handoff_delivered_at,'')<>'' THEN 1 ELSE 0 END||x'1f'||
+             CASE WHEN COALESCE(TRIM(graded_verdict),'')<>'' OR COALESCE(graded_at,'')<>'' THEN 1 ELSE 0 END
+           FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+      if [[ ( "$_sh_cst" == "done" || "$_sh_cst" == "cancelled" ) && "$_sh_grd" != "1" \
+            && "$_sh_eff" == "no grader yet"* ]]; then
+        _sh_eff="closed without a grader (no delivery was bound, so none was attached)"
+      fi
       echo; echo "verify: ${_sh_pol} (${_sh_src}) — ${_sh_eff}"
       # DIVE-4559: the size rule is part of the answer to "will this be graded",
       # so it is printed with it — but only when the box has turned it on, and
@@ -1668,7 +1680,12 @@ cmd_task_show() {
       # "the filer chose no reviewer" would invent a decision nobody made.
       local _sh_rm; _sh_rm=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
       if [[ -n "$_sh_rm" ]]; then
-        echo "review: ${_sh_rm} — $(review_mode_cost_note "$_sh_rm")"
+        local _sh_rn
+        if _sh_rn=$(review_mode_closed_note "$_sh_rm" "$_sh_cst" "${_sh_dlv:-0}" "${_sh_grd:-0}"); then
+          echo "review: ${_sh_rm} — ${_sh_rn}"
+        else
+          echo "review: ${_sh_rm} — $(review_mode_cost_note "$_sh_rm")"
+        fi
       else
         echo "review: unrecorded (row predates the filing-time review mode, DIVE-4324)"
       fi
