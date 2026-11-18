@@ -1082,31 +1082,68 @@ _loop_improve_on() { [[ "$(_loop_pref_get "loop.improve.${1}")" == "on" ]]; }
 _loop_improve_state() { local s; s=$(_loop_pref_get "loop.improve.state.${1}"); jq -e 'type=="object"' <<<"$s" >/dev/null 2>&1 && printf '%s' "$s" || printf '{}'; }
 _loop_improve_log() { local s; s=$(_loop_pref_get "loop.improve.log.${1}"); jq -e 'type=="array"' <<<"$s" >/dev/null 2>&1 && printf '%s' "$s" || printf '[]'; }
 
-# Words that LIMIT what a loop may do. A change that takes one away widens the
-# loop as surely as one that adds "post": "Never post it." -> "Post it." adds no
-# floor word, and it is the widest change of all.
-_LOOP_IMPROVE_LIMIT_RX="never|not|no|none|nothing|nobody|nowhere|nor|don't|dont|doesn't|do not|does not|cannot|can't|won't|mustn't|must not|shouldn't|should not|only|just|at most|up to|max|maximum|limit|limits|limited|within|without|unless|except|avoid|forbid|forbidden|refuse|stop|ask first|approval|approve|confirm|draft|drafts"
+# Words that LIMIT what a loop may do, matched as STEMS ("approv" catches
+# approve, approved, approval; "until approved" -> "until 9am" moves no exact
+# word). A sentence that carries one is READ-ONLY to the improver: the meaning of
+# a limit lives in the words around it ("Do not send it." -> "Do not hesitate to
+# send it." keeps every word and flips it), so no word count can guard an edit
+# of it (quinn, DIVE-8692 it3).
+_LOOP_IMPROVE_LIMIT_RX="never|not|no|none|nothing|nobody|nowhere|nor|don't|dont|doesn't|do not|does not|cannot|can't|won't|mustn't|must not|shouldn't|should not|only|just|at most|up to|max|maximum|limit[a-z]*|within|without|unless|except[a-z]*|avoid[a-z]*|forbid[a-z]*|refus[a-z]*|stop[a-z]*|ask first|approv[a-z]*|confirm[a-z]*|review[a-z]*|until|till|before|after|wait[a-z]*|once|draft[a-z]*|permission[a-z]*|allow[a-z]*|may|must"
+# Words that set a limit ASIDE. An appended "Ignore the rule above." carries no
+# floor or reach word and undoes every limit in the loop, so these are refused
+# on the add side like reach is.
+_LOOP_IMPROVE_OVERRIDE_RX="ignor[a-z]*|disregard[a-z]*|overrid[a-z]*|bypass[a-z]*|regardless|no longer|anyway|exempt[a-z]*|waive[a-z]*|skip the rule|skip the check"
 
 # _loop_improve_terms <rx> <text> -> "count term" lines, lower-cased.
 _loop_improve_terms() {
   grep -oiwE -- "$1" <<<"$2" 2>/dev/null | tr '[:upper:]' '[:lower:]' | sort | uniq -c
 }
 
+# _loop_improve_sentence <body> <find> -> the whole sentence(s) of <body> that
+# <find> touches (find widened out to the nearest . ! ? or newline each side), or
+# <find> itself when it does not occur. "it." in "Do not send it." touches the
+# limit sentence even though "it." carries no limit word.
+_loop_improve_sentence() {
+  local body="$1" find="$2" nl=$'\n' pre post lead trail
+  [[ -n "$find" && "$body" == *"$find"* ]] || { printf '%s' "$find"; return 0; }
+  pre="${body%%"$find"*}"; post="${body#*"$find"}"
+  lead="${pre##*[.!?${nl}]}"
+  if [[ "$find" == *[.!?${nl}] ]]; then trail=""; else trail="${post%%[.!?${nl}]*}"; fi
+  printf '%s%s%s' "$lead" "$find" "$trail"
+}
+
 # _loop_improve_widens <loop's current text> <new text> [<the text it replaces>]
-# -> prints what widens (rc 0), or nothing (rc 1). Both directions are COUNTED
-# against the replaced text, never against the whole loop:
-#  - ADDS: a floor or reach term (or a recipient/link) the new text carries MORE
-#    often than the text it replaces. An append replaces nothing, so any such
-#    term in it is refused. Presence elsewhere in the loop is NOT scope: in
-#    "Draft a reply. Do not send it." the word "send" is there BECAUSE it is
-#    forbidden, and "Send the reply when ready." appended next to it is the
-#    widest change of all (quinn, DIVE-8692 it2).
-#  - REMOVES: a floor, reach or limit term the replaced text carries more often
-#    than its replacement ("Never buy" -> "Keep it brief" takes the limit away).
+# -> prints what widens (rc 0), or nothing (rc 1).
+#  - READ-ONLY: the sentence the change rewrites (the find text widened to its
+#    sentence) may carry NO floor, reach or limit term. Limit text is never the
+#    improver's to edit, only to leave alone; it may append, and edit OTHER
+#    sentences. The nouns price/prices/pricing are exempt: a watch loop reads them.
+#  - ADDS: a floor, reach or override term (or a recipient/link) the new text
+#    carries. An append replaces nothing and a rewrite replaces only term-free
+#    text, so any such term in the new text is new reach. Presence elsewhere in
+#    the loop is NOT scope: in "Draft a reply. Do not send it." the word "send" is
+#    there BECAUSE it is forbidden (quinn, DIVE-8692 it2).
 _loop_improve_widens() {
-  local old="${1,,}" new="${2,,}" gone="${3:-}" rx term n o
-  old="${old//’/\'}"; new="${new//’/\'}"; gone="${gone,,}"; gone="${gone//’/\'}"
-  for rx in "$_GATE_T2_FLOOR_RX" "$_LOOP_IMPROVE_REACH_RX"; do
+  local cur="$1" new="${2,,}" gone="${3:-}" rx term n o
+  new="${new//’/\'}"
+  if [[ -n "${gone//[[:space:]]/}" ]]; then
+    gone=$(_loop_improve_sentence "$cur" "$gone"); gone="${gone,,}"; gone="${gone//’/\'}"
+    for rx in "$_LOOP_IMPROVE_LIMIT_RX" "$_GATE_T2_FLOOR_RX" "$_LOOP_IMPROVE_REACH_RX" "$_LOOP_IMPROVE_OVERRIDE_RX"; do
+      [[ -n "$rx" ]] || continue
+      while read -r n term; do
+        [[ -n "$term" ]] || continue
+        [[ "$term" =~ ^(price|prices|pricing)$ ]] && continue
+        printf '"%s" is in the sentence it would rewrite (limit text is read-only)' "$term"; return 0
+      done < <(_loop_improve_terms "$rx" "$gone")
+    done
+    # A recipient or a link in the rewritten sentence is reach too.
+    local r0
+    for r0 in '[[:alnum:]._%+-]+@[[:alnum:].-]+' '@[[:alnum:]_]{3,}' 'https?://[^[:space:]]+'; do
+      term=$(grep -oE -- "$r0" <<<"$gone" 2>/dev/null | head -n1)
+      [[ -n "$term" ]] && { printf '"%s" is in the sentence it would rewrite (limit text is read-only)' "$term"; return 0; }
+    done
+  fi
+  for rx in "$_GATE_T2_FLOOR_RX" "$_LOOP_IMPROVE_REACH_RX" "$_LOOP_IMPROVE_OVERRIDE_RX"; do
     [[ -n "$rx" ]] || continue
     while read -r n term; do
       [[ -n "$term" ]] || continue
@@ -1115,30 +1152,14 @@ _loop_improve_widens() {
       # counted, so "End with the lowest price in bold." is not refused while
       # "Then buy the cheapest one." is.
       [[ "$term" =~ ^(price|prices|pricing)$ ]] && continue
-      o=$(grep -oiwE -- "$rx" <<<"$gone" 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -cxF -- "$term" 2>/dev/null) || o=0
-      if (( n > o )); then printf '"%s" added' "$term"; return 0; fi
+      printf '"%s" added' "$term"; return 0
     done < <(_loop_improve_terms "$rx" "$new")
   done
-  if [[ -n "${gone//[[:space:]]/}" ]]; then
-    for rx in "$_LOOP_IMPROVE_LIMIT_RX" "$_GATE_T2_FLOOR_RX" "$_LOOP_IMPROVE_REACH_RX"; do
-      [[ -n "$rx" ]] || continue
-      while read -r n term; do
-        [[ -n "$term" ]] || continue
-        o=$(grep -oiwE -- "$rx" <<<"$new" 2>/dev/null | tr '[:upper:]' '[:lower:]' | grep -cxF -- "$term" 2>/dev/null) || o=0
-        if (( o < n )); then printf '"%s" removed' "$term"; return 0; fi
-      done < <(_loop_improve_terms "$rx" "$gone")
-    done
-  fi
-  # A recipient or a link is reach whatever word introduces it. Counted against
-  # the replaced text too: "Do not write to boss@x.com" names the address only
-  # to forbid it.
+  # A recipient or a link is reach whatever word introduces it.
   local r
   for r in '[[:alnum:]._%+-]+@[[:alnum:].-]+' '@[[:alnum:]_]{3,}' 'https?://[^[:space:]]+' '\+?[0-9][0-9 ()-]{7,}[0-9]'; do
-    while read -r n term; do
-      [[ -n "$term" ]] || continue
-      o=$(grep -oE -- "$r" <<<"$gone" 2>/dev/null | grep -cxF -- "$term" 2>/dev/null) || o=0
-      if (( n > o )); then printf '"%s" added' "$term"; return 0; fi
-    done < <(grep -oE -- "$r" <<<"$new" 2>/dev/null | sort | uniq -c)
+    term=$(grep -oE -- "$r" <<<"$new" 2>/dev/null | head -n1)
+    [[ -n "$term" ]] && { printf '"%s" added' "$term"; return 0; }
   done
   return 1
 }
