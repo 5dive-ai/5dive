@@ -19,6 +19,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT license"></a>
   <a href="https://play.google.com/store/apps/details?id=ai.fivedive.app&amp;referrer=utm_source%3Dgithub%26utm_medium%3Downed%26utm_campaign%3D5dive-readme"><img src="https://img.shields.io/badge/Android-3DDC84?logo=android&amp;logoColor=white" alt="Android app on Google Play"></a>
   <a href="https://github.com/5dive-ai/5dive/releases/latest/download/5dive.dmg"><img src="https://img.shields.io/badge/Mac-000000?logo=apple&amp;logoColor=white" alt="5dive for Mac: download the .dmg"></a>
+  <a href="https://github.com/5dive-ai/5dive/releases/latest/download/5dive-setup.exe"><img src="https://img.shields.io/badge/Windows-0078D4?logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0id2hpdGUiPjxwYXRoIGQ9Ik0wIDBoMTEuNHYxMS40SDB6TTEyLjYgMEgyNHYxMS40SDEyLjZ6TTAgMTIuNmgxMS40VjI0SDB6TTEyLjYgMTIuNkgyNFYyNEgxMi42eiIvPjwvc3ZnPg==" alt="5dive for Windows: download the .exe"></a>
 </p>
 
 ```sh
