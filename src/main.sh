@@ -313,6 +313,8 @@ Agents:
   5dive agent recover <agent> [--to=<account|default>]  # restart a stuck seat, or move it to another login; the admin (lead) seat may run it without sudo.
                                                      # An account for ANOTHER harness (Claude, ChatGPT, Grok) is refused
                                                      # unless --switch-harness, which runs 'agent switch' below
+  5dive agent proactive <name> [off|little|more] [--json]  # may it message its owner first? off (default) / a little
+                                                     # (1 a day) / more (3 a day); claim|reaction are its run's verbs (DIVE-8718)
   5dive agent switch <name> --to=claude|codex|grok [--account=<account|default>] [--no-handoff] [--handoff-wait=<s>]
                                                      # move an agent between Claude Code, Codex and Grok IN PLACE: same name,
                                                      # unix user, bot, tasks and grants; memory + instructions converted,
@@ -992,6 +994,11 @@ _agent_verb_dispatch() {
         install)
           AUDIT_CMD="agent install"; AUDIT_ARGS=("$@")
           cmd_install "$@" ;;   # no registry mutation; auditable install recipe
+        # DIVE-8718: Off / A little / More — a capped check-in loop that may
+        # message the owner first. Status is read-only (the app's sheet polls it).
+        proactive)
+          case "${2:-}" in ""|status|--json|-h|--help|help) ;; *) AUDIT_CMD="agent proactive"; AUDIT_ARGS=("${1:-}" "${2:-}") ;; esac
+          cmd_agent_proactive "$@" ;;
         switch)
           AUDIT_CMD="agent switch"; AUDIT_ARGS=("$@")
           cmd_agent_switch "$@" ;;   # takes the registry lock itself, after the handoff wait

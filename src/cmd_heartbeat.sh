@@ -6180,6 +6180,23 @@ _hb_mz_matches_within_day() {
   return 1
 }
 
+# DIVE-8718: the template ids of "Check in with you" loops whose agent has sent
+# its cap of proactive messages today (box-local day; little = 1, more = 3).
+# State is src/cmd_agent_proactive.sh's: proactive.agent.<name> and
+# proactive.log.<name> in task_prefs. Prints nothing on any error: a broken read
+# never stops a loop the cap did not stop.
+_hb_proactive_capped() {
+  local today; today=$(TZ="$(_task_box_tz 2>/dev/null || echo UTC)" date +%F 2>/dev/null) || return 0
+  db "SELECT json_extract(a.value,'\$.tid') FROM task_prefs a
+      WHERE a.key GLOB 'proactive.agent.*' AND json_valid(a.value)
+        AND json_extract(a.value,'\$.level') IN ('little','more')
+        AND json_extract(a.value,'\$.tid') IS NOT NULL
+        AND (SELECT COUNT(*) FROM task_prefs l, json_each(l.value) e
+             WHERE l.key = 'proactive.log.' || substr(a.key, 17) AND json_valid(l.value)
+               AND json_extract(e.value,'\$.day') = $(sqlq "$today"))
+            >= CASE json_extract(a.value,'\$.level') WHEN 'more' THEN 3 ELSE 1 END;" 2>/dev/null || true
+}
+
 _hb_materialize_recurring() {
   local now="$1" minute_start slot_ep slot_tag _wi tid sched last_fired policy bound assignee open open_read open_rc stamp_err n_made=0
   local -a win_ep=() win_f=()
@@ -6204,7 +6221,7 @@ _hb_materialize_recurring() {
   # fork) and cached here. UTC and NULL keep the win_f fast path above.
   local -A tzwin=()
   local sched_tz _t_ep _t_rep _t_f _t_ex
-  local last_skipped skip_reason late_slot
+  local last_skipped skip_reason late_slot _pa_read=0 _pa_capped=""
   while IFS=$'\x1f' read -r tid sched last_fired policy bound assignee sched_tz last_skipped skip_reason; do
     [[ -n "$tid" ]] || continue
     # DIVE-5218: the latest minute in the window this template is due in.
@@ -6250,6 +6267,18 @@ _hb_materialize_recurring() {
     # pacing floor since DIVE-5364: a hold now stamps last_skipped, and a slot
     # that already fired must never be stamped as skipped.
     if [[ -n "$last_fired" ]] && ! [[ "$last_fired" < "$minute_start" ]]; then
+      continue
+    fi
+    # DIVE-8718: an agent's "Check in with you" loop does not start once that
+    # agent has sent today's cap of first messages. The cap is enforced here and
+    # in `agent proactive claim`, never by the loop's text, which the improver
+    # may rewrite. Read once per pass, only when some slot is due.
+    if (( ! _pa_read )); then _pa_capped=$(_hb_proactive_capped); _pa_capped=" ${_pa_capped//$'\n'/ } "; _pa_read=1; fi
+    if [[ "$_pa_capped" == *" ${tid} "* ]]; then
+      stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now'), last_skip_reason='proactive: daily cap reached' WHERE id=${tid};" 2>&1) \
+        || _hb_log "[materializer] $(_hb_ident "$tid") last_skipped_at stamp FAILED: ${stamp_err//$'\n'/ }" \
+        || true
+      _hb_log "[materializer] $(_hb_ident "$tid") slot at ${minute_start} NOT fired — its agent already sent today's proactive cap (DIVE-8718)"
       continue
     fi
     # DIVE-6804: an unassigned template gets its owner HERE, before the pace
