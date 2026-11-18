@@ -27,7 +27,21 @@ recipe="${TYPE_INSTALL[openclaw]}"
 [[ "$recipe" == *'nvm use 24 --silent'* ]]
 [[ "$recipe" == *'ln -sfn "$(nvm which 24)" /home/claude/.local/bin/node'* ]]
 [[ "$recipe" == *'[[ "${FORCE_INSTALL:-0}" != 1 && -x "$(npm prefix -g)/bin/openclaw" ]]'* ]]
-[[ "$recipe" == *'npm --loglevel=error --no-fund --no-audit install -g openclaw@latest'* ]]
+# DIVE-8705: a pinned release, never @latest; a known-bad installed copy is replaced.
+[[ "$recipe" == *"npm --loglevel=error --no-fund --no-audit install -g openclaw@${OPENCLAW_PIN_VERSION}"* ]]
+[[ "$OPENCLAW_PIN_VERSION" =~ ^[0-9]{4}\.[0-9]+\.[0-9]+$ ]]
+[[ "$recipe" != *'openclaw@latest'* ]]
+# The bad-version check, run for real against package.json files.
+bad_re=$(sed -n "s/.*grep -qE '\([^']*\)' .*/\1/p" <<<"$recipe")
+[[ -n "$bad_re" ]]
+printf -v pkg '{\n  "name": "openclaw",\n  "version": "2026.11.5",\n'
+grep -qE "$bad_re" <<<"$pkg"
+printf -v pkg '{\n  "name": "openclaw",\n  "version": "%s",\n' "$OPENCLAW_PIN_VERSION"
+if grep -qE "$bad_re" <<<"$pkg"; then echo "FAIL: bad-version check matched: pin" >&2; exit 1; fi
+printf -v pkg '{\n  "version": "2026.11.50",\n'
+if grep -qE "$bad_re" <<<"$pkg"; then echo "FAIL: bad-version check matched: 2026.11.50" >&2; exit 1; fi
+printf -v pkg '{\n  "version": "2026x11y5",\n'
+if grep -qE "$bad_re" <<<"$pkg"; then echo "FAIL: bad-version check matched: 2026x11y5" >&2; exit 1; fi
 [[ "$recipe" != *'https://openclaw.ai/install.sh'* ]]
 [[ "$recipe" == *'ln -sfn "$(npm prefix -g)/bin/openclaw" /home/claude/.local/bin/openclaw'* ]]
 [[ "$recipe" == *'&& [[ -x /home/claude/.local/bin/openclaw ]]'* ]]

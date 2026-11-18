@@ -447,6 +447,16 @@ try:
 except sqlite3.Error:
     sys.exit(2)
 '
+# DIVE-8705: the OpenClaw release every new install gets, instead of @latest.
+# 2026.11.5 (npm latest from 2026-11-17 10:00Z) added a client-credential
+# migration that a fresh 5dive seat never runs: its gateway refuses to start
+# ("Client credential migration is incomplete or stale; run openclaw doctor
+# --fix"), so the web chat answers "OpenClaw could not answer just now" on every
+# new box. init-smoke was green on 2026.11.4 the night before. An installed copy
+# whose version is in OPENCLAW_BAD_VERSIONS is replaced by the pin the next time
+# the recipe runs. Raise the pin only with an init-smoke openclaw run green on it.
+OPENCLAW_PIN_VERSION=2026.11.4
+OPENCLAW_BAD_VERSIONS='2026.11.5'
 # The Hermes release every new install gets (DIVE-7330, see [hermes] below).
 HERMES_PIN_TAG=v2026.9.24
 HERMES_PIN_COMMIT=f97608f178d1ffeca59860195ab7da295f7c8e5f
@@ -606,7 +616,7 @@ declare -A TYPE_INSTALL=(
   # upstream wrapper re-selects nvm's default Node and may attempt a privileged
   # NodeSource upgrade, which fails in our non-interactive `sudo -u claude`
   # installer. FORCE_INSTALL makes --upgrade refresh this exact Node-24 global.
-  [openclaw]="{ . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && nvm use 24 --silent; } && { [[ \"\${FORCE_INSTALL:-0}\" != 1 && -x \"\$(npm prefix -g)/bin/openclaw\" ]] || npm --loglevel=error --no-fund --no-audit install -g openclaw@latest; } && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(nvm which 24)\" /home/claude/.local/bin/node && ln -sfn \"\$(npm prefix -g)/bin/openclaw\" /home/claude/.local/bin/openclaw && [[ -x /home/claude/.local/bin/openclaw ]]"
+  [openclaw]="{ . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && nvm use 24 --silent; } && { [[ \"\${FORCE_INSTALL:-0}\" != 1 && -x \"\$(npm prefix -g)/bin/openclaw\" ]] && ! grep -qE '\"version\": *\"(${OPENCLAW_BAD_VERSIONS//./\\.})\"' \"\$(npm prefix -g)/lib/node_modules/openclaw/package.json\" 2>/dev/null || npm --loglevel=error --no-fund --no-audit install -g openclaw@${OPENCLAW_PIN_VERSION}; } && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(nvm which 24)\" /home/claude/.local/bin/node && ln -sfn \"\$(npm prefix -g)/bin/openclaw\" /home/claude/.local/bin/openclaw && [[ -x /home/claude/.local/bin/openclaw ]]"
   # antigravity's installer drops the native-Go binary at ~/.local/bin/agy
   # and self-updates in the background on each run, so no daily-cron
   # equivalent of @google/gemini-cli's npm update is needed.
