@@ -87,7 +87,10 @@ printf '%s\n' "$PERSONA" > "$REG/packs/maya/persona.yaml"
 fetch_list >/dev/null
 eq_t 'inspect/import disclosure: rendersSystemPrompt=false' 'false' "$(_pack_disclosure_json "$TMP/x" 2>/dev/null | jq -r '.rendersSystemPrompt')"
 cp "$TMP/x/registry-persona.yaml" "$TMP/x/persona.yaml"
-eq_t '…control: the same file as persona.yaml WOULD re-render' 'true' "$(_pack_disclosure_json "$TMP/x" 2>/dev/null | jq -r '.rendersSystemPrompt')"
+# DIVE-8723: and even as persona.yaml it renders only when the pack has no CLAUDE.md.
+eq_t '…as persona.yaml beside the pack'"'"'s own CLAUDE.md: still no re-render' 'false' "$(_pack_disclosure_json "$TMP/x" 2>/dev/null | jq -r '.rendersSystemPrompt')"
+rm -f "$TMP/x/CLAUDE.md"
+eq_t '…control: persona.yaml and no CLAUDE.md WOULD re-render' 'true' "$(_pack_disclosure_json "$TMP/x" 2>/dev/null | jq -r '.rendersSystemPrompt')"
 
 echo '== install =='
 ME=$(id -un); MG=$(id -gn)
