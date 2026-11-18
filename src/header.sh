@@ -456,6 +456,18 @@ HERMES_PIN_COMMIT=f97608f178d1ffeca59860195ab7da295f7c8e5f
 # Hermes and no SDK, and create skips the recipe when Hermes is there).
 HERMES_SDK_STEP="{ (cd /home/claude/.hermes/hermes-agent && ./venv/bin/python -c 'from tools.lazy_deps import ensure; ensure(\"provider.anthropic\", prompt=False)') || echo 'warn: could not install the Anthropic SDK into Hermes; a Hermes agent on Anthropic will not answer until it is installed (retry: sudo 5dive agent install hermes --upgrade)' >&2; }"
 
+# DIVE-8669: the npm route to Claude Code, for a box the native installer
+# cannot download on (see TYPE_INSTALL[claude]). nvm's own npm, Node 24 only if
+# nvm has no node at all; the link target is asked of the npm that installed it
+# (`npm prefix -g`, the DIVE-2596 lesson). Never runs when the binary is there.
+# Every variable the recipe assigns is read BRACED (${_cc}, never $_cc): the
+# recipe runs through `sudo -u claude -i bash -lc`, and sudo -i backslash-escapes
+# every character except [A-Za-z0-9_$-], so the OUTER login shell expands a bare
+# $_cc (still unset there) before the inner bash assigns it. `{` is escaped, so
+# ${_cc} reaches the inner shell intact. Live on box 640 the bare form ran npm
+# and then linked nothing (main, DIVE-8669 iteration 1).
+CLAUDE_NPM_FALLBACK="{ echo 'claude: the native installer left no /home/claude/.local/bin/claude; installing it from npm instead' >&2; . /home/claude/.nvm/nvm.sh; { command -v npm >/dev/null 2>&1 || nvm install 24 >/dev/null; } && npm install -g @anthropic-ai/claude-code && _cc=\"\$(npm prefix -g)/bin/claude\" && [[ -x \"\${_cc}\" ]] && mkdir -p /home/claude/.local/bin && ln -sfn \"\${_cc}\" /home/claude/.local/bin/claude; }"
+
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
 # (caller must hand-install). Idempotent: each recipe checks first.
@@ -470,7 +482,19 @@ declare -A TYPE_INSTALL=(
   # gate can never flip no matter how many times you retry. Same defect class as
   # DIVE-2061 (`command -v 5dive` grading the installed CLI instead of the bundle
   # under test). This is the question the codex comment below already prescribes.
-  [claude]="[[ -x /home/claude/.local/bin/claude ]] || curl -fsSL https://claude.ai/install.sh | bash"
+  #
+  # DIVE-8669: Anthropic's binary CDN (downloads.claude.ai) answers 403 to some
+  # box IPv4s while claude.ai/install.sh itself still answers. The native
+  # installer then dies (or the pipe reports bash's 0 on an empty script) and
+  # leaves no ~/.local/bin/claude, so every hire on that box failed forever:
+  # 100% of the buyers it hit. npm reaches the same build from the same box, so
+  # when the native path leaves no binary, install the npm package (a native
+  # binary, no node at runtime) and link it to the ONE path agent-start and the
+  # hire check read. Install-then-link: the link is written only after npm's
+  # binary is executable, and only when ~/.local/bin/claude is not, so a
+  # working claude is never replaced by a failed fallback. The recipe's verdict
+  # is the binary itself, never the pipe's status.
+  [claude]="[[ -x /home/claude/.local/bin/claude ]] || { curl -fsSL https://claude.ai/install.sh | bash; [[ -x /home/claude/.local/bin/claude ]] || ${CLAUDE_NPM_FALLBACK}; [[ -x /home/claude/.local/bin/claude ]]; }"
   # devin: same exact-path guard; the installer self-manages the versioned
   # store + ~/.local/bin symlink, so -x makes the recipe idempotent.
   # DIVE-7115: the installer's last line is `devin setup`, a login prompt. With
@@ -598,7 +622,7 @@ declare -A TYPE_INSTALL=(
   # DIVE-5424: antigravity.google's frontend cache answers gzip whether or not
   # the client asked (9 of 12 plain fetches on 2026-10-03), so a bare
   # `curl | bash` feeds bash compressed bytes. --compressed makes curl decode it.
-  [antigravity]="[ -x /home/claude/.local/bin/agy ] || curl -fsSL --compressed https://antigravity.google/cli/install.sh | bash; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\$p\" ] && ln -sf \"\$p\" /home/claude/.local/bin/agy; }"
+  [antigravity]="[ -x /home/claude/.local/bin/agy ] || curl -fsSL --compressed https://antigravity.google/cli/install.sh | bash; [ -x /home/claude/.local/bin/agy ] || { mkdir -p /home/claude/.local/bin; p=\$(command -v agy 2>/dev/null || true); [ -n \"\${p}\" ] && ln -sf \"\${p}\" /home/claude/.local/bin/agy; }"
   # grok's installer drops the binary at ~/.grok/bin/grok but only creates the
   # ~/.local/bin/grok symlink *opportunistically* (its line 328 requires
   # ~/.local/bin already on PATH and ~/.grok/bin not on PATH). On a fresh VM
