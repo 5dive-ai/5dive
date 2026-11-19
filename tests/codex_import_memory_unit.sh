@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — ~30s measured (2026-09-24, local): three 662-atom fixtures are the 1.5 MB case the row names and are not shrinkable without grading a toy; the arms guard the import path, not a per-change core path.
+# TIER: nightly — 45.6s measured (CI installed-host-s3, run 44130804783; header-drift window 2026-11-18, max of the nightly runs it named, DIVE-8747; was ~30s local, 2026-09-24): three 662-atom fixtures are the 1.5 MB case the row names and are not shrinkable without grading a toy; the arms guard the import path, not a per-change core path.
 # DIVE-4923 unit harness: a CLAUDE pack imported onto a CODEX seat must land its
 # memory usable. Measured on 0.51.0 (marketing -> leo, 661 atoms): 1,560,263 B
 # of raw memory inlined into ~/.codex/AGENTS.md (codex reads 32 KiB of it), the

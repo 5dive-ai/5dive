@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 70.7s measured (DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
+# TIER: nightly — 148.2s measured (CI installed-host-s2, run 44265886823; header-drift window 2026-11-18, max of the nightly runs it named, DIVE-8747; was 70.7s, DIVE-2525): does not fit the 300s PR core; the nightly sweep runs it.
 # DIVE-2039 ACCEPTANCE — selfcheck proven by MUTATION, not by a green run.
 #
 # This is the whole ticket's acceptance criterion, and it is not a formality. A green
