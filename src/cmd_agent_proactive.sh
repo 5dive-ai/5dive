@@ -1,11 +1,13 @@
 # -------- 5dive agent proactive (DIVE-8718) --------
 #
 # lodar 2026-11-18, "like Muse": an agent may message its owner FIRST, unasked,
-# when something is worth it. Per agent, three levels:
+# when something is worth it. Per agent, three levels, shown as Normal / High /
+# Very high (DIVE-8767, lodar 11-19: never "Off", since every agent already answers,
+# reports back and asks). The arguments stay off|little|more:
 #
-#   off    (the default)  nothing changes: the agent only answers.
-#   little                one check-in loop, twice a day; at most 1 message a day.
-#   more                  the same loop, four times a day; at most 3 messages a day.
+#   off    Normal (the default)  nothing changes: answers and reports back, as usual.
+#   little High                  one check-in loop, twice a day; at most 1 message a day.
+#   more   Very high             the same loop, four times a day; at most 3 messages a day.
 #
 #   5dive agent proactive <name> [--json]                 status (the app's sheet)
 #   5dive agent proactive <name> off|little|more          set the level
@@ -155,8 +157,8 @@ _proactive_status() {
     return 0
   fi
   jq -r '
-    if .level == "off" then "\(.agent): Proactive · Off — only answers, never messages first"
-    else "\(.agent): Proactive · \(if .level == "more" then "More" else "A little" end) — checks in \(.checks_per_day) times a day · \(.sent_today) of \(.cap) today · next check \(.next_check // "-") · loop \(.loop // "-")" end' <<<"$view"
+    if .level == "off" then "\(.agent): Proactive · Normal — answers and reports back, as usual; never messages first"
+    else "\(.agent): Proactive · \(if .level == "more" then "Very high" else "High" end) — checks in \(.checks_per_day) times a day · \(.sent_today) of \(.cap) today · next check \(.next_check // "-") · loop \(.loop // "-")" end' <<<"$view"
 }
 
 # Make, resume or re-time the agent's check-in loop. Echoes its id.
@@ -195,7 +197,7 @@ _proactive_set() {
     if [[ -n "$tid" ]]; then
       # Paused, not deleted: on again resumes this task with its learned text.
       db "UPDATE tasks SET status='blocked', parked_at=datetime('now'), wake_at=NULL,
-            park_reason='Proactive is off. Turn it on: 5dive agent proactive ${name} little'
+            park_reason='Proactive is at Normal. Raise it: 5dive agent proactive ${name} little'
           WHERE id=${tid} AND status NOT IN ('done','cancelled')
             AND (need_type IS NULL OR need_answered_at IS NOT NULL);"
     fi
@@ -208,9 +210,9 @@ _proactive_set() {
       '{level:$l, tid:(if $t == "" then null else ($t|tonumber) end), loop:(if $i == "" then null else $i end), set_at:$at, set_by:$a}')"
   local msg
   case "$level" in
-    off)    msg="${name}: Proactive · Off — it only answers now${ident:+ (loop ${ident} paused, kept)}" ;;
-    little) msg="${name}: Proactive · A little — checks in twice a day, at most 1 message a day (loop ${ident})" ;;
-    more)   msg="${name}: Proactive · More — checks in 4 times a day, at most 3 messages a day (loop ${ident})" ;;
+    off)    msg="${name}: Proactive · Normal — it answers and reports back, as usual${ident:+ (loop ${ident} paused, kept)}" ;;
+    little) msg="${name}: Proactive · High — checks in twice a day, at most 1 message a day (loop ${ident})" ;;
+    more)   msg="${name}: Proactive · Very high — checks in 4 times a day, at most 3 messages a day (loop ${ident})" ;;
   esac
   ok "$msg" '{agent:$n, level:$l, previous:$p, loop:(if $i == "" then null else $i end), cap:($c|tonumber)}' \
      --arg n "$name" --arg l "$level" --arg p "$prev" --arg i "$ident" --arg c "$(_proactive_cap "$level")"
@@ -241,7 +243,7 @@ _proactive_claim() {
   level=$(_proactive_level "$name"); cap=$(_proactive_cap "$level"); sent=$(_proactive_sent_today "$name")
   if [[ "$level" == "off" ]]; then
     [[ -n "${_pfd:-}" ]] && exec {_pfd}>&-
-    fail "$E_VALIDATION" "no: Proactive is off for ${name}. Send nothing."
+    fail "$E_VALIDATION" "no: Proactive is at Normal for ${name}: no check-in messages. Send nothing."
   fi
   if (( sent >= cap )); then
     [[ -n "${_pfd:-}" ]] && exec {_pfd}>&-
@@ -288,11 +290,12 @@ cmd_agent_proactive() {
   done
   if [[ "$verb" == "help" || -z "$name" ]]; then
     cat <<'HELP'
-5dive agent proactive <name> [--json]                 Off / A little / More, messages today, next check
-5dive agent proactive <name> off|little|more          off (default): only answers. little: checks in twice
-                                                      a day, at most 1 message a day. more: 4 checks a day,
-                                                      at most 3 messages. On = one self-improving loop,
-                                                      "Check in with you"; off pauses it (kept).
+5dive agent proactive <name> [--json]                 Normal / High / Very high, messages today, next check
+5dive agent proactive <name> off|little|more          off = Normal (default): answers and reports back, as
+                                                      usual. little = High: checks in twice a day, at most
+                                                      1 message a day. more = Very high: 4 checks a day, at
+                                                      most 3 messages. High or Very high = one self-improving
+                                                      loop, "Check in with you"; off pauses it (kept).
 5dive agent proactive <name> claim --text="<msg>"     a check-in run asks before it sends; refused at the cap
 5dive agent proactive <name> reaction acted|not-now   how the owner took the last message (feeds its score)
 HELP
