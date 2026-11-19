@@ -4705,6 +4705,9 @@ _PACK_TAIL_MARKERS=(
   "# Subagent model choice"
   "# Working comms (chat / Telegram / team)"
   "<!-- 5dive:team:begin"
+  # DIVE-8833: a codex seat's copy of ~/.claude/owner-rules.md, just above its
+  # baseline (5dive-agent-start). The owner's rules are the seat's, never the pack's.
+  "<!-- 5dive:owner-rules:begin"
   "<!-- ${CODEX_BASELINE_MARKER:-5dive:codex-operating-baseline}:begin"
 )
 
