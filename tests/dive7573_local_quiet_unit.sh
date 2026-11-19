@@ -17,10 +17,15 @@
 #   DIVE-7624 Q5-Q9  a custom-endpoint profile (also via the Your-own-AI save)
 #               gets DISABLE_TELEMETRY + DISABLE_ERROR_REPORTING with local-only
 #               OFF; never a catalog vendor, never over the operator's own value
+#   DIVE-8799 P1-P9  only a LOCAL custom host gets the three vars (DISABLE_TELEMETRY
+#               turns off Claude Code's feature flags, channels among them): a
+#               public cloud host gets none, a re-apply on one removes the values
+#               we wrote and keeps an operator's own; the host classifier
 #
 # Seams: curl/git/claude/systemctl are PATH stubs, sudo/chown/id are functions;
 # no root, no network, no real seat. Every path is under a temp dir; the custom
-# endpoint is an example.com name (any URL outside the vendor catalog is custom).
+# endpoint is a private office address (DIVE-8799: only a LOCAL custom host is
+# quieted); PUBLIC_URL is an example.com name (outside the catalog, public).
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" || true
 cd "$(dirname "$0")/.."
@@ -39,7 +44,8 @@ done
 set +e
 JSON_MODE=0
 REAL_GIT=$(command -v git)
-CUSTOM_URL="https://llm.example.com/anthropic"
+CUSTOM_URL="http://192.168.1.20:11434"
+PUBLIC_URL="https://llm.example.com/anthropic"
 on()  { touch "$FIVE_LOCAL_ONLY_FILE"; unset _GH_ORG_RESOLVED; }
 off() { rm -f "$FIVE_LOCAL_ONLY_FILE"; unset _GH_ORG_RESOLVED; }
 step() { :; }
@@ -270,6 +276,53 @@ quiet_both my-ai && grep -q '^my-ai ANTHROPIC_BASE_URL=http://192.168.1.20:11434
 : >"$cap"; ( custom_ai_save my-ai codex http://192.168.1.20:11434 qwen3:8b "" ) >/dev/null 2>&1
 ! grep -q 'DISABLE_TELEMETRY' "$cap" && grep -q FIVEDIVE_CUSTOM_HARNESS=codex "$cap" \
   && ok_ 'Q9 a non-Claude harness on the same save is untouched' || bad_ 'Q9 codex' "$(cat "$cap")"
+
+# ── DIVE-8799: a PUBLIC custom host (a cloud vendor the catalog lacks) is quieted
+# like a catalog vendor: not at all. P1/P4/P5 are red on the pre-fix tree.
+rm -f "$FIVE_LOCAL_ONLY_FILE"
+UNSET="$T/unset.cap"; : >"$UNSET"
+profile_unset_var() { printf '%s %s\n' "$1" "$2" >>"$UNSET"; }
+none_of3() { ! grep -q 'DISABLE_TELEMETRY\|DISABLE_ERROR_REPORTING\|ENABLE_TOOL_SEARCH' "$1"; }
+SEED=(); : >"$cap"; : >"$UNSET"
+( _apply_byo_claude custom k qwen-bj qwen3-max "$PUBLIC_URL" ) >/dev/null 2>&1
+grep -qx "qwen-bj ANTHROPIC_BASE_URL=$PUBLIC_URL" "$cap" && none_of3 "$cap" && [[ ! -s "$UNSET" ]] \
+  && ok_ 'P1 a public https custom host gets none of the three vars' || bad_ 'P1 public' "$(cat "$cap" "$UNSET")"
+for u in http://127.0.0.1:11434 http://192.168.7.3:8000 https://gpu.local/v1 https://100.101.2.3:11434; do
+  : >"$cap"; ( _apply_byo_claude custom k office-llm qwen3:8b "$u" ) >/dev/null 2>&1
+  quiet_both office-llm && grep -qx 'office-llm ENABLE_TOOL_SEARCH=false' "$cap" \
+    && ok_ "P2 a local custom host ($u) gets all three" || bad_ "P2 local $u" "$(cat "$cap")"
+done
+: >"$cap"; ( _apply_byo_claude openrouter sk-or-x or-prof "" ) >/dev/null 2>&1
+none_of3 "$cap" && [[ ! -s "$UNSET" ]] && ok_ 'P3 a catalog host gets none and heals nothing' || bad_ 'P3 catalog' "$(cat "$cap" "$UNSET")"
+# A profile written before the fix (smoky-canyon, report 1174): re-applying it heals.
+SEED=([DISABLE_TELEMETRY]=1 [DISABLE_ERROR_REPORTING]=1 [ENABLE_TOOL_SEARCH]=false); : >"$cap"; : >"$UNSET"
+( _apply_byo_claude custom k qwen-bj qwen3-max "$PUBLIC_URL" ) >/dev/null 2>&1
+[[ "$(sort "$UNSET" | tr '\n' ' ')" == "qwen-bj DISABLE_ERROR_REPORTING qwen-bj DISABLE_TELEMETRY qwen-bj ENABLE_TOOL_SEARCH " ]] && none_of3 "$cap" \
+  && ok_ 'P4 re-applying an old public profile removes the three values we wrote' || bad_ 'P4 heal' "$(cat "$UNSET")"
+SEED=([DISABLE_TELEMETRY]=true [ENABLE_TOOL_SEARCH]=auto); : >"$cap"; : >"$UNSET"
+( _apply_byo_claude custom k qwen-bj qwen3-max "$PUBLIC_URL" ) >/dev/null 2>&1
+[[ ! -s "$UNSET" ]] && none_of3 "$cap" \
+  && ok_ "P5 an operator's own value on a public host survives the heal" || bad_ 'P5 operator' "$(cat "$UNSET")"
+SEED=([DISABLE_TELEMETRY]=1); : >"$cap"; : >"$UNSET"
+( _apply_byo_claude custom k office-llm qwen3:8b "$CUSTOM_URL" ) >/dev/null 2>&1
+[[ ! -s "$UNSET" ]] && ! grep -q 'DISABLE_TELEMETRY' "$cap" \
+  && ok_ 'P6 a local host never heals (its existing value stays)' || bad_ 'P6 local keep' "$(cat "$UNSET")"
+SEED=()
+on; : >"$cap"; ( _apply_byo_claude custom k office-llm qwen3:8b "https://llm.corp.example.com" ) >/dev/null 2>&1; off
+quiet_both office-llm && ok_ 'P7 local-only on: any custom host is quieted' || bad_ 'P7 local-only' "$(cat "$cap")"
+pub=0; for u in https://dashscope.aliyuncs.com/apps/anthropic https://token-plan.maas.qwencloudapi.com \
+               http://100.63.0.1 http://100.128.0.1 https://8.8.8.8 ftp://127.0.0.1 ''; do
+  claude_baseurl_is_local "$u" && { pub=1; bad_ 'P8 public classed local' "$u"; }
+done
+(( pub == 0 )) && ok_ 'P8 public names, addresses next to CGNAT, and non-http schemes are not local'
+# The real writer: profile_unset_var drops the one line, keeps the rest.
+( unset -f profile_unset_var; source src/cmd_auth.sh
+  AUTH_PROFILES_DIR="$T/ap"; mkdir -p "$AUTH_PROFILES_DIR/p"
+  printf 'A=1\nDISABLE_TELEMETRY=1\nB=2\n' >"$AUTH_PROFILES_DIR/p/combined.env"
+  chown() { :; }; secrets_group() { echo root; }; secret_file_secure() { :; }
+  profile_unset_var p DISABLE_TELEMETRY; profile_unset_var p NOPE; profile_unset_var q X
+  [[ "$(cat "$AUTH_PROFILES_DIR/p/combined.env")" == $'A=1\nB=2' ]] ) \
+  && ok_ 'P9 profile_unset_var removes only that var; absent var/profile is a no-op' || bad_ 'P9 unset writer'
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))

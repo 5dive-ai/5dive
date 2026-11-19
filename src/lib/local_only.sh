@@ -69,8 +69,10 @@ LOCAL_ONLY_HARNESS_ENV=(PI_OFFLINE=1 PI_TELEMETRY=0 PI_SKIP_VERSION_CHECK=1
 LOCAL_MODEL_SEAT_ENV=(ENABLE_TOOL_SEARCH=false)
 # DIVE-7624: a seat on a local/custom model sends its prompts only to that model,
 # so it sends Anthropic nothing else either: no usage stats, no error reports.
-# Written into every custom-endpoint profile (_apply_byo_claude), local-only or
-# not. Auto-update is NOT here: outside local-only mode updates stay on, and
+# Written into a custom-endpoint profile on a LOCAL host (_apply_byo_claude,
+# claude_baseurl_is_local), local-only or not. DIVE-8799: never on a public
+# cloud host. DISABLE_TELEMETRY also turns off Claude Code's feature flags, and
+# channels (Telegram, dashboard chat) are one, default off. Auto-update is NOT here: outside local-only mode updates stay on, and
 # local-only's own list already silences all of it (NONESSENTIAL_TRAFFIC).
 LOCAL_MODEL_QUIET_ENV=(DISABLE_TELEMETRY=1 DISABLE_ERROR_REPORTING=1)
 
@@ -248,11 +250,10 @@ _lo_host_is_local() {
   return 1
 }
 
-# `local_only_url_is_local <url>` — 0 for an http(s) URL whose host passes
-# _lo_host_is_local. Userinfo and port are stripped; any other scheme is not a
-# model endpoint and is refused.
-local_only_url_is_local() {
-  local url="$1" rest host
+# `_lo_url_host <url>` — the host of an http(s) URL, userinfo and port stripped
+# (an IPv6 literal keeps its brackets). Non-zero for any other scheme.
+_lo_url_host() {
+  local url="$1" rest
   case "$url" in
     http://*)  rest="${url#http://}" ;;
     https://*) rest="${url#https://}" ;;
@@ -260,8 +261,32 @@ local_only_url_is_local() {
   esac
   rest="${rest%%/*}"; rest="${rest%%\?*}"; rest="${rest%%#*}"
   rest="${rest##*@}"
-  if [[ "$rest" == \[*\]* ]]; then host="${rest%%\]*}]"; else host="${rest%:*}"; fi
+  if [[ "$rest" == \[*\]* ]]; then printf '%s' "${rest%%\]*}]"; else printf '%s' "${rest%:*}"; fi
+}
+
+# `local_only_url_is_local <url>` — 0 for an http(s) URL whose host passes
+# _lo_host_is_local. Any other scheme is not a model endpoint and is refused.
+local_only_url_is_local() {
+  local host
+  host=$(_lo_url_host "$1") || return 1
   _lo_host_is_local "$host"
+}
+
+# DIVE-8799: `claude_baseurl_is_local <url>` — 0 when a Claude seat on <url>
+# runs on a model of the owner's own: local-only mode is on, or the host is on
+# this box or a private network (local_only_url_is_local), or it is a CGNAT /
+# Tailscale address (100.64.0.0/10), the usual way to reach a GPU box at home.
+# Kept out of _lo_host_is_local on purpose: that one is local-only mode's
+# promise that nothing leaves the building, and a tailnet hop may leave it.
+# A public cloud host (Qwen Beijing, a vendor the catalog lacks) is NOT local.
+claude_baseurl_is_local() {
+  local host a b
+  local_only_on && return 0
+  local_only_url_is_local "$1" && return 0
+  host=$(_lo_url_host "$1") || return 1
+  [[ "$host" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+  (( a == 100 && b >= 64 && b <= 127 ))
 }
 
 # The one refusal sentence. Plain words: the owner reads this, not a developer.
