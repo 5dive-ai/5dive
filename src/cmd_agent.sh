@@ -467,6 +467,9 @@ _cmd_list_legacy() {
     # surface can tell "Theo is already here" (even as diveteam-theo) by WHO the
     # agent is, not by its name.
     pack: (.value.pack.slug // null),
+    # DIVE-8819: "helper" = the 5dive helper seat. Not a hire: My team and the
+    # plan agent count skip any row with a system value.
+    system: (.value.system // null),
     isolation: (.value.isolation // "admin"),
     heartbeat: (.value.heartbeat // null),
     createdAt: .value.createdAt,
@@ -1509,6 +1512,7 @@ for name, value in agents.items():
         "workdir": value.get("workdir") or default_workdir,
         "authProfile": value.get("authProfile"),
         "botUsername": value.get("botUsername"),
+        "system": value.get("system"),  # DIVE-8819: the helper seat, not a hire
         "isolation": isolation,
         "heartbeat": value.get("heartbeat"),
         "createdAt": value.get("createdAt"),

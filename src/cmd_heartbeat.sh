@@ -10698,6 +10698,12 @@ cmd_heartbeat_tick() {
   tasks_db_init
   _HB_BALANCE_TICK_MOVED=0   # DIVE-6106: one balance move fleet-wide per tick
   local reg now; reg=$(registry_read); now=$(date +%s)
+  # DIVE-8819: the 5dive helper seat, built once and greeting once. One stat
+  # once it has greeted; never fatal to the tick.
+  if declare -F _helper_tick >/dev/null; then
+    local _hb_helper; _hb_helper=$(lazy_need _helper_tick; _helper_tick "$reg" 2>&1) || true
+    [[ -z "$_hb_helper" ]] || _hb_log "[helper] $(tr '\n' ';' <<<"$_hb_helper")"
+  fi
   local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0 sk_capped=0 sk_parked=0 sk_pace=0
   local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
   # DIVE-4585: republish the account-usage snapshot FIRST, before anything in
