@@ -439,7 +439,8 @@ _proactive_store() {
   d="$home/.claude/projects/$(printf '%s' "$(_proactive_workdir "$1")" | sed 's:/:-:g')/memory"
   # Made as the agent, so every new dir is the agent's and none is root's.
   _proactive_as_agent "$1" mkdir -p -m 700 -- "$d" 2>/dev/null || return 1
-  _proactive_in_home "$home" "$d" && printf '%s' "$d"
+  if _proactive_in_home "$home" "$d"; then printf '%s' "$d"; return 0; fi
+  return 1
 }
 # The human who owns <agent>'s gates, or '' (the box owner).
 _proactive_owner_of() {
@@ -524,6 +525,7 @@ _proactive_seed() {
         break
       done
       # Owner facts the owner's other agents on this box already hold.
+      local seats; seats=$(_proactive_seed_seats | awk 'NF && !seen[$0]++')
       while read -r seat; do
         [[ -n "$seat" && "$seat" != "$name" ]] || continue
         (( seeded >= _PROACTIVE_SEED_MAX )) && break
@@ -541,7 +543,7 @@ _proactive_seed() {
               && seeded=$((seeded + 1))
           done
         done
-      done < <(_proactive_seed_seats | awk 'NF && !seen[$0]++')
+      done <<<"$seats"
       why="seeded ${seeded} owner facts"
     fi
   fi
