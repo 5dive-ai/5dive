@@ -994,7 +994,7 @@ _agent_verb_dispatch() {
         install)
           AUDIT_CMD="agent install"; AUDIT_ARGS=("$@")
           cmd_install "$@" ;;   # no registry mutation; auditable install recipe
-        # DIVE-8718: Off / A little / More — a capped check-in loop that may
+        # DIVE-8718: Normal / High / Very high (off|little|more) — a capped check-in loop that may
         # message the owner first. Status is read-only (the app's sheet polls it).
         proactive)
           case "${2:-}" in ""|status|--json|-h|--help|help) ;; *) AUDIT_CMD="agent proactive"; AUDIT_ARGS=("${1:-}" "${2:-}") ;; esac
