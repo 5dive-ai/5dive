@@ -84,7 +84,7 @@ Check in with your owner. Look at what you know: your memory, your open tasks an
 
 First, if your owner answered your last check-in message, record how they took it: 5dive agent proactive ${name} reaction acted (they used it) or 5dive agent proactive ${name} reaction not-now (they waved it off).
 
-Then decide if ONE thing is worth their attention now: something that needs them, a result they were waiting for, a problem you found, or one useful idea that fits what they care about. If nothing is worth it, send nothing. A quiet day is a good day.
+Then decide if ONE thing is worth their attention now: a result they were waiting for, a problem you found, or one useful idea that fits what they care about. Their asks and approvals already reach them, so never repeat one here. If nothing is worth it, send nothing. A quiet day is a good day.
 
 If something is worth it, ask first: 5dive agent proactive ${name} claim --text="<the message>". Only if it says yes, send that message to your owner where you normally talk to them. If it refuses, send nothing.
 
