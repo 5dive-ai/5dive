@@ -126,7 +126,7 @@ gate_arm() {
   [[ "$(col "$anchor" tier)" == "2" && "$(col "$anchor" needs_capability)" == "human_tap" ]] \
     && ok_t "G${label} filed like the T2 plan gate: tier 2, needs human_tap (never 48h auto-applied)" \
     || bad_t "G${label} tier/capability" "tier=$(col "$anchor" tier) cap=$(col "$anchor" needs_capability)"
-  [[ "$(col "$anchor" ask)" == *"over checkpoint (8>6)"* ]] \
+  [[ "$(col "$anchor" ask)" == *"Plans over 6 steps need your OK"* ]] \
     && ok_t "G${label} the ask still names WHY it gated (over checkpoint), not 'carries a Tier-2 task'" \
     || bad_t "G${label} reason text" "ask='$(col "$anchor" ask)'"
   LAST_ANCHOR="$anchor"

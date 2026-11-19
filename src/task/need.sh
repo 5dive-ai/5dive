@@ -1717,6 +1717,12 @@ _gate_option_has_second_person() {
 # opinion on who the ask belongs to.
 _GATE_ASK_MAX_WORDS=25
 
+# The cap for a caller in another module (DIVE-8837). Read through a call, not
+# the global: a top-level global read from another module is a dep edge in the
+# lazy loader, and that edge pulled this whole module into `heartbeat ls` (which
+# loads cmd_goal) on every run. A call edge costs nothing until it is made.
+_gate_ask_max_words() { printf '%s' "$_GATE_ASK_MAX_WORDS"; }
+
 # Each alternation is a shape a person outside our codebase cannot read. Tuned
 # against the 30-day corpus (every match printed and eyeballed) so the ENGLISH
 # neighbours of each shape survive:
