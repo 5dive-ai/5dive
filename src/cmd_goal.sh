@@ -142,7 +142,31 @@ ${roster}
   low-labeled task whose text implies a high-risk action is rejected outright.
 - The graph must be acyclic. Leaves (deliverable tasks) should carry acceptance
   criteria and a verify command where non-trivial.
+
+HOW TO FINISH: write the JSON object, and nothing else, to a file, then close
+this task with \`5dive task done <this task> --result-file=<that file>\`. Your
+task's result IS the plan and a program parses it: no summary sentence, no
+path to the file, no code fence. This replaces the usual one-or-two-sentence
+result for this task.
 PROMPT
+}
+
+# DIVE-8778: the plan out of a planner task's result. A result that is a JSON object is the plan.
+# A planner that wrapped it anyway (a ```json fence, a sentence before or after) still yields it:
+# the first fenced block, else the span from the first «{» to the last «}», if that parses as an
+# object. Echoes the plan, or nothing. Never reads a path the result names: the agent closes with
+# --result-file, which reads the file as the agent itself (a file named in prose would be read as
+# whoever polls, which is not the agent's to choose).
+_goal_extract_plan() {
+  local result="$1" cand
+  if printf '%s' "$result" | jq -e 'type=="object"' >/dev/null 2>&1; then printf '%s' "$result"; return 0; fi
+  cand=$(printf '%s\n' "$result" | awk '/^[[:space:]]*```/{ if (in_b) exit; in_b=1; next } in_b')
+  if [[ -n "$cand" ]] && printf '%s' "$cand" | jq -e 'type=="object"' >/dev/null 2>&1; then printf '%s' "$cand"; return 0; fi
+  [[ "$result" == *"{"*"}"* ]] || return 0
+  cand="{${result#*\{}"
+  cand="${cand%\}*}}"
+  if printf '%s' "$cand" | jq -e 'type=="object"' >/dev/null 2>&1; then printf '%s' "$cand"; fi
+  return 0
 }
 
 # ------- assignee/role resolution: echoes agent or "" (unresolvable) -------
@@ -359,7 +383,8 @@ _goal_invoke_planner() {
   result=$(printf '%s' "$spawn_json" | jq -r '.data.result // ""')
   [[ "$status" == "done" ]] || fail "$E_TIMEOUT" "planner did not return a plan (loop $status) — inspect: 5dive task loops"
   [[ -n "$result" ]] || fail "$E_GENERIC" "planner returned an empty plan"
-  printf '%s' "$result"
+  local plan; plan=$(_goal_extract_plan "$result")
+  printf '%s' "${plan:-$result}"
 }
 
 # _goal_free_prefix <base> — echo a project prefix (UPPERCASE letters) not yet
@@ -795,7 +820,8 @@ _goal_job_advance() {
   # Plan ready -> finish once.
   if [[ "$tstatus" == "done" ]]; then
     local plan; plan=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${task_id};")
-    if [[ -z "$plan" ]] || ! printf '%s' "$plan" | jq -e . >/dev/null 2>&1; then
+    plan=$(_goal_extract_plan "$plan")
+    if [[ -z "$plan" ]]; then
       local payload; payload=$(jq -cn --arg j "$job_id" --arg p "$planner" '{ok:true, data:{job:$j, status:"failed", reason:"planner returned an empty or invalid plan", planner:$p}}')
       db "UPDATE goal_jobs SET status='failed', result_json=$(sqlq "$payload"), updated_at=$(date +%s) WHERE job_id=$(sqlq "$job_id");" >/dev/null 2>&1 || true
       if (( JSON_MODE )); then printf '%s\n' "$payload"; else echo "job ${job_id}: FAILED — empty plan"; fi

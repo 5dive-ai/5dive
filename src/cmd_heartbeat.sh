@@ -5563,6 +5563,14 @@ _hb_grade_turn_budget() { printf '%s' "${_HB_GRADE_TURN_BUDGET:-25}"; }
 # pins the two together: every row shape is run through BOTH, and a shape where
 # the clause emits the verifier variant while this returns non-zero (or the
 # reverse) FAILS the harness. Do not "fix" a disagreement by editing one side.
+# DIVE-8778: true when the row was filed by `loop spawn --schema` (cmd_loop.sh stamps
+# «[loop spawn] loop_id=… schema=present» on its body): its result is parsed as JSON.
+_hb_is_schema_row() {
+  local task_id="$1"
+  [[ "$task_id" =~ ^[0-9]+$ ]] || return 1
+  [[ "$(db "SELECT 1 FROM tasks WHERE id=${task_id} AND body LIKE '%[loop spawn] loop_id=%schema=present%';")" == "1" ]]
+}
+
 _hb_is_grade_wake() {  # <agent> <task_id>
   local name="$1" task_id="$2"
   [[ "$task_id" =~ ^[0-9]+$ ]] || return 1
@@ -5653,7 +5661,14 @@ _hb_nudge_text() { # <agent> <task_id> <task_ident>
     _hb_grade_packet_available "$task_id" 2>/dev/null \
       && _hb_read="you are GRADING it: run '5dive task grade-context ${task_ident}' and grade from that bounded packet (acceptance criteria, the delivery's claim block, the diff at the delivered sha, the checks to re-run) — do not '5dive task show ${task_ident}' unless the packet says a field is missing"
   fi
-  local nudge="/goal ${task_ident} — your only row this turn; ${_hb_read}. TERMINAL, then stop: DONE — '5dive task done ${task_ident} --result=\"<1-2 self-contained sentences; the creator and the dashboard read this field>\"' (on a row that carries a verifier the same verb DELIVERS instead, and delivered is terminal for you); GATED — '5dive task need ${task_ident} --type=decision|approval|secret|manual --ask=\"<one crisp question>\"' if it needs a human (decision: --options=\"<first choice>|<second choice>\"; decision/approval: --recommend=\"<answer>\"; secret: --secret-key=<KEY> --connector=tools); CANCELLED — '5dive task cancel ${task_ident} --result=\"<why>\"' only if the row is genuinely impossible. Self-audit before you close. The rest of the contract (gate vs cancel, the ask's shape, single-row scope, maker/verifier separation, the knowledge clause) is in /home/claude/projects/CLAUDE.md under \"Task lifecycle\" — read it ONCE per session, it is not repeated here. Stop after ${_hb_turns} turns."
+  # DIVE-8778: a row `loop spawn --schema` filed (the goal planner, a loop grader) is read by a MACHINE:
+  # its result must be the JSON object itself. The prose rule below beat the planner prompt's «return
+  # ONLY a JSON object» on CLI 0.137 (3 of 3 plans on even-branch closed with a one-line summary and
+  # the JSON in a scratchpad file), so such a row is told to close with the file, and why.
+  local _hb_done="'5dive task done ${task_ident} --result=\"<1-2 self-contained sentences; the creator and the dashboard read this field>\"'"
+  _hb_is_schema_row "$task_id" 2>/dev/null \
+    && _hb_done="'5dive task done ${task_ident} --result-file=<a file holding ONLY the JSON object this row asks for>' (the result IS that JSON, read by a program: no summary sentence, no path to it, no code fence)"
+  local nudge="/goal ${task_ident} — your only row this turn; ${_hb_read}. TERMINAL, then stop: DONE — ${_hb_done} (on a row that carries a verifier the same verb DELIVERS instead, and delivered is terminal for you); GATED — '5dive task need ${task_ident} --type=decision|approval|secret|manual --ask=\"<one crisp question>\"' if it needs a human (decision: --options=\"<first choice>|<second choice>\"; decision/approval: --recommend=\"<answer>\"; secret: --secret-key=<KEY> --connector=tools); CANCELLED — '5dive task cancel ${task_ident} --result=\"<why>\"' only if the row is genuinely impossible. Self-audit before you close. The rest of the contract (gate vs cancel, the ask's shape, single-row scope, maker/verifier separation, the knowledge clause) is in /home/claude/projects/CLAUDE.md under \"Task lifecycle\" — read it ONCE per session, it is not repeated here. Stop after ${_hb_turns} turns."
   # DIVE-6433: the gate's chrome follows the owner's language (_gate_t), but the
   # ask and options are this agent's own words. On a box whose owner writes in
   # Russian, say so here, where the agent reads the gate verb, rather than
