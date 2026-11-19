@@ -29,7 +29,7 @@
 # needs a second process; the in-process `_gate_closure_sign` it re-execs to IS
 # driven, and arm 4 proves the archived signature actually re-verifies rather
 # than merely being non-empty.
-# TIER: nightly — 26.6s measured (CI pristine-s1, run 44041025504; header-drift window 2026-11-18, max of the nightly runs it named, DIVE-8747; was 17.2s on the CI installed-host runner, unit-tests
+# TIER: nightly — 32.2s measured (CI pristine-s2, run 44520525624; header-drift window 2026-11-19, DIVE-8834; was 26.6s on CI pristine-s1, run 44041025504, DIVE-8747; 17.2s on the CI installed-host runner, unit-tests
 # test-installed-host, run 31451886133; 26.0s on the control-plane host, agent-main
 # seat, non-root). It does not fit the 300s PR core and the cost is INHERENT, not
 # incidental: the mutation grading re-execs this entire harness twice as children,

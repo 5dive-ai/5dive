@@ -7,7 +7,7 @@
 # The model call is a seam (FIVEDIVE_LOOP_IMPROVE_AI): a stub that replays a
 # canned answer and counts its calls. Throwaway STATE_DIR — never touches the
 # live tasks.db. Run: bash tests/loop_improve_unit.sh
-# TIER: nightly — 25.1s measured on poke-two (agent-dev seat, 2026-11-18, worktree cli-8692): ~17 real
+# TIER: nightly — 39.1s measured (CI pristine-s2, run 44520525624; header-drift window 2026-11-19, max of the nightly runs it named, DIVE-8834; was 25.1s on poke-two, 2026-11-18): ~17 real
 # task-done closes through the whole close path; does not fit the 300s PR core. The PR runs it
 # anyway as a changed harness, and the nightly sweep after that.
 set -uo pipefail
