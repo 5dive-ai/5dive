@@ -354,8 +354,8 @@ mutant() { # <label> <sed-expr> <file> [state-dir]
 }
 mutant "no revocation check (c)" 's/index(\$k) != null/false/' "$REVOKED"
 mutant "no expiry check (d)" 's/(( now < not_after ))/true/' "$EXPIRED"
-mutant "no root check on the certificate (e)" 's/_ou_sig_ok "\$root" "\$t\/signing_key"/true/' "$OTHERROOT"
-mutant "no certificate kind check (m)" 's/ and \.kind == "5dive-signing-key"//' "$OFFICE"
+mutant "no root check on the certificate (e)" 's/_ou_sig_ok "\$root" "\$t\/\$f" "\$t\/\${f}_sig"/true/' "$OTHERROOT"
+mutant "no certificate kind check (m)" 's/ and \.kind == \$kind and / and /' "$OFFICE"
 mutant "no key_id recomputation (f)" 's/"\$(_ou_key_id "\$skey")" == "\$key_id"/1 == 1/' "$BADID"
 mutant "the manifest checked with the pinned key, not the certified one (g)" 's/^    key="\$meta\/certified.pem"$/    key="$OFFLINE_UPDATE_PUBKEY_FILE"/' "$UNCERT"
 cp -a "$KEPT_DIR" "$WORK/state-j"

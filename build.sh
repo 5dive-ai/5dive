@@ -208,6 +208,7 @@ LAZY_FILES=(
   src/cmd_chat.sh
   src/cmd_selfupdate.sh
   src/lib/offline_update.sh
+  src/lib/office_app.sh
 )
 
 # main.sh closes the core: it installs the EXIT trap and calls `main "$@"`.

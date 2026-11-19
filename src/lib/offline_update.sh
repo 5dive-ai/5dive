@@ -159,30 +159,37 @@ _ou_key_id() { # <pubkey.pem> — sha256 of the DER SubjectPublicKeyInfo
 # the root. 0 = <meta>/certified.pem is the key manifest.sig must verify with,
 # and _OU_KEEP_REVOKED names a newer root-signed list to keep once the whole
 # file verifies (empty = nothing to keep). 1 = refused, _OU_WHY says why.
+# DIVE-8809: <field> office_key checks an office app file's certificate instead
+# (kind 5dive-office-app-key): the kind is signed in, so neither key can sign
+# for the other. Default signing_key: an update file, unchanged.
 _ou_chain() {
-  local meta="$1" root="$2" m="$1/manifest.json" t="$1/trust" k v
+  local meta="$1" root="$2" m="$1/manifest.json" t="$1/trust" k v f="${3:-signing_key}" kind=5dive-signing-key
+  [[ "$f" == office_key ]] && kind=5dive-office-app-key
   _OU_KEEP_REVOKED=""
   jq -e '.trust | type == "object"' "$m" >/dev/null 2>&1 \
     || { _OU_WHY="this file is not signed by 5dive's root key (it carries no certificate for its signing key)"; return 1; }
   mkdir -m 700 "$t" || { _OU_WHY="internal: could not create $t"; return 1; }
-  for k in signing_key signing_key_sig revoked revoked_sig; do
+  for k in "$f" "${f}_sig" revoked revoked_sig; do
     v="$(jq -r --arg k "$k" '.trust[$k] | strings' "$m" 2>/dev/null)" || v=""
     [[ -n "$v" ]] && base64 -d <<<"$v" > "$t/$k" 2>/dev/null && [[ -s "$t/$k" ]] \
       || { _OU_WHY="this file's certificate from 5dive's root key is incomplete or damaged ($k)"; return 1; }
   done
 
   # The signing key, certified by the ROOT.
-  _ou_sig_ok "$root" "$t/signing_key" "$t/signing_key_sig" \
+  _ou_sig_ok "$root" "$t/$f" "$t/${f}_sig" \
     || { _OU_WHY="the key that signed this file is not certified by 5dive's root key — the file was changed or was not made by 5dive"; return 1; }
-  jq -e '.format == 1 and .kind == "5dive-signing-key" and (.key_id|type == "string")
-         and (.pubkey|type == "string") and (.not_after|type == "number")' "$t/signing_key" >/dev/null 2>&1 \
-    || { _OU_WHY="the signing key certificate in this file is not in a format this 5dive reads"; return 1; }
+  if ! jq -e --arg kind "$kind" '.format == 1 and .kind == $kind and (.key_id|type == "string")
+         and (.pubkey|type == "string") and (.not_after|type == "number")' "$t/$f" >/dev/null 2>&1; then
+    if [[ "$f" == office_key ]]; then _OU_WHY="this file's key is not certified for the office app (only 5dive's office app key may sign one) — refused"
+    else _OU_WHY="the signing key certificate in this file is not in a format this 5dive reads"; fi
+    return 1
+  fi
   local skey="$meta/certified.pem" key_id not_after now
-  jq -r '.pubkey' "$t/signing_key" > "$skey"
-  key_id="$(jq -r '.key_id' "$t/signing_key")"
+  jq -r '.pubkey' "$t/$f" > "$skey"
+  key_id="$(jq -r '.key_id' "$t/$f")"
   [[ "$key_id" =~ ^[0-9a-f]{64}$ && "$(_ou_key_id "$skey")" == "$key_id" ]] \
     || { _OU_WHY="the signing key certificate in this file names a different key than it carries — refused"; return 1; }
-  not_after="$(jq -r '.not_after | floor' "$t/signing_key" 2>/dev/null)" || not_after=""
+  not_after="$(jq -r '.not_after | floor' "$t/$f" 2>/dev/null)" || not_after=""
   [[ "$not_after" =~ ^[0-9]{1,12}$ ]] \
     || { _OU_WHY="the signing key certificate in this file has no usable expiry date"; return 1; }
   now="${OFFLINE_UPDATE_NOW:-$(date +%s)}"

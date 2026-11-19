@@ -382,23 +382,83 @@ _lp_spawn_update() {
 
 # `local _panel-update-run` (root; the transient unit runs it): install the
 # copy, record the verdict in plain words, remove the copy.
+# DIVE-8809: the same slot takes the office app file (`local app install`), and
+# the private Office server file: its update file goes first (self-update), then
+# its app, by the 5dive that update just put in. "Already this version" on one
+# half is not a failure when the other half installed.
 _lp_update_run() {
   require_root
-  local copy msg to rc log
+  local copy msg to rc log kind
   copy="$(_lp_update_dir)/update.tar"; log="$(_lp_update_dir)/install.log"
   [[ -f "$copy" && ! -L "$copy" ]] || { _lp_update_write_status failed "No update file was waiting."; return 0; }
   rm -f -- "$log"
-  msg=$(export FIVEDIVE_PANEL_UPDATE=1 LP_CLI_LOG="$log"; _lp_cli_json self-update --from="$copy" </dev/null) && rc=0 || rc=$?
+  kind=update
+  if [[ "$(head -c 2 -- "$copy" 2>/dev/null)" == '#!' ]]; then kind=server
+  elif tar -xOf "$copy" manifest.json 2>/dev/null | jq -e '.kind == "5dive-office-app"' >/dev/null 2>&1; then kind=app; fi
+  case "$kind" in
+    app)    _lp_app_run "$copy" "$log" ;;
+    server) _lp_server_run "$copy" "$log" ;;
+    *)
+      msg=$(export FIVEDIVE_PANEL_UPDATE=1 LP_CLI_LOG="$log"; _lp_cli_json self-update --from="$copy" </dev/null) && rc=0 || rc=$?
+      rm -f -- "$copy"
+      if (( rc == 0 )); then
+        to=$("$(_lp_cli)" --json --version 2>/dev/null | jq -r '.data.version // empty' 2>/dev/null) || to=""
+        _lp_update_write_status "done" "Updated${to:+ to $to}." "$to" "$log"
+      else
+        msg="${msg#update refused: }"
+        _lp_update_write_status failed "Not installed: ${msg}" "" "$log"
+      fi
+      _lp_audit "panel" "update-run" "" "$( (( rc == 0 )) && printf 'ok %s' "$to" || printf 'failed: %s' "${msg:0:200}")" ;;
+  esac
+  return 0
+}
+
+# The office app file alone.
+_lp_app_run() {
+  local copy="$1" log="$2" msg rc v
+  msg=$(LP_CLI_LOG="$log"; _lp_cli_json local app install "$copy" </dev/null) && rc=0 || rc=$?
   rm -f -- "$copy"
   if (( rc == 0 )); then
-    to=$("$(_lp_cli)" --json --version 2>/dev/null | jq -r '.data.version // empty' 2>/dev/null) || to=""
-    _lp_update_write_status "done" "Updated${to:+ to $to}." "$to" "$log"
+    v=$(jq -r '.installed // empty' <<<"$msg" 2>/dev/null) || v=""
+    _lp_update_write_status "done" "The 5dive app${v:+ $v} is installed. Your team opens it at this server's address." "" "$log"
   else
-    msg="${msg#update refused: }"
-    _lp_update_write_status failed "Not installed: ${msg}" "" "$log"
+    _lp_update_write_status failed "Not installed: ${msg#office app not installed: }" "" "$log"
   fi
-  _lp_audit "panel" "update-run" "" "$( (( rc == 0 )) && printf 'ok %s' "$to" || printf 'failed: %s' "${msg:0:200}")"
-  return 0
+  _lp_audit "panel" "app-install" "" "$( (( rc == 0 )) && printf 'ok %s' "$v" || printf 'failed: %s' "${msg:0:200}")"
+}
+
+# The Office server file: 5dive first, then the app.
+_lp_server_run() {
+  local copy="$1" log="$2" work line upd m1="" m2="" r1=0 r2=0 to v
+  work="$(mktemp -d "$(_lp_update_dir)/.server.XXXXXX")" || { rm -f -- "$copy"; _lp_update_write_status failed "Not installed: no room to unpack the file."; return 0; }
+  line="$(awk '/^__5DIVE_USB_PAYLOAD__$/ { print NR + 1; exit }' "$copy" 2>/dev/null)"
+  upd=""
+  if [[ "$line" =~ ^[0-9]+$ ]] && tail -n +"$line" -- "$copy" >"$work/payload.tar" 2>/dev/null; then
+    upd="$(LC_ALL=C tar -tf "$work/payload.tar" 2>/dev/null | grep -E '^(\./)?5dive-offline-[0-9]+\.[0-9]+\.[0-9]+\.tar$' | head -n 1)" || upd=""
+    [[ -n "$upd" ]] && tar -xf "$work/payload.tar" -C "$work" --no-same-owner --no-same-permissions "$upd" 2>/dev/null || upd=""
+    rm -f -- "$work/payload.tar"
+  fi
+  if [[ -z "$upd" ]]; then
+    rm -rf -- "$work" "$copy"; _lp_update_write_status failed "Not installed: this is not a 5dive file this server reads."; return 0
+  fi
+  m1=$(export FIVEDIVE_PANEL_UPDATE=1 LP_CLI_LOG="$log.1"; _lp_cli_json self-update --from="$work/${upd#./}" </dev/null) && r1=0 || r1=$?
+  m2=$(LP_CLI_LOG="$log.2"; _lp_cli_json local app install "$copy" </dev/null) && r2=0 || r2=$?
+  cat -- "$log.1" "$log.2" >"$log" 2>/dev/null; chmod 0600 -- "$log" 2>/dev/null; rm -f -- "$log.1" "$log.2"
+  rm -rf -- "$work" "$copy"
+  to=$("$(_lp_cli)" --json --version 2>/dev/null | jq -r '.data.version // empty' 2>/dev/null) || to=""
+  v=$( (( r2 == 0 )) && jq -r '.installed // empty' <<<"$m2" 2>/dev/null) || v=""
+  local same1=0 same2=0
+  [[ "$m1" == *"nothing newer to install"* ]] && same1=1
+  [[ "$m2" == *"nothing newer to install"* ]] && same2=1
+  if (( (r1 == 0 || same1) && (r2 == 0 || same2) )); then
+    if (( same1 && same2 )); then _lp_update_write_status "done" "Nothing to do: this server already runs everything in this file." "$to" "$log"
+    else _lp_update_write_status "done" "Updated${to:+ to 5dive $to}${v:+ and the 5dive app $v}." "$to" "$log"; fi
+  elif (( r1 != 0 && ! same1 )); then
+    _lp_update_write_status failed "Not installed: ${m1#update refused: }" "" "$log"
+  else
+    _lp_update_write_status failed "5dive${to:+ $to} is in, but the app is not: ${m2#office app not installed: }" "$to" "$log"
+  fi
+  _lp_audit "panel" "server-run" "" "update rc=$r1 app rc=$r2${to:+ $to}${v:+ app $v}"
 }
 
 _lp_exec() {
