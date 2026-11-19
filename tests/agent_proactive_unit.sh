@@ -36,6 +36,13 @@ _hb_log() { printf '%s\n' "$*" >>"$LOG"; }
 # The agent is the harness's own unix user, so the "only itself or root" rule
 # lets it through (agent-dev -> dev on a seat, runner on CI).
 ME=$(id -un); N="${ME#agent-}"
+# DIVE-8838: raising the level is root-only (the owner's tap in the app). ROOT=1
+# plays the app; ROOT=0 plays the agent itself.
+ROOT=1
+_proactive_is_root() { [[ "$ROOT" == "1" ]]; }
+export AGENT_HOME_ROOT="$TMP/home" FIRST_JOB_DIR="$TMP/first-jobs"
+mkdir -p "$AGENT_HOME_ROOT/agent-$N/.claude/projects/-w/memory" "$FIRST_JOB_DIR"
+_proactive_seed_seats() { printf '%s\n' ${SEATS:-}; }
 P() { ( cmd_agent_proactive "$N" "$@" ) 2>"$TMP/err" | tee "$TMP/out"; }
 st() { P --json | jq -r ".data | $1"; }
 
@@ -135,10 +142,12 @@ t "T10 the grade's prompt carries the owner's reaction" "1" "$(grep -c 'FROM THE
 
 # T9 — only the agent itself or root.
 if [[ "$EUID" != "0" ]]; then
+  ROOT=0
   ( cmd_agent_proactive scout-nobody little ) >/dev/null 2>"$TMP/err"; rc=$?
   t "T9 another agent's level refused" "1|1" "$([[ $rc -ne 0 ]] && echo 1)|$(grep -c 'only scout-nobody itself or root' "$TMP/err")"
   ( cmd_agent_proactive scout-nobody claim --text=hi ) >/dev/null 2>&1; rc=$?
   t "T9 another agent's claim refused" "1" "$([[ $rc -ne 0 ]] && echo 1)"
+  ROOT=1
 else
   printf 'skip - T9 runs as root (root is allowed by design)\n'
 fi
@@ -149,6 +158,140 @@ t "T9 status is readable by anyone" "0" "$( ( cmd_agent_proactive scout-nobody -
 # loop never lists "something that needs them" as worth a message; the three useful kinds stay.
 _b="$(_proactive_body scout)"
 t "T11 the loop does not message about what needs them" "0|1|1" "$(grep -c 'something that needs them' <<<"$_b")|$(grep -c 'a result they were waiting for, a problem you found, or one useful idea' <<<"$_b")|$(grep -c 'asks and approvals already reach them' <<<"$_b")"
+
+# ---------------- DIVE-8838: track record, earned level-up, day-one memory ----------------
+# A clean agent per block: its log, offer and level are prefs keyed by name.
+seed_log() { # <name> <acted count> <total> [day] — <total> past messages, the first <acted> acted on
+  local nm="$1" a="$2" tot="$3" d="${4:-2000-01-01}"
+  db "INSERT INTO task_prefs (key,value,updated_at) VALUES ('proactive.log.$nm',
+      (SELECT json_group_array(json_object('at','2000-01-01 00:00:00','day','$d','text','m'||value,
+         'reaction', CASE WHEN value <= $a THEN 'acted' ELSE 'not-now' END))
+       FROM generate_series(1,$tot)), datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null \
+  || db "INSERT OR REPLACE INTO task_prefs (key,value,updated_at) VALUES ('proactive.log.$nm',
+      '$(jq -cn --argjson a "$a" --argjson t "$tot" --arg d "$d" '[range(1;$t+1) | {at:"2000-01-01 00:00:00", day:$d, text:("m\(.)"), reaction:(if . <= $a then "acted" else "not-now" end)}]')', datetime('now'));"
+}
+clear_agent() { db "DELETE FROM task_prefs WHERE key LIKE 'proactive.%.$1';"; }
+P off >/dev/null; clear_agent "$N"; P little >/dev/null
+
+# T12 — acted_last_10 in --json, over the last 10 only.
+seed_log "$N" 9 14
+t "T12 acted_last_10 is over the last 10" '{"acted":5,"sent":10}' "$(P --json | jq -c .data.acted_last_10)"
+seed_log "$N" 2 3
+t "T12 fewer than 10 sent" '{"acted":2,"sent":3}' "$(P --json | jq -c .data.acted_last_10)"
+t "T12 human status names it" "1" "$( (JSON_MODE=0; cmd_agent_proactive "$N") | grep -c 'acted on 2 of the last 3')"
+
+# T13 — the offer fires at 8/10, not at 7/10, rides the claim (no extra message).
+seed_log "$N" 7 10
+out=$(P claim --text="hello")
+t "T13 7 of 10: yes, no offer" "true|null" "$(jq -r '.data | "\(.allowed)|\(.offer)"' <<<"$out")"
+t "T13 7 of 10: no offer recorded" "null" "$(st .offer)"
+seed_log "$N" 8 10
+out=$(P claim --text="Your Acme invoice is due Friday. Want me to draft the payment note?")
+t "T13 8 of 10: offer on the yes" "more|Very high" "$(jq -r '.data.offer | "\(.to)|\(.label)"' <<<"$out")"
+t "T13 the offer line" "You acted on 8 of my last 10. Want me to message you a bit more (Very high)?" "$(jq -r .data.offer.line <<<"$out")"
+t "T13 human output says to end the message with it" "1" "$(seed_log "$N" 8 10; db "DELETE FROM task_prefs WHERE key='proactive.offer.$N';"; (JSON_MODE=0; cmd_agent_proactive "$N" claim --text=x 2>/dev/null) | grep -c 'End the message with this line, word for word')"
+t "T13 it rode one claimed message (counted against the cap)" "1" "$(db "SELECT value FROM task_prefs WHERE key='proactive.log.$N';" | jq '[.[] | select(.offer == "more")] | length')"
+t "T13 status shows the open offer" "little|more|null" "$(st '.offer | "\(.from)|\(.to)|\(.answer)"')"
+# The cap holds: a capped day has no claim, so no offer.
+db "DELETE FROM task_prefs WHERE key='proactive.offer.$N';"
+seed_log "$N" 10 10 "$(date -u +%F)"
+P claim --text="again" >/dev/null; rc=$?
+t "T13 at the cap: refused, no offer" "1|null" "$([[ $rc -ne 0 ]] && echo 1)|$(st .offer)"
+
+# T14 — the level does not change without the owner's tap.
+seed_log "$N" 8 10; db "DELETE FROM task_prefs WHERE key='proactive.offer.$N';"
+P claim --text="x" >/dev/null
+t "T14 an open offer changes nothing by itself" "little" "$(st .level)"
+ROOT=0
+P more >/dev/null; rc=$?
+t "T14 the agent cannot raise itself" "1|little" "$([[ $rc -ne 0 ]] && echo 1)|$(st .level)"
+t "T14 the refusal says so" "1" "$( (ROOT=0; JSON_MODE=0; cmd_agent_proactive "$N" more) 2>&1 | grep -m1 -c "only your owner can raise")"
+P offer yes >/dev/null; rc=$?
+t "T14 the agent cannot say Yes for the owner" "1|little|null" "$([[ $rc -ne 0 ]] && echo 1)|$(st .level)|$(st .offer.answer)"
+P off >/dev/null; t "T14 the agent may lower itself" "off" "$(st .level)"
+ROOT=1; P offer yes >/dev/null; rc=$?
+t "T14 Yes needs the level the offer was made at (now Normal): refused" "1|off" "$([[ $rc -ne 0 ]] && echo 1)|$(st .level)"
+P little >/dev/null
+out=$(P offer yes 2>/dev/null)
+t "T14 the owner's Yes (root) raises it through the set verb" "more|little" "$(jq -r '.data | "\(.level)|\(.previous)"' <<<"$out")"
+t "T14 offer answered yes" "yes" "$(st .offer.answer)"
+P offer yes >/dev/null; rc=$?
+t "T14 a second Yes: no open offer" "1|more" "$([[ $rc -ne 0 ]] && echo 1)|$(st .level)"
+db "DELETE FROM task_prefs WHERE key='proactive.offer.$N';"
+P offer yes >/dev/null; rc=$?
+t "T14 Yes with no offer at all is refused" "1" "$([[ $rc -ne 0 ]] && echo 1)"
+
+# T15 — never at Very high; not again within 30 days after Not now or no answer.
+seed_log "$N" 10 10
+out=$(P claim --text="x")
+t "T15 Very high: never an offer, even at 10 of 10" "null|null" "$(jq -r .data.offer <<<"$out")|$(st .offer)"
+ROOT=1; P little >/dev/null; seed_log "$N" 9 10
+out=$(P claim --text="x"); t "T15 High again: offer" "more" "$(jq -r .data.offer.to <<<"$out")"
+ROOT=0; out=$(P offer not-now); ROOT=1
+t "T15 Not now recorded (the agent may record a no)" "not-now|little" "$(st .offer.answer)|$(st .level)"
+seed_log "$N" 10 10; out=$(P claim --text="x")
+t "T15 within 30 days of Not now: no offer" "null" "$(jq -r .data.offer <<<"$out")"
+db "UPDATE task_prefs SET value=json_set(value,'\$.at',datetime('now','-29 days')) WHERE key='proactive.offer.$N';"
+seed_log "$N" 10 10; out=$(P claim --text="x")
+t "T15 day 29: still none" "null" "$(jq -r .data.offer <<<"$out")"
+db "UPDATE task_prefs SET value=json_set(value,'\$.at',datetime('now','-31 days')) WHERE key='proactive.offer.$N';"
+seed_log "$N" 10 10; out=$(P claim --text="x")
+t "T15 after 30 days: offered again" "more" "$(jq -r .data.offer.to <<<"$out")"
+# No answer at all also blocks for 30 days.
+seed_log "$N" 10 10; out=$(P claim --text="x")
+t "T15 an unanswered offer: none again within 30 days" "null" "$(jq -r .data.offer <<<"$out")"
+db "UPDATE task_prefs SET value=json_set(value,'\$.at',datetime('now','-31 days')) WHERE key='proactive.offer.$N';"
+ROOT=1; P offer yes >/dev/null; rc=$?
+t "T15 an offer older than 30 days cannot be answered Yes" "1|little" "$([[ $rc -ne 0 ]] && echo 1)|$(st .level)"
+
+# T16 — the loop text: offers only from claim, never raise itself (read-only limit sentence).
+_b="$(_proactive_body scout)"
+t "T16 body: offer line only from claim, never raise itself" "1|1" "$(grep -c 'Only when that yes gives you an offer line' <<<"$_b")|$(grep -c 'never raise your own level' <<<"$_b")"
+
+# T17 — day-one memory: seeded once, from the owner's own agents, never a secret.
+mk_atom() { # <seat> <file> <type> <body>
+  local d="$AGENT_HOME_ROOT/agent-$1/.claude/projects/-w/memory"; mkdir -p "$d"
+  printf -- '---\nname: %s\ndescription: "%s"\nmetadata:\n  type: %s\n---\n\n%s\n' "${2%.md}" "about the owner" "$3" "$4" >"$d/$2"
+}
+S=seedme; T="$AGENT_HOME_ROOT/agent-$S/.claude/projects/-w/memory"; mkdir -p "$T"
+mk_atom olivia user_owner_bakery.md user "Owner runs a bakery in Porto and reads on a phone."
+mk_atom olivia user_owner_password.md user "Owner's bank password is in the notes app."
+mk_atom olivia user_owner_task.md user "Owner asked for DIVE-123 to ship by Friday."
+mk_atom olivia user_owner_clients.md user "Owner's client Acme pays late."
+mk_atom olivia feedback_style.md feedback "Keep replies short."
+mk_atom olivia user_owner_seeded_once.md user "x"; printf '  seeded: proactive\n' >>"$AGENT_HOME_ROOT/agent-olivia/.claude/projects/-w/memory/user_owner_seeded_once.md"
+mk_atom theo user_owner_mornings.md user "Owner prefers messages in the morning."
+mk_atom stranger user_other_owner.md user "Someone else's owner likes jazz."
+db "INSERT INTO humans (id, display_name, role) VALUES ('h-owner','Lodar','owner'), ('h-other','Kim','member');
+    INSERT INTO human_agents (human_id, agent) VALUES ('h-other','stranger');"
+jq -cn --arg n "$S" '{token:"t", name:$n, job:"Find three wholesale flour suppliers near Porto", status:"done"}' >"$FIRST_JOB_DIR/t.json"
+jq -cn '{token:"u", name:"theo", job:"Theo task content", status:"done"}' >"$FIRST_JOB_DIR/u.json"
+export SEATS="olivia theo stranger $S"
+NS() { ( cmd_agent_proactive "$S" "$@" ) 2>"$TMP/err"; }
+NS little >/dev/null
+t "T17 seeded once, recorded" "4" "$(NS --json | jq -r .data.seeded.atoms)"
+t "T17 the owner's own agents' owner facts copied" "1|1" "$(grep -l 'bakery in Porto' "$T"/user_seeded_*.md | wc -l)|$(grep -l 'in the morning' "$T"/user_seeded_*.md | wc -l)"
+t "T17 owner's name and hire answer" "1|1" "$(grep -l 'name is Lodar' "$T"/user_seeded_*.md | wc -l)|$(grep -l 'wholesale flour suppliers' "$T"/user_seeded_*.md | wc -l)"
+t "T17 secrets skipped" "0" "$(cat "$T"/*.md | grep -ci 'password')"
+t "T17 task content, client facts, feedback, re-seeds, another owner's agent skipped" "0|0|0|0|0|0" \
+  "$(cat "$T"/*.md | grep -c 'DIVE-123')|$(cat "$T"/*.md | grep -c 'Acme')|$(cat "$T"/*.md | grep -c 'Keep replies short')|$(grep -lx 'x' "$T"/*.md 2>/dev/null | wc -l)|$(cat "$T"/*.md | grep -c 'jazz')|$(cat "$T"/*.md | grep -c 'Theo task content')"
+t "T17 every seeded atom is marked for consolidation" "4|4|4" \
+  "$(grep -l '^  seeded: proactive' "$T"/user_seeded_*.md | wc -l)|$(grep -l '^  valid_to: ' "$T"/user_seeded_*.md | wc -l)|$(grep -l '^  confidence: low' "$T"/user_seeded_*.md | wc -l)"
+t "T17 indexed in MEMORY.md" "4" "$(grep -c 'seeded-' "$T/MEMORY.md")"
+mk_atom olivia user_owner_new.md user "Owner just bought a second shop."
+NS off >/dev/null; NS more >/dev/null
+t "T17 runs once: off and up again seeds nothing new" "4|0" "$(ls "$T"/user_seeded_*.md | wc -l)|$(cat "$T"/*.md | grep -c 'second shop')"
+# An agent that already knows its owner is not seeded.
+K=knows; KT="$AGENT_HOME_ROOT/agent-$K/.claude/projects/-w/memory"
+mk_atom "$K" user_a.md user "a"; mk_atom "$K" user_b.md user "b"; mk_atom "$K" user_c.md user "c"
+( cmd_agent_proactive "$K" little ) >/dev/null 2>&1
+t "T17 knows its owner already: nothing seeded" "0|0" "$(ls "$KT"/user_seeded_*.md 2>/dev/null | wc -l)|$( ( cmd_agent_proactive "$K" --json ) | jq -r .data.seeded.atoms)"
+# Not root: no seed (and no raise).
+ROOT=0; NR=nr; mkdir -p "$AGENT_HOME_ROOT/agent-$NR/.claude/projects/-w/memory"
+( cmd_agent_proactive "$NR" little ) >/dev/null 2>&1; rc=$?
+t "T17 the agent raising itself: refused, nothing seeded" "1|null" "$([[ $rc -ne 0 ]] && echo 1)|$( ( cmd_agent_proactive "$NR" --json ) | jq -r .data.seeded)"
+ROOT=1
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

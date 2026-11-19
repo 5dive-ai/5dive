@@ -317,6 +317,7 @@ Agents:
                                                      # unless --switch-harness, which runs 'agent switch' below
   5dive agent proactive <name> [off|little|more] [--json]  # may it message its owner first? off (default) / a little
                                                      # (1 a day) / more (3 a day); claim|reaction are its run's verbs (DIVE-8718)
+                                                     # only the owner raises it; offer yes|not-now answers a level-up (DIVE-8838)
   5dive agent switch <name> --to=claude|codex|grok [--account=<account|default>] [--no-handoff] [--handoff-wait=<s>]
                                                      # move an agent between Claude Code, Codex and Grok IN PLACE: same name,
                                                      # unix user, bot, tasks and grants; memory + instructions converted,
