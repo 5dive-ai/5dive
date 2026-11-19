@@ -1699,6 +1699,22 @@ profile_set_var() {
   secret_file_secure "$file"   # DIVE-5690: the rename dropped the readers
 }
 
+# profile_unset_var <profile> <VAR> — drop VAR from the profile's combined.env.
+# A no-op when the file or the var is absent; same atomic rewrite and perms as
+# profile_set_var. DIVE-8799: heals a custom-endpoint profile's old quiet vars.
+profile_unset_var() {
+  local profile="$1" var="$2" file tmp
+  [[ -n "$profile" && "$var" =~ ^[A-Z_][A-Z0-9_]*$ ]] || return 0
+  file="${AUTH_PROFILES_DIR}/${profile}/combined.env"
+  [[ -f "$file" ]] && grep -q "^${var}=" "$file" || return 0
+  tmp=$(mktemp "${file}.XXXXXX")
+  grep -v "^${var}=" "$file" > "$tmp" || true
+  chown "root:$(secrets_group)" "$tmp"
+  chmod 640 "$tmp"
+  mv "$tmp" "$file"
+  secret_file_secure "$file"
+}
+
 # write_default_connector <filename.env> <VAR> <VALUE> — replaces any prior
 # entries for <VAR> in /etc/5dive/connectors/<filename.env>, then rewrites
 # with correct perms. Value via stdin.

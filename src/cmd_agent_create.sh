@@ -2206,18 +2206,30 @@ _apply_byo_claude() {
   # Custom endpoints (esp. z.ai during peak hours) can be slow; raise the
   # client-side request timeout so long tool turns don't get cut off.
   printf '%s' "3000000" | profile_set_var "$profile" API_TIMEOUT_MS
-  # DIVE-7573 (D4): a custom endpoint (no catalog row: self-hosted, Ollama, the
+  # DIVE-7573 (D4): a custom endpoint on a LOCAL model (self-hosted, Ollama, the
   # office model) gets tool search OFF. Claude Code hides the chat's reply tool
   # behind it and a small model never searches, so it never replies.
   # DIVE-7624: and no usage stats or error reports to Anthropic, local-only or
   # not (LOCAL_MODEL_QUIET_ENV). Each var is written only when the profile has no
   # value for it, so an operator's own setting survives.
+  # DIVE-8799: keyed on a LOCAL host (claude_baseurl_is_local), not on "no catalog
+  # row". DISABLE_TELEMETRY also turns off Claude Code's feature flags, channels
+  # among them, so a cloud vendor the catalog lacks (Qwen Beijing) lost Telegram
+  # and dashboard chat. A public custom host now gets what a catalog vendor gets:
+  # none of them. A profile written before this fix still holds them, so a
+  # re-apply on a public custom host removes each one that still has exactly the
+  # value we wrote; any other value is the operator's and stays.
   if [[ -z "$(claude_baseurl_catalog_provider "$base_url")" ]]; then
-    local _tse
+    local _tse _is_local=0
+    claude_baseurl_is_local "$base_url" && _is_local=1
     for _tse in "${LOCAL_MODEL_SEAT_ENV[@]:-ENABLE_TOOL_SEARCH=false}" \
                 ${LOCAL_MODEL_QUIET_ENV[@]+"${LOCAL_MODEL_QUIET_ENV[@]}"}; do
-      [[ -z "$(profile_env_value "$profile" "${_tse%%=*}")" ]] || continue
-      printf '%s' "${_tse#*=}" | profile_set_var "$profile" "${_tse%%=*}"
+      if (( _is_local )); then
+        [[ -z "$(profile_env_value "$profile" "${_tse%%=*}")" ]] || continue
+        printf '%s' "${_tse#*=}" | profile_set_var "$profile" "${_tse%%=*}"
+      elif [[ "$(profile_env_value "$profile" "${_tse%%=*}")" == "${_tse#*=}" ]]; then
+        profile_unset_var "$profile" "${_tse%%=*}"
+      fi
     done
   fi
   # DIVE-5255: OpenRouter pre-authorises every turn's max_tokens against what is
