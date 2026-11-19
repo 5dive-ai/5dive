@@ -832,6 +832,73 @@ TOML
   fi
 fi
 
+# DIVE-8833: the owner's standing rules on a codex seat. A pack's instructions
+# open with `@~/.claude/owner-rules.md` and tell the employee to write each
+# standing rule there (DIVE-8830). Claude Code resolves that import every
+# session; codex reads ~/.codex/AGENTS.md as plain text, so on codex the rules
+# were written to a file nothing loaded and were gone after a restart. Copy the
+# file's current text into a marker block of AGENTS.md at every start (a harness
+# switch ends in a start too). Only this block is ever written: the owner's file
+# is only read, and every byte outside the markers stays as it was. The block
+# sits just above the codex baseline, i.e. right after the pack's section: pack
+# sync owns the head of the file, and codex drops the TAIL past 32 KiB. An
+# absent or blank file removes the block (and the blank line after it), so the
+# file is back to its exact bytes. Never fails the boot.
+if [[ "$TYPE" == "codex" && -d "$HOME/.codex" ]]; then
+  _orf="$HOME/.claude/owner-rules.md"
+  _oaf="$HOME/.codex/AGENTS.md"
+  _orm="5dive:owner-rules"
+  _orb=""
+  if [[ -f "$_orf" && -r "$_orf" ]] && grep -q '[^[:space:]]' "$_orf" 2>/dev/null; then
+    # Bytes, not characters (the 32 KiB limit is in bytes, Cyrillic is two),
+    # cut back to the last whole line; a marker line inside the file is dropped
+    # so it can never close the block early.
+    _orb=$(LC_ALL=C awk -v max="${FIVEDIVE_OWNER_RULES_BUDGET:-6000}" -v id="$_orm" '
+      index($0, "<!-- " id ":") { next }
+      { n += length($0) + 1; if (n > max) { cut = 1; exit } print }
+      END { if (cut) print "\n(cut at " max " bytes; the full list is in ~/.claude/owner-rules.md)" }' "$_orf" \
+      | awk 'NF { seen = 1 } seen' ) || _orb=""
+    [[ -n "$_orb" ]] && _orb="<!-- ${_orm}:begin -->
+# Your owner's standing rules
+
+Copied by 5dive from ~/.claude/owner-rules.md when this session started. Follow
+every one of them. To add or change a rule, edit that file, one rule per line;
+it is copied here again at the next start. Do not edit this block.
+
+${_orb}
+<!-- ${_orm}:end -->"
+  fi
+  if [[ -L "$_oaf" ]]; then
+    echo "warn: $_oaf is a symlink — owner rules not copied into it" >&2
+  elif [[ -f "$_oaf" || -n "$_orb" ]]; then
+    _ort=$(mktemp "$HOME/.codex/.AGENTS.md.XXXXXX" 2>/dev/null) || _ort=""
+    if [[ -n "$_ort" ]] \
+       && { [[ -f "$_oaf" ]] && cat "$_oaf" || :; } | ORB="$_orb" awk -v id="$_orm" \
+            -v anchor="<!-- 5dive:codex-operating-baseline:begin" '
+            BEGIN { blk = ENVIRON["ORB"] }   # not -v: that would eat the backslashes in a rule
+            function put() { if (blk != "" && !done) { print blk; print ""; done = 1 } }
+            index($0, "<!-- " id ":begin") { skip = 1; next }
+            skip { if (index($0, "<!-- " id ":end")) { skip = 0; drop = 1 } next }
+            drop { drop = 0; if ($0 == "") next }
+            index($0, anchor) == 1 { put() }
+            { print }
+            END { put() }' >"$_ort"; then
+      if [[ -f "$_oaf" ]] && cmp -s "$_ort" "$_oaf"; then
+        rm -f "$_ort"
+      elif [[ ! -f "$_oaf" && ! -s "$_ort" ]]; then
+        rm -f "$_ort"
+      else
+        chmod 600 "$_ort" && mv -f "$_ort" "$_oaf" \
+          || { rm -f "$_ort"; echo "warn: could not copy the owner rules into $_oaf" >&2; }
+      fi
+    else
+      [[ -n "$_ort" ]] && rm -f "$_ort"
+      echo "warn: could not copy the owner rules into $_oaf" >&2
+    fi
+  fi
+  unset _orf _oaf _orm _orb _ort
+fi
+
 # DIVE-1900: post-seed assertion, shared by the credential seed blocks below.
 #
 # The bug this whole area exists to kill is a SILENT one: a successful login
