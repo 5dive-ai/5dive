@@ -1310,6 +1310,24 @@ _task_stamp_confirmed_delivery() { # <comma-separated numeric task ids>
       WHERE id IN (${task_ids}) AND need_type IS NOT NULL AND need_answered_at IS NULL;" 2>/dev/null || true
 }
 
+# DIVE-8803: may a GROUP named by last-human-chat.json take an owner send?
+# The telegram plugin moves that pointer on every accepted human message, in a
+# DM or an allowlisted group, from ANY member of the group, owner or not. So on a
+# box where the owner added their agent to a group with other people, the last
+# word from anyone there carried the owner's gate (and its buttons) into a room
+# the other members read; seen 2026-11-19, a client's question for her owner
+# posted to the group she sat in. Observed traffic is not a destination. A group
+# is the owner's room only when access.json SAYS so, by binding it to a topic
+# (`agent config telegram.home-channel`, a forum seat), or when there is no
+# owner DM to send to at all (a group-only bot, where the group is all there is).
+# Otherwise the pointer is ignored and the send takes the DM path below.
+_task_owner_pointer_group_ok() { # <access_file> <chat>
+  jq -e --arg c "$2" '
+    ((.groups // {}) | has($c))
+    and ( ((.groups[$c].message_thread_id // "") | tostring | (. != "" and . != "null"))
+          or (((.allowFrom // []) | length) == 0) )' "$1" >/dev/null 2>&1
+}
+
 # DIVE-4413: describe, in the filer's words, where a LEGACY (registry-empty)
 # gate send will fan out to. Read off the same access.json the send path walks,
 # in the same order, so the preview and the delivery cannot drift into
@@ -1325,8 +1343,8 @@ _task_legacy_owner_destinations() { # <access_file>
   if [[ -r "$ptr_file" ]]; then
     p_chat=$(jq -r '.chatId // empty' "$ptr_file" 2>/dev/null) || p_chat=""
     p_thread=$(jq -r '.messageThreadId // empty' "$ptr_file" 2>/dev/null) || p_thread=""
-    if [[ -n "$p_chat" ]] && jq -e --arg c "$p_chat" \
-         '((.allowFrom // []) | index($c) != null) or ((.groups // {}) | has($c))' "$access_file" >/dev/null 2>&1; then
+    if [[ -n "$p_chat" ]] && { jq -e --arg c "$p_chat" '(.allowFrom // []) | index($c) != null' "$access_file" >/dev/null 2>&1 \
+         || _task_owner_pointer_group_ok "$access_file" "$p_chat"; }; then
       if [[ -z "$p_thread" ]]; then
         p_thread=$(jq -r --arg c "$p_chat" '(.groups[$c].message_thread_id // "") | tostring' "$access_file" 2>/dev/null) || p_thread=""
         [[ "$p_thread" == "null" ]] && p_thread=""
@@ -1379,8 +1397,8 @@ _task_send_targets_note() {
 # where the human last talked to this agent (last-human-chat.json beside
 # access.json), the alert and its tap buttons go THERE, but only when that
 # chat is still allowlisted in access.json (a stale or hand-edited pointer
-# must never widen the audience). No pointer (plugin predates the feature) =
-# legacy flow: human DMs first (allowFrom — exactly the users who /started
+# must never widen the audience), and for a group only when it is the
+# owner's room (_task_owner_pointer_group_ok, DIVE-8803). No pointer = legacy flow: human DMs first (allowFrom — exactly the users who /started
 # the bot), then the agent's bound forum topic(s) so nothing is silently
 # lost. A Bot API {ok:true} is required before task ids are stamped delivered;
 # failures are logged loudly and retry against an allowed group topic. Always
@@ -1427,7 +1445,7 @@ _task_send_owner() {
         _task_stamp_confirmed_delivery "$task_ids"
         return 0
       fi
-      if jq -e --arg c "$p_chat" '(.groups // {}) | has($c)' "$access_file" >/dev/null 2>&1; then
+      if _task_owner_pointer_group_ok "$access_file" "$p_chat"; then
         # DIVE-4413: a NULL messageThreadId in the pointer is not a vote for
         # "General". The pointer is written by the telegram plugin from inbound
         # traffic and predates forum topics, so a three-month-old pointer names
@@ -1450,7 +1468,8 @@ _task_send_owner() {
         _task_stamp_confirmed_delivery "$task_ids"
         return 0
       fi
-      # Pointer references a chat that is no longer allowed — ignore it.
+      # Pointer references a chat that is no longer allowed, or a group that is
+      # not the owner's room (DIVE-8803) — ignore it.
     fi
   fi
 
