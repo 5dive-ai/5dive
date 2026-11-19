@@ -145,5 +145,10 @@ fi
 t "T9 a bad name is refused" "1" "$( ( cmd_agent_proactive 'Bad Name' ) >/dev/null 2>&1 || echo 1)"
 t "T9 status is readable by anyone" "0" "$( ( cmd_agent_proactive scout-nobody --json ) >/dev/null 2>&1; echo $?)"
 
+# T11 — DIVE-8765 (lodar 11-19, "human gates are always on"): asks already reach the owner, so the
+# loop never lists "something that needs them" as worth a message; the three useful kinds stay.
+_b="$(_proactive_body scout)"
+t "T11 the loop does not message about what needs them" "0|1|1" "$(grep -c 'something that needs them' <<<"$_b")|$(grep -c 'a result they were waiting for, a problem you found, or one useful idea' <<<"$_b")|$(grep -c 'asks and approvals already reach them' <<<"$_b")"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
