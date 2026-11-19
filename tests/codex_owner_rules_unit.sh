@@ -145,4 +145,4 @@ check "pack tail markers know the block" \
 check "switch carry strips the block" \
   "$(grep -cF '_switch_strip_block 5dive:owner-rules' src/cmd_agent_switch.sh)" "1"
 
-exit "$fail"
+exit $fail
