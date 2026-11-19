@@ -179,16 +179,38 @@ fd, tmp = tempfile.mkstemp(dir=state, prefix='.access.', suffix='.tmp')
 with os.fdopen(fd, 'w') as f:
     json.dump(merged, f, indent=2)
 os.replace(tmp, path)
+
+# DIVE-8791: how many DM ids this write lets in that the old file did not.
+old_allow = existing.get('allowFrom') if isinstance(existing.get('allowFrom'), list) else []
+print(f"added={len(set(allow) - set(map(str, old_allow)))}")
 PY
 )
-  local err
-  if ! err=$(sudo -u "$user" env STATE="$state_dir" PATCH="$body" python3 -c "$script" 2>&1 >/dev/null); then
-    fail "$E_VALIDATION" "${err:-telegram access.json write failed for agent '$name'}"
+  local out added
+  if ! out=$(sudo -u "$user" env STATE="$state_dir" PATCH="$body" python3 -c "$script" 2>&1); then
+    fail "$E_VALIDATION" "${out:-telegram access.json write failed for agent '$name'}"
+  fi
+  added=$(sed -n 's/^added=\([0-9][0-9]*\)$/\1/p' <<<"$out" | tail -1)
+  added=${added:-0}
+
+  # DIVE-8791: a bot a manager made (a Connect tap) stays owner-only on
+  # Telegram's side until 5dive lifts the lock, so a person added here was
+  # refused by Telegram while `get` listed them. Lift it when this write lets
+  # someone new in; removing ids or re-saving the same list never calls out.
+  local open_state=skipped msg="telegram access updated for '$name'"
+  if (( added > 0 )); then
+    _tg_open_bot "$name"
+    open_state="$_TG_OPEN_STATE"
+    case "$open_state" in
+      open)        msg+="; its bot is open, so they can reach it now" ;;
+      not_managed) msg+="; its bot has no owner-only lock, so they can reach it now" ;;
+      no_account)  msg+="; this box has no 5dive account, so its bot has no owner-only lock" ;;
+      *) warn "${_TG_OPEN_ERROR}. Telegram still blocks everyone but the owner; retry as root: 5dive agent _telegram_open ${name}" ;;
+    esac
   fi
 
-  ok "telegram access updated for '$name'" \
-     '{name:$n, updated:true}' \
-     --arg n "$name"
+  ok "$msg" \
+     '{name:$n, updated:true, added:$a, open_state:$s}' \
+     --arg n "$name" --argjson a "$added" --arg s "$open_state"
 }
 
 # DIVE-6675: "In groups, answer: when called by name · every message", the
@@ -668,34 +690,50 @@ cmd_agent_telegram_open() {
   [[ ",$channels," == *",telegram,"* ]] \
     || fail "$E_VALIDATION" "agent '$name' has channels=$channels — _telegram_open only applies to telegram"
 
-  local env_file token
-  env_file=$(_tg_app_env_file)
-  token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$env_file" 2>/dev/null | head -1 || true)
+  _tg_open_bot "$name"
+  case "$_TG_OPEN_STATE" in
+    no_account)
+      ok "this box has no 5dive account, so its bot has no owner-only lock" \
+        '{agent:$a, state:"no_account"}' --arg a "$name" ;;
+    open)
+      ok "${name}'s bot is open: anyone can reach it, and access.json still decides who is answered" \
+        '{agent:$a, state:"open"}' --arg a "$name" ;;
+    not_managed)
+      ok "${name}'s bot was not made by a manager bot, so it has no owner-only lock" \
+        '{agent:$a, state:"not_managed"}' --arg a "$name" ;;
+    *) fail "$E_GENERIC" "$_TG_OPEN_ERROR" ;;
+  esac
+}
+
+# _tg_open_bot <name>: the one POST that lifts the lock, run as root. Shared by
+# `_telegram_open` and `telegram-access set` (DIVE-8791), so it never exits
+# and always returns 0 (the CLI runs under set -e): it sets _TG_OPEN_STATE
+# (open | not_managed | no_account | failed) and, on failed, _TG_OPEN_ERROR.
+_tg_open_bot() {
+  local name="$1" token out code body err
+  _TG_OPEN_STATE=failed; _TG_OPEN_ERROR=""
+  token=$(sed -n 's/^CONNECTORD_TOKEN=//p' "$(_tg_app_env_file)" 2>/dev/null | head -1 || true)
   if [[ -z "$token" ]]; then
-    ok "this box has no 5dive account, so its bot has no owner-only lock" \
-      '{agent:$a, state:"no_account"}' --arg a "$name"
-    return 0
+    _TG_OPEN_STATE=no_account; return 0
   fi
-  local out code body err
   out=$(printf 'header = "authorization: Bearer %s"\n' "$token" \
     | curl -sS --max-time 20 -K - -X POST -w '\n%{http_code}' \
         "$(_tg_app_api)/server/telegram/agents/${name}/open" 2>/dev/null) || out=""
   code="${out##*$'\n'}"; body="${out%$'\n'*}"
-  [[ "$code" =~ ^[0-9]{3}$ ]] || fail "$E_GENERIC" "5dive could not be reached to open ${name}'s bot"
+  if [[ ! "$code" =~ ^[0-9]{3}$ ]]; then
+    _TG_OPEN_ERROR="5dive could not be reached to open ${name}'s bot"; return 0
+  fi
   if [[ "$code" == 200 ]]; then
     if jq -e '.open == true' >/dev/null 2>&1 <<<"$body"; then
-      ok "${name}'s bot is open: anyone can reach it, and access.json still decides who is answered" \
-        '{agent:$a, state:"open"}' --arg a "$name"
-      return 0
+      _TG_OPEN_STATE=open; return 0
     fi
     if jq -e '.reason == "not_managed"' >/dev/null 2>&1 <<<"$body"; then
-      ok "${name}'s bot was not made by a manager bot, so it has no owner-only lock" \
-        '{agent:$a, state:"not_managed"}' --arg a "$name"
-      return 0
+      _TG_OPEN_STATE=not_managed; return 0
     fi
   fi
   err=$(jq -r '.error // empty' <<<"$body" 2>/dev/null || true)
-  fail "$E_GENERIC" "5dive could not open ${name}'s bot (HTTP ${code}${err:+, $err})"
+  _TG_OPEN_ERROR="5dive could not open ${name}'s bot (HTTP ${code}${err:+, $err})"
+  return 0
 }
 
 cmd_telegram_resolve_handle() {

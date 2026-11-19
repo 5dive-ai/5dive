@@ -216,6 +216,8 @@ Agents:
   5dive agent telegram-access get <name>             # read access.json: who can DM the bot, group settings.
   5dive agent telegram-access set <name>             # write access.json from {dmPolicy,allowFrom,groups} JSON
                                                      # piped on stdin. Plugin re-reads per-message — no restart.
+                                                     # Adding an id also lifts Telegram's owner-only lock on a
+                                                     # manager-made bot (data.open_state says what happened).
   5dive agent telegram-access groups <name> [--answer=name|every|owner] [--names=<a,b,...>]
                                                      # in groups, answer when called by name (default) or every
                                                      # message: sets every group + groups added later.
