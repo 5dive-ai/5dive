@@ -1,0 +1,26 @@
+{
+  "_about": "DIVE-8807: what the 5dive app reads from each path the office server answers under /api/proxy. Field -> allowed JSON types ('a|b'); [x] = an array of x; {..} = an object with those fields. Taken from the app's own types at lodar/5dive-frontend 69686de31: lib/team-login.ts (TeamView, TeamPerson), types/dashboard.ts (ServerState), app/dashboard/_components/resource-pressure.ts (HealthUsage), lib/chat-unread.ts (UnreadConversation), app/dashboard/agents/_components/agent-chat.tsx (ChatMessage), lib/chat-e2e/chat-e2e.ts (Directory), app/dashboard/agents/_components/agent-exec.ts + agent-exec-envelope.ts (exec), agent-shell.ts (ServerAgent), tasks/_components/lead-hold.ts (InboxPayload). /me is the slices' shared contract (DIVE-8807 row). 'envelope' = the {ok,data} the app parses out of exec stdout.",
+  "paths": {
+    "GET /me": { "response": { "id": "string", "name": "string", "role": "string", "office": "boolean" } },
+    "GET /team": { "response": { "role": "string", "me": "string|null", "ownerEmail": "string|null", "max": "number",
+      "members": [ { "id": "string|number", "email": "string|null", "invitedEmail": "string|null", "state": "string", "invitedAt": "string|null", "joinedAt": "string|null", "agents": "array|null", "perms": "array" } ],
+      "cabinets": { "current": "number|null", "teams": "array", "max": "number" } } },
+    "POST /team/invite": { "request": { "email": "Contract Person" }, "response": { "ok": "boolean", "link": "string" } },
+    "GET /server/status": { "response": { "status": "string", "selfHosted": "boolean", "chatOnly": "boolean", "domain": "string|null" } },
+    "GET /server/health": { "response": { "disk": { "used": "number", "total": "number" }, "memory": { "used": "number", "total": "number" }, "uptimeSeconds": "number" } },
+    "GET /server/conversations": { "response": { "conversations": [ { "id": "number", "dmAgent": "string|null", "unread": "number", "participants": ["string"], "lastMessage": { "id": "number", "createdAt": "string" } } ] } },
+    "POST /server/conversations": { "request": { "agent": "alice" }, "response": { "ok": "boolean", "conversation": { "id": "number" } } },
+    "POST /server/conversations/<conversation>/read": { "request": { "lastId": 1 }, "response": { "ok": "boolean" } },
+    "GET /server/messages?agent=alice&limit=200": { "response": { "messages": [ { "id": "number", "conversation": "number", "agent": "string", "direction": "string", "chatId": "string", "body": "string", "metadata": "object|null", "createdAt": "string", "collectedAt": "string|null", "deliveredAt": "string|null" } ] } },
+    "POST /server/messages": { "request": { "agent": "alice", "body": "contract hello" }, "response": { "id": "number", "conversation": "number", "delivered": "boolean", "queued": "boolean" } },
+    "GET /server/chat-e2e": { "response": { "enabled": "boolean", "kind": "string|null", "box": "object|null", "devices": "array" } },
+    "POST /server/agents/exec agent list": { "request": { "args": ["agent", "list", "--json"] }, "response": { "exit": "number", "stdout": "string", "stderr": "string" },
+      "envelope": [ { "name": "string", "type": "string", "channels": "string", "createdAt": "string", "active": "string", "enabled": "string" } ] },
+    "POST /server/agents/exec task inbox": { "request": { "args": ["task", "inbox", "--json"] }, "response": { "exit": "number", "stdout": "string" },
+      "envelope": { "inbox": [ { "id": "number", "ident": "string", "title": "string", "status": "string", "assignee": "string", "need_type": "string", "ask": "string" } ], "needs_you": "number" } },
+    "POST /server/agents/exec account list": { "request": { "args": ["account", "list", "--json"] }, "response": { "exit": "number", "stdout": "string" },
+      "envelope": [ { "name": "string", "types": ["string"], "agents": "array" } ] },
+    "POST /server/agents/exec secret saved ls": { "request": { "args": ["secret", "saved", "ls", "--json"] }, "response": { "exit": "number", "stdout": "string" }, "envelope": { "names": ["string"] } },
+    "POST /server/agents/exec update --check": { "request": { "args": ["update", "--check", "--json"] }, "response": { "exit": "number", "stdout": "string" }, "envelope": { "current": "string|null", "latest": "string|null", "behind": "boolean" } }
+  }
+}
