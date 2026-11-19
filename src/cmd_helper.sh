@@ -153,15 +153,18 @@ _helper_tick() {
   seat=$(_helper_seat "$reg")
   case "$seat" in
     taken) return 0 ;;
-    none)
-      [[ -e "$d/built" ]] && return 0   # built once and the owner removed it
-      _helper_build_spent && return 0
-      if systemd-run --unit="$HELPER_UNIT" --collect --quiet \
-           "$(_helper_self)" helper ensure >/dev/null 2>&1; then
-        printf 'building the helper seat (unit %s)\n' "$HELPER_UNIT"
-      fi
-      return 0 ;;
+    none) [[ -e "$d/built" ]] && return 0 ;;   # built once and the owner removed it
   esac
+  # No seat yet, or a seat whose build stopped half way (marked, no persona):
+  # `helper ensure` creates what is missing and finishes the rest.
+  if [[ ! -e "$d/built" ]]; then
+    _helper_build_spent && return 0
+    if systemd-run --unit="$HELPER_UNIT" --collect --quiet \
+         "$(_helper_self)" helper ensure >/dev/null 2>&1; then
+      printf 'building the helper seat (unit %s)\n' "$HELPER_UNIT"
+    fi
+    return 0
+  fi
   (( $(_helper_hires "$reg") > 0 )) || return 0
   _helper_running || return 0
   _helper_greet
@@ -176,20 +179,25 @@ _helper_build_spent() {
   (( n >= HELPER_BUILD_TRIES ))
 }
 
+# <seat> = none | mine. The system mark goes on right after the create, so a
+# build that stops later (persona, restart) still leaves a seat that is not a
+# hire and reads `mine`; the next tick finishes it (no `built` yet).
 _helper_build() {
-  local d f self
+  local seat="$1" d f self
   d=$(_helper_dir); self=$(_helper_self)
   local n=0; read -r n 2>/dev/null <"$d/build-tries" || n=0; [[ "$n" =~ ^[0-9]+$ ]] || n=0
   printf '%s\n' $((n + 1)) >"$d/build-tries"
-  "$self" agent create "$HELPER_AGENT" --type=claude --auth-profile="$HELPER_ACCOUNT" \
-      --channels=dashboard --isolation=standard --no-heartbeat --no-team-bot </dev/null >&2 \
-    || return 1
+  if [[ "$seat" == none ]]; then
+    "$self" agent create "$HELPER_AGENT" --type=claude --auth-profile="$HELPER_ACCOUNT" \
+        --channels=dashboard --isolation=standard --no-heartbeat --no-team-bot </dev/null >&2 \
+      || return 1
+  fi
+  with_registry_lock _helper_mark || return 1
   lazy_need persona_install_doc
   f=$(mktemp) || return 1
   _helper_persona >"$f"
   persona_install_doc "$HELPER_AGENT" claude "$f" >&2 || { rm -f "$f"; return 1; }
   rm -f "$f"
-  with_registry_lock _helper_mark || return 1
   date -u +%FT%TZ >"$d/built"
   "$self" agent restart "$HELPER_AGENT" </dev/null >/dev/null 2>&1 || true
 }
@@ -209,11 +217,11 @@ cmd_helper_ensure() {
   reg=$(registry_read)
   seat=$(_helper_seat "$reg")
   case "$seat" in
-    mine)  ok "the helper seat is here" '{state:"present"}'; return 0 ;;
+    mine)  [[ -e "$d/built" ]] && { ok "the helper seat is here" '{state:"present"}'; return 0; } ;;
     taken) ok "no helper: an agent of yours is already named ${HELPER_AGENT}" '{state:"name-taken"}'; return 0 ;;
+    none)  [[ -e "$d/built" ]] && { ok "no helper: it was removed, so it stays removed" '{state:"removed"}'; return 0; } ;;
   esac
-  [[ -e "$d/built" ]] && { ok "no helper: it was removed, so it stays removed" '{state:"removed"}'; return 0; }
-  _helper_build || fail "$E_GENERIC" "could not build the helper seat (re-run: sudo 5dive helper ensure)"
+  _helper_build "$seat" || fail "$E_GENERIC" "could not build the helper seat (re-run: sudo 5dive helper ensure)"
   ok "built the helper seat '${HELPER_AGENT}' (5dive, Help & setup)" '{state:"built"}'
 }
 
@@ -235,6 +243,16 @@ cmd_helper() {
   case "$sub" in
     ensure) cmd_helper_ensure "$@" ;;
     status) cmd_helper_status "$@" ;;
+    help|-h|--help)
+      cat <<'EOF'
+usage: 5dive helper ensure|status [--json]
+
+The "5dive" Help & setup seat on a paid 5dive server. It is not a hire.
+
+  5dive helper status   is this box eligible, is the seat here, built, greeted
+  5dive helper ensure   root: build the seat if this box should have one
+EOF
+      ;;
     *) fail "$E_USAGE" "usage: 5dive helper ensure|status [--json]" ;;
   esac
 }

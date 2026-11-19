@@ -8,7 +8,9 @@
 #      asks it, any other answer retries and asks only after the tries run out;
 #   4. which boxes: no demo AI = nothing; an owner's own agent named `helper` is
 #      left alone; a seat the owner removed is not built again; a build that keeps
-#      failing stops after its tries.
+#      failing stops after its tries;
+#   5-8. the persona; the greeted claim against a racing tick; a build that stops
+#      after create is marked and resumed, never a hire; --help exits 0.
 # Throwaway STATE_DIR and fake 5dive / systemd-run / curl on PATH: no root, no
 # network, nothing on the live box is touched.
 # Run: bash tests/helper_seat_unit.sh
@@ -71,6 +73,7 @@ fresh() {   # a new box: state dir, registry, optional demo AI account
   : >"$CALLS"
 }
 reg_with() { printf '{"agents":%s}' "$1"; }
+built() { mkdir -p "$STATE_DIR/helper"; date >"$STATE_DIR/helper/built"; }
 HELPER_ROW='"helper":{"type":"claude","system":"helper"}'
 HIRE_ROW='"theo":{"type":"claude"}'
 n_calls() { grep -c -- "$1" "$CALLS"; }
@@ -113,7 +116,7 @@ _helper_tick "$(reg_with '{}')" >/dev/null
 t 'a build that failed its tries stops' 0 "$(n_calls systemd-run)"
 
 echo '== 3. the greeting waits for an owner, then goes out once =='
-fresh 7; FAKE_HTTP=404
+fresh 7; built; FAKE_HTTP=404
 _helper_tick "$(reg_with "{$HELPER_ROW}")" >/dev/null
 t 'no hire yet (an unclaimed spare): no greeting' 0 "$(n_calls '_deliver')"
 RUNNING=0; _helper_tick "$(reg_with "{$HELPER_ROW,$HIRE_ROW}")" >/dev/null; RUNNING=1
@@ -128,7 +131,7 @@ FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
 t 'after a restart: still one greeting' 1 "$(n_calls '_deliver')"
 t 'greeted is recorded' yes "$([[ -s "$STATE_DIR/helper/greeted" ]] && echo yes)"
 t 'once greeted, the tick reads nothing' 0 "$(n_calls curl | awk '{print ($1>2)?1:0}')"
-fresh 8; REG="$(reg_with "{$HELPER_ROW,$HIRE_ROW}")"
+fresh 8; built; REG="$(reg_with "{$HELPER_ROW,$HIRE_ROW}")"
 FAKE_DELIVER_FAIL=1 FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
 t 'a failed send leaves no greeted mark' no "$([[ -e "$STATE_DIR/helper/greeted" ]] && echo yes || echo no)"
 FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
@@ -137,7 +140,7 @@ t 'the retry sends it, once' 2 "$(n_calls '_deliver')"
 t 'greeted after the retry' yes "$([[ -e "$STATE_DIR/helper/greeted" ]] && echo yes)"
 
 echo '== 4. the handover read =='
-fresh 9; REG="$(reg_with "{$HELPER_ROW,$HIRE_ROW}")"
+fresh 9; built; REG="$(reg_with "{$HELPER_ROW,$HIRE_ROW}")"
 FAKE_HTTP=200 FAKE_BODY='{"business":"a bakery\nin Lyon","suggested":["theo","dude","x y"],"asked_at":"2026-11-19T10:00:00Z"}' \
   _helper_tick "$REG" >/dev/null
 msg=$(sed -n '/_deliver/,$p' "$CALLS")
@@ -146,10 +149,10 @@ has '200: names the business' '"a bakery in Lyon"' "$msg"
 has '200: says not to ask again' 'Do not ask about it again' "$msg"
 has '200: passes at most two clean suggestions' '5dive suggested: theo, dude)' "$msg"
 hasnt '200: does not ask the question' 'what does your business do' "$msg"
-fresh 10; FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
+fresh 10; built; FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
 msg=$(sed -n '/_deliver/,$p' "$CALLS")
 has '404: asks the one question' 'what does your business do?' "$msg"
-fresh 11; HELPER_HANDOVER_TRIES=3
+fresh 11; built; HELPER_HANDOVER_TRIES=3
 for i in 1 2; do FAKE_HTTP=503 _helper_tick "$REG" >/dev/null; done
 t 'API down: no greeting while tries remain' 0 "$(n_calls '_deliver')"
 FAKE_HTTP=503 _helper_tick "$REG" >/dev/null
@@ -171,6 +174,51 @@ done
 # by root with no SUDO_UID, which the DIVE-6843 refusal lets through.
 has 'built as a standard seat on the demo AI' '--auth-profile="$HELPER_ACCOUNT" \' "$(grep -A1 'agent create "$HELPER_AGENT"' src/cmd_helper.sh)"
 has 'standard isolation' '--isolation=standard' "$(grep -A1 'agent create "$HELPER_AGENT"' src/cmd_helper.sh)"
+
+echo '== 6. the greeted claim holds against a second sender =='
+# A tick that read the handover, then lost the race: another tick already wrote
+# greeted. noclobber makes the claim fail, so this one sends nothing.
+fresh 12; built; mkdir -p "$STATE_DIR/helper"; echo 'claimed by the other tick' >"$STATE_DIR/helper/greeted"
+FAKE_HTTP=404 _helper_greet >/dev/null
+t 'a claim already taken: no second send' 0 "$(n_calls '_deliver')"
+t 'the other claim is left as it was' 'claimed by the other tick' "$(cat "$STATE_DIR/helper/greeted")"
+
+echo '== 7. a build that stops half way is still not a hire =='
+# agent create wrote the row, then the persona step failed.
+fresh 13; reg_with '{"helper":{"type":"claude"}}' >"$REGISTRY"
+registry_read() { cat "$REGISTRY"; }
+persona_install_doc() { printf 'persona %s\n' "$1" >>"$CALLS"; return "${FAKE_PERSONA_RC:-0}"; }
+IN_REGISTRY_LOCK=1 FAKE_PERSONA_RC=1 _helper_build none 2>/dev/null; rc=$?
+t 'the half build reports failure' 1 "$rc"
+t 'it is marked system=helper anyway' helper "$(jq -r '.agents.helper.system' "$REGISTRY")"
+t 'so it reads mine, not taken' mine "$(_helper_seat "$(cat "$REGISTRY")")"
+t 'and it is not a hire' 0 "$(_helper_hires "$(cat "$REGISTRY")")"
+t 'not built yet' no "$([[ -e "$STATE_DIR/helper/built" ]] && echo yes || echo no)"
+: >"$CALLS"
+out=$(_helper_tick "$(cat "$REGISTRY")")
+has 'the next tick resumes the build' 'building the helper seat' "$out"
+t 'and does not greet a seat with no persona' 0 "$(n_calls '_deliver')"
+: >"$CALLS"
+IN_REGISTRY_LOCK=1 _helper_build mine 2>/dev/null; rc=$?
+t 'finishing a marked seat succeeds' 0 "$rc"
+t 'finishing does not create the seat again' 0 "$(n_calls 'agent create')"
+t 'finishing installs the persona' 1 "$(n_calls 'persona helper')"
+t 'then it is built' yes "$([[ -e "$STATE_DIR/helper/built" ]] && echo yes)"
+fresh 14; reg_with '{}' >"$REGISTRY"
+IN_REGISTRY_LOCK=1 _helper_build none 2>/dev/null
+t 'a new build creates the seat' 1 "$(n_calls 'agent create helper')"
+unset -f registry_read persona_install_doc
+
+echo '== 8. --help =='
+for h in --help -h help; do
+  out=$(cmd_helper "$h" 2>&1); rc=$?
+  t "helper $h exits 0" 0 "$rc"
+  has "helper $h prints the usage line" 'usage: 5dive helper ensure|status' "$out"
+done
+t 'the usage line is what _verb_own_usage reads' 'usage: 5dive helper ensure|status [--json]' \
+  "$(_verb_own_usage cmd_helper '5dive helper ensure|status')"
+t 'helper is a builtin verb (plugins cannot claim it)' 1 \
+  "$(grep '^readonly FIVEDIVE_BUILTIN_VERBS=' src/cmd_plugin.sh | grep -c ' helper ')"
 
 echo "pass=$PASS fail=$FAIL"
 (( FAIL == 0 ))
