@@ -545,6 +545,30 @@ cmd_goal_add() {
   _goal_spawn_async_job "$outcome" "$project" "$planner" "$max_tasks" "$depth_cap" "$checkpoint" "$ceiling" "$yes" "$dry_run" "$from"
 }
 
+# _goal_plan_gate_ask <outcome> <task_count> <checkpoint> <has_t2> — the plan
+# gate's --ask, always inside the gate's 25-word cap (DIVE-8837). The ping a
+# person gets shows the ask and not the anchor's title, so the outcome is named,
+# clipped to the words the cap leaves and dropped for "your goal" when what is
+# left would read as one of our internal names. The full outcome is the anchor's
+# title and body either way.
+_goal_plan_gate_ask() {
+  local outcome="$1" n="$2" checkpoint="$3" has_t2="$4"
+  local why="Plans over ${checkpoint} steps need your OK."
+  [[ "$has_t2" == "1" ]] && why="One step involves money, publishing, secrets or deletion."
+  local tail="${why} Full plan in the task."
+  local fixed; fixed=$(_gate_ask_word_count "Approve the ${n}-step plan for ${tail}")
+  local budget=$(( _GATE_ASK_MAX_WORDS - fixed ))
+  local -a w=(); read -r -a w <<<"${outcome//\"/}"
+  local name=""
+  if (( budget > 0 && ${#w[@]} > 0 )); then
+    if (( ${#w[@]} <= budget )); then name="${w[*]}"
+    else name="${w[*]:0:budget}…"; fi
+    name="\"${name}\""
+    _gate_ask_jargon_term "$name" >/dev/null 2>&1 && name=""
+  fi
+  printf 'Approve the %s-step plan for %s? %s' "$n" "${name:-your goal}" "$tail"
+}
+
 # ------- finish: _goal_finish_with_plan <plan> <outcome> <project> <planner> <max_tasks> <depth_cap> <checkpoint> <yes> <dry_run> <from> -------
 # Steps 2-6: validate -> resolve project -> dry-run render / gate / materialize.
 # Emits the terminal envelope (dryRun|gated|materialized) in the caller's mode.
@@ -617,7 +641,9 @@ _goal_finish_with_plan() {
   local proj_exists; proj_exists=$(db "SELECT 1 FROM projects WHERE key=$(sqlq "$pkey");")
   local pname; pname=$(printf '%s' "$plan" | jq -r '.project.name // ""')
   [[ -n "$pname" ]] || pname="$outcome"
+  local proj_made=0
   if [[ "$proj_exists" != "1" ]]; then
+    proj_made=1
     JSON_MODE=1 cmd_project_add "$pkey" --prefix="$pprefix" --name="$pname" \
       --goal="$outcome" ${planner:+--lead-agent="$planner"} >/dev/null \
       || fail "$E_GENERIC" "goal: could not create project '$pkey'"
@@ -625,9 +651,10 @@ _goal_finish_with_plan() {
 
   if [[ "$needs_gate" == "1" ]]; then
     # Idempotency: if we already filed a plan gate for this goal, don't double up.
-    local anchor_id anchor_ident
+    local anchor_id anchor_ident anchor_made=0
     anchor_id=$(db "SELECT id FROM tasks WHERE project_key=$(sqlq "$pkey") AND title LIKE 'Goal:%' AND kind='standard' ORDER BY id LIMIT 1;")
     if [[ -z "$anchor_id" ]]; then
+      anchor_made=1
       local add_json
       add_json=$(JSON_MODE=1 cmd_task_add --materialized --project="$pkey" --priority=high ${planner:+--assignee="$planner"} ${from:+--from="$from"} \
                    --body="$(printf 'Goal: %s\n\nProposed plan (%s tasks, critical path %s) — approve to materialize:\n\n%s\n\n--- plan json ---\n%s' \
@@ -663,9 +690,25 @@ _goal_finish_with_plan() {
     # checked result and is not one — which is why the empty-envelope bug could
     # not have been caught here. Discard explicitly, like the objective path does,
     # so the exit status is visibly the only thing this call is trusted for.
-    JSON_MODE=1 cmd_task_need "$anchor_id" --type=decision --options="approve|revise" --recommend="approve" "${tier_arg[@]}" ${from:+--from="$from"} \
-      --ask="Approve this ${GOAL_TASK_COUNT}-task plan for \"${outcome}\"? (${reason}) Full plan in the task body." >/dev/null \
-      || fail "$E_GENERIC" "goal: could not file the plan gate"
+    # DIVE-8837: the ask used to quote the WHOLE outcome, so any outcome over ~11
+    # words broke the 25-word ask cap and the gate was refused. `cmd_task_need`
+    # runs in a subshell here because its refusal is `fail` = `exit`: run in this
+    # shell it ended the finish before the anchor could be rolled back, and the
+    # async poll (which reads only stdout) recorded "plan finish failed" with the
+    # cap's reason lost.
+    local gate_ask need_out need_rc=0
+    gate_ask=$(_goal_plan_gate_ask "$outcome" "$GOAL_TASK_COUNT" "$checkpoint" "$GOAL_HAS_T2")
+    need_out=$(JSON_MODE=1 cmd_task_need "$anchor_id" --type=decision --options="approve|revise" --recommend="approve" "${tier_arg[@]}" ${from:+--from="$from"} \
+      --ask="$gate_ask" 2>/dev/null) || need_rc=$?
+    if (( need_rc != 0 )); then
+      # No anchor without a gate: an anchor this call made is removed, and so is a
+      # project it made, so a retry starts clean instead of finding an ungated
+      # "Goal:" row that the idempotency lookup above would silently reuse.
+      (( anchor_made )) && db "DELETE FROM tasks WHERE id=${anchor_id};" >/dev/null 2>&1
+      (( proj_made )) && db "DELETE FROM projects WHERE key=$(sqlq "$pkey") AND NOT EXISTS (SELECT 1 FROM tasks WHERE project_key=$(sqlq "$pkey"));" >/dev/null 2>&1
+      local need_msg; need_msg=$(printf '%s' "$need_out" | jq -r '.error.message // empty' 2>/dev/null | head -n1)
+      fail "$E_GENERIC" "goal: could not file the plan gate: ${need_msg:-task need exited ${need_rc}}"
+    fi
     if (( JSON_MODE )); then
       ok "" '{gated:true, project:{key:$k,prefix:$pf}, anchor:$ai, taskCount:($n|tonumber), criticalPath:($cp|tonumber), hasT2:($t2=="1"), reason:$r}' \
          --arg k "$pkey" --arg pf "$pprefix" --arg ai "$anchor_ident" --arg n "$GOAL_TASK_COUNT" --arg cp "$GOAL_CRIT_PATH" --arg t2 "$GOAL_HAS_T2" --arg r "$reason"
@@ -854,10 +897,18 @@ _goal_job_advance() {
     # under `set -e`: an unguarded substitution that exits non-zero would kill the
     # whole process here, wedging the job in 'finishing'. The `||` both captures
     # the exit code and disarms set -e.
-    local env="" rc=0
-    env=$(JSON_MODE=1 _goal_finish_with_plan "$plan" "$outcome" "$project" "$planner" "$max_tasks" "$depth_cap" "$checkpoint" "$yes" "$dry_run" "$from" 2>/dev/null) || rc=$?
+    # DIVE-8837: stderr is kept, not discarded — a finish that dies without a JSON
+    # envelope on stdout still leaves its `error:` line there, and that line is
+    # the job's reason instead of the generic "plan finish failed".
+    local env="" rc=0 errline="" errf; errf=$(mktemp "${TMPDIR:-/tmp}/goal-finish.XXXXXX" 2>/dev/null) || errf=/dev/null
+    env=$(JSON_MODE=1 _goal_finish_with_plan "$plan" "$outcome" "$project" "$planner" "$max_tasks" "$depth_cap" "$checkpoint" "$yes" "$dry_run" "$from" 2>"$errf") || rc=$?
+    if [[ "$errf" != /dev/null ]]; then
+      errline=$(grep -m1 '^error: ' "$errf" 2>/dev/null | sed 's/^error: //') || errline=""
+      rm -f "$errf"
+    fi
     if (( rc != 0 )) || [[ -z "$env" ]] || [[ "$(printf '%s' "$env" | jq -r '.ok // false' 2>/dev/null)" != "true" ]]; then
-      local emsg; emsg=$(printf '%s' "$env" | jq -r '.error.message // "plan finish failed"' 2>/dev/null); [[ -n "$emsg" ]] || emsg="plan finish failed"
+      local emsg; emsg=$(printf '%s' "$env" | jq -r '.error.message // empty' 2>/dev/null | head -n1)
+      emsg="${emsg:-${errline:-plan finish failed}}"
       local payload; payload=$(jq -cn --arg j "$job_id" --arg r "$emsg" --arg p "$planner" '{ok:true, data:{job:$j, status:"failed", reason:$r, planner:$p}}')
       db "UPDATE goal_jobs SET status='failed', result_json=$(sqlq "$payload"), updated_at=$(date +%s) WHERE job_id=$(sqlq "$job_id");" >/dev/null 2>&1 || true
       if (( JSON_MODE )); then printf '%s\n' "$payload"; else echo "job ${job_id}: FAILED — ${emsg}"; fi
