@@ -557,7 +557,8 @@ _goal_plan_gate_ask() {
   [[ "$has_t2" == "1" ]] && why="One step involves money, publishing, secrets or deletion."
   local tail="${why} Full plan in the task."
   local fixed; fixed=$(_gate_ask_word_count "Approve the ${n}-step plan for ${tail}")
-  local budget=$(( _GATE_ASK_MAX_WORDS - fixed ))
+  local max; max=$(_gate_ask_max_words)
+  local budget=$(( max - fixed ))
   local -a w=(); read -r -a w <<<"${outcome//\"/}"
   local name=""
   if (( budget > 0 && ${#w[@]} > 0 )); then

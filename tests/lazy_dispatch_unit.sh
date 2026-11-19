@@ -583,6 +583,20 @@ else
   _timed_ratio_arm '`heartbeat ls`' 110 \
     'Iteration 2 measured 117% here with no arm to catch it; the load path has regressed for the widest-closure verb.' \
     heartbeat ls
+
+  # DIVE-8837: the timing arm above only shows a widened closure on the CI
+  # runner (114-117% there, 90% on a dev box). The cause it caught is
+  # structural, so pin it structurally: cmd_goal read need.sh's top-level
+  # _GATE_ASK_MAX_WORDS, which is a DEP edge, and that pulled the gate module
+  # into every `heartbeat ls`. Call a function in need.sh instead of reading a
+  # global from it.
+  if FIVE_LAZY_TRACE=1 "$BUNDLE" heartbeat ls 2>&1 >/dev/null \
+       | sed -n 's/^5dive\[lazy\] load //p' | tr ' ' '\n' | grep -qx 'task__need'; then
+    bad_t "\`heartbeat ls\` does not load the gate module (task__need)" \
+          "it does. Grep __MODDEPS in the built bundle for which module now reads a top-level global from src/task/need.sh."
+  else
+    ok_t "\`heartbeat ls\` does not load the gate module (task__need)"
+  fi
 fi
 
 # --- T13: piped into a shell, it refuses with a reason -----------------------
