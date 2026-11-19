@@ -218,7 +218,13 @@ done < <(jq -r '.paths | to_entries[] | [.key, (.value.request // {} | tojson), 
 # Every route the server answers has a contract arm (or is named here as one the app reads nothing from).
 ANSWERED=$(grep -oE '\["(GET|POST|PUT|DELETE)", /\^\\/[^$]*\$/' "$TMPD/server.ts" | sed -E 's/\["([A-Z]+)", \/\^(.*)\$\//\1 \2/; s/\\//g' | sort -u)
 NO_READ='POST /team/leave|PUT /team/members/([a-f0-9]{8,32})/agents|DELETE /team/members/(i?[a-f0-9]{8,32})|POST /server/files/upload|POST /server/files/mkdir|GET /server/files/download|GET /server/messages/stream|POST /server/conversations/(d+)/read'
-miss=$(while read -r a; do k=$(sed -E 's/\(d\+\)/<conversation>/' <<<"$a"); jq -e --arg k "$k" '.paths | keys | map(split(" ")[0:2] | join(" ") | split("?")[0]) | index($k)' "$FIX" >/dev/null || grep -qxE "$NO_READ" <<<"$a" || grep -qxF "$a" <<<"${NO_READ//|/$'\n'}" || echo "$a"; done <<<"$ANSWERED")
+has_arm() {  # $1 = an answered "METHOD /path"; 0 when the contract has it or NO_READ names it
+  local k; k=$(sed -E 's/\(d\+\)/<conversation>/' <<<"$1")
+  if jq -e --arg k "$k" '.paths | keys | map(split(" ")[0:2] | join(" ") | split("?")[0]) | index($k)' "$FIX" >/dev/null; then return 0; fi
+  if grep -qxE "$NO_READ" <<<"$1"; then return 0; fi
+  grep -qxF "$1" <<<"${NO_READ//|/$'\n'}"
+}
+miss=$(while read -r a; do has_arm "$a" || echo "$a"; done <<<"$ANSWERED")
 check 'C0 every answered path has a contract arm or is a write the app reads nothing back from' '[[ -z "$miss" && $(wc -l <<<"$ANSWERED") -ge 18 ]]'
 [[ -n "$miss" ]] && printf '  no contract arm: %s\n' $miss
 
