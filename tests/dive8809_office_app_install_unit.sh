@@ -196,7 +196,8 @@ OUT=$(bash packaging/offline/build-office.sh "$T/pub/5dive-usb-3.4.5.run" "$T/5d
 check 'B1 one file, named for both versions, with its .sha256' '[[ $rc == 0 && "$OUT" == "$T/dist/5dive-office-server-3.4.5-app-1.2.0.run" && -x "$OUT" ]] && (cd "$T/dist" && sha256sum -c --quiet 5dive-office-server-3.4.5-app-1.2.0.run.sha256)'
 line=$(awk '/^__5DIVE_USB_PAYLOAD__$/ { print NR + 1; exit }' "$OUT"); tail -n +"$line" "$OUT" >"$T/opay.tar"
 check 'B2 its payload holds the update file, the packages and the app; the starter names the new checksum' '[[ "$(tar -tf "$T/opay.tar" | grep -cE "^(5dive-offline-3.4.5.tar|5dive-office-app-1.2.0.tar|debs/x.deb)$")" == 3 ]] && grep -q "^FIVE_USB_PAYLOAD_SHA256=\"$(sha256sum "$T/opay.tar" | cut -d" " -f1)\"$" "$OUT"'
-check 'B2a the public installer is untouched (it never carries the app)' '! tail -n +"$line" "$T/pub/5dive-usb-3.4.5.run" | tar -t 2>/dev/null | grep -q office-app'
+pline=$(awk '/^__5DIVE_USB_PAYLOAD__$/ { print NR + 1; exit }' "$T/pub/5dive-usb-3.4.5.run"); publist=$(tail -n +"$pline" "$T/pub/5dive-usb-3.4.5.run" | tar -t 2>/dev/null)
+check 'B2a the public installer is untouched (it never carries the app)' 'grep -qx "5dive-offline-3.4.5.tar" <<<"$publist" && ! grep -q office-app <<<"$publist"'
 d="$(mktemp -d "$T/x.XXXXXX")"; tar -xf "$T/app-1.2.0.tar" -C "$d"; mkdir -p "$T/u"; tar -C "$d" --no-recursion -cf "$T/u/5dive-office-app-1.2.0.tar" manifest.json payload/app.tar.gz
 bash packaging/offline/build-office.sh "$T/pub/5dive-usb-3.4.5.run" "$T/u/5dive-office-app-1.2.0.tar" "$T/dist-u" >/dev/null 2>"$T/b.err"; rc=$?
 check 'B3 an UNSIGNED app file is refused' '[[ $rc != 0 ]] && grep -q UNSIGNED "$T/b.err"'
