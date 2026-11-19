@@ -2,7 +2,7 @@
 # TIER: core — pure bash + awk, no tmux, no agent, no network (<1s).
 # DIVE-8833 unit: a codex seat loads ~/.claude/owner-rules.md each session.
 #
-# Every OINOA pack opens with `@~/.claude/owner-rules.md` and tells the employee
+# Every partner pack opens with `@~/.claude/owner-rules.md` and tells the employee
 # to write each standing rule there (DIVE-8830). Claude Code resolves the import;
 # codex reads ~/.codex/AGENTS.md as plain text, so the rule was gone after a
 # restart. 5dive-agent-start now copies the file into a marker block of
