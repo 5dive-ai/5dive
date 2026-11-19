@@ -204,6 +204,7 @@ _lc_usage() {
     "       sudo 5dive local pair [--owner] [--name=<person>]  # a one-time code to connect a phone or laptop" \
     "                                                   # --owner: it may also manage the server at /panel" \
     "       sudo 5dive local devices ls | revoke <id>" \
+    "       sudo 5dive local app install <file>         # serve the 5dive app at / (the old page moves to /lite)" \
     "            5dive local status"
 }
 
@@ -214,13 +215,14 @@ cmd_local() {
     pair)    _lc_pair "$@" ;;
     devices) _lc_devices "$@" ;;
     status)  _lc_status "$@" ;;
+    app)     _oa_cmd "$@" ;;       # DIVE-8809: the office app (src/lib/office_app.sh)
     _agents) _lc_agents_write ;;
     _restage) _lc_restage ;;       # DIVE-7579 (D6): install.sh --upgrade runs it
     _cert-sync) _lc_cert_sync ;;   # DIVE-8611: the daily timer and certbot's deploy hook run it
     _panel-update-run) _lp_update_run ;;   # DIVE-7579 (D4): the panel's transient update unit
     panel-exec) _lp_exec "$@" ;;   # DIVE-7576: the panel's one root entry (src/cmd_local_panel.sh)
     ""|-h|--help|help) _lc_usage ;;
-    *) fail "$E_USAGE" "local: unknown subcommand '$sub' (serve, pair, devices, status)." ;;
+    *) fail "$E_USAGE" "local: unknown subcommand '$sub' (serve, pair, devices, status, app)." ;;
   esac
 }
 
