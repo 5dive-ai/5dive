@@ -590,8 +590,11 @@ else
   # _GATE_ASK_MAX_WORDS, which is a DEP edge, and that pulled the gate module
   # into every `heartbeat ls`. Call a function in need.sh instead of reading a
   # global from it.
-  if FIVE_LAZY_TRACE=1 "$BUNDLE" heartbeat ls 2>&1 >/dev/null \
-       | sed -n 's/^5dive\[lazy\] load //p' | tr ' ' '\n' | grep -qx 'task__need'; then
+  # Capture first, then test the string: a `| grep -q` here would SIGPIPE the
+  # writer under pipefail and pass exactly when task__need IS loaded.
+  HB_MODS=$(FIVE_LAZY_TRACE=1 "$BUNDLE" heartbeat ls 2>&1 >/dev/null \
+       | sed -n 's/^5dive\[lazy\] load //p' | tr '\n' ' ')
+  if [[ " $HB_MODS " == *' task__need '* ]]; then
     bad_t "\`heartbeat ls\` does not load the gate module (task__need)" \
           "it does. Grep __MODDEPS in the built bundle for which module now reads a top-level global from src/task/need.sh."
   else
