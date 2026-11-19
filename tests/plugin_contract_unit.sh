@@ -563,7 +563,11 @@ if [[ -z "$REGISTRY" ]]; then
   printf '  !! NOT RUN — T9d/T9e (the real voice manifest) need a registry checkout.\n'
 else
   VOICE="$(_plugin_source_dir 5dive-plugins voice)/.claude-plugin/plugin.json"
-  t "T9d voice names the real host installer, not a placeholder" "sudo 5dive-setup-voice" \
+  # The verb, not the bare installer: voice declares its own `voice` verb (the
+  # manifest's fivedive.verbs) and `voice setup` runs the installer the plugin
+  # ships, so the command works on a box where nothing put 5dive-setup-voice on
+  # PATH (5dive-plugins DIVE-7855; read at the DIVE-8746 pin bump).
+  t "T9d voice names the real host installer, not a placeholder" "sudo 5dive voice setup" \
     "$(jq -r '.fivedive.setup.command' "$VOICE")"
   t "T9e voice asks for audio, which is what makes its consent screen honest" "true" \
     "$(jq -r '[.fivedive.grants[]] | index("audio-io") != null' "$VOICE")"

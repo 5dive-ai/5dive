@@ -303,7 +303,12 @@ const fromCli = JSON.parse(readFileSync('${TMP}/drained.json', 'utf8')) as Dispa
   say('c1_outcome', await h.d.submit(fromCli))
   const start = h.requests.find(r => r.method === 'turn/start')
   say('c1_trigger', start?.params?.turnTrigger)
-  say('c1_text', start?.params?.input?.[0]?.text)
+  // DIVE-8414 (5dive-plugins) gives a teammate turn its own leading rider, so
+  // the message is no longer input[0]: grade the rider and the text apart, the
+  // same split C3 makes for the recovery rider.
+  const c1texts = (start?.params?.input ?? []).filter((i: any) => i?.type === 'text').map((i: any) => i?.text ?? '')
+  say('c1_teammate_rider', c1texts.some((t: string) => t.startsWith('[5dive teammate]')))
+  say('c1_text', c1texts.filter((t: string) => !t.startsWith('[5dive teammate]'))[0])
   say('c1_msgid', start?.params?.clientUserMessageId)
   // The ingest() acceptance predicate, applied to the CLI's own bytes.
   say('c1_ingestable', Boolean(fromCli?.id && fromCli?.text?.trim()
@@ -321,15 +326,27 @@ const fromCli = JSON.parse(readFileSync('${TMP}/drained.json', 'utf8')) as Dispa
   say('c2_tg', await h.d.submit(tg))
   say('c2_dash', await h.d.submit(dash))
   say('c2_same_route_steers', await h.d.submit({ id: 'tg-2', text: 'more', route: { source: 'telegram', chat_id: '42' } }))
+  // DIVE-5504 (5dive-plugins) publishes silent progress events beside the
+  // answers and holds an answer until it proves to be the turn's last, so a
+  // reply is a published event of kind 'message', read once its turn closes.
+  // Every event (progress included) is still graded for its route below.
+  const replies = () => h.published.filter(p => p.meta?.kind === 'message')
   await h.d.notification('item/completed', { turnId: 'turn-1', item: { type: 'agentMessage', id: 'i1', text: 'reply one' } })
-  say('c2_reply_sources', h.published.map(p => p.route.source))
-  say('c2_reply_chat', h.published.map(p => p.route.chat_id))
   // The queued dashboard message starts only once the telegram turn completes.
   await h.d.notification('turn/completed', { turn: { id: 'turn-1', status: 'completed' } })
+  say('c2_reply_sources', replies().map(p => p.route.source))
+  say('c2_reply_chat', replies().map(p => p.route.chat_id))
+  say('c2_reply_text', replies().map(p => p.text))
   const starts = h.requests.filter(r => r.method === 'turn/start')
   say('c2_started_triggers', starts.map(r => r.params.turnTrigger))
   await h.d.notification('item/completed', { turnId: 'turn-2', item: { type: 'agentMessage', id: 'i2', text: 'reply two' } })
-  say('c2_all_reply_sources', h.published.map(p => p.route.source))
+  await h.d.notification('turn/completed', { turn: { id: 'turn-2', status: 'completed' } })
+  say('c2_all_reply_sources', replies().map(p => p.route.source))
+  say('c2_all_reply_text', replies().map(p => p.text))
+  // No event of either turn, progress or answer, reaches the other channel.
+  say('c2_cross_events', h.published.filter(p =>
+    (p.meta?.turnId === 'turn-1' && p.route.source !== 'telegram')
+    || (p.meta?.turnId === 'turn-2' && p.route.source !== 'dashboard')).length)
 }
 
 // C3 — RESTART MID-FLOW. A dispatcher that dies holding an active turn tells the
@@ -375,6 +392,7 @@ DRIVER_EOF
     eq_t "stage C1: the real dispatcher ACCEPTS the message the real CLI wrote" '"started"' "$(_v c1_outcome)"
     eq_t "stage C1: it passes ingest()'s acceptance predicate on the CLI's own bytes" 'true' "$(_v c1_ingestable)"
     eq_t "stage C1: the turn is tagged with the originating channel" '"5dive:agent"' "$(_v c1_trigger)"
+    eq_t "stage C1: a teammate turn carries the teammate rider" 'true' "$(_v c1_teammate_rider)"
     eq_t "stage C1: the agent's text reached the model input unaltered" '"hello from the e2e gate"' "$(_v c1_text)"
     [[ "$(_v c1_msgid)" == '"5dive-'* ]] \
       && ok_t "stage C1: the CLI's message id is the app-server's client id (dedup survives the seam)" \
@@ -385,10 +403,13 @@ DRIVER_EOF
     eq_t "stage C2: the SAME channel steers the running turn" '"steered"' "$(_v c2_same_route_steers)"
     eq_t "stage C2: the reply goes to the originating channel only" '["telegram"]' "$(_v c2_reply_sources)"
     eq_t "stage C2: and to the originating conversation only" '["42"]' "$(_v c2_reply_chat)"
+    eq_t "stage C2: the reply is the model's text" '["reply one"]' "$(_v c2_reply_text)"
     eq_t "stage C2: the queued dashboard message starts after the telegram turn" \
       '["5dive:telegram","5dive:dashboard"]' "$(_v c2_started_triggers)"
     eq_t "stage C2: each reply lands on its own channel, never the other" \
       '["telegram","dashboard"]' "$(_v c2_all_reply_sources)"
+    eq_t "stage C2: each channel got its own reply" '["reply one","reply two"]' "$(_v c2_all_reply_text)"
+    eq_t "stage C2: no event of either turn reached the other channel" '0' "$(_v c2_cross_events)"
 
     eq_t "stage C3: a restart tells the route whose turn it lost" '"telegram"' "$(_v c3_notice_source)"
     eq_t "stage C3: and tells it as an error, not as a model reply" '"error"' "$(_v c3_notice_kind)"
