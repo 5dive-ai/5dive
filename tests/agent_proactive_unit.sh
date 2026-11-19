@@ -287,6 +287,21 @@ K=knows; KT="$AGENT_HOME_ROOT/agent-$K/.claude/projects/-w/memory"
 mk_atom "$K" user_a.md user "a"; mk_atom "$K" user_b.md user "b"; mk_atom "$K" user_c.md user "c"
 ( cmd_agent_proactive "$K" little ) >/dev/null 2>&1
 t "T17 knows its owner already: nothing seeded" "0|0" "$(ls "$KT"/user_seeded_*.md 2>/dev/null | wc -l)|$( ( cmd_agent_proactive "$K" --json ) | jq -r .data.seeded.atoms)"
+# A seed never follows a link the agent planted, and writes as the agent.
+O="$TMP/outside"; mkdir -p "$O/real"
+SL=linker; SLT="$AGENT_HOME_ROOT/agent-$SL/.claude/projects/-w/memory"; mkdir -p "$SLT"
+ln -s "$O/idx" "$SLT/MEMORY.md"; ln -s "$O/atom" "$SLT/user_seeded_owner_name.md"
+( cmd_agent_proactive "$SL" little ) >/dev/null 2>&1
+t "T17 dangling links planted for MEMORY.md and an atom: nothing at either target, 0 seeded" "0|0|0" \
+  "$(ls -A "$O" | grep -cv '^real$')|$( ( cmd_agent_proactive "$SL" --json ) | jq -r .data.seeded.atoms)|$(ls "$SLT" | grep -cv -e '^MEMORY.md$' -e '^user_seeded_owner_name.md$')"
+SD=dirlink; mkdir -p "$AGENT_HOME_ROOT/agent-$SD/.claude/projects/-w"; ln -s "$O/real" "$AGENT_HOME_ROOT/agent-$SD/.claude/projects/-w/memory"
+( cmd_agent_proactive "$SD" little ) >/dev/null 2>&1
+t "T17 the memory dir is a link out of the home: nothing written through it" "0" "$(ls -A "$O/real" | wc -l)"
+DR=dropper; DRH="$AGENT_HOME_ROOT/agent-$DR"; mkdir -p "$DRH"; : >"$TMP/as.log"
+( _proactive_as_agent() { printf '%s %s\n' "$1" "$2" >>"$TMP/as.log"; shift; "$@"; }; cmd_agent_proactive "$DR" little ) >/dev/null 2>&1
+_n=$(ls "$DRH"/.claude/projects/*/memory/user_seeded_*.md 2>/dev/null | wc -l)
+t "T17 every seed write runs as the agent: its store made, each atom and index line" "1|1|$((_n * 2 + 1))|0" \
+  "$([[ $_n -ge 1 ]] && echo 1)|$(grep -c "^$DR mkdir" "$TMP/as.log")|$(grep -c "^$DR " "$TMP/as.log")|$(grep -vc "^$DR " "$TMP/as.log")"
 # Not root: no seed (and no raise).
 ROOT=0; NR=nr; mkdir -p "$AGENT_HOME_ROOT/agent-$NR/.claude/projects/-w/memory"
 ( cmd_agent_proactive "$NR" little ) >/dev/null 2>&1; rc=$?

@@ -396,9 +396,30 @@ _proactive_home() {
   printf '%s' "${h:-/home/agent-$1}"
 }
 _proactive_seed_seats() { _task_roster 2>/dev/null; printf '%s\n' "${_TASK_ROSTER:-}"; }
-_proactive_seed_chown() { # <name> <dir>
-  local u="agent-$1"; [[ "$1" == "claude" ]] && u=claude
-  _proactive_is_root && chown -R "$u":"$u" "$2" 2>/dev/null; return 0
+# Run <cmd> as the agent's own unix user when we are really root, else as the
+# caller. Every seed WRITE into an agent's home goes through here: the agent
+# owns that tree and can swap any component for a link, and as the agent a link
+# reaches nothing the agent could not already reach. Root only READS (other
+# seats' 0600 stores). `runuser`, not `sudo -u` (runas is narrowed, DIVE-3263);
+# no runuser means no write, never root writing in its place.
+_proactive_seed_user() { if [[ "$1" == "claude" ]]; then printf claude; else printf 'agent-%s' "$1"; fi; }
+_proactive_as_agent() { # <name> <cmd...>
+  local u; u=$(_proactive_seed_user "$1"); shift
+  if [[ "$EUID" == "0" ]]; then
+    command -v runuser >/dev/null 2>&1 || { printf 'runuser not found; refusing to write as root for %s\n' "$u" >&2; return 1; }
+    ( cd / || exit 1; runuser -u "$u" -- "$@" )
+  else
+    "$@"
+  fi
+}
+# rc 0 when <dir> is a real directory under <home> with no link below home:
+# it must resolve to exactly the home's real path plus the same relative path.
+_proactive_in_home() { # <home> <dir>
+  local h r rel="${2#"$1"/}"
+  [[ "$rel" != "$2" && -d "$2" && ! -L "$2" ]] || return 1
+  h=$(realpath -e -- "$1" 2>/dev/null) || return 1
+  r=$(realpath -e -- "$2" 2>/dev/null) || return 1
+  [[ "$r" == "$h/$rel" ]]
 }
 _proactive_workdir() {
   local w; w=$(registry_read 2>/dev/null | jq -r --arg n "$1" '.agents[$n].workdir // empty' 2>/dev/null) || w=""
@@ -410,13 +431,15 @@ _proactive_store() {
   local home d first=""
   home=$(_proactive_home "$1")
   for d in "$home"/.claude/projects/*/memory; do
-    [[ -d "$d" ]] || continue
-    [[ -f "$d/MEMORY.md" ]] && { printf '%s' "$d"; return 0; }
+    _proactive_in_home "$home" "$d" || continue
+    [[ -f "$d/MEMORY.md" && ! -L "$d/MEMORY.md" ]] && { printf '%s' "$d"; return 0; }
     [[ -z "$first" ]] && first="$d"
   done
   [[ -n "$first" ]] && { printf '%s' "$first"; return 0; }
   d="$home/.claude/projects/$(printf '%s' "$(_proactive_workdir "$1")" | sed 's:/:-:g')/memory"
-  mkdir -p "$d" 2>/dev/null && chmod 700 "$d" && printf '%s' "$d"
+  # Made as the agent, so every new dir is the agent's and none is root's.
+  _proactive_as_agent "$1" mkdir -p -m 700 -- "$d" 2>/dev/null || return 1
+  _proactive_in_home "$home" "$d" && printf '%s' "$d"
 }
 # The human who owns <agent>'s gates, or '' (the box owner).
 _proactive_owner_of() {
@@ -441,16 +464,19 @@ _proactive_seed_ok() {
   grep -qiE "$_PROACTIVE_SEED_OTHERS_RX" "$f" && return 1
   return 0
 }
-_proactive_seed_write() { # <store> <slug> <from> <description> <body>
-  local store="$1" slug="$2" from="$3" desc="$4" body="$5" f
-  f="$store/user_seeded_$(printf '%s' "$slug" | tr '-' '_').md"
-  [[ -e "$f" ]] && return 1
+_proactive_seed_write() { # <name> <store> <slug> <from> <description> <body>
+  local name="$1" store="$2" slug="$3" from="$4" desc="$5" body="$6" f idx
+  f="$store/user_seeded_$(printf '%s' "$slug" | tr '-' '_').md"; idx="$store/MEMORY.md"
+  # A link anywhere here (even a dangling one) is refused, not followed.
+  [[ -e "$f" || -L "$f" || -L "$idx" || -L "$store" ]] && return 1
   { printf -- '---\nname: seeded-%s\ndescription: "%s"\nmetadata:\n  type: user\n  seeded: proactive\n  seeded_from: %s\n  compiled_at: %s\n  confidence: low\n  valid_to: %s\n  provenance: "seeded on day one by 5dive agent proactive (DIVE-8838) from what this box knew about the owner; replace it with what you learn"\n---\n\n%s\n' \
       "$slug" "$(printf '%s' "$desc" | sed 's/"/\\"/g')" "$from" "$(date -u +%F)" \
       "$(date -u -d "+${_PROACTIVE_SEED_KEEP_DAYS} days" +%F)" "$body"
-  } >"$f" || return 1
-  chmod 600 "$f" 2>/dev/null
-  printf -- '- [seeded-%s](%s) — %s\n' "$slug" "$(basename "$f")" "$desc" >>"$store/MEMORY.md"
+  } | _proactive_as_agent "$name" bash -c 'umask 077; set -C; cat >"$1"' _ "$f" 2>/dev/null || return 1
+  [[ -L "$idx" ]] && return 1
+  printf -- '- [seeded-%s](%s) — %s\n' "$slug" "$(basename "$f")" "$desc" \
+    | _proactive_as_agent "$name" bash -c '[[ -L "$1" ]] && exit 1; cat >>"$1"' _ "$idx" 2>/dev/null
+  return 0
 }
 _proactive_body_of() { awk 'BEGIN{n=0} /^---$/ && n<2 {n++; next} n>=2 {print}' "$1" | sed '/./,$!d'; }
 _proactive_desc_of() {
@@ -482,7 +508,7 @@ _proactive_seed() {
         oname=$(db "SELECT display_name FROM humans WHERE role='owner' AND NULLIF(display_name,'') IS NOT NULL ORDER BY created_at LIMIT 1;" 2>/dev/null)
       fi
       if [[ -n "$oname" ]] && ! grep -qiE "$_PROACTIVE_SEED_SECRET_RX" <<<"$oname"; then
-        _proactive_seed_write "$store" owner-name box "Your owner's name is ${oname}" \
+        _proactive_seed_write "$name" "$store" owner-name box "Your owner's name is ${oname}" \
           "Your owner's name is ${oname}. Address them by it." && seeded=$((seeded + 1))
       fi
       # The hire answer: the first job the owner gave THIS agent.
@@ -493,7 +519,7 @@ _proactive_seed() {
         job=$(jq -r '.job // empty' "$jf" 2>/dev/null)
         [[ -n "$job" ]] || continue
         grep -qiE "$_PROACTIVE_SEED_SECRET_RX" <<<"$job" && continue
-        _proactive_seed_write "$store" hire-first-job hire "What your owner asked you for first, when they hired you" \
+        _proactive_seed_write "$name" "$store" hire-first-job hire "What your owner asked you for first, when they hired you" \
           "When your owner hired you, the first thing they asked for was: ${job}" && seeded=$((seeded + 1))
         break
       done
@@ -504,20 +530,19 @@ _proactive_seed() {
         [[ "$(_proactive_owner_of "$seat")" == "$owner" ]] || continue
         local d sh; sh=$(_proactive_home "$seat")
         for d in "$sh"/.claude/projects/*/memory; do
-          [[ -d "$d" ]] || continue
+          _proactive_in_home "$sh" "$d" || continue
           for f in "$d"/*.md; do
             (( seeded >= _PROACTIVE_SEED_MAX )) && break 2
             _proactive_seed_ok "$f" || continue
             slug=$(basename "$f" .md); slug="${slug#user_}"; slug=$(printf '%s' "$slug" | tr '_A-Z' '-a-z' | tr -cd 'a-z0-9-')
             body=$(_proactive_body_of "$f"); desc=$(_proactive_desc_of "$f")
             [[ -n "${body//[[:space:]]/}" ]] || continue
-            _proactive_seed_write "$store" "${slug:0:50}" "$seat" "${desc:-An owner fact from ${seat}}" "$body" \
+            _proactive_seed_write "$name" "$store" "${slug:0:50}" "$seat" "${desc:-An owner fact from ${seat}}" "$body" \
               && seeded=$((seeded + 1))
           done
         done
       done < <(_proactive_seed_seats | awk 'NF && !seen[$0]++')
       why="seeded ${seeded} owner facts"
-      _proactive_seed_chown "$name" "$store"
     fi
   fi
   _proactive_pref_set "proactive.seeded.${name}" "$(jq -cn --arg at "$(db "SELECT datetime('now');")" \
