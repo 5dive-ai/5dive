@@ -18,8 +18,11 @@
 # un-revoke, an EQUAL serial with other bytes does not either (both lists
 # apply), and a list is kept only after the whole file verified; (k) a root
 # key file others can write; (l) the pre-DIVE-7888 verifier takes a file WITH
-# trust. Then the builder's refusals, --write-pubkey, and MUTANTS that drop one
-# check each and must let the matching bad file through.
+# trust; (m) DIVE-8806: a root-signed OFFICE APP key certificate (kind
+# 5dive-office-app-key) for the very key that signed the file is refused — the
+# kind keeps the two keys from crossing over. Then the builder's refusals,
+# --write-pubkey, and MUTANTS that drop one check each and must let the
+# matching bad file through.
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
@@ -48,11 +51,11 @@ SK_ID="$(kid "$WORK/sk.pub")"; SK2_ID="$(kid "$WORK/sk2.pub")"
 NOW="$(date +%s)"; LATER=$((NOW + 30*86400))
 sign() { openssl pkeyutl -sign -inkey "$1" -rawin -in "$2" -out "$3"; } # <priv> <data> <sig>
 
-# mkcert <dir> <root-priv> <pub> <not_after> [key_id] — signing-key.json + .sig
+# mkcert <dir> <root-priv> <pub> <not_after> [key_id] [kind] — signing-key.json + .sig
 mkcert() {
   mkdir -p "$1"
-  printf '%s' "$(jq -cn --arg id "${5:-$(kid "$3")}" --arg pk "$(cat "$3")" --argjson na "$4" \
-    '{format:1,kind:"5dive-signing-key",key_id:$id,pubkey:$pk,not_after:$na}')" > "$1/signing-key.json"
+  printf '%s' "$(jq -cn --arg id "${5:-$(kid "$3")}" --arg pk "$(cat "$3")" --argjson na "$4" --arg kind "${6:-5dive-signing-key}" \
+    '{format:1,kind:$kind,key_id:$id,pubkey:$pk,not_after:$na}')" > "$1/signing-key.json"
   sign "$2" "$1/signing-key.json" "$1/signing-key.sig"
 }
 # mkrev <dir> <root-priv> <serial> [key_id…] — revoked.json + .sig
@@ -283,6 +286,20 @@ if old="$(git show "$OLD_SHA:src/lib/offline_update.sh" 2>/dev/null)" && [[ -n "
   else bad_t "(l) the pre-DIVE-7888 verifier refuses a file with trust" "old boxes could not update"; fi
 else bad_t "(l) commit $OLD_SHA not in this checkout (CI checks out with fetch-depth 0)"; fi
 
+# (m) THE OFFICE APP KEY (DIVE-8806). The root certifies a second key, for the
+# office app, with kind "5dive-office-app-key" — the shape the ceremony page
+# writes to office-key.json. A CLI update file carrying that
+# certificate (root-signed, unexpired, unrevoked, for the very key that signed
+# the manifest) must be refused: only the kind tells the two keys apart.
+TM="$WORK/trust-m"; mkcert "$TM" "$WORK/root.pem" "$WORK/sk.pub" "$LATER" "" 5dive-office-app-key; mkrev "$TM" "$WORK/root.pem" 1
+[[ "$(cat "$TM/signing-key.json")" == "{\"format\":1,\"kind\":\"5dive-office-app-key\",\"key_id\":\"$SK_ID\",\"pubkey\":$(jq -n --arg pk "$(cat "$WORK/sk.pub")" '$pk'),\"not_after\":$LATER}" ]] \
+  && ok_t "(m) fixture: the certificate has office-key.json's agreed shape (fields in order, kind 5dive-office-app-key)" || bad_t "(m) fixture bytes" "$(cat "$TM/signing-key.json")"
+fresh_state
+OFFICE="$(variant office "$TM" "$WORK/sk.pem")"
+refused "(m) an update file whose certificate is the root's OFFICE APP key certificate" "$OFFICE" "certificate in this file is not in a format"
+[[ ! -e "$OFFLINE_UPDATE_STATE_DIR/update-revoked.json" ]] \
+  && ok_t "(m) the refused office-key file's revocation list is not kept" || bad_t "(m) the office-key file's list was kept"
+
 # ---------------------------------------------------------------- the builder
 build out-x "$WORK/sk2.pem" "$T1" >/dev/null && bad_t "builder: signed with SK2 using SK's certificate" \
   || { grep -q 'for another key' "$WORK/build.err" && ok_t "builder: refuses a certificate for another key than the signing key" \
@@ -338,6 +355,7 @@ mutant() { # <label> <sed-expr> <file> [state-dir]
 mutant "no revocation check (c)" 's/index(\$k) != null/false/' "$REVOKED"
 mutant "no expiry check (d)" 's/(( now < not_after ))/true/' "$EXPIRED"
 mutant "no root check on the certificate (e)" 's/_ou_sig_ok "\$root" "\$t\/signing_key"/true/' "$OTHERROOT"
+mutant "no certificate kind check (m)" 's/ and \.kind == "5dive-signing-key"//' "$OFFICE"
 mutant "no key_id recomputation (f)" 's/"\$(_ou_key_id "\$skey")" == "\$key_id"/1 == 1/' "$BADID"
 mutant "the manifest checked with the pinned key, not the certified one (g)" 's/^    key="\$meta\/certified.pem"$/    key="$OFFLINE_UPDATE_PUBKEY_FILE"/' "$UNCERT"
 cp -a "$KEPT_DIR" "$WORK/state-j"

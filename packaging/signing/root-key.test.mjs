@@ -10,7 +10,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(join(here, "root-key.html"), "utf8");
 const script = html.split("<script>")[1].split("</script>")[0];
 const pure = script.split("// >>> pure")[1].split("// <<< pure")[0];
-const names = "DEFAULT_UPDATE_KEY b64 unb64 hex sha256hex toPem fromPem ed25519Supported createMasterKey loadMasterKey importUpdateKey parseRevokedIds signingKeyJson revokedJson buildPublicFile".split(" ");
+const names = "DEFAULT_UPDATE_KEY b64 unb64 hex sha256hex toPem fromPem ed25519Supported createMasterKey loadMasterKey importUpdateKey parseRevokedIds KEY_KINDS signingKeyJson revokedJson buildPublicFile".split(" ");
 const P = new Function(pure.split("\n").slice(1).join("\n") + `\nreturn {${names.join(",")}};`)();
 
 const dir = mkdtempSync(join(tmpdir(), "rootkey-"));
@@ -78,6 +78,26 @@ const v3 = verify(f("bundle-root.pem"), f("tampered.json"), f("signing-key.sig")
 check("NEG: one-byte change in signing-key.json fails openssl verify", v3 !== "Signature Verified Successfully" && /Failure/i.test(v3), `(${v3.split("\n")[0]})`);
 const tamperedR = Buffer.from(rv); tamperedR[5] ^= 0x01; writeFileSync(f("tamperedR.json"), tamperedR);
 check("NEG: one-byte change in revoked.json fails openssl verify", verify(f("bundle-root.pem"), f("tamperedR.json"), f("revoked.sig")) !== "Signature Verified Successfully");
+
+// --- office app key (DIVE-8806): same root, its own kind and file names ---
+execFileSync("openssl", ["genpkey", "-algorithm", "ed25519", "-out", f("office.pem")]);
+const officePub = ossl("pkey", "-in", f("office.pem"), "-pubout").stdout;
+const officeKey = await P.importUpdateKey(officePub);
+const ofb = JSON.parse(await P.buildPublicFile(m, officeKey, 90, 1, "", now, "office"));
+check("office bundle: office_key_* fields in place of signing_key_*", JSON.stringify(Object.keys(ofb)) === JSON.stringify(["root_pubkey_pem", "root_fingerprint", "office_key_json_b64", "office_key_sig_b64", "revoked_json_b64", "revoked_sig_b64"]));
+check("office kind table: files office-key.json/.sig, kind 5dive-office-app-key", P.KEY_KINDS.office.file === "office-key" && P.KEY_KINDS.office.kind === "5dive-office-app-key" && P.KEY_KINDS.update.file === "signing-key" && P.KEY_KINDS.update.kind === "5dive-signing-key");
+const ok = Buffer.from(ofb.office_key_json_b64, "base64");
+const officeId = derSha(`-in ${f("office.pem")} -pubout`);
+check("office-key.json exact bytes (kind 5dive-office-app-key, order, compact)", ok.toString("utf8") === `{"format":1,"kind":"5dive-office-app-key","key_id":"${officeId}","pubkey":${JSON.stringify(officePub)},"not_after":${Math.floor(now / 1000) + 90 * 86400}}`, `\n      ${ok.toString("utf8")}`);
+writeFileSync(f("office-key.json"), ok); writeFileSync(f("office-key.sig"), Buffer.from(ofb.office_key_sig_b64, "base64"));
+check("openssl verifies office-key.json against the root", verify(f("bundle-root.pem"), f("office-key.json"), f("office-key.sig")) === "Signature Verified Successfully");
+check("office bundle carries the same revocation list format", Buffer.from(ofb.revoked_json_b64, "base64").toString() === `{"format":1,"kind":"5dive-revocations","serial":1,"revoked":[]}`);
+const upd = JSON.parse(await P.buildPublicFile(m, officeKey, 90, 1, "", now, "update"));
+check("same key approved as update key: kind 5dive-signing-key (the kind follows the choice)", JSON.parse(Buffer.from(upd.signing_key_json_b64, "base64")).kind === "5dive-signing-key");
+const dflt = JSON.parse(await P.buildPublicFile(m, officeKey, 90, 1, "", now));
+check("default choice is the update key", "signing_key_json_b64" in dflt && !("office_key_json_b64" in dflt));
+check("NEG: 5dive's update key refused as the office app key", await throwsAsync(async () => P.buildPublicFile(m, await P.importUpdateKey(P.DEFAULT_UPDATE_KEY), 90, 1, "", now, "office")));
+check("NEG: unknown key choice refused", await throwsAsync(() => P.buildPublicFile(m, officeKey, 90, 1, "", now, "other")));
 
 // --- "I already have a master key" ---
 const again = await P.loadMasterKey(m.privatePem);

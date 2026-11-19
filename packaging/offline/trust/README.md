@@ -18,6 +18,10 @@ A new `revoked.json` replaces the checked-in one only with a HIGHER `serial`
 (or the same bytes). Two different lists with one serial cannot be ordered: a
 box then applies both, and the ceremony page refuses to block a key on list 1.
 
+The ceremony page can also approve the office app key (`office-key.json` /
+`office-key.sig`, kind `5dive-office-app-key`, same `revoked.json`). Those are
+for the office app, not this folder: an update file carrying one is refused.
+
 Only public files go here. Never the root's private key, never the signing
 key's private key (that stays in the `OFFLINE_UPDATE_SIGNING_KEY` repo secret).
 
