@@ -80,8 +80,14 @@
 
   <section id="s-update">
     <p class="step">Step 2 of 4</p>
-    <h1>Approve the update key</h1>
-    <p>This is the update key from the 5dive team. Leave it as it is unless they sent you a new one.</p>
+    <h1>Approve a key</h1>
+    <p>Which key are you approving?</p>
+    <label class="check"><input type="radio" name="which" value="update" checked autocomplete="off">
+      Update key (CLI updates)</label>
+    <label class="check"><input type="radio" name="which" value="office" autocomplete="off">
+      Office app key (the app an office server serves)</label>
+    <p id="p-update">This is the update key from the 5dive team. Leave it as it is unless they sent you a new one.</p>
+    <p id="p-office" hidden>Paste the office app key the 5dive team sent you.</p>
     <textarea id="t-upd" autocomplete="off" spellcheck="false"></textarea>
     <label for="n-days">Valid for (days)</label>
     <input type="number" id="n-days" value="365" min="1" max="3650" autocomplete="off">
@@ -161,10 +167,10 @@ async function loadMasterKey(pemText) {
 async function importUpdateKey(pemText) {
   const pem = String(pemText).replace(/\r\n?/g, "\n").trim() + "\n";
   if (!/^-----BEGIN PUBLIC KEY-----\n[A-Za-z0-9+/=\n]+-----END PUBLIC KEY-----\n$/.test(pem))
-    throw new Error("The update key text is not complete. Paste it again exactly as you got it.");
+    throw new Error("The key text is not complete. Paste it again exactly as you got it.");
   const der = fromPem("PUBLIC KEY", pem);
   try { await crypto.subtle.importKey("spki", der, ED, true, ["verify"]); }
-  catch { throw new Error("That is not a valid update key."); }
+  catch { throw new Error("That is not a valid key."); }
   return { pem, keyId: await sha256hex(der) };
 }
 
@@ -178,9 +184,16 @@ function parseRevokedIds(text) {
   for (const id of ids) if (!/^[0-9a-f]{64}$/.test(id)) throw new Error(`This blocked key is not valid: ${id.slice(0, 20)}…`);
   return [...new Set(ids)];
 }
+// Which key the root approves. The kind is signed in, so one key cannot pass as the other:
+// update files refuse an office key, the office app refuses an update key. `file` names the
+// certificate files (<file>.json/.sig); `field` the bundle fields (<field>_json_b64/_sig_b64).
+const KEY_KINDS = {
+  update: { kind: "5dive-signing-key", file: "signing-key", field: "signing_key" },
+  office: { kind: "5dive-office-app-key", file: "office-key", field: "office_key" },
+};
 // Exact bytes the boxes verify: compact JSON, keys in this order.
-function signingKeyJson(pem, keyId, notAfter) {
-  return JSON.stringify({ format: 1, kind: "5dive-signing-key", key_id: keyId, pubkey: pem, not_after: notAfter });
+function signingKeyJson(pem, keyId, notAfter, kind = KEY_KINDS.update.kind) {
+  return JSON.stringify({ format: 1, kind, key_id: keyId, pubkey: pem, not_after: notAfter });
 }
 function revokedJson(serial, ids) {
   return JSON.stringify({ format: 1, kind: "5dive-revocations", serial, revoked: ids });
@@ -191,19 +204,23 @@ async function signBytes(master, bytes) {
     throw new Error("Signing failed its own check. Do not use this result.");
   return sig;
 }
-async function buildPublicFile(master, update, days, serial, revokedText, nowMs) {
+async function buildPublicFile(master, update, days, serial, revokedText, nowMs, which = "update") {
+  const k = KEY_KINDS[which];
+  if (!k) throw new Error("Choose which key you are approving.");
   const ids = parseRevokedIds(revokedText);
-  if (update.keyId === master.fingerprint) throw new Error("That update key is the master key itself. Use the key from 5dive.");
+  if (update.keyId === master.fingerprint) throw new Error("That key is the master key itself. Use the key from 5dive.");
+  if (which === "office" && update.keyId === (await importUpdateKey(DEFAULT_UPDATE_KEY)).keyId)
+    throw new Error("That is the update key, not the office app key. Paste the office app key from 5dive.");
   if (ids.includes(update.keyId)) throw new Error("You are blocking the same key you are approving.");
   const notAfter = Math.floor(nowMs / 1000) + wholeNumber(days, 1, 3650, "Days") * 86400;
-  const sk = enc.encode(signingKeyJson(update.pem, update.keyId, notAfter));
+  const sk = enc.encode(signingKeyJson(update.pem, update.keyId, notAfter, k.kind));
   const n = wholeNumber(serial, 1, 1e9, "List number");
   // List 1 is the first ceremony's empty list. Blocking on 1 would make a second list 1 that boxes cannot order.
   if (ids.length && n < 2) throw new Error("To block a key, set List number higher than every list you made before (2 or more).");
   const rv = enc.encode(revokedJson(n, ids));
   return JSON.stringify({
     root_pubkey_pem: master.publicPem, root_fingerprint: master.fingerprint,
-    signing_key_json_b64: b64(sk), signing_key_sig_b64: b64(await signBytes(master, sk)),
+    [`${k.field}_json_b64`]: b64(sk), [`${k.field}_sig_b64`]: b64(await signBytes(master, sk)),
     revoked_json_b64: b64(rv), revoked_sig_b64: b64(await signBytes(master, rv)),
   }, null, 2) + "\n";
 }
@@ -257,14 +274,24 @@ $("b-load").onclick = guard(async () => {
 });
 $("b-load-next").onclick = () => { $("t-load").value = ""; show("s-update"); };
 
+const which = () => document.querySelector("input[name=which]:checked").value;
+document.querySelectorAll("input[name=which]").forEach(r => r.onchange = () => {
+  const office = which() === "office", t = $("t-upd");
+  $("p-update").hidden = office; $("p-office").hidden = !office;
+  if (office && t.value === DEFAULT_UPDATE_KEY) t.value = "";      // no default office key: paste 5dive's
+  if (!office && !t.value.trim()) t.value = DEFAULT_UPDATE_KEY;
+  $("err").textContent = "";
+});
 $("b-upd-next").onclick = guard(async () => {
   update = await importUpdateKey($("t-upd").value);
   wholeNumber($("n-days").value, 1, 3650, "Days");
   show("s-revoke");
 });
 $("b-sign").onclick = guard(async () => {
-  const file = await buildPublicFile(master, update, $("n-days").value, $("n-serial").value, $("t-rev").value, Date.now());
-  $("b-pub").onclick = () => download("5dive-master-key-PUBLIC.json", file, "application/json");
+  const w = which();
+  const file = await buildPublicFile(master, update, $("n-days").value, $("n-serial").value, $("t-rev").value, Date.now(), w);
+  const name = w === "office" ? "5dive-master-key-PUBLIC-office.json" : "5dive-master-key-PUBLIC.json";
+  $("b-pub").onclick = () => download(name, file, "application/json");
   $("out-fp").textContent = master.fingerprint;
   show("s-out");
 });
