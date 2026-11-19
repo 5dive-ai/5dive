@@ -218,6 +218,38 @@ WOUT="$("$WINDOW" "$W"/*.report --drift-strict 2>&1)"; WRC=$?
 want "--drift-strict exits 8 on a confirmed stale claim" "8" "$WRC"
 has "the other_unit row, WRONG on only one job, stays a disagreement" "$WOUT" "stopwatch disagreement (1 box)"
 
+# DIVE-8834: A HEADER WIDENED SINCE THE SAMPLE IS RE-GRADED, NOT RE-CONVICTED. The window
+# re-reads the claim on the checkout, so a fixed file stops being a STALE CLAIM the night
+# the fix lands, instead of after its old runs roll out of the window. The fixture is a
+# real file with a real claim (this harness), and the numbers are derived from that
+# claim so a future re-measure of this header cannot quietly turn the arm vacuous.
+. "$ROOT/tests/lib/tier.sh"
+SELF="tests/header_drift_window_unit.sh"
+CUR="$(tier_claim "$ROOT/$SELF")"
+SUP="$TMP/sup"; mkdir -p "$SUP"
+OLDC="$(awk -v c="$CUR" 'BEGIN{printf "%.1f", c/4}')"
+UNDER="$(awk -v c="$CUR" 'BEGIN{printf "%.1f", c}')"
+OVER="$(awk -v c="$CUR" 'BEGIN{printf "%.1f", c*2+4}')"
+mkr() { # mkr <file> <run> <job> <row>
+  { printf '# run-harnesses report\n# harvest_run_id=%s\n# harvest_job=%s\n' "$2" "$3"
+    printf '# tier=full\n# label=pristine\n# harnesses=120\n# wall_clock_s=500\n'
+    printf '# cal_status=measured\n# cal_us_per_iter=119385\n# header_drift_wrong=1\n'
+    printf '# header_drift_file=%s\n' "$4"; } > "$SUP/$1"; }
+mkr s1.report 501 job-1 "WRONG"$'\t'"$SELF"$'\t'"$OLDC"$'\t'"$UNDER"$'\t'"300"
+mkr s2.report 502 job-2 "WRONG"$'\t'"$SELF"$'\t'"$OLDC"$'\t'"$UNDER"$'\t'"300"
+mkr s3.report 503 job-3 "WRONG"$'\t'"$SELF"$'\t'"$OLDC"$'\t'"$UNDER"$'\t'"300"
+SOUT="$("$WINDOW" "$SUP"/*.report --drift-strict 2>&1)"; SRC=$?
+if [[ -n "$CUR" ]]; then ok "the fixture file carries a claim to re-grade against ($CUR s)"
+else bad "the fixture file carries a claim to re-grade against" "tier_claim empty for $SELF"; fi
+hasnt "WRONG against a claim since widened past the measurement is not a STALE CLAIM" "$SOUT" "  STALE CLAIM"
+has "and the dropped samples are counted out loud" "$SOUT" "3 WRONG sample(s) dropped"
+want "--drift-strict does not gate on a superseded claim" "0" "$SRC"
+mkr s2.report 502 job-2 "WRONG"$'\t'"$SELF"$'\t'"$OLDC"$'\t'"$OVER"$'\t'"700"
+mkr s3.report 503 job-3 "WRONG"$'\t'"$SELF"$'\t'"$OLDC"$'\t'"$OVER"$'\t'"700"
+SOUT="$("$WINDOW" "$SUP"/*.report --drift-strict 2>&1)"; SRC=$?
+has "still WRONG against the CURRENT claim on two jobs is still a STALE CLAIM" "$SOUT" "  STALE CLAIM"
+want "and --drift-strict still gates on it" "8" "$SRC"
+
 # ABSENT IS EXCLUDED, NOT SCORED CLEAN — and the exclusion is NAMED. A window of
 # pre-carrier samples must refuse, not report a healthy corpus.
 OLD="$TMP/oldw"; mkdir -p "$OLD"

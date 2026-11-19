@@ -11,7 +11,8 @@
 #
 # DIVE-7598. This header is packaging/offline/usb-install.sh; the builder
 # (packaging/offline/build-usb.sh) fills in the four values below and appends the
-# payload: the signed update file 5dive-offline-<version>.tar and debs/*.deb.
+# payload: the signed update file 5dive-offline-<version>.tar and debs/*.deb
+# (and, in the private Office server file, 5dive-office-app-<version>.tar).
 # The payload's sha256 is checked before anything is unpacked; the update file's
 # signature is then checked by the 5dive inside it, against 5dive's release key,
 # exactly as `self-update --from=` checks one.
@@ -126,6 +127,17 @@ fi
 mkdir -p "$work/cli"
 tar -xOf "$upd" payload/cli.tar.gz | tar -xz -C "$work/cli" ./5dive \
   || die "this file is damaged (no 5dive in it)"
+# DIVE-8809: the office app. The private Office server file (build-office.sh)
+# carries the signed app file in this same payload; the public one does not.
+app="$(find "$work" -maxdepth 1 -type f -name '5dive-office-app-*.tar' | head -n 1)"
 say "Installing 5dive"
-"${FIVE_USB_SHELL:-bash}" "$work/cli/5dive" _usb_install --from="$upd" ${claude:+"--claude=$claude"} ${pass[@]+"${pass[@]}"}
-exit $?
+rc=0
+"${FIVE_USB_SHELL:-bash}" "$work/cli/5dive" _usb_install --from="$upd" ${claude:+"--claude=$claude"} ${pass[@]+"${pass[@]}"} || rc=$?
+(( rc == 0 )) || exit "$rc"
+if [[ -n "$app" ]]; then
+  # Checked by the 5dive just installed, against 5dive's root key (local app install).
+  say "Installing the 5dive app"
+  "${FIVE_USB_APP_CLI:-/usr/local/bin/5dive}" local app install "$app" \
+    || die "5dive is installed, but the 5dive app is not (above). The old chat page works meanwhile; run this file again to retry."
+fi
+exit 0

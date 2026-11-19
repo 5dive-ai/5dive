@@ -26,10 +26,10 @@ _local_chat_server_ts() {
 //   bun local_chat_server.ts admin devices-revoke <id>
 import { Database } from "bun:sqlite";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, statfsSync, writeFileSync } from "node:fs";
 import { freemem, totalmem, uptime } from "node:os";
 import { open } from "node:fs/promises";
-import { join } from "node:path";
+import { extname, join, normalize } from "node:path";
 
 const env = process.env;
 const STATE = env.LC_STATE || "/var/lib/5dive-local-chat";
@@ -440,17 +440,94 @@ function pairThrottled(): boolean {
   return false;
 }
 
+// DIVE-8809: the office app (`5dive local app install`), unpacked root-owned under
+// /opt/5dive/office-app/<version>; `current` names the one served. Read on every
+// request (a realpath), so an install needs no restart. No app: the page below.
+const APP_DIR = env.LC_APP_DIR || "/opt/5dive/office-app/current";
+type OfficeApp = { root: string; index: string; fallbacks: { prefix: string; file: string }[] };
+let appSeen: { real: string; app: OfficeApp | null } | null = null;
+function officeApp(): OfficeApp | null {
+  let real = "";
+  try { real = realpathSync(APP_DIR); } catch { return null; }
+  if (appSeen?.real === real) return appSeen.app;
+  let app: OfficeApp | null = null;
+  try {
+    const a = JSON.parse(readFileSync(join(real, "manifest.json"), "utf8"))?.app ?? {};
+    const safe = (v: unknown, re: RegExp): v is string => typeof v === "string" && re.test(v) && !v.includes("..");
+    const index = safe(a.index, /^\/[A-Za-z0-9._\/-]*$/) ? a.index : "/";
+    const fallbacks = (Array.isArray(a.fallbacks) ? a.fallbacks : [])
+      .filter((f: any) => safe(f?.prefix, /^\/[A-Za-z0-9._\/-]+\/$/) && safe(f?.file, /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/));
+    if (statSync(join(real, "app")).isDirectory()) app = { root: join(real, "app"), index, fallbacks };
+  } catch {}
+  appSeen = { real, app };
+  return app;
+}
+const APP_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
+  ".json": "application/json", ".webmanifest": "application/manifest+json", ".txt": "text/plain; charset=utf-8",
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif",
+  ".svg": "image/svg+xml", ".ico": "image/x-icon", ".woff2": "font/woff2", ".woff": "font/woff", ".map": "application/json",
+};
+// The app talks only to this server: the browser is told so (connect-src 'self').
+const APP_CSP = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; " +
+  "font-src 'self' data:; connect-src 'self'; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'";
+function appFile(app: OfficeApp, rel: string): string | null {
+  if (rel.includes("\0") || rel.split("/").includes("..")) return null;
+  const p = normalize(join(app.root, rel));
+  if (p !== app.root && !p.startsWith(app.root + "/")) return null;
+  try {
+    const st = statSync(p);
+    const f = st.isDirectory() ? join(p, "index.html") : p;
+    return statSync(f).isFile() ? f : null;
+  } catch { return null; }
+}
+function serveApp(app: OfficeApp, p: string): Response {
+  let rel = "";
+  try { rel = decodeURIComponent(p); } catch { return json({ error: "not found" }, 404); }
+  let f = appFile(app, rel.slice(1));
+  if (!f) {
+    const fb = app.fallbacks.find((x) => rel.startsWith(x.prefix) && rel.length > x.prefix.length);
+    if (fb) f = appFile(app, fb.file);
+  }
+  const status = f ? 200 : 404;
+  if (!f) f = appFile(app, "404.html");
+  if (!f) return json({ error: "not found" }, 404);
+  const ext = extname(f);
+  return new Response(Bun.file(f), {
+    status,
+    headers: {
+      "content-type": APP_TYPES[ext] ?? "application/octet-stream",
+      // Content-hashed names never change; everything else is checked on each load.
+      "cache-control": rel.startsWith("/_next/static/") ? "public, max-age=31536000, immutable" : "no-cache",
+      "x-content-type-options": "nosniff",
+      "referrer-policy": "no-referrer",
+      ...(ext === ".html" ? { "content-security-policy": APP_CSP, "x-frame-options": "DENY" } : {}),
+    },
+  });
+}
+const PAGE_HEADERS = {
+  "content-type": "text/html; charset=utf-8",
+  "content-security-policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: blob:",
+  "x-frame-options": "DENY",
+  "referrer-policy": "no-referrer",
+};
+
 async function browserSide(req: Request, url: URL): Promise<Response> {
   const p = url.pathname;
-  if ((p === "/" || p === "/join" || p === "/panel") && req.method === "GET")
-    return new Response(p === "/panel" ? PANEL_PAGE : PAGE, {
-      headers: {
-        "content-type": "text/html; charset=utf-8",
-        "content-security-policy": "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: blob:",
-        "x-frame-options": "DENY",
-        "referrer-policy": "no-referrer",
-      },
-    });
+  const read = req.method === "GET" || req.method === "HEAD";
+  if (p === "/panel" && read) return new Response(PANEL_PAGE, { headers: PAGE_HEADERS });
+  // DIVE-8809: with the app installed, / opens it for a signed-in device; a
+  // signed-out one gets the page's sign-in (a code, or a join link at /join),
+  // which comes back to / once in. /lite is the page, always.
+  if ((p === "/" || p === "/join" || p === "/lite") && read) {
+    const app = officeApp();
+    if (app && p === "/" && deviceOf(req)) return new Response(null, { status: 302, headers: { location: app.index + url.search, "cache-control": "no-store" } });
+    return new Response(app && p !== "/lite" ? PAGE.replace('<html lang="en">', '<html lang="en" data-app="1">') : PAGE, { headers: PAGE_HEADERS });
+  }
+  if (read && !p.startsWith("/api/")) {
+    const app = officeApp();
+    if (app) return serveApp(app, p);
+  }
   // DIVE-8807: the office app's own API paths (a fixed allowlist, never forwarded).
   if (p.startsWith("/api/proxy/")) return officeProxy(req, url);
   // Every write carries a custom header, so a page on another origin cannot
@@ -776,6 +853,7 @@ function showPair() {
       const r = await fetch("/api/pair", { method: "POST", headers: H, body: JSON.stringify({ code: $("#code").value, name: deviceName() }) });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(j.error || "That code did not work.");
+      if (APP) return location.replace("/");
       showList();
     } catch (e) { $("#err").textContent = e.message; }
   };
@@ -856,6 +934,9 @@ back.onclick = () => { location.hash = ""; };
 const route = () => { const a = decodeURIComponent(location.hash.slice(1)); a ? showThread(a) : showList(); };
 // DIVE-8807: a join link (https://<office>/join#<code>, from Team → Invite)
 // spends its code once, then this device is in and the code leaves the address.
+// DIVE-8809: the server marks the page when an office app is installed; a device
+// that signs in here then opens the app at /.
+const APP = document.documentElement.dataset.app === "1";
 async function boot() {
   if (location.pathname === "/join") {
     const token = location.hash.slice(1);
@@ -863,6 +944,7 @@ async function boot() {
     if (token) {
       const r = await fetch("/api/proxy/team/accept", { method: "POST", headers: H, body: JSON.stringify({ token }) }).catch(() => null);
       if (!r || !r.ok) { showPair(); $("#err").textContent = "That invite link is used or expired. Ask for a new one."; return; }
+      if (APP) return location.replace("/");
     }
   }
   window.onhashchange = route; route();
@@ -1003,8 +1085,8 @@ const views = {
           (d.certificate.renewsBySelf ? "When your IT renews it, the chat takes the new one by itself." : "When your IT renews it, they give the new files to this server once more.")) + '</p></div>' : "") +
       '<div class="card"><h3>Connected devices</h3><button class="btn" id="inv" style="margin:6px 0 4px">＋ Invite a person</button>' + d.devices.map((v) =>
         '<div class="item"><div class="grow"><b>' + esc(v.name) + (v.id === d.me ? " (this one)" : "") + '</b><span>' + (v.role === "owner" ? "Can manage" : "Chat only") + ' · last seen ' + esc(seen(v.last_seen)) + '</span></div><button class="btn red" data-rv="' + esc(v.id) + '">Remove</button></div>').join("") + '</div>' +
-      (d.updateFromFile ? '<div class="card"><h3>Update</h3><p class="mute">This server runs 5dive ' + esc(d.version || "") + '. Got an update file from your IT team? Pick it and install.</p>' +
-        '<input type="file" id="uf" accept=".tar"><button class="btn" id="ub">Install update</button><p id="us" class="mute"></p>' +
+      (d.updateFromFile ? '<div class="card"><h3>Update</h3><p class="mute">This server runs 5dive ' + esc(d.version || "") + '. Got an update file or the Office server file from your IT team? Pick it and install.</p>' +
+        '<input type="file" id="uf" accept=".tar,.run"><button class="btn" id="ub">Install update</button><p id="us" class="mute"></p>' +
         '<details id="ul" hidden><summary class="mute">What the last install said</summary><pre id="ulog" class="mute" style="white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px"></pre></details></div>' : "") +
       // DIVE-7886: a Support file for a server with no internet (marketing's words).
       '<div class="card"><h3>Need help?</h3><p class="mute">No internet on this server? Save a support file, then attach it in Support in the 5dive app from any computer.</p>' +
@@ -1268,6 +1350,11 @@ const ownerCount = () => (db.query("SELECT COUNT(*) AS n FROM people WHERE role 
 
 const teamRoutes: [string, RegExp, Handler][] = [
   ["GET", /^\/me$/, (_r, _u, c) => json({ id: c.me.id, name: c.me.name, role: c.me.role, office: true })],
+  // DIVE-8809 (contract addition from DIVE-8806): the app's "Sign out" — this device only.
+  ["DELETE", /^\/me$/, (_r, _u, c) => {
+    db.query("UPDATE devices SET revoked = 1 WHERE id = ?").run(c.dev.id);
+    return new Response(null, { status: 204, headers: { "set-cookie": "lc_dev=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0", "cache-control": "no-store" } });
+  }],
   ["GET", /^\/team$/, (_r, _u, c) => {
     const people = livePeople().filter((p) => p.id !== c.me.id || c.me.role === "member");
     const cabinets = { current: null, teams: [], max: 1 };

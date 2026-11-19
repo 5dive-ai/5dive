@@ -134,8 +134,8 @@ field() { # field <file> <key> -> value, empty if absent
 # runner, and it is exactly the evidence the removed exit 5 never had. Raising it to 3
 # would be defensible and is a flag, not a constant, for that reason.
 # ---------------------------------------------------------------------------
-declare -A DRIFT_JOBS=() DRIFT_SEEN=() DRIFT_GRADED=()
-dskipped=0; dskipnames=""
+declare -A DRIFT_JOBS=() DRIFT_SEEN=() DRIFT_GRADED=() DRIFT_SUPERSEDED=()
+dskipped=0; dskipnames=""; dsuperseded=0
 for f in "${FILES[@]}"; do
   [[ -r "$f" ]] || continue           # already named as a skip by the cal pass below
   _rid="$(field "$f" harvest_run_id)"; _job="$(field "$f" harvest_job)"
@@ -156,6 +156,24 @@ for f in "${FILES[@]}"; do
     # exit 5 used, and folding it in would make the verdict answer a different question
     # than the one it is named for.
     [[ "$_sev" == "WRONG" ]] || continue
+    # DIVE-8834: a sample graded a header that has SINCE been widened is re-graded
+    # against the header on this checkout. Without this, a fix leaves every older
+    # sample in the window, and the issue keeps naming a fixed file as a STALE CLAIM
+    # until those runs roll out of the last 20 (5dive#1729 re-listed three files
+    # DIVE-8747 had already widened). Same thresholds as run-harnesses.sh. A file with
+    # no readable claim here (renamed, deleted, prose) keeps its recorded verdict.
+    IFS=$'\t' read -r _rclaim _rms _ <<<"$_rest"
+    _cclaim="$(tier_claim "$_nm" 2>/dev/null)"
+    if [[ -n "$_cclaim" && -n "$_rms" && "$_cclaim" != "$_rclaim" ]]; then
+      _cms=$(awk -v c="$_cclaim" 'BEGIN{printf "%d", c*1000 + 0.5}')
+      _mms=$(awk -v c="$_rms" 'BEGIN{printf "%d", c*1000 + 0.5}')
+      _gap=$(( _mms - _cms ))
+      if (( _cms <= 0 || _gap < TIER_CLAIM_DRIFT_FAIL_S * 1000 || _gap * 100 / _cms < TIER_CLAIM_DRIFT_FAIL_PCT )); then
+        [[ -n "${DRIFT_SUPERSEDED["$_nm|$_jid"]:-}" ]] || dsuperseded=$((dsuperseded+1))
+        DRIFT_SUPERSEDED["$_nm|$_jid"]=1
+        continue
+      fi
+    fi
     [[ -n "${DRIFT_SEEN["$_nm|$_jid"]:-}" ]] && continue
     DRIFT_SEEN["$_nm|$_jid"]=1
     DRIFT_JOBS["$_nm"]="${DRIFT_JOBS["$_nm"]:-}$_jid "
@@ -167,6 +185,7 @@ ngraded=${#DRIFT_GRADED[@]}
 printf 'tier-cal-window: stale-claim verdict (DIVE-3188) — %d job(s) carried a graded drift count' "$ngraded"
 (( dskipped )) && printf ', %d excluded:%s' "$dskipped" "$dskipnames"
 printf '\n'
+(( dsuperseded )) && printf 'tier-cal-window: %d WRONG sample(s) dropped: their header has since been widened past the time they measured (DIVE-8834)\n' "$dsuperseded"
 if (( ngraded < MIN_RUNS )); then
   # The same fail-closed call the cal window makes, for the same reason: a verdict
   # computed from too little reads exactly like a verdict computed from enough.

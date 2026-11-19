@@ -178,7 +178,7 @@ for p in billing keys server/shell server/terminal enterprise/plan agent-telegra
   check "A2 not answered → 404, never forwarded: /$p" '[[ "$(code_ boss "$X/'"$p"'")" == 404 ]]'
 done
 check 'A3 a write from another origin is refused' '[[ "$(curl -sk -o /dev/null -w "%{http_code}" -b "$TMPD/boss" -H "origin: https://evil.example.test" -H "content-type: application/json" -d "{\"name\":\"X\"}" "$X/team/invite")" == 403 ]]'
-check 'A4 a wrong method on an answered path is 405' '[[ "$(code_ boss -X DELETE "$X/me")" == 405 ]]'
+check 'A4 a wrong method on an answered path is 405' '[[ "$(code_ boss -X PUT -d "{}" "$X/me")" == 405 ]]'
 
 # long poll and the live feed
 LAST=$(as_ boss "$X/server/messages?agent=bob" | jq '[.messages[].id] | max // 0')
@@ -217,7 +217,7 @@ while IFS=$'\t' read -r key req shape; do
 done < <(jq -r '.paths | to_entries[] | [.key, (.value.request // {} | tojson), (.value.response | tojson)] | @tsv' "$FIX")
 # Every route the server answers has a contract arm (or is named here as one the app reads nothing from).
 ANSWERED=$(grep -oE '\["(GET|POST|PUT|DELETE)", /\^\\/[^$]*\$/' "$TMPD/server.ts" | sed -E 's/\["([A-Z]+)", \/\^(.*)\$\//\1 \2/; s/\\//g' | sort -u)
-NO_READ='POST /team/leave|PUT /team/members/([a-f0-9]{8,32})/agents|DELETE /team/members/(i?[a-f0-9]{8,32})|POST /server/files/upload|POST /server/files/mkdir|GET /server/files/download|GET /server/messages/stream|POST /server/conversations/(d+)/read'
+NO_READ='DELETE /me|POST /team/leave|PUT /team/members/([a-f0-9]{8,32})/agents|DELETE /team/members/(i?[a-f0-9]{8,32})|POST /server/files/upload|POST /server/files/mkdir|GET /server/files/download|GET /server/messages/stream|POST /server/conversations/(d+)/read'
 has_arm() {  # $1 = an answered "METHOD /path"; 0 when the contract has it or NO_READ names it
   local k; k=$(sed -E 's/\(d\+\)/<conversation>/' <<<"$1")
   if jq -e --arg k "$k" '.paths | keys | map(split(" ")[0:2] | join(" ") | split("?")[0]) | index($k)' "$FIX" >/dev/null; then return 0; fi
