@@ -50,6 +50,7 @@ Agents:
   5dive market --kind=plugin                         # browse plugins (voice, telegram, dashboard, buzz)
   5dive plugin add|list|remove|upgrade <plugin>      # install a plugin; see '5dive plugin --help'
   5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see '5dive hire --help'
+  5dive helper ensure|status                         # the 5dive "Help & setup" seat on a paid server (not a hire)
   5dive partner hire <pack> [--as=<name>]            # on a PARTNER box: hire a colleague from the partner's
                                                      # catalogue through the partner path (5dive-api records it
                                                      # on the partner's account). No root: any seat that can read
@@ -1433,6 +1434,11 @@ main() {
         hire) AUDIT_CMD="partner hire"; AUDIT_ARGS=("${@:2}") ;;
       esac
       cmd_partner "$@" ;;
+    helper)
+      # DIVE-8819: the 5dive helper seat. `ensure` builds it (audited, no registry
+      # lock here: it shells out to `agent create`, which takes the lock itself).
+      [[ "${1:-}" == ensure ]] && { AUDIT_CMD="helper ensure"; AUDIT_ARGS=(); }
+      cmd_helper "$@" ;;
     agent)
       _agent_verb_dispatch "$@" ;;
     fire)

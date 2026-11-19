@@ -2601,7 +2601,9 @@ HELP
   reg=$(registry_read)
 
   local names agents="{}"
-  mapfile -t names < <(jq -r '.agents | keys[]' <<<"$reg")
+  # DIVE-8819: a system seat (the 5dive helper) belongs to the box, not the
+  # team: a copy of the team onto another box must not carry it as a hire.
+  mapfile -t names < <(jq -r '.agents | to_entries[] | select((.value.system // "") == "") | .key' <<<"$reg")
   local name
   for name in "${names[@]}"; do
     local type channels workdir profile model effort role mgr
