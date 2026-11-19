@@ -2039,7 +2039,7 @@ if len(summ) == 1:
 
 # 98 — THE SHARD COUNT IS A PINNED NUMBER, NOT A SENTENCE. Found by codex grading this
 # row's own PR: changing BOTH core matrices from [1, 2] to [1, 2, 3] passes 142/0.
-# (N is 6 as of DIVE-5344 — see the notes on CORE_SHARDS below. Read every `[1, 2, 3]`
+# (N is 10 as of DIVE-8761 — see the notes on CORE_SHARDS below. Read every `[1, 2, 3]`
 # in this header as "one more shard than is pinned"; the arm is about N moving in the
 # workflow alone, whatever N is.) Every
 # arm above stays green because every one of them is about the shape of the split and not
@@ -2149,7 +2149,14 @@ if len(summ) == 1:
 # installed-host (82%), about two days of headroom at the ~8s/shard/day growth measured since
 # DIVE-4658. At six it is 178s / 206s (69%). TIER_BUDGET_CORE, TIER_CAL_SCALE_MAX_PCT and
 # TIER_CAL_BASELINE_US are untouched by this change too.
-CORE_SHARDS = 6
+#
+# DIVE-8761 (dev, 2026-11-19): 6 -> 10. Six lasted 49 days. Three consecutive main runs
+# (44436729689, 44437722568, 44440277989) read shards of 213-330s, and the merge queue ejected
+# #1716 and #1718 with every harness passing. Sized against the box: each shard ran 0.77x to
+# 1.21x its table price, so each split's worst planned shard is costed at 1.21x. Pristine /
+# installed-host: eight is 238 / 250s (83%, over 85% within days), nine is 211 / 222s (74%),
+# ten is 190 / 200s (67%). The cap and the calibration constants are untouched again.
+CORE_SHARDS = 10
 # One corpus job per environment (pristine, installed-host) and one confirm job per
 # environment. Both are counts of JOBS, and both are capacity: another corpus job is
 # another 300s cap, and another confirm job is another box re-running a shard.

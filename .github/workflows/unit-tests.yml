@@ -60,7 +60,7 @@ env:
 jobs:
   # DIVE-3315: INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s
   # stands; the core corpus does not fit under it any more. (Two when this was written;
-  # THREE since DIVE-4147, FOUR since DIVE-4658 and SIX since DIVE-5344 — the gates and the
+  # THREE since DIVE-4147, FOUR since DIVE-4658, SIX since DIVE-5344 and TEN since DIVE-8761 — the gates and the
   # measurements are the blocks below.) Measured on main
   # 2026-08-11/12: 313s pristine against a 312s effective cap, with ~6% runner spread
   # and the mutation-harness lever exhausted at ~7s available against ~13s needed
@@ -164,6 +164,35 @@ jobs:
   # As above, this is capacity and not paydown. core_us_per_harness reads 177% of its reference
   # on run 36835715525, and that is the number to bring down.
   #
+  # DIVE-8761: N = 10, decided by dev on that row on 2026-11-19. ops' brief named a seventh or
+  # eighth shard, or paydown; both are recorded with their numbers below. Six shards lasted 49
+  # days, not the nine forecast. By 2026-11-19 the corpus was 709 core harnesses and
+  # 1568-1667s pristine / 1560-1804s installed-host un-sharded. Three consecutive main runs
+  # (44436729689, 44437722568, 44440277989; heads 426b4d11, abea50f5, 2fee702a) read first-pass
+  # shards of 213-330s. The merge queue ejected #1716 and #1718 with every harness passing
+  # (runs 44429402349, 44429404304). The weights table was refreshed the day before (DIVE-8748)
+  # and is NOT refreshed here: the planner already reproduces all three runs 709 of 709, and it
+  # balances its own shards to within a few seconds. What is left over is the box.
+  #
+  # SIZED AGAINST THE BOX, NOT THE OVERAGE. Each shard of those three runs, measured against its
+  # own price in the shipped table, ran 0.77x to 1.21x (36 shards). That ~44% spread is the
+  # ~100s run-to-run swing, and a shard draws one box for its whole run. Each split is planned
+  # with the shipped table, and its worst shard is costed at the table price times the slowest
+  # box measured (1.21x). Pristine / installed-host:
+  #   seven  272 / 286s  (95%)
+  #   eight  238 / 250s  (83%)   under 85% on today's corpus only; growth takes it over in days
+  #   nine   211 / 222s  (74%)
+  #   ten    190 / 200s  (67%)   what this commit takes
+  # Re-costed instead at each run's own per-harness prices (no box factor), the worst shard at
+  # ten is 178s pristine / 187s installed-host (62%). The corpus grew ~11s a day from 10-01 to
+  # 11-19, or ~1.1s per shard per day at ten. On the slowest box that is ~55s to 85%, about
+  # six weeks. Ten costs four more runner jobs per environment (~1 min of setup each, standard
+  # runners are free). It should also cut the confirm re-runs, which 2fee702a spent five of.
+  # Paydown was the alternative, and it is too small: the five harnesses the row names sum to
+  # ~93s per environment, out of ~1600-1800s. At six shards that lowers the mean shard by ~15s
+  # against a ~100s box swing, and demoting any one of them moves only the shard it sits in.
+  # core_us_per_harness against its reference is still the number this capacity cannot launder.
+  #
   # AND THE UN-SHARDED TOTAL IS STILL PRINTED, by `core-budget-report` below: sharding
   # is the obvious way to lose the number this whole scheme exists to surface. Two jobs
   # reporting 157s read as comfortable while the corpus still costs 313s. Per-shard is
@@ -187,7 +216,7 @@ jobs:
       # un-sharded total is re-summed from the shards' reports, and a cancelled shard
       # is a hole in exactly the number this row exists to keep legible.
       fail-fast: false
-      matrix: { shard: [1, 2, 3, 4, 5, 6] }
+      matrix: { shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }
     steps:
       # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
       # moves a payload the real CLI produced into the real dispatcher that lives in
@@ -730,7 +759,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      matrix: { shard: [1, 2, 3, 4, 5, 6] }
+      matrix: { shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] }
     steps:
       # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
       # moves a payload the real CLI produced into the real dispatcher that lives in
@@ -1212,7 +1241,8 @@ jobs:
         run: |
           bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
             core-pristine-1.txt core-pristine-2.txt core-pristine-3.txt core-pristine-4.txt \
-            core-pristine-5.txt core-pristine-6.txt
+            core-pristine-5.txt core-pristine-6.txt core-pristine-7.txt core-pristine-8.txt \
+            core-pristine-9.txt core-pristine-10.txt
 
   acp-graded-installed:
     # DIVE-4186: queue-time only. Its `needs` would carry the skip anyway; spelled out
@@ -1230,7 +1260,8 @@ jobs:
         run: |
           bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
             core-installed-1.txt core-installed-2.txt core-installed-3.txt core-installed-4.txt \
-            core-installed-5.txt core-installed-6.txt
+            core-installed-5.txt core-installed-6.txt core-installed-7.txt core-installed-8.txt \
+            core-installed-9.txt core-installed-10.txt
 
   # DIVE-3315: THE FOUR REQUIRED CHECKS, kept by NAME. `test`, `test-installed-host`,
   # `test-confirm` and `test-installed-host-confirm` are required status checks on main.
