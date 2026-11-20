@@ -2,8 +2,8 @@
 # DIVE-8819 isolated unit harness for the 5dive helper seat (src/cmd_helper.sh):
 #   1. outside the agent count: the seat is marked system=helper, `agent list
 #      --json` carries that field from both builders, and the hire count skips it;
-#   2. the greeting goes out ONCE: a second tick, a seat restart and a failed
-#      send that is retried never produce a second message;
+#   2. the welcome goes out ONCE: a second tick, a seat restart and a failed
+#      post that is retried never produce a second message;
 #   3. the handover read: 200 skips the question and names the business, 404
 #      asks it, any other answer retries and asks only after the tries run out;
 #   4. which boxes: no demo AI = nothing; an owner's own agent named `helper` is
@@ -11,6 +11,10 @@
 #      failing stops after its tries;
 #   5-8. the persona; the greeted claim against a racing tick; a build that stops
 #      after create is marked and resumed, never a hire; --help exits 0.
+#   9-11. DIVE-8850: the BOX posts the welcome into the app as the helper (no
+#      notice, no model in the path); a 0.138.0 box with `greeted` and no reply
+#      from its seat is welcomed once, one whose seat did reply is not; a sealed
+#      chat gets it sealed as the helper.
 # Throwaway STATE_DIR and fake 5dive / systemd-run / curl on PATH: no root, no
 # network, nothing on the live box is touched.
 # Run: bash tests/helper_seat_unit.sh
@@ -37,7 +41,6 @@ CALLS="$TMP/calls.log"; : >"$CALLS"
 cat >"$FAKE/5dive" <<'EOF'
 #!/usr/bin/env bash
 printf '5dive %s\n' "$*" >>"$CALLS"
-[[ "$1 $2" == "agent _deliver" && -n "${FAKE_DELIVER_FAIL:-}" ]] && exit 1
 exit 0
 EOF
 cat >"$FAKE/systemd-run" <<'EOF'
@@ -61,6 +64,18 @@ _partner_box_token() { printf '%s' "$CONNECTORD_TOKEN"; }
 _partner_api_base() { printf 'https://api.example.test'; }
 RUNNING=1
 _helper_running() { (( RUNNING )); }
+# The app rail: one line per post into $CALLS. FAKE_POST_CODE answers a plain
+# post, FAKE_SEALED_CODE a sealed one.
+_dash_relay_token() { printf 'box-token-fixture'; }
+_dash_relay_api_base() { printf 'https://api.example.test'; }
+_dash_relay_call() {
+  printf 'post %s %s\n' "$2" "$3" >>"$CALLS"
+  if jq -e '.metadata.e2e' <<<"$3" >/dev/null 2>&1; then printf '%s\n{}' "${FAKE_SEALED_CODE:-200}"
+  else printf '%s\n{}' "${FAKE_POST_CODE:-200}"; fi
+}
+_chat_e2e_live() { printf '%s' "$STATE_DIR/chat-e2e"; }
+_chat_e2e_run() { local req; req=$(cat); printf 'seal %s as=%s %s\n' "$1" "$4" "$req" >>"$CALLS"; printf '{"env":{"h":{"c":"dashboard"},"sealed":true}}'; }
+HELPER_SEAT_HOME="$TMP/seat-home"
 
 fresh() {   # a new box: state dir, registry, optional demo AI account
   STATE_DIR="$TMP/box$1"; HELPER_STATE_DIR="$STATE_DIR"
@@ -70,7 +85,7 @@ fresh() {   # a new box: state dir, registry, optional demo AI account
     mkdir -p "$AUTH_PROFILES_DIR/demo-ai"
     printf 'ANTHROPIC_AUTH_TOKEN=sk-or-v1-fixture\n' >"$AUTH_PROFILES_DIR/demo-ai/combined.env"
   fi
-  : >"$CALLS"
+  : >"$CALLS"; rm -rf "$HELPER_SEAT_HOME"
 }
 reg_with() { printf '{"agents":%s}' "$1"; }
 built() { mkdir -p "$STATE_DIR/helper"; date >"$STATE_DIR/helper/built"; }
@@ -115,49 +130,57 @@ fresh 6; mkdir -p "$STATE_DIR/helper"; echo 6 >"$STATE_DIR/helper/build-tries"
 _helper_tick "$(reg_with '{}')" >/dev/null
 t 'a build that failed its tries stops' 0 "$(n_calls systemd-run)"
 
-echo '== 3. the greeting waits for an owner, then goes out once =='
+echo '== 3. the welcome waits for an owner, then goes out once =='
 fresh 7; built; FAKE_HTTP=404
 _helper_tick "$(reg_with "{$HELPER_ROW}")" >/dev/null
-t 'no hire yet (an unclaimed spare): no greeting' 0 "$(n_calls '_deliver')"
+t 'no hire yet (an unclaimed spare): no welcome' 0 "$(n_calls '^post')"
 RUNNING=0; _helper_tick "$(reg_with "{$HELPER_ROW,$HIRE_ROW}")" >/dev/null; RUNNING=1
-t 'seat not running: no greeting' 0 "$(n_calls '_deliver')"
+t 'seat not running: no welcome' 0 "$(n_calls '^post')"
 REG="$(reg_with "{$HELPER_ROW,$HIRE_ROW}")"
 FAKE_HTTP=404 FAKE_BODY='{"error":"none"}' _helper_tick "$REG" >/dev/null
 FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
-t 'two ticks: one greeting' 1 "$(n_calls 'agent _deliver --system-notice helper')"
+t 'two ticks: one welcome' 1 "$(n_calls '^post https://api.example.test/server/messages/event')"
+t 'posted as the helper' helper "$(sed -n 's/^post [^ ]* //p' "$CALLS" | jq -r .agent)"
+t 'with the one retry key' helper-welcome "$(sed -n 's/^post [^ ]* //p' "$CALLS" | jq -r .metadata.reply_key)"
+t 'the seat is handed no notice (no model in the path)' 0 "$(n_calls '_deliver')"
 # A seat restart changes nothing on disk the greeting reads; the box restart
 # (STATE_DIR persists) neither.
 FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
-t 'after a restart: still one greeting' 1 "$(n_calls '_deliver')"
-t 'greeted is recorded' yes "$([[ -s "$STATE_DIR/helper/greeted" ]] && echo yes)"
-t 'once greeted, the tick reads nothing' 0 "$(n_calls curl | awk '{print ($1>2)?1:0}')"
+t 'after a restart: still one welcome' 1 "$(n_calls '^post')"
+t 'welcomed is recorded' yes "$([[ -s "$STATE_DIR/helper/welcomed" ]] && echo yes)"
+t 'once welcomed, the tick reads nothing' 0 "$(n_calls curl | awk '{print ($1>2)?1:0}')"
 fresh 8; built; REG="$(reg_with "{$HELPER_ROW,$HIRE_ROW}")"
-FAKE_DELIVER_FAIL=1 FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
-t 'a failed send leaves no greeted mark' no "$([[ -e "$STATE_DIR/helper/greeted" ]] && echo yes || echo no)"
+FAKE_POST_CODE=502 FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
+t 'a refused post leaves no welcomed mark' no "$([[ -e "$STATE_DIR/helper/welcomed" ]] && echo yes || echo no)"
 FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
 FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
-t 'the retry sends it, once' 2 "$(n_calls '_deliver')"
-t 'greeted after the retry' yes "$([[ -e "$STATE_DIR/helper/greeted" ]] && echo yes)"
+t 'the retry posts it, once' 2 "$(n_calls '^post')"
+t 'welcomed after the retry' yes "$([[ -e "$STATE_DIR/helper/welcomed" ]] && echo yes)"
 
 echo '== 4. the handover read =='
 fresh 9; built; REG="$(reg_with "{$HELPER_ROW,$HIRE_ROW}")"
 FAKE_HTTP=200 FAKE_BODY='{"business":"a bakery\nin Lyon","suggested":["theo","dude","x y"],"asked_at":"2026-11-19T10:00:00Z"}' \
   _helper_tick "$REG" >/dev/null
-msg=$(sed -n '/_deliver/,$p' "$CALLS")
+msg=$(sed -n 's/^post [^ ]* //p' "$CALLS" | jq -r .body)
 has 'reads GET /helper/handover' 'https://api.example.test/helper/handover' "$(cat "$CALLS")"
-has '200: names the business' '"a bakery in Lyon"' "$msg"
-has '200: says not to ask again' 'Do not ask about it again' "$msg"
-has '200: passes at most two clean suggestions' '5dive suggested: theo, dude)' "$msg"
+has '200: names the business' 'For your business (a bakery in Lyon)' "$msg"
+has '200: names at most two clean suggestions' 'a good first hire is Theo or Dude:' "$msg"
 hasnt '200: does not ask the question' 'what does your business do' "$msg"
+t '200: the whole welcome' "Hi, I'm 5dive, your helper on this server. For your business (a bakery in Lyon), a good first hire is Theo or Dude: find them on the Hire screen. Ask me anything about setting up." "$msg"
 fresh 10; built; FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
-msg=$(sed -n '/_deliver/,$p' "$CALLS")
-has '404: asks the one question' 'what does your business do?' "$msg"
+msg=$(sed -n 's/^post [^ ]* //p' "$CALLS" | jq -r .body)
+t '404: asks the one question' "Hi, I'm 5dive, your helper on this server. I help you set up 5dive and choose your agents. What does your business do?" "$msg"
+t 'the welcome is at most 40 words' yes "$( (( $(wc -w <<<"$msg") <= 40 )) && echo yes)"
+fresh 15; built; FAKE_HTTP=200 FAKE_BODY='{"business":"a bakery","suggested":[]}' _helper_tick "$REG" >/dev/null
+has '200 with no suggestion: offers to suggest' "You told me about your business: a bakery. Tell me what you want done first" "$(sed -n 's/^post [^ ]* //p' "$CALLS" | jq -r .body)"
+long=$(printf 'x%.0s' {1..300})
+has 'a long business is clipped' "(${long:0:119}…)" "$(_helper_greeting "$long" 'theo')"
 fresh 11; built; HELPER_HANDOVER_TRIES=3
 for i in 1 2; do FAKE_HTTP=503 _helper_tick "$REG" >/dev/null; done
-t 'API down: no greeting while tries remain' 0 "$(n_calls '_deliver')"
+t 'API down: no welcome while tries remain' 0 "$(n_calls '^post')"
 FAKE_HTTP=503 _helper_tick "$REG" >/dev/null
-t 'API down past the tries: one greeting' 1 "$(n_calls '_deliver')"
-has 'API down past the tries: it asks' 'what does your business do?' "$(sed -n '/_deliver/,$p' "$CALLS")"
+t 'API down past the tries: one welcome' 1 "$(n_calls '^post')"
+has 'API down past the tries: it asks' 'What does your business do?' "$(sed -n 's/^post [^ ]* //p' "$CALLS" | jq -r .body)"
 HELPER_HANDOVER_TRIES=12
 
 echo '== 5. what the seat is =='
@@ -166,6 +189,7 @@ has 'never takes a job' 'Never take a job, never claim one, and never say "On it
 has 'never builds or edits agents' 'Never build, edit, restart or remove agents' "$p"
 has 'how-to in two lines' 'in at most two short lines' "$p"
 has 'Telegram is the plane icon' 'plane icon' "$p"
+has 'knows 5dive sent its welcome' 'Never send another welcome' "$p"
 for g in "$(_helper_greeting '' '')" "$(_helper_greeting 'a bakery' 'theo')"; do
   hasnt 'no greeting says On it' 'on it' "$g"
   hasnt 'no greeting says it messaged first' 'messaged you first' "$g"
@@ -175,13 +199,13 @@ done
 has 'built as a standard seat on the demo AI' '--auth-profile="$HELPER_ACCOUNT" \' "$(grep -A1 'agent create "$HELPER_AGENT"' src/cmd_helper.sh)"
 has 'standard isolation' '--isolation=standard' "$(grep -A1 'agent create "$HELPER_AGENT"' src/cmd_helper.sh)"
 
-echo '== 6. the greeted claim holds against a second sender =='
+echo '== 6. the welcomed claim holds against a second sender =='
 # A tick that read the handover, then lost the race: another tick already wrote
-# greeted. noclobber makes the claim fail, so this one sends nothing.
-fresh 12; built; mkdir -p "$STATE_DIR/helper"; echo 'claimed by the other tick' >"$STATE_DIR/helper/greeted"
+# welcomed. noclobber makes the claim fail, so this one posts nothing.
+fresh 12; built; mkdir -p "$STATE_DIR/helper"; echo 'claimed by the other tick' >"$STATE_DIR/helper/welcomed"
 FAKE_HTTP=404 _helper_greet >/dev/null
-t 'a claim already taken: no second send' 0 "$(n_calls '_deliver')"
-t 'the other claim is left as it was' 'claimed by the other tick' "$(cat "$STATE_DIR/helper/greeted")"
+t 'a claim already taken: no second post' 0 "$(n_calls '^post')"
+t 'the other claim is left as it was' 'claimed by the other tick' "$(cat "$STATE_DIR/helper/welcomed")"
 
 echo '== 7. a build that stops half way is still not a hire =='
 # agent create wrote the row, then the persona step failed.
@@ -197,7 +221,7 @@ t 'not built yet' no "$([[ -e "$STATE_DIR/helper/built" ]] && echo yes || echo n
 : >"$CALLS"
 out=$(_helper_tick "$(cat "$REGISTRY")")
 has 'the next tick resumes the build' 'building the helper seat' "$out"
-t 'and does not greet a seat with no persona' 0 "$(n_calls '_deliver')"
+t 'and does not welcome from a seat with no persona' 0 "$(n_calls '^post')"
 : >"$CALLS"
 IN_REGISTRY_LOCK=1 _helper_build mine 2>/dev/null; rc=$?
 t 'finishing a marked seat succeeds' 0 "$rc"
@@ -219,6 +243,44 @@ t 'the usage line is what _verb_own_usage reads' 'usage: 5dive helper ensure|sta
   "$(_verb_own_usage cmd_helper '5dive helper ensure|status')"
 t 'helper is a builtin verb (plugins cannot claim it)' 1 \
   "$(grep '^readonly FIVEDIVE_BUILTIN_VERBS=' src/cmd_plugin.sh | grep -c ' helper ')"
+
+echo '== 9. a 0.138.0 box: greeted, but did the seat reply? =='
+REG="$(reg_with "{$HELPER_ROW,$HIRE_ROW}")"
+transcript() { mkdir -p "$HELPER_SEAT_HOME/.claude/projects/-home-agent-helper"; printf '%s\n' "$1" >"$HELPER_SEAT_HOME/.claude/projects/-home-agent-helper/s.jsonl"; }
+# Hetzner, row 664: the seat answered in its terminal, no reply-tool call.
+fresh 16; built; echo '2026-11-20T01:05:02Z' >"$STATE_DIR/helper/greeted"
+transcript '{"type":"assistant","message":{"content":[{"type":"text","text":"I'"'"'m 5dive. What does your business do?"}]}}'
+FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
+t 'no reply from the seat: the box welcomes the owner' 1 "$(n_calls '^post')"
+FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
+t 'then never again' 1 "$(n_calls '^post')"
+# OVH, row 666: the seat called the reply tool (app message 4000).
+fresh 17; built; echo '2026-11-20T01:27:58Z' >"$STATE_DIR/helper/greeted"
+transcript '{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"mcp__plugin_dashboard_dashboard__reply","input":{"chat_id":"dashboard","text":"Hi, I'"'"'m 5dive"}}]}}'
+out=$(FAKE_HTTP=404 _helper_tick "$REG")
+t 'the seat already replied: no second welcome' 0 "$(n_calls '^post')"
+has 'and says why' 'already wrote to the owner' "$out"
+t 'it is recorded, so the transcript is read once' yes "$([[ -s "$STATE_DIR/helper/welcomed" ]] && echo yes)"
+t 'and the handover is not read' 0 "$(n_calls curl)"
+rm -rf "$HELPER_SEAT_HOME"; FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
+t 'a later tick does nothing' 0 "$(n_calls '^post')"
+
+echo '== 10. a sealed chat gets it sealed, as the helper =='
+fresh 18; built; mkdir -p "$STATE_DIR/chat-e2e"; echo '{}' >"$STATE_DIR/chat-e2e/box.jwk"
+FAKE_POST_CODE=409 FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
+t 'plain refused, then one sealed post' 2 "$(n_calls '^post')"
+sealed=$(sed -n 's/^post [^ ]* //p' "$CALLS" | tail -n 1)
+t 'the sealed post is e2e, in the DM conversation, with the key' 'dashboard|1|helper-welcome|helper' \
+  "$(jq -r '"\(.metadata.chat_id)|\(.metadata.e2e.v)|\(.metadata.reply_key)|\(.agent)"' <<<"$sealed")"
+has 'root seals it as the helper, for dashboard' 'as=helper {"op":"seal","conv":"dashboard","m":"b-helper-welcome"' "$(cat "$CALLS")"
+t 'welcomed' yes "$([[ -s "$STATE_DIR/helper/welcomed" ]] && echo yes)"
+fresh 19; built
+FAKE_POST_CODE=409 FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
+t 'sealed chat but no box key here: no welcomed mark, retried next tick' no "$([[ -e "$STATE_DIR/helper/welcomed" ]] && echo yes || echo no)"
+t 'and nothing sealed' 0 "$(n_calls '^seal')"
+
+echo '== 11. no notice reaches the seat =='
+t 'the module never hands the seat the welcome' 0 "$(grep -c 'system-notice' src/cmd_helper.sh)"
 
 echo "pass=$PASS fail=$FAIL"
 (( FAIL == 0 ))

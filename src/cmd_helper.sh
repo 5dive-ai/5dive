@@ -7,8 +7,8 @@
 # My team skip any seat that carries it.
 #
 #   5dive helper ensure      root: build the seat if this box should have one (idempotent)
-#   5dive helper status      eligible / seat / built / greeted, for a person or --json
-#   (heartbeat tick)         _helper_tick: build it once, then greet once
+#   5dive helper status      eligible / seat / built / welcomed, for a person or --json
+#   (heartbeat tick)         _helper_tick: build it once, then welcome the owner once
 #
 # WHICH BOXES. A box that holds the demo AI account (demo-ai): the account a
 # paid my.5dive server is built with (5dive-api fivedive-box-key.ts). Self-hosted
@@ -24,15 +24,30 @@
 # two ticks cannot build it twice (systemd refuses a second unit of that name).
 #
 # ONCE. <state>/helper/built is written when the seat is built: if the owner
-# removes the seat, it is not built again. <state>/helper/greeted is claimed
-# (noclobber) BEFORE the greeting is sent and dropped again only if the send
-# fails, so a restart, a second tick or an update never greets twice.
+# removes the seat, it is not built again. <state>/helper/welcomed is claimed
+# (noclobber) BEFORE the welcome is posted and dropped again only if the post
+# fails, so a restart, a second tick or an update never welcomes twice.
 #
-# THE GREETING waits for an owner: the seat is running and the box has at least
+# THE WELCOME waits for an owner: the seat is running and the box has at least
 # one hire (an unclaimed spare has none). It reads GET /helper/handover with the
-# box token. 200 = the owner already said what the business does: skip the
-# question and suggest 1-2 hires. 404 = ask the one question. Anything else is
-# retried next tick, at most HELPER_HANDOVER_TRIES times, then it asks.
+# box token. 200 = the owner already said what the business does: name it and
+# suggest 1-2 hires. 404 = ask the one question. Anything else is retried next
+# tick, at most HELPER_HANDOVER_TRIES times, then it asks.
+#
+# DIVE-8850: the BOX posts the welcome, as the helper, into the owner's app chat
+# (POST /server/messages/event, the route the seat's own replies take). 0.138.0
+# handed the seat a notice and let the model choose to reply: on one box in
+# three it answered in its own terminal and the owner never saw it. The text is
+# fixed here, so no model sits between the tick and the owner's app. A sealed
+# chat (the owner already paired a device) gets it sealed by root, as the
+# helper. One reply_key, so a post the API stored but whose answer was lost is
+# not stored twice on the retry.
+#
+# 0.138.0 BOXES left <state>/helper/greeted (the notice went in, the reply may
+# not have) and no `welcomed`, so the tick runs again there. Any box is welcomed
+# unless the seat's own transcript shows it already called the app's reply tool
+# (it answered that notice, or the owner wrote to it first): that is the one
+# record on the box of a message it got out.
 
 HELPER_AGENT="${HELPER_AGENT:-helper}"
 HELPER_ACCOUNT="demo-ai"            # = CREATE_DEMO_AI_ACCOUNT (cmd_agent_create.sh)
@@ -40,6 +55,8 @@ HELPER_SYSTEM="helper"              # the registry/list marker every count skips
 HELPER_UNIT="5dive-helper-ensure"
 HELPER_HANDOVER_TRIES="${HELPER_HANDOVER_TRIES:-12}"
 HELPER_BUILD_TRIES="${HELPER_BUILD_TRIES:-6}"   # a build that keeps failing stops after this many ticks
+HELPER_REPLY_TOOL="mcp__plugin_dashboard_dashboard__reply"   # the seat's app reply (dashboard@5dive-plugins)
+HELPER_REPLY_KEY="helper-welcome"   # /server/messages/event dedupes a retry on it (DIVE-7713)
 
 _helper_dir()  { printf '%s/helper' "${HELPER_STATE_DIR:-$STATE_DIR}"; }
 _helper_self() { printf '%s' "${FIVEDIVE_SELF_BIN:-/usr/local/bin/5dive}"; }
@@ -81,6 +98,9 @@ What you do:
 - When it fits, suggest one or two agents to hire from the Hire screen, and say in a few words why each one fits this business. The owner hires them there, the normal way.
 - Telegram: the owner connects any agent, you too, by tapping the plane icon next to it in My team.
 
+Your first message:
+- 5dive already sent the owner your welcome for you: hi, and what does your business do (or, if they told 5dive already, one or two agents to hire). Never send another welcome. When they answer, suggest one or two agents.
+
 What you never do:
 - Never take a job, never claim one, and never say "On it". If the owner asks you to do work, say which agent to hire for it.
 - Never build, edit, restart or remove agents, and never change the server.
@@ -88,16 +108,24 @@ What you never do:
 EOF
 }
 
-# The one-time greeting, sent to the seat as a notice it turns into ONE message.
-# <business> empty = the owner was never asked: ask the one question.
+# _helper_cap <id> -> Theo (an agent id from the helper's fact sheet is its first name).
+_helper_cap() { printf '%s' "${1^}"; }
+
+# The one welcome, posted as the helper. <business> empty = the owner was never
+# asked: ask the one question. <suggested> = "theo, dude" (at most two ids).
 _helper_greeting() {
-  local business="$1" suggested="$2"
-  if [[ -n "$business" ]]; then
-    printf '%s\n' "Send your owner your first and only welcome message now, where you normally talk to them. They already told 5dive what their business does: \"${business}\". Do not ask about it again."
-    printf '%s\n' "Say hi as 5dive, then suggest one or two agents to hire for that business${suggested:+ (5dive suggested: ${suggested})}, a few words each on why. At most 50 words. Do not start any work."
+  local business="$1" suggested="$2" a b hire=""
+  if [[ -z "$business" ]]; then
+    printf '%s' "Hi, I'm 5dive, your helper on this server. I help you set up 5dive and choose your agents. What does your business do?"
+    return 0
+  fi
+  (( ${#business} > 120 )) && business="${business:0:119}…"
+  IFS=', ' read -r a b <<<"$suggested"
+  [[ -n "$a" ]] && hire="$(_helper_cap "$a")${b:+ or $(_helper_cap "$b")}"
+  if [[ -n "$hire" ]]; then
+    printf '%s' "Hi, I'm 5dive, your helper on this server. For your business (${business}), a good first hire is ${hire}: find them on the Hire screen. Ask me anything about setting up."
   else
-    printf '%s\n' "Send your owner your first and only welcome message now, where you normally talk to them."
-    printf '%s\n' "Say hi as 5dive, say in a few words that you help them set up and choose agents, and ask one question: what does your business do? At most 40 words. Do not start any work."
+    printf '%s' "Hi, I'm 5dive, your helper on this server. You told me about your business: ${business}. Tell me what you want done first, and I'll suggest who to hire."
   fi
 }
 
@@ -121,10 +149,58 @@ _helper_handover() {
   esac
 }
 
-# Claim, send, and roll the claim back only when the send failed.
+# _helper_post <text> — root: post <text> into the owner's app chat AS the
+# helper. rc 0 only when the API stored it.
+_helper_post() {
+  local text="$1" tok base body out code live side env
+  lazy_need _dash_relay_call _dash_relay_api_base _dash_relay_token
+  tok=$(_dash_relay_token 2>/dev/null) || return 1
+  [[ -n "$tok" ]] || return 1
+  base=$(_dash_relay_api_base) || return 1
+  body=$(jq -nc --arg a "$HELPER_AGENT" --arg b "$text" --arg k "$HELPER_REPLY_KEY" \
+           '{agent:$a, body:$b, metadata:{reply_key:$k}}') || return 1
+  out=$( (_dash_relay_call POST "${base}/server/messages/event" "$body" "$tok" 20) 2>/dev/null ) || return 1
+  code="${out%%$'\n'*}"
+  [[ "$code" =~ ^2[0-9][0-9]$ ]] && return 0
+  # 409 = the chat is sealed (the owner paired a device): root seals it as the
+  # helper, in the DM conversation every sealed chat post uses ("dashboard").
+  [[ "$code" == 409 ]] || return 1
+  lazy_need _chat_e2e_live _chat_e2e_run
+  live=$(_chat_e2e_live)
+  [[ -f "$live/box.jwk" ]] || return 1
+  side=$(mktemp) || return 1
+  env=$(jq -nc --arg t "$text" --arg m "b-${HELPER_REPLY_KEY}" '{op:"seal", conv:"dashboard", m:$m, msg:{text:$t}}' \
+          | (_chat_e2e_run call "$live" "$side" "$HELPER_AGENT") 2>/dev/null | jq -c '.env // empty' 2>/dev/null) || env=""
+  rm -f "$side"
+  [[ -n "$env" ]] || return 1
+  body=$(jq -nc --arg a "$HELPER_AGENT" --arg b "$env" --arg k "$HELPER_REPLY_KEY" \
+           '{agent:$a, body:$b, metadata:{chat_id:"dashboard", reply_key:$k, e2e:{v:1}}}') || return 1
+  out=$( (_dash_relay_call POST "${base}/server/messages/event" "$body" "$tok" 20) 2>/dev/null ) || return 1
+  [[ "${out%%$'\n'*}" =~ ^2[0-9][0-9]$ ]]
+}
+
+# The seat already got a message out to the app: its transcript holds a call to
+# the app's reply tool (a 0.138.0 notice it answered, or the owner wrote first).
+_helper_seat_replied() {
+  local home f
+  home="${HELPER_SEAT_HOME:-$(getent passwd "agent-${HELPER_AGENT}" 2>/dev/null | cut -d: -f6)}"
+  home="${home:-/home/agent-${HELPER_AGENT}}"
+  for f in "$home"/.claude/projects/*/*.jsonl; do
+    [[ -f "$f" ]] || continue
+    grep -qF "\"name\":\"${HELPER_REPLY_TOOL}\"" -- "$f" 2>/dev/null && return 0
+  done
+  return 1
+}
+
+# Claim, post, and roll the claim back only when the post failed.
 _helper_greet() {
   local d tries=0 h="" rc=0 business="" suggested="" msg
   d=$(_helper_dir)
+  if _helper_seat_replied; then
+    ( set -o noclobber; printf '%s the seat already wrote in the app\n' "$(date -u +%FT%TZ)" >"$d/welcomed" ) 2>/dev/null
+    printf 'no welcome: the helper already wrote to the owner in the app\n'
+    return 0
+  fi
   h=$(_helper_handover) || rc=$?
   if (( rc == 1 )); then
     read -r tries 2>/dev/null <"$d/handover-tries" || tries=0
@@ -134,19 +210,19 @@ _helper_greet() {
   fi
   (( rc == 0 )) && IFS=$'\t' read -r business suggested <<<"$h"
   msg=$(_helper_greeting "$business" "$suggested")
-  ( set -o noclobber; date -u +%FT%TZ >"$d/greeted" ) 2>/dev/null || return 0
-  if ! "$(_helper_self)" agent _deliver --system-notice "$HELPER_AGENT" "$msg" >/dev/null 2>&1; then
-    rm -f "$d/greeted"; return 1
+  ( set -o noclobber; date -u +%FT%TZ >"$d/welcomed" ) 2>/dev/null || return 0
+  if ! _helper_post "$msg"; then
+    rm -f "$d/welcomed"; return 1
   fi
   rm -f "$d/handover-tries"
-  printf 'greeted (%s)\n' "$([[ -n "$business" ]] && echo 'from the handover' || echo 'asked the question')"
+  printf 'welcomed the owner in the app (%s)\n' "$([[ -n "$business" ]] && echo 'from the handover' || echo 'asked the question')"
 }
 
 # The heartbeat's step. Prints one line when it did something, nothing otherwise.
 _helper_tick() {
   local d reg seat
   d=$(_helper_dir)
-  [[ -e "$d/greeted" ]] && return 0
+  [[ -e "$d/welcomed" ]] && return 0
   _helper_box_eligible || return 0
   mkdir -p "$d" 2>/dev/null || return 1
   reg="${1:-$(registry_read 2>/dev/null)}"
@@ -230,7 +306,7 @@ cmd_helper_status() {
   d=$(_helper_dir)
   _helper_box_eligible && eligible=true
   [[ -e "$d/built" ]] && built=true
-  [[ -e "$d/greeted" ]] && greeted=true
+  [[ -e "$d/welcomed" ]] && greeted=true
   reg=$(registry_read 2>/dev/null) || reg='{}'
   seat=$(_helper_seat "$reg")
   ok "helper: eligible=$eligible seat=$seat built=$built greeted=$greeted" \
@@ -249,7 +325,7 @@ usage: 5dive helper ensure|status [--json]
 
 The "5dive" Help & setup seat on a paid 5dive server. It is not a hire.
 
-  5dive helper status   is this box eligible, is the seat here, built, greeted
+  5dive helper status   is this box eligible, is the seat here, built, welcomed
   5dive helper ensure   root: build the seat if this box should have one
 EOF
       ;;
