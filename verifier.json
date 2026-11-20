@@ -1,26 +1,20 @@
 {
-  "date": "2026-11-19",
-  "generatedAtUtc": "2026-11-19T02:01:22Z",
+  "date": "2026-11-20",
+  "generatedAtUtc": "2026-11-20T02:01:20Z",
   "window": {
     "days": 30,
-    "from": "2026-10-20",
-    "to": "2026-11-18",
+    "from": "2026-10-21",
+    "to": "2026-11-19",
     "basis": "each task counts once, on the UTC day of its last task.done; the window is the whole days before the publish date"
   },
   "totals": {
-    "shipped": 2126,
-    "reviewed": 1090,
-    "firstTry": 587,
-    "sentBack": 503,
-    "sendBacks": 696
+    "shipped": 2152,
+    "reviewed": 1087,
+    "firstTry": 586,
+    "sentBack": 501,
+    "sendBacks": 703
   },
   "days": [
-    {
-      "date": "2026-10-20",
-      "reviewed": 41,
-      "firstTry": 19,
-      "sentBack": 22
-    },
     {
       "date": "2026-10-21",
       "reviewed": 37,
@@ -194,11 +188,17 @@
       "reviewed": 35,
       "firstTry": 18,
       "sentBack": 17
+    },
+    {
+      "date": "2026-11-19",
+      "reviewed": 38,
+      "firstTry": 18,
+      "sentBack": 20
     }
   ],
   "reasons": {
     "basis": "one fixed category per send-back, by rule from the reviewer's finding; no match or no preserved finding = other. Sums to totals.sendBacks.",
-    "total": 696,
+    "total": 703,
     "categories": [
       {
         "key": "conflict",
@@ -213,17 +213,17 @@
       {
         "key": "writing",
         "label": "Unclear writing",
-        "count": 149
+        "count": 144
       },
       {
         "key": "tests",
         "label": "Failing tests",
-        "count": 312
+        "count": 317
       },
       {
         "key": "proof",
         "label": "No proof it works",
-        "count": 58
+        "count": 55
       },
       {
         "key": "ask",
@@ -233,7 +233,7 @@
       {
         "key": "other",
         "label": "Other",
-        "count": 77
+        "count": 87
       }
     ]
   },
