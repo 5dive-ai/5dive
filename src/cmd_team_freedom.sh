@@ -419,8 +419,9 @@ cmd_team_freedom() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json) JSON_MODE=1 ;;
-      --agent=*) agent="${1#--agent=}" ;;
-      --agent) [[ $# -ge 2 ]] || fail "$E_USAGE" "--agent needs a name: --agent=<name>"; agent="$2"; shift ;;
+      # An empty name must not fall through to "every agent": a typo would widen to the whole team.
+      --agent=*) agent="${1#--agent=}"; [[ -n "$agent" ]] || fail "$E_USAGE" "--agent needs a name: --agent=<name>" ;;
+      --agent) [[ $# -ge 2 && -n "$2" ]] || fail "$E_USAGE" "--agent needs a name: --agent=<name>"; agent="$2"; shift ;;
       -h|--help|help) verb=help ;;
       *) [[ -z "$verb" ]] && verb="$1" || fail "$E_USAGE" "one level at a time: ask|balanced|yolo" ;;
     esac

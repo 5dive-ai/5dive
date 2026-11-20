@@ -191,13 +191,15 @@ jq '.approve_inbound=true' "$EMAIL" >"$TMP/m2" && mv "$TMP/m2" "$EMAIL"
 t "T15 ann custom with the email gate" 'custom|[{"switch":"email.inbound","agent":"ann","now":"on","want":"off"}]' "$(F --agent=ann --json | jq -c '.data | "\(.level)|\(.differs)"' | jq -r .)"
 t "T15 bob still balanced" "balanced" "$(F --agent=bob --json | jq -r .data.level)"
 
-# T16 — refusals: not on the team, bad name, non-root.
+# T16 — refusals: not on the team, bad name, empty --agent=, non-root.
 F --agent=sysadmin --json >/dev/null; rc=$?
 t "T16 sysadmin is not on the team (rc 4)" "4" "$rc"
 F yolo --agent=nobody >/dev/null; rc=$?
 t "T16 unknown agent refused (rc 4)" "4|1" "$rc|$(grep -c "'nobody' is not on the team" "$TMP/err")"
 F yolo --agent='a;b' >/dev/null; rc=$?
 t "T16 bad name is a usage error" "1" "$([[ $rc -ne 0 ]] && echo 1)"
+F yolo --agent= >/dev/null; rc=$?
+t "T16 empty --agent= refused (rc 2), nobody moved" "2|1|balanced" "$rc|$(grep -c -- '--agent needs a name' "$TMP/err")|$(F --agent=bob --json | jq -r .data.level)"
 ROOT=0; F yolo --agent=bob >/dev/null; ROOT=1
 t "T16 non-root refusal names --agent" "1" "$(grep -c 'sudo 5dive team freedom yolo --agent=bob' "$TMP/err")"
 
