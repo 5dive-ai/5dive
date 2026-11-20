@@ -88,7 +88,7 @@ fresh() {   # a new box: state dir, registry, optional demo AI account
   : >"$CALLS"; rm -rf "$HELPER_SEAT_HOME"
 }
 reg_with() { printf '{"agents":%s}' "$1"; }
-built() { mkdir -p "$STATE_DIR/helper"; date >"$STATE_DIR/helper/built"; }
+built() { mkdir -p "$STATE_DIR/helper"; date >"$STATE_DIR/helper/built"; echo "$HELPER_PERSONA_REV" >"$STATE_DIR/helper/persona-rev"; }
 HELPER_ROW='"helper":{"type":"claude","system":"helper"}'
 HIRE_ROW='"theo":{"type":"claude"}'
 n_calls() { grep -c -- "$1" "$CALLS"; }
@@ -188,7 +188,16 @@ p=$(_helper_persona)
 has 'never takes a job' 'Never take a job, never claim one, and never say "On it"' "$p"
 has 'never builds or edits agents' 'Never build, edit, restart or remove agents' "$p"
 has 'how-to in two lines' 'in at most two short lines' "$p"
-has 'Telegram is the plane icon' 'plane icon' "$p"
+# DIVE-8898: the how-to lines name the app's real labels (pinned to the app by
+# 5dive-frontend src/lib/helper-howto.test.ts), never a Model row or the old plane icon.
+for l in '"My team", tap "Add your AI subscription"' 'under "Runs on", tap "Add AI subscription"' \
+         'tap "Connect Telegram"' 'open "Settings", then "Tools"' 'tap "Hire", then "Hire"' \
+         '"Create your own agent"' 'under "Plan", tap "Manage billing"' '"Manage on the website"'; do
+  has "how-to names $l" "$l" "$p"
+done
+hasnt 'never names Model' 'Model' "$p"
+hasnt 'no plane icon' 'plane icon' "$p"
+t 'the persona is one marked block' "$HELPER_PERSONA_BEGIN|$HELPER_PERSONA_END" "$(head -n1 <<<"$p")|$(tail -n1 <<<"$p")"
 has 'knows 5dive sent its welcome' 'Never send another welcome' "$p"
 for g in "$(_helper_greeting '' '')" "$(_helper_greeting 'a bakery' 'theo')"; do
   hasnt 'no greeting says On it' 'on it' "$g"
@@ -281,6 +290,47 @@ t 'and nothing sealed' 0 "$(n_calls '^seal')"
 
 echo '== 11. no notice reaches the seat =='
 t 'the module never hands the seat the welcome' 0 "$(grep -c 'system-notice' src/cmd_helper.sh)"
+
+echo '== 12. a built seat gets the new how-to lines once (DIVE-8898) =='
+SEAT_MD="$TMP/seat-md/CLAUDE.md"
+persona_target() { printf '%s' "$SEAT_MD"; }
+install() { local src="${@: -2:1}" dst="${@: -1}"; cp "$src" "$dst"; }   # no chown in the harness
+old_persona() {   # what 0.139.x installed: unmarked, with the plane icon line
+  printf '%s\n' '# You are 5dive: Help & setup' '' 'What you do:' \
+    '- Telegram: the owner connects any agent, you too, by tapping the plane icon next to it in My team.' '' \
+    'What you never do:' '- Never say you messaged them first, and never talk about AI budgets, keys or limits.'
+}
+fresh 20; mkdir -p "$STATE_DIR/helper" "$(dirname "$SEAT_MD")"; date >"$STATE_DIR/helper/built"; date >"$STATE_DIR/helper/welcomed"
+{ old_persona; printf '\n%s\n' '# Base seat notes' 'kept line'; } >"$SEAT_MD"
+out=$(_helper_tick "$REG")
+md=$(cat "$SEAT_MD")
+has 'a welcomed seat on rev 1 is refreshed' 'new how-to lines' "$out"
+has 'it now names Add your AI subscription' 'tap "Add your AI subscription"' "$md"
+hasnt 'the plane icon line is gone' 'plane icon' "$md"
+t 'the old block is gone, not doubled' 1 "$(grep -c '^# You are 5dive: Help & setup' <<<"$md")"
+has 'what was below the persona stays' 'kept line' "$md"
+t 'the rev is written' "$HELPER_PERSONA_REV" "$(cat "$STATE_DIR/helper/persona-rev")"
+t 'the seat is restarted once' 1 "$(n_calls 'agent restart helper')"
+: >"$CALLS"; _helper_tick "$REG" >/dev/null
+t 'the next tick leaves it alone' 0 "$(n_calls 'agent restart')"
+# rev 2 -> rev 3: the marked block is swapped, the notes below stay, no doubling
+HELPER_PERSONA_REV=3; _helper_tick "$REG" >/dev/null; HELPER_PERSONA_REV=2
+md=$(cat "$SEAT_MD")
+t 'a marked block is replaced, not doubled' 1 "$(grep -cF "$HELPER_PERSONA_BEGIN" <<<"$md")"
+has 'and the notes below it stay' 'kept line' "$md"
+t 'with exactly one blank line before them' '' "$(grep -B1 '^# Base seat notes' <<<"$md" | head -n1)"
+# a seat the owner removed, or their own agent named helper: never touched
+fresh 21; mkdir -p "$STATE_DIR/helper" "$(dirname "$SEAT_MD")"; date >"$STATE_DIR/helper/built"
+old_persona >"$SEAT_MD"
+_helper_tick "$(reg_with "{$HIRE_ROW}")" >/dev/null
+has 'a removed seat: its file is not rewritten' 'plane icon' "$(cat "$SEAT_MD")"
+t 'and the tick stops asking' "$HELPER_PERSONA_REV" "$(cat "$STATE_DIR/helper/persona-rev")"
+# a fresh build stamps the current rev, so the tick never refreshes it again
+fresh 22; mkdir -p "$STATE_DIR/helper"; reg_with "{$HELPER_ROW}" >"$REGISTRY"; registry_read() { cat "$REGISTRY"; }
+persona_install_doc() { return 0; }
+IN_REGISTRY_LOCK=1 _helper_build mine 2>/dev/null
+t 'a new build is stamped with this rev' "$HELPER_PERSONA_REV" "$(cat "$STATE_DIR/helper/persona-rev")"
+unset -f persona_target install registry_read persona_install_doc
 
 echo "pass=$PASS fail=$FAIL"
 (( FAIL == 0 ))

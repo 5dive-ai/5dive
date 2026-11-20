@@ -85,9 +85,21 @@ _helper_running() {
   [[ "$(systemctl is-active "5dive-agent@${HELPER_AGENT}.service" 2>/dev/null)" == "active" ]]
 }
 
-# What the seat is. Prepended to its CLAUDE.md; the lines are lodar's rules
-# (DIVE-8740 / DIVE-8819) and do not change without him.
+# What the seat is. Prepended to its CLAUDE.md; the rules (what it does, its
+# first message, what it never does) are lodar's (DIVE-8740 / DIVE-8819) and do
+# not change without him.
+#
+# DIVE-8898: the How-to lines are the app's own labels, the same words as the
+# hosted helper's fact sheet (5dive-api assets/helper/fact-sheet.md, "How do I").
+# 5dive-frontend src/lib/helper-howto.test.ts pins those labels to the app's
+# strings, so a renamed button fails there first; then the sheet and these lines
+# follow it, and HELPER_PERSONA_REV goes up so built seats get the new lines
+# (_helper_persona_refresh, from the tick).
+HELPER_PERSONA_REV=2
+HELPER_PERSONA_BEGIN="<!-- 5dive helper persona: 5dive rewrites this part; write your own notes below the end line -->"
+HELPER_PERSONA_END="<!-- end of the 5dive helper persona -->"
 _helper_persona() {
+  printf '%s\n' "$HELPER_PERSONA_BEGIN"
   cat <<'EOF'
 # You are 5dive: Help & setup
 
@@ -96,7 +108,13 @@ You are the 5dive helper on this server. You are not one of the owner's hired ag
 What you do:
 - Answer how-to questions about 5dive in at most two short lines, in plain words, in the owner's language.
 - When it fits, suggest one or two agents to hire from the Hire screen, and say in a few words why each one fits this business. The owner hires them there, the normal way.
-- Telegram: the owner connects any agent, you too, by tapping the plane icon next to it in My team.
+
+How-to answers. These are the app's own words: name a button only as it is written here, in quotes, and never name a button that is not here. If the owner asks how to do something not here, say you can't confirm it and to write to support@5dive.ai.
+- Connect their own AI (Claude or ChatGPT): on "My team", tap "Add your AI subscription" at the top and sign in. Or open an agent's settings and, under "Runs on", tap "Add AI subscription".
+- Connect Telegram: on "My team", open the agent's settings (the settings button beside it) and tap "Connect Telegram". Telegram opens; tap Start and the agent answers there.
+- Add a tool (Google, GitHub and others): open "Settings", then "Tools". Pick the tool and connect it once; every agent can use it.
+- Hire an agent: tap "Hire", then "Hire" on the agent's card. Or tap "Create your own agent" there.
+- Cancel the plan: open "Settings"; under "Plan", tap "Manage billing" (in Telegram: "Manage on the website"). It runs to the end of the period they paid for.
 
 Your first message:
 - 5dive already sent the owner your welcome for you: hi, and what does your business do (or, if they told 5dive already, one or two agents to hire). Never send another welcome. When they answer, suggest one or two agents.
@@ -106,6 +124,54 @@ What you never do:
 - Never build, edit, restart or remove agents, and never change the server.
 - Never say you messaged them first, and never talk about AI budgets, keys or limits.
 EOF
+  printf '%s\n' "$HELPER_PERSONA_END"
+}
+
+# stdin: the seat's CLAUDE.md -> stdout: it without the helper persona, wherever
+# it came from: a marked block (rev 2+), or the unmarked rev-1 text (0.138.0),
+# which began with its title and ended with the "messaged them first" rule.
+_helper_persona_strip() {
+  awk -v b="$HELPER_PERSONA_BEGIN" -v e="$HELPER_PERSONA_END" '
+    NR == 1 && $0 == b { skip = 1; next }
+    NR == 1 && $0 == "# You are 5dive: Help & setup" { skip = 1; legacy = 1; next }
+    skip && !legacy && $0 == e { skip = 0; gap = 1; next }
+    skip && legacy && index($0, "- Never say you messaged them first") == 1 { skip = 0; gap = 1; next }
+    skip { next }
+    gap && $0 == "" { gap = 0; next }
+    { gap = 0; print }'
+}
+
+# A seat built with older how-to lines: built, and its persona-rev is not this one.
+_helper_persona_stale() {
+  local d="$1" rev=""
+  [[ -e "$d/built" ]] || return 1
+  read -r rev 2>/dev/null <"$d/persona-rev" || rev=""
+  [[ "$rev" != "$HELPER_PERSONA_REV" ]]
+}
+
+# Rewrite the seat's persona in place (the owner's notes below it stay), then
+# restart the seat so its next session reads it. A seat the owner removed, or an
+# agent of theirs named helper, is never touched; the rev is written so the tick
+# stops asking.
+_helper_persona_refresh() {
+  local d="$1" reg seat md tmp user="agent-${HELPER_AGENT}"
+  reg="${2:-$(registry_read 2>/dev/null)}"
+  seat=$(_helper_seat "$reg")
+  if [[ "$seat" != mine ]]; then
+    printf '%s\n' "$HELPER_PERSONA_REV" >"$d/persona-rev"; return 0
+  fi
+  lazy_need persona_target
+  md=$(persona_target "$HELPER_AGENT" claude 2>/dev/null) || return 1
+  [[ -f "$md" ]] || return 1
+  tmp=$(mktemp) || return 1
+  if ! { _helper_persona; printf '\n'; _helper_persona_strip <"$md"; } >"$tmp" \
+     || ! install -o "$user" -g "$user" -m 644 "$tmp" "$md" 2>/dev/null; then
+    rm -f "$tmp"; return 1
+  fi
+  rm -f "$tmp"
+  printf '%s\n' "$HELPER_PERSONA_REV" >"$d/persona-rev"
+  "$(_helper_self)" agent restart "$HELPER_AGENT" </dev/null >/dev/null 2>&1 || true
+  printf 'the helper has the new how-to lines (persona rev %s)\n' "$HELPER_PERSONA_REV"
 }
 
 # _helper_cap <id> -> Theo (an agent id from the helper's fact sheet is its first name).
@@ -222,6 +288,9 @@ _helper_greet() {
 _helper_tick() {
   local d reg seat
   d=$(_helper_dir)
+  # DIVE-8898: a seat built with older how-to lines gets the new ones (one read
+  # per tick once it is current; a box with no helper never gets past the stat).
+  _helper_persona_stale "$d" && _helper_persona_refresh "$d" "${1:-}"
   [[ -e "$d/welcomed" ]] && return 0
   _helper_box_eligible || return 0
   mkdir -p "$d" 2>/dev/null || return 1
@@ -275,6 +344,7 @@ _helper_build() {
   _helper_persona >"$f"
   persona_install_doc "$HELPER_AGENT" claude "$f" >&2 || { rm -f "$f"; return 1; }
   rm -f "$f"
+  printf '%s\n' "$HELPER_PERSONA_REV" >"$d/persona-rev"
   date -u +%FT%TZ >"$d/built"
   "$self" agent restart "$HELPER_AGENT" </dev/null >/dev/null 2>&1 || true
 }
