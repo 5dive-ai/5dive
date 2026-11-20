@@ -153,5 +153,14 @@ t "T12 launcher: full files no approval gates" "1" "$(grep -c 'Do not file appro
 t "T12 launcher: yolo still honors hard gates" "1" "$(grep -c 'You MUST still get a human.s explicit go before crossing a HARD GATE' bin/5dive-agent-start)"
 t "T12 helper seat opts out of the team level" "1" "$(grep -c -- '--autonomy=standard </dev/null' "$SRC/cmd_helper.sh")"
 
+# T13 — the real CLI runs under errexit: a clean set (no switch refused) and a
+# re-set (nothing to change) both exit 0 with the ok line, not a silent death.
+E() { ( set -euo pipefail; cmd_team_freedom "$@" ) 2>"$TMP/err"; }
+out=$(E yolo); rc=$?
+t "T13 clean set under errexit: rc 0" "0" "$rc"
+t "T13 clean set under errexit: ok line, changes named, none failed" "true|YOLO|1|0" "$(jq -r '"\(.ok)|\(.data.label)|\(.data.changed|length>0|if . then 1 else 0 end)|\(.data.failed|length)"' <<<"$out" 2>/dev/null)"
+out=$(E yolo); rc=$?
+t "T13 re-set under errexit: rc 0, nothing changed" "0|true|[]" "$rc|$(jq -r '.ok' <<<"$out" 2>/dev/null)|$(jq -c '.data.changed' <<<"$out" 2>/dev/null)"
+
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))

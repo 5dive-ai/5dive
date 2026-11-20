@@ -244,8 +244,10 @@ _freedom_set() {
     res+="$(_freedom_apply_agent "$level" "$n" "$t")"$'\n'
   done <<<"$(_freedom_team)"
   local changed failed
-  changed=$(grep '^ok ' <<<"$res" | cut -d' ' -f2- | jq -Rcs 'split("\n") | map(select(length>0))')
-  failed=$(grep '^fail ' <<<"$res" | cut -d' ' -f2- | jq -Rcs 'split("\n") | map(select(length>0))')
+  # jq filters, not grep: a clean set has no `fail` line (a re-set no `ok`
+  # line), and a grep that matches nothing would end the run under errexit.
+  changed=$(jq -Rcs 'split("\n") | map(select(startswith("ok ")) | .[3:])' <<<"$res")
+  failed=$(jq -Rcs 'split("\n") | map(select(startswith("fail ")) | .[5:])' <<<"$res")
   if [[ "$(jq length <<<"$failed")" != 0 ]]; then
     fail "$E_GENERIC" "team freedom is $(_freedom_label "$level"), but these did not change: $(jq -r 'join("; ")' <<<"$failed"). Status shows them as custom until they do."
   fi
