@@ -2321,6 +2321,17 @@ case "${AUTONOMY,,}" in
     else
       echo "[5dive] autonomy=$AUTONOMY ignored for type '$TYPE' (claude-only for now)" >&2
     fi ;;
+  full)
+    # DIVE-8853: YOLO team freedom (`5dive team freedom yolo`). lodar 2026-11-20:
+    # "if money, passwords, steps you can't undo cannot be switched off thats not
+    # yolo" — so this one keeps NO hard gate. What it cannot change is not a
+    # permission: a secret the box does not hold, and the wallet's cap.
+    if [[ "$TYPE" == "claude" ]]; then
+      FULL_DIRECTIVE="AUTONOMY MODE: full — your owner set the team to YOLO: nothing waits for their OK. Act on your own call, including paying (from your own wallet, within its cap), using saved logins and passwords this box already holds, deleting, and other steps that cannot be undone. Do not file approval gates (5dive task need --type=approval) for these and do not stop to ask: do it, then tell the owner what you did. Ask the owner only for what you cannot get yourself: a secret this box does not hold (5dive task need --type=secret, a secure link), or a real choice only they can make (--type=decision). The wallet's cap is the owner's budget: never work around it. This mode is set per-agent and persists across context resets."
+      ARGS+=(--append-system-prompt "$FULL_DIRECTIVE")
+    else
+      echo "[5dive] autonomy=$AUTONOMY ignored for type '$TYPE' (claude-only for now)" >&2
+    fi ;;
   standard|"") : ;;  # no directive — default behavior
   *) echo "[5dive] unknown AGENT_AUTONOMY='$AUTONOMY' — treating as standard" >&2 ;;
 esac

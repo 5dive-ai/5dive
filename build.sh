@@ -122,6 +122,7 @@ LAZY_FILES=(
   src/cmd_agent_config.sh
   src/cmd_agent_switch.sh
   src/cmd_agent_proactive.sh
+  src/cmd_team_freedom.sh
   src/cmd_agent_telegram.sh
   src/cmd_tg_connect_greet.sh
   src/cmd_agent_teambot.sh

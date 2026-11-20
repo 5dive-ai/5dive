@@ -3445,6 +3445,7 @@ cmd_team() {
   case "$sub" in
     import) : ;;
     plan)    _team_plan "$@"; return $? ;;
+    freedom) cmd_team_freedom "$@"; return $? ;;   # DIVE-8853
     start)   _team_release start "$@"; return $? ;;
     decline) _team_release decline "$@"; return $? ;;
     leave)   _team_leave "$@"; return $? ;;

@@ -36,6 +36,7 @@ Compose (declarative agents via 5dive.yaml):
   5dive export [-o file]                             # dump the live fleet to a v2 5dive.yaml
   5dive team import <slug|path> [--auth-profile=]    # provision a whole company template in one call
   5dive team ls                                      # list bundled team templates
+  5dive team freedom [ask|balanced|yolo] [--json]    # how much the whole team does without asking you
   # Default file: 5dive.yaml or 5dive.yml in cwd.
   # --type=<harness> on up / ps / team import puts the WHOLE roster on one harness
   # (every bundled template says claude). Omit it and nothing changes.
