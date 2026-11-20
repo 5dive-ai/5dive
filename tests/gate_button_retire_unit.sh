@@ -286,6 +286,12 @@ seed_gate() { # <title> -> ident on stdout; files a real gate through the real n
   [[ -n "$id" ]] || { printf ''; return 1; }
   ident=$(db "SELECT ident FROM tasks WHERE id=${id};" 2>/dev/null)
   [[ -n "$ident" ]] || { printf ''; return 1; }
+  # DIVE-8884: give the row a HOLDER. CI runs this with no agent identity, so the
+  # filer is the `cli` sentinel, and since DIVE-8875 a sentinel-filed gate keeps
+  # the row on its holder and the answer resumes THAT holder; with no holder the
+  # answer correctly pings nobody and the stub-count arm below read 0. With a
+  # holder the resume ping fires under every actor (an agent filer or `cli`).
+  db "UPDATE tasks SET assignee='fixture-holder' WHERE id=${id};" >/dev/null 2>&1
   : >"$LOG"
   ( cmd_task_need "$ident" --type=decision --ask="proceed?" --options="A|B" --ask-ok="fixture gate: the options ARE the input under test, not prose a person reads (DIVE-4462)" --recommend=A ) >/dev/null 2>&1
   printf '%s' "$ident"
