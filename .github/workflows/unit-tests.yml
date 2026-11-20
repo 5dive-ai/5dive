@@ -249,7 +249,7 @@ jobs:
       # gates a merge — measured on a true depth-1 clone: 36 passed, 0 failed,
       # 2 SKIPPED, against 41/0/0 on a full checkout. That had been true since
       # this workflow was written; a skip count is not a green count.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
       # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
@@ -283,7 +283,7 @@ jobs:
       # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
       # what that runner installs, so this job grades the same node the listing meets.
       - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 'lts/*' }
       # DIVE-2525: the budget is NOT passed here. It lives in tests/lib/tier.sh next
       # to the tier definition, because a budget spelled in the caller is raised by
@@ -336,7 +336,7 @@ jobs:
           # 65% of budget with zero failing harnesses (run 34470906776). The translator
           # annotates and returns 0 for a 6 ONLY; exit 1 and exit 4 pass through.
           bash scripts/shard-exit.sh "$rc" 'core/pristine-s${{ matrix.shard }}' 'core-pristine-${{ matrix.shard }}.txt'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: "core-pristine-${{ matrix.shard }}"
@@ -393,7 +393,7 @@ jobs:
     # 67s on the shared control-plane box, 41.4s on a CI runner.
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Grade this workflow's own structure (DIVE-3315 arms, DIVE-3479 arm 99)
         run: bash tests/corpus_tier_budget_unit.sh
       # DIVE-4754 -- THE REPO-WIDE HALF, and it is first because it is the half
@@ -497,7 +497,7 @@ jobs:
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too, and the
       # diff below needs the base commit to exist at all.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       - name: Which harnesses did this change touch?
         id: changed
@@ -574,7 +574,7 @@ jobs:
       # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
       # what that runner installs, so this job grades the same node the listing meets.
       - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 'lts/*' }
       - name: Run them (any tier)
         if: steps.changed.outputs.files != ''
@@ -643,7 +643,7 @@ jobs:
     timeout-minutes: 10
     steps:
       # DIVE-2229: full history, like every checkout here (baseline_pin_unit holds it).
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
@@ -692,7 +692,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       # DIVE-2039: the rail prover, from the pristine side. `snapshot-rails` is
       # allowlisted because GitHub CI has no ops checkout — that exemption can
@@ -723,7 +723,7 @@ jobs:
           ./build.sh
           bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness,scorecard-honesty \
             --label=pristine --report=selfcheck-pristine.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with: { name: selfcheck-pristine, path: selfcheck-pristine.txt, if-no-files-found: error }
 
@@ -786,7 +786,7 @@ jobs:
           git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       # DIVE-2829: the seeding lives in .github/scripts/simulate-installed-host.sh
       # because the confirm job below must reproduce THIS environment exactly. A
@@ -823,7 +823,7 @@ jobs:
       # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
       # what that runner installs, so this job grades the same node the listing meets.
       - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 'lts/*' }
       # DIVE-2829: see the pristine job. This is the job the 2026-08-05 pair was
       # measured on, and the one whose red froze release-cut.yml.
@@ -856,7 +856,7 @@ jobs:
           # 65% of budget with zero failing harnesses (run 34470906776). The translator
           # annotates and returns 0 for a 6 ONLY; exit 1 and exit 4 pass through.
           bash scripts/shard-exit.sh "$rc" 'core/installed-host-s${{ matrix.shard }}' 'core-installed-${{ matrix.shard }}.txt'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: "core-installed-${{ matrix.shard }}"
@@ -875,7 +875,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       # DIVE-2829: the same seeding script the corpus jobs use, for the same reason —
       # two copies of a setup block are two environments as soon as one is edited.
@@ -899,7 +899,7 @@ jobs:
           sudo bash ./5dive selfcheck --allow=snapshot-rails,ship-ledger-liveness,scorecard-honesty \
             --label=installed-root --report=selfcheck-root.txt
           sudo chown "$USER" selfcheck-root.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with: { name: selfcheck-installed, path: "selfcheck-*.txt", if-no-files-found: error }
 
@@ -916,9 +916,9 @@ jobs:
     needs: [rails-pristine, rails-installed-host]
     steps:
       # DIVE-2229: full history — pinned baselines must resolve here too.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: selfcheck-*, merge-multiple: true }
       # Fails closed on a missing, headerless, different-corpus or
       # disagreeing-allowlist report — a job that died before writing one cannot
@@ -982,7 +982,7 @@ jobs:
           git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       - name: Build the bundle (harness precondition, not an accident of ordering)
         run: ./build.sh
@@ -994,7 +994,7 @@ jobs:
       # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
       # what that runner installs, so this job grades the same node the listing meets.
       - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 'lts/*' }
       # DIVE-3580: the second box's verdict is only independent of the first while the
       # fleet's draw is — and on #708 it was not: both runners confirmed a red that
@@ -1038,7 +1038,7 @@ jobs:
           # 65% of budget with zero failing harnesses (run 34470906776). The translator
           # annotates and returns 0 for a 6 ONLY; exit 1 and exit 4 pass through.
           bash scripts/shard-exit.sh "$rc" 'core/pristine-confirm-s${{ matrix.shard }}' 'core-pristine-confirm-${{ matrix.shard }}.txt'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: "core-pristine-confirm-${{ matrix.shard }}"
@@ -1090,7 +1090,7 @@ jobs:
           git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       - name: Simulate a box with 5dive installed
         run: bash .github/scripts/simulate-installed-host.sh
@@ -1104,7 +1104,7 @@ jobs:
       # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
       # what that runner installs, so this job grades the same node the listing meets.
       - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 'lts/*' }
       # DIVE-3580: same baseline, same hand-off discipline — see the pristine confirm job.
       - name: Fetch the last green main run's per-harness baseline (DIVE-3580)
@@ -1137,7 +1137,7 @@ jobs:
           # 65% of budget with zero failing harnesses (run 34470906776). The translator
           # annotates and returns 0 for a 6 ONLY; exit 1 and exit 4 pass through.
           bash scripts/shard-exit.sh "$rc" 'core/installed-host-confirm-s${{ matrix.shard }}' 'core-installed-confirm-${{ matrix.shard }}.txt'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: "core-installed-confirm-${{ matrix.shard }}"
@@ -1165,7 +1165,7 @@ jobs:
       pristine: ${{ steps.plan.outputs.pristine }}
       installed: ${{ steps.plan.outputs.installed }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: 'core-*', merge-multiple: true }
       - name: Which shards went over their cap on their FIRST box?
         id: plan
@@ -1233,9 +1233,9 @@ jobs:
     needs: core-pristine
     steps:
       # DIVE-2229: full history, like every other checkout in this file.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: 'core-pristine-*', merge-multiple: true }
       - name: The ACP server must have been GRADED (pristine)
         run: |
@@ -1252,9 +1252,9 @@ jobs:
     needs: core-installed-host
     steps:
       # DIVE-2229: full history, like every other checkout in this file.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: 'core-installed-*', merge-multiple: true }
       - name: The ACP server must have been GRADED (installed host)
         run: |
@@ -1295,7 +1295,7 @@ jobs:
           git -C "$RUNNER_TEMP/5dive-plugins" remote add origin https://github.com/5dive-ai/5dive-plugins
           git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$DEVTEAM_PLUGINS_REF"
           git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       - name: Run the devteam harnesses against this tree (shard ${{ matrix.shard }})
         run: |
@@ -1412,9 +1412,9 @@ jobs:
       # fetch-depth: 0 like every other checkout in this file -- DIVE-2229's rule is
       # whole-file, and `tests/baseline_pin_unit.sh` grades it per STEP, so a depth-1
       # checkout here reds that harness whether or not this job resolves a pinned commit.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: 'core-*', merge-multiple: true }
       - name: Re-sum the shards and print the UN-SHARDED core total
         run: |
@@ -1537,7 +1537,7 @@ jobs:
           # was PRODUCED is a different question from whether it PASSES, and it is graded next
           # door — `core-total-produced` reds on an absence, never on a value.
           exit 0
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: core-unsharded-total
@@ -1579,7 +1579,7 @@ jobs:
     needs: [core-pristine, core-installed-host, core-budget-report]
     if: always()
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         # continue-on-error: a MISSING artifact is the defect this job exists to catch, so it
         # must reach the grading step rather than dying in the download.
         continue-on-error: true

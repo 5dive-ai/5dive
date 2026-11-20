@@ -37,7 +37,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       # DIVE-4237 — MAKE THE HEAD SHA AN OBJECT BEFORE ANYTHING DIFFS IT.
@@ -143,7 +143,7 @@ jobs:
     steps:
       # fetch-depth 0 brings the tags with it; the pin must be an OBJECT here or
       # `git cat-file -e <pin>:<path>` is vacuously false and the script refuses.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
