@@ -27,6 +27,8 @@ name: Header-drift window
 # this rail's own liveness signal, on the DIVE-1924 badge-staleness principle: the
 # body carries the date it was written, so a rail that dies leaves an issue visibly
 # frozen rather than a silence indistinguishable from "nothing recurred".
+# DIVE-8899: the issue is OPEN only while the verdict is actionable. A clean run
+# closes it; while closed, the newest one is still rewritten, so the stamp stays live.
 # DIVE-4166 adds the calibration half to this same durable window: label/tier
 # populations get separate medians, and 20 comparable samples still >=25% off their
 # baseline print REBASELINE REQUIRED into this issue. It remains non-red for the same
@@ -164,11 +166,38 @@ jobs:
             echo "from anywhere else (DIVE-1924)._"
           } > issue-body.md
 
+          # DIVE-8899: an OPEN issue means "a seat has something to do". A new open issue
+          # is filed to the board as a row, so opening one on a clean verdict woke a seat
+          # for nothing (5dive#1743: 0 stale claims, 0 re-baselines, filed the day after
+          # #1729's fix closed its predecessor). Actionable = a STALE CLAIM row, a
+          # REBASELINE REQUIRED line, or a window the script could not read (a rail that
+          # cannot see is not "nothing recurred"). UNPROTECTED counts are diagnostic and
+          # are printed every run, so they do not open an issue on their own.
+          actionable=0
+          grep -qE '  STALE CLAIM$|REBASELINE REQUIRED:|NO REPORTS HARVESTED|UNDETERMINED' window.txt \
+            && actionable=1
+          echo "actionable=$actionable"
+
           num="$(gh issue list --state open --limit 50 --json number,title \
                    --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
           if [ -n "${num:-}" ]; then
             gh issue edit "$num" --body-file issue-body.md
             echo "updated issue #$num"
-          else
+            if [ "$actionable" = 0 ]; then
+              gh issue close "$num" --comment "Clean verdict at ${STAMP}: no stale claim, no re-baseline. Closing; the next finding opens a new issue."
+              echo "closed issue #$num (clean verdict)"
+            fi
+          elif [ "$actionable" = 1 ]; then
             gh issue create --title "$TITLE" --body-file issue-body.md
+          else
+            # Clean and nothing open: keep the liveness stamp (DIVE-1924) on the newest
+            # closed issue instead of opening a new one.
+            last="$(gh issue list --state closed --limit 100 --json number,title \
+                      --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)"
+            if [ -n "${last:-}" ]; then
+              gh issue edit "$last" --body-file issue-body.md
+              echo "clean verdict: rewrote closed issue #$last, opened nothing"
+            else
+              echo "clean verdict: no issue to rewrite, opened nothing"
+            fi
           fi
