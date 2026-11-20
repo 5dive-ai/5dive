@@ -1584,6 +1584,12 @@ cmd_task_answer() {
   # pre-DIVE-1958 rows (gate_filed_by NULL) resolving exactly as before; the identical
   # COALESCE is already used by the DIVE-2011 delivery frame a few hundred lines down.
   local owner; owner=$(db "SELECT COALESCE(NULLIF(gate_filed_by,''), NULLIF(assignee,''), NULLIF(created_by,''), '') FROM tasks WHERE id=${id};")
+  # DIVE-8875: a sentinel filer (root/cron `cli`, `council`, ...) is nobody to
+  # wake, and the filing now leaves the row on its holder, so resume the holder.
+  if _task_is_principal_sentinel "$owner"; then
+    owner=$(db "SELECT COALESCE(NULLIF(assignee,''), '') FROM tasks WHERE id=${id};")
+    if _task_is_principal_sentinel "$owner"; then owner=""; fi
+  fi
   # DIVE-394 provenance: record WHO answered. `human:` prefix when a trusted path
   # passed --human; otherwise the resolved actor label.
   local answered_by; answered_by=$(task_actor "$from")

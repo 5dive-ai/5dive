@@ -3598,6 +3598,13 @@ cmd_task_need() {
   # `task answer` knows who to ping to resume. The inbox is defined by the gate
   # (need_type set), not by assignee, so it still surfaces to the human.
   local actor; actor=$(task_actor "$from")
+  # DIVE-8875: a gate filed by a principal sentinel (root or cron with no --from
+  # is `cli`; `--from=council` is `council`) must not take the row. The CASE
+  # below otherwise hands the row to the filer, and nothing dispatches a
+  # sentinel (DIVE-3344), so the heartbeat's own [task-budget] gate stranded the
+  # maker's row on `cli` and a "keep going" answer resumed nothing.
+  local _filer_is_sentinel=0
+  if _task_is_principal_sentinel "$actor"; then _filer_is_sentinel=1; fi
   if [[ "$type" == "decision" ]] && _gate_option_has_second_person "$options"; then
     warn "--options contains second-person wording whose referent can invert between filer and answerer. Prefer account names (for example, main-runs-task-done|dev3-gets-a-credential). Filing continues; the answer receipt will name filer ${actor} and the concrete answerer (DIVE-2212)."
   fi
@@ -4240,6 +4247,8 @@ db "BEGIN IMMEDIATE;
             gate_prev_status=CASE WHEN status='blocked' THEN gate_prev_status
                                   ELSE status END,
             assignee=CASE
+              WHEN ${_filer_is_sentinel} = 1 AND assignee IS NOT NULL
+              THEN assignee
               WHEN maker_agent IS NOT NULL AND verifier IS NOT NULL
                    AND assignee=verifier AND handoff_delivered_at IS NOT NULL
                    AND verifier IS NOT $(sqlq "$actor")
