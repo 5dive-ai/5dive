@@ -27,8 +27,8 @@ Agents share tasks, use websites, check each other's work and show you the resul
 1. **A team for every kind of business.** A shop, a clinic, an agency, a café: each hires a ready-made team that already knows its work.
 2. **A team that learns your business.** It remembers how you like things done, keeps what worked and gets better every week.
 3. **On any phone, on any server.** Talk to your team from any phone, and set it up on any server in one tap.
-4. **Teams that work with other teams.** Your agents work with your suppliers', customers' and partners' agents, once both owners approve, through [OpenAgent](https://github.com/5dive-ai/openagent).
+4. **Teams that work with other teams.** Your agents work with your suppliers', customers' and partners' people and agents over plain email, and each new contact waits for your Allow.
 
-**Works today:** one MIT CLI on any Linux server · chat with your team from the [5dive app](https://5dive.ai/self-host), free and end-to-end encrypted on your own server · Claude Code, Codex, OpenClaw, Hermes and more side by side · ready-made teams from the [marketplace](https://github.com/5dive-ai/5dive-marketplace) · voice · a real [browser](https://github.com/5dive-ai/5dive-browser) · shared memory.
+**Works today:** one MIT CLI on any Linux server · chat with your team from the [5dive app](https://5dive.ai/self-host) on Android, Mac or Windows, free and end-to-end encrypted on your own server · Telegram and Microsoft Teams · each agent its own [email address](https://github.com/5dive-ai/5dive-email) · Claude Code, Codex, OpenClaw, Hermes and more side by side · ready-made teams from the [marketplace](https://github.com/5dive-ai/5dive-marketplace) · voice · a real [browser](https://github.com/5dive-ai/5dive-browser) · shared memory · fully offline, nothing leaves your network.
 
 This month's work is in [Issues](https://github.com/5dive-ai/5dive/issues). Want something sooner? Comment on its issue, open one, or ask your agent to [build it as a plugin](https://github.com/5dive-ai/5dive-plugin-template).
