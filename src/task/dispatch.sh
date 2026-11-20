@@ -831,7 +831,9 @@ cmd_task_orphans() {
     for col in badAssignee badVerifier badCreator; do
       val=$(printf '%s' "$line" | jq -r --arg k "$col" '.[$k] // empty')
       [[ -n "$val" ]] || continue
-      hint=$(_task_roster_nearmiss "$val")
+      # DIVE-8875: a sentinel (`cli`) is not a typo of a seat, so no near miss.
+      hint=""
+      _task_is_principal_sentinel "$val" || hint=$(_task_roster_nearmiss "$val")
       marks+="${marks:+, }${col#bad}='${val}'"
       # NOT `$([[ -n "$hint" ]] && printf …)`: on the no-hint path that
       # substitution exits 1, and an assignment takes the substitution's status —

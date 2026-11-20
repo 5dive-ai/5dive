@@ -1870,6 +1870,14 @@ _task_role_skew_note() {
 # distinct from `cron` makes each external delivery's provenance queryable.
 _TASK_PRINCIPAL_SENTINELS="cli council telegram dashboard lodar editor proof cron trigger"
 
+# _task_is_principal_sentinel <name> — 0 when <name> is one of the sentinels
+# above. A FUNCTION, not a read of the global, on purpose: other modules call it,
+# and a call edge loads this module only when it runs, where a read of the
+# global would be a lazy-loader dep edge that loads it with every caller.
+_task_is_principal_sentinel() {
+  [[ -n "${1:-}" && " ${_TASK_PRINCIPAL_SENTINELS} " == *" $1 "* ]]
+}
+
 _TASK_ROSTER=""; _TASK_ROSTER_STATE=""; _TASK_ROSTER_REG=""
 
 # _task_roster — SETS `_TASK_ROSTER` (newline-separated lane names) and
@@ -2032,7 +2040,7 @@ _task_require_lane() {
   # The sentinel gets its own refusal: it is a legal created_by, so "not a
   # registered agent" would read as a contradiction to anyone who has seen it in
   # that column.
-  if grep -qw -- "$name" <<<"$_TASK_PRINCIPAL_SENTINELS"; then
+  if _task_is_principal_sentinel "$name"; then
     fail "$E_VALIDATION" "${flag}='${name}' is not a lane — '${name}' is the actor sentinel for an invocation that could not be attributed to an agent (root, cron, a build bot). It is legal as a CREATOR and never as an owner: nothing wakes it, so the row would sit undispatched forever. Name a real agent: 5dive agent list"
   fi
   hint=$(_task_roster_nearmiss "$name")
@@ -2063,7 +2071,7 @@ _task_require_principal() {
   _task_roster
   [[ "$_TASK_ROSTER_STATE" == "ok" ]] || { _task_roster_unestablished_note "$name"; return 0; }
   if _task_roster_has "$name"; then return 0; fi
-  if grep -qw -- "$name" <<<"$_TASK_PRINCIPAL_SENTINELS"; then return 0; fi
+  if _task_is_principal_sentinel "$name"; then return 0; fi
   hint=$(_task_roster_nearmiss "$name")
   fail "$E_VALIDATION" "${flag}='${name}' is not a registered agent or a known principal$([[ -n "$hint" ]] && printf -- " — did you mean '%s'?" "$hint") (a creator that does not exist misroutes every gate this row ever files; known non-agent principals: ${_TASK_PRINCIPAL_SENTINELS})"
 }
