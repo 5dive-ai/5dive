@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DIVE-8853 isolated unit harness for `5dive team freedom [ask|balanced|yolo]`:
+# DIVE-8853/DIVE-8872 isolated unit harness for `5dive team freedom [ask|balanced|yolo] [--agent=<n>]`:
 # one owner level that sets every switch that asks the owner (browser asks,
 # email gates, proactive, per-agent autonomy), reads back "custom" with what
 # differs once a switch is changed by hand, and is taken by new agents. On YOLO
@@ -130,17 +130,22 @@ F ask >/dev/null; mv "$TMP/browser.json" "$TMP/browser.off"
 t "T9 no browser: still ask, nothing differs" "ask|[]" "$(st '"\(.level)|\(.differs)"' | tr -d '"')"
 mv "$TMP/browser.off" "$TMP/browser.json"
 
-# T10 — new agents take the level: claude gets its autonomy, others none, and
-# proactive is set once it is up (nothing to do on Ask me often).
+# T10 — DIVE-8872: a new agent starts on Balanced once Team freedom has been
+# used on this box (whatever the others are on); before that, today's defaults.
 F yolo >/dev/null
-t "T10 new claude agent autonomy" "full" "$(_freedom_new_agent_autonomy claude)"
+t "T10 new claude agent autonomy: Balanced's" "yolo" "$(_freedom_new_agent_autonomy claude)"
 t "T10 new codex agent: no autonomy" "" "$(_freedom_new_agent_autonomy codex)"
-echo off >"$TMP/pro.cat"; _freedom_new_agent_inherit cat
-t "T10 new agent proactive" "more" "$(cat "$TMP/pro.cat")"
-F ask >/dev/null; calls_since; _freedom_new_agent_inherit cat
-t "T10 ask: nothing to inherit" "0" "$(writes)"
-db "DELETE FROM task_prefs WHERE key='freedom.team';"
-t "T10 unset: new agent keeps the default" "" "$(_freedom_new_agent_autonomy claude)"
+jq '.agents.cat={type:"claude"}' "$REGISTRY" >"$TMP/r2" && mv "$TMP/r2" "$REGISTRY"
+printf 'AGENT_NAME=cat\nAGENT_AUTONOMY=yolo\n' >"$ENV_DIR/cat.env"; echo off >"$TMP/pro.cat"; _freedom_new_agent_inherit cat
+t "T10 new agent proactive: Balanced's" "little" "$(cat "$TMP/pro.cat")"
+t "T10 new agent stored on Balanced, matches it" "balanced|balanced|[]" "$(F --agent=cat --json | jq -r '.data | "\(.level)|\(.set_level)|\(.differs)"')"
+t "T10 the shared browser follows the most careful agent (cat)" "ask ask allow ask" "$(jq -r '"\(.pay) \(.publish) \(.send) \(.delete)"' "$TMP/browser.json")"
+t "T10 ann stays YOLO" "yolo" "$(F --agent=ann --json | jq -r .data.level)"
+jq 'del(.agents.cat)' "$REGISTRY" >"$TMP/r2" && mv "$TMP/r2" "$REGISTRY"
+db "DELETE FROM task_prefs WHERE key LIKE 'freedom.%';"
+t "T10 never used: new agent keeps today's default" "" "$(_freedom_new_agent_autonomy claude)"
+calls_since; _freedom_new_agent_inherit cat
+t "T10 never used: nothing stored or written" "0|0" "$(writes)|$(db "SELECT count(*) FROM task_prefs WHERE key LIKE 'freedom.%';")"
 
 # T11 — a bad level is a usage error, not a silent no-op.
 F free >/dev/null; rc=$?
@@ -161,6 +166,48 @@ t "T13 clean set under errexit: rc 0" "0" "$rc"
 t "T13 clean set under errexit: ok line, changes named, none failed" "true|YOLO|1|0" "$(jq -r '"\(.ok)|\(.data.label)|\(.data.changed|length>0|if . then 1 else 0 end)|\(.data.failed|length)"' <<<"$out" 2>/dev/null)"
 out=$(E yolo); rc=$?
 t "T13 re-set under errexit: rc 0, nothing changed" "0|true|[]" "$rc|$(jq -r '.ok' <<<"$out" 2>/dev/null)|$(jq -c '.data.changed' <<<"$out" 2>/dev/null)"
+
+# T14 — DIVE-8872: the level is PER AGENT. One agent's set touches only its own
+# switches; the shared browser follows the most careful agent.
+F ask >/dev/null
+out=$(F yolo --agent=bob)
+t "T14 set bob yolo ok, names bob" "yolo|bob|ask" "$(jq -r '.data | "\(.level)|\(.agent)|\(.browser_level)"' <<<"$out")"
+t "T14 bob proactive more, ann untouched" "more off" "$(cat "$TMP/pro.bob") $(cat "$TMP/pro.ann")"
+t "T14 ann email and autonomy untouched" "true true 0" "$(jq -r '"\(.approve_inbound) \(.approve_new)"' "$EMAIL") $(grep -c AUTONOMY "$ENV_DIR/ann.env")"
+t "T14 browser stays on ann's Ask me often" "ask ask ask ask" "$(jq -r '"\(.pay) \(.publish) \(.send) \(.delete)"' "$TMP/browser.json")"
+t "T14 the set line says the browser stays careful" "1" "$( (JSON_MODE=0; F yolo --agent=bob) | grep -c 'browser is shared by the whole box and stays on Ask me often')"
+t "T14 per-agent status: bob yolo, nothing differs" "bob|yolo|yolo|[]" "$(F --agent=bob --json | jq -r '.data | "\(.agent)|\(.level)|\(.set_level)|\(.differs)"')"
+t "T14 per-agent status: browser reported beside, at ask" "ask|[]" "$(F --agent=bob --json | jq -r '.data.browser | "\(.level)|\(.differs)"')"
+t "T14 team status: two agents, mixed = custom" "custom|ann:ask,bob:yolo" "$(F --json | jq -r '.data | "\(.level)|\([.agents[] | "\(.agent):\(.level)"] | join(","))"')"
+F yolo --agent=ann >/dev/null
+t "T14 every agent on YOLO: browser always" "always always always always" "$(jq -r '"\(.pay) \(.publish) \(.send) \(.delete)"' "$TMP/browser.json")"
+t "T14 team status yolo" "yolo|yolo" "$(st '"\(.level)|\(.set_level)"' | tr -d '"')"
+F balanced --agent bob >/dev/null
+t "T14 --agent <name> form; browser back to Balanced" "little|ask ask allow ask" "$(cat "$TMP/pro.bob")|$(jq -r '"\(.pay) \(.publish) \(.send) \(.delete)"' "$TMP/browser.json")"
+t "T14 ann still yolo" "yolo" "$(F --agent=ann --json | jq -r .data.level)"
+
+# T15 — per-agent Custom: a hand change makes only that agent custom.
+jq '.approve_inbound=true' "$EMAIL" >"$TMP/m2" && mv "$TMP/m2" "$EMAIL"
+t "T15 ann custom with the email gate" 'custom|[{"switch":"email.inbound","agent":"ann","now":"on","want":"off"}]' "$(F --agent=ann --json | jq -c '.data | "\(.level)|\(.differs)"' | jq -r .)"
+t "T15 bob still balanced" "balanced" "$(F --agent=bob --json | jq -r .data.level)"
+
+# T16 — refusals: not on the team, bad name, non-root.
+F --agent=sysadmin --json >/dev/null; rc=$?
+t "T16 sysadmin is not on the team (rc 4)" "4" "$rc"
+F yolo --agent=nobody >/dev/null; rc=$?
+t "T16 unknown agent refused (rc 4)" "4|1" "$rc|$(grep -c "'nobody' is not on the team" "$TMP/err")"
+F yolo --agent='a;b' >/dev/null; rc=$?
+t "T16 bad name is a usage error" "1" "$([[ $rc -ne 0 ]] && echo 1)"
+ROOT=0; F yolo --agent=bob >/dev/null; ROOT=1
+t "T16 non-root refusal names --agent" "1" "$(grep -c 'sudo 5dive team freedom yolo --agent=bob' "$TMP/err")"
+
+# T17 — DIVE-8853's whole-team key is read as the level of an agent with none of
+# its own; the set-everyone form replaces it with per-agent keys.
+db "DELETE FROM task_prefs WHERE key LIKE 'freedom.%';"
+db "INSERT INTO task_prefs (key, value, updated_at) VALUES ('freedom.team', '{\"level\":\"ask\",\"set_at\":\"x\",\"set_by\":\"root\"}', datetime('now'));"
+t "T17 legacy team key read per agent" "ask|ask" "$(F --agent=ann --json | jq -r .data.set_level)|$(F --agent=bob --json | jq -r .data.set_level)"
+F yolo >/dev/null
+t "T17 set-everyone writes per-agent keys, drops the team key" "freedom.agent.ann,freedom.agent.bob" "$(db "SELECT group_concat(key) FROM (SELECT key FROM task_prefs WHERE key LIKE 'freedom.%' ORDER BY key);")"
 
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))
