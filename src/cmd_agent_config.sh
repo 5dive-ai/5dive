@@ -34,7 +34,8 @@ cmd_config() {
   #     telegram.account-url      (claude only — https:// or tg:// URL behind the
   #                                lite bot's /account button; empty removes it)
   #     discord.token             (bot/app token for this agent's discord plugin)
-  #     autonomy                  (claude only — standard|yolo; yolo appends the
+  #     autonomy                  (claude only — standard|yolo|full; full = YOLO team
+  #                                freedom, no hard gates (DIVE-8853); yolo appends the
   #                                approved "act on your recs, still honor hard
   #                                gates" directive to the system prompt so it
   #                                survives /clear. 'son-of-anton' == yolo. DIVE-499)
@@ -335,7 +336,7 @@ cmd_config() {
         [[ "$type" == "claude" ]] \
           || fail "$E_VALIDATION" "type '$type' does not support 'autonomy' (claude only)"
         valid_autonomy "$v" \
-          || fail "$E_VALIDATION" "invalid autonomy '$v' (standard|yolo|son-of-anton)"
+          || fail "$E_VALIDATION" "invalid autonomy '$v' (standard|yolo|son-of-anton|full)"
         _AUTONOMY_OVERRIDE="$v"
         autonomy_changed=1
         env_dirty=1

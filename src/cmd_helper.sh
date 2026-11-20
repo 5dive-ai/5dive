@@ -265,7 +265,8 @@ _helper_build() {
   printf '%s\n' $((n + 1)) >"$d/build-tries"
   if [[ "$seat" == none ]]; then
     "$self" agent create "$HELPER_AGENT" --type=claude --auth-profile="$HELPER_ACCOUNT" \
-        --channels=dashboard --isolation=standard --no-heartbeat --no-team-bot </dev/null >&2 \
+        --channels=dashboard --isolation=standard --no-heartbeat --no-team-bot \
+        --autonomy=standard </dev/null >&2 \
       || return 1
   fi
   with_registry_lock _helper_mark || return 1

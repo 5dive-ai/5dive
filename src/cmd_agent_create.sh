@@ -1961,7 +1961,8 @@ agent_home_conflict_check() {
 
 # DIVE-499: accepted autonomy modes. 'son-of-anton' is a yolo synonym (a Silicon
 # Valley nod); the runtime (5dive-agent-start) maps both to the same directive.
-valid_autonomy() { [[ "$1" =~ ^(standard|yolo|son-of-anton)$ ]]; }
+# DIVE-8853: 'full' is YOLO team freedom: no hard gates either (5dive-agent-start).
+valid_autonomy() { [[ "$1" =~ ^(standard|yolo|son-of-anton|full)$ ]]; }
 
 write_agent_env() {
   local name="$1" type="$2" channels="$3" workdir="${4:-}" profile="${5:-}" isolation="${6:-standard}"
@@ -3618,6 +3619,7 @@ cmd_create() {
   local no_heartbeat=0 heartbeat_every="" _hb_driver=""
   local heartbeat_fresh=""   # DIVE-8189: --fresh / --no-fresh; "" = org-chart default
   local autonomy="standard"   # DIVE-499
+  local autonomy_explicit=0   # DIVE-8853: unset -> the team freedom level's
   local can_push=0            # DIVE-1462/STEER-4: delegated-push (builder) capability
   local can_deploy=0          # INST-5: delegated-deploy (production ship) capability
   local inherit_memory=""     # DIVE-990 memory-as-onboarding
@@ -3625,8 +3627,8 @@ cmd_create() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --type=*)                    type="${1#--type=}" ;;
-      --yolo)                      autonomy="yolo" ;;
-      --autonomy=*)                autonomy="${1#--autonomy=}" ;;
+      --yolo)                      autonomy="yolo"; autonomy_explicit=1 ;;
+      --autonomy=*)                autonomy="${1#--autonomy=}"; autonomy_explicit=1 ;;
       --channels=*)                channels="${1#--channels=}"; channels_set=1 ;;
       --telegram-token=*)          telegram_token="${1#--telegram-token=}" ;;
       --telegram-home-channel=*)   telegram_home_channel="${1#--telegram-home-channel=}" ;;
@@ -3729,7 +3731,12 @@ cmd_create() {
     [[ "$type" == "claude" ]] \
       || fail "$E_VALIDATION" "--telegram-profile is claude-only (type is $type) — no other type's telegram bridge has a lite profile"
   fi
-  valid_autonomy "$autonomy" || fail "$E_VALIDATION" "invalid --autonomy '$autonomy' (standard|yolo|son-of-anton)"
+  # DIVE-8853: a new agent takes the team freedom level unless told otherwise.
+  if (( ! autonomy_explicit )); then
+    local _fr_aut; _fr_aut=$(_freedom_new_agent_autonomy "$type" 2>/dev/null) || _fr_aut=""
+    [[ -n "$_fr_aut" ]] && autonomy="$_fr_aut"
+  fi
+  valid_autonomy "$autonomy" || fail "$E_VALIDATION" "invalid --autonomy '$autonomy' (standard|yolo|son-of-anton|full)"
   # DIVE-1462/STEER-4: --can-push grants the delegated-push (builder) capability.
   # It is a STANDARD-isolation refinement: admin agents already reach `_push_do`
   # through their broad sudo (so the flag is a redundant no-op there — accept it,
@@ -5043,6 +5050,10 @@ cmd_create() {
       warn "could not link '$human_id' to '$name' — the agent is fine; link it with: sudo 5dive human link $human_id --agent=$name"
     fi
   fi
+  # DIVE-8853: the team freedom level's proactive setting (autonomy was taken above).
+  # An explicit --autonomy/--yolo opts the seat out of the team level (the 5dive
+  # helper passes --autonomy=standard: a system seat is not on the team).
+  (( autonomy_explicit )) || _freedom_new_agent_inherit "$name" || true
   # DIVE-7102: said last, so it is the line the lead relays. Never a token ask.
   if (( tg_by_tap )); then
     step "Telegram for '$name': the owner taps \"Connect Telegram\" next to $name in My team on 5dive.app. One tap: no BotFather, no token in chat. Do not ask the owner for a bot token."
