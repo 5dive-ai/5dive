@@ -256,12 +256,24 @@ jobs:
   # exactly as visible, and exactly as much a policy decision, as raising the number.
   # `budget-report` re-sums the shards and prints the UN-SHARDED total, because that
   # total is what this row exists to make legible and sharding is how you lose it.
+  #
+  # DIVE-8890: N went 3 -> 4, and that IS the policy decision above, taken by main.
+  # Main (c747058e, run 44702283920) went red with zero failing harnesses:
+  # full-installed-host (2) spent 1376s (104% calibration) and the other five shards
+  # sat at 73-97%, so the cut refused a main whose code was green. The un-sharded
+  # totals were 3644s pristine and 3415s installed-host, against an aggregate
+  # 3 x 1320s, with the time-weighted plan (tests/lib/harness-weights.tsv) at
+  # 1131s / 1169s per shard. At N=4 the same plan is 848s / 877s (64-66%); the worst
+  # actual-over-plan seen on that run (x1.18) puts the slowest shard near 78%. Not 5:
+  # the org runs on GitHub Free (20 concurrent jobs, shared with unit-tests.yml's
+  # 24 shards), and the corpus grows ~7%/month by count. When budget-report's
+  # `shards NEEDED` column reaches 4, the next shard is the question on the table.
   full-pristine:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix: { shard: [1, 2, 3] }
+      matrix: { shard: [1, 2, 3, 4] }
     steps:
       # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
       # moves a payload the real CLI produced into the real dispatcher that lives in
@@ -349,7 +361,7 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix: { shard: [1, 2, 3] }
+      matrix: { shard: [1, 2, 3, 4] }
     steps:
       # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
       # moves a payload the real CLI produced into the real dispatcher that lives in
@@ -912,11 +924,11 @@ jobs:
       - name: The ACP server must have been GRADED (pristine)
         run: |
           bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
-            full-pristine-1.txt full-pristine-2.txt full-pristine-3.txt
+            full-pristine-1.txt full-pristine-2.txt full-pristine-3.txt full-pristine-4.txt
       - name: The ACP server must have been GRADED (installed host)
         run: |
           bash tests/meta/harness-graded-union.sh --harness=acp_stdio_unit.sh --min-ms=1000 \
-            full-installed-1.txt full-installed-2.txt full-installed-3.txt
+            full-installed-1.txt full-installed-2.txt full-installed-3.txt full-installed-4.txt
 
   budget-report:
     runs-on: ubuntu-latest
