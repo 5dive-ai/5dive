@@ -57,7 +57,7 @@ jobs:
       # depth 0 so the base sha is reachable — a shallow clone cannot diff against it.
       - name: Checkout
         if: github.event_name == 'pull_request'
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 

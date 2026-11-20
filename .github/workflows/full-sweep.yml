@@ -288,7 +288,7 @@ jobs:
           git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
       # DIVE-2229: full history — pinned baselines must resolve here too.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
       # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
@@ -316,7 +316,7 @@ jobs:
       # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
       # what that runner installs, so this job grades the same node the listing meets.
       - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 'lts/*' }
       - name: Run the FULL corpus (budgeted, shard ${{ matrix.shard }})
         run: |
@@ -337,7 +337,7 @@ jobs:
       # if: always() — an over-budget or red run is exactly the run whose timings
       # somebody needs, and losing the report would leave the trend with a hole
       # precisely where it changed.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: "full-pristine-${{ matrix.shard }}"
@@ -375,7 +375,7 @@ jobs:
           git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$PLUGINS_REF"
           git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       # DIVE-1919 / DIVE-2018: seed the host state that actually differs from a
       # pristine runner, so harnesses that leak out of their isolation red HERE
@@ -429,7 +429,7 @@ jobs:
       # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
       # what that runner installs, so this job grades the same node the listing meets.
       - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 'lts/*' }
       - name: Run the FULL corpus (installed host, budgeted, shard ${{ matrix.shard }})
         run: |
@@ -447,7 +447,7 @@ jobs:
           rc=$?
           set -e
           bash scripts/shard-exit.sh "$rc" 'full/installed-host-s${{ matrix.shard }}' 'full-installed-${{ matrix.shard }}.txt'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: "full-installed-${{ matrix.shard }}"
@@ -548,7 +548,7 @@ jobs:
           git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$PLUGINS_REF"
           git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
       # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
@@ -576,7 +576,7 @@ jobs:
       # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
       # what that runner installs, so this job grades the same node the listing meets.
       - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 'lts/*' }
       - name: Every harness must be able to FAIL (shard ${{ matrix.shard }})
         run: |
@@ -590,7 +590,7 @@ jobs:
       # report goes to the union job. `if: always()` because a run that found UNWIRED
       # still made a valid coverage observation, and losing it would let a red probe
       # silently shrink the union.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: "probe-pristine-${{ matrix.shard }}"
@@ -650,7 +650,7 @@ jobs:
           git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$PLUGINS_REF"
           git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       - name: Simulate a box with 5dive installed
         run: |
@@ -705,14 +705,14 @@ jobs:
       # the ACP registry's runner — and acp_stdio_unit grades it under BOTH. lts/* is
       # what that runner installs, so this job grades the same node the listing meets.
       - name: Install Node LTS (harness precondition — acp_stdio_unit grades the node runtime)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with: { node-version: 'lts/*' }
       - name: Every harness must be able to FAIL (installed host, shard ${{ matrix.shard }})
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
             --shard=${{ matrix.shard }}/${{ strategy.job-total }} \
             --label=installed-host --report=probe-installed-${{ matrix.shard }}.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: "probe-installed-${{ matrix.shard }}"
@@ -797,7 +797,7 @@ jobs:
           git -C "$RUNNER_TEMP/5dive-plugins" fetch --quiet --depth 1 origin "$PLUGINS_REF"
           git -C "$RUNNER_TEMP/5dive-plugins" checkout --quiet FETCH_HEAD
           echo "TELEGRAM_CODEX_PLUGIN_DIR=$RUNNER_TEMP/5dive-plugins/plugins/telegram-codex" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
       # DIVE-2525: BUILD THE BUNDLE FIRST, EXPLICITLY. Three harnesses
       # (install_checksum, ledger, policy_refusals) need ./5dive and ./5dive.sha256
@@ -817,7 +817,7 @@ jobs:
         run: |
           bash tests/meta/harness-verdict-probe.sh --assume-clean \
             --only="$SLOW_HARNESSES" --label=slow --report=probe-slow.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with: { name: probe-slow, path: probe-slow.txt, if-no-files-found: error }
 
@@ -848,9 +848,9 @@ jobs:
     # sound in the first place.
     if: github.event_name != 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: probe-*, merge-multiple: true }
       # The union script fails closed on a missing, headerless, or different-corpus
       # report, so a job that died before writing one cannot silently shrink what we
@@ -901,9 +901,9 @@ jobs:
       # (tests/baseline_pin_unit.sh arm D sweeps every checkout in this workflow), and
       # a per-job exemption is exactly the thing that goes stale when the job later
       # grows a step that does need a baseline.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with: { fetch-depth: 0 }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: "full-*", merge-multiple: true }
       # Reports named EXPLICITLY, not globbed, and once per environment: a lane that
       # died has to red this job rather than quietly reduce the union it is checked
@@ -923,7 +923,7 @@ jobs:
     needs: [full-pristine, full-installed-host]
     if: always()
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with: { pattern: 'full-*', merge-multiple: true }
       - name: Report the sweep's wall-clock
         run: |

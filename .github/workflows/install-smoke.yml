@@ -50,7 +50,7 @@ jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install shellcheck
         # DIVE-8088: retried only on a download error (scripts/net-retry.sh).
         run: scripts/net-retry.sh sudo sh -c 'apt-get update -qq && apt-get install -y -qq shellcheck'
@@ -179,7 +179,7 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build image (runs install.sh against fresh ubuntu:22.04)
         run: |
           # DIVE-2091: the bundle is generated at tag time and is no longer
@@ -320,7 +320,7 @@ jobs:
   install-contract:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build image (runs install.sh against fresh ubuntu:22.04)
         run: |
           ./build.sh

@@ -132,7 +132,7 @@ jobs:
       contents: write   # create the release page (the tag itself goes over SSH, DIVE-8014)
       checks: read      # read the CI verdict on main's tip
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: main
           fetch-depth: 0
