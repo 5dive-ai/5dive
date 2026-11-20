@@ -304,6 +304,6 @@ HELP
       return 0 ;;
     ""|status) _freedom_status ;;
     ask|balanced|yolo) _freedom_set "$verb" ;;
-    *) fail "$E_USAGE" "unknown level: $verb (ask|balanced|yolo)" ;;
+    *) fail "$E_USAGE" "unknown level: $verb (ask|balanced|yolo|status|help)" ;;
   esac
 }
