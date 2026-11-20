@@ -1167,9 +1167,22 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
       local _bind_iter _cur_iter
       _bind_iter=$(db "SELECT COALESCE(CAST(delivery_ref_iteration AS TEXT),'') FROM tasks WHERE id=${id};")
       _cur_iter=$(db "SELECT COALESCE(iteration,0) FROM tasks WHERE id=${id};")
-      if [[ -n "$_bind_iter" ]] && (( _bind_iter < _cur_iter )); then
+      # DIVE-8904: an old iteration on the binding is a reason to ASK, not proof
+      # the PR is wrong. Most loops push the fix to the SAME bound PR and the maker
+      # re-delivers with `task done`, which never re-stamps the iteration — ten
+      # rows refused here on 11-19..11-20 with the graded work merged in the bound
+      # PR. So before refusing, measure: when the closer's `graded-sha:` IS the
+      # bound PR's head (or merge commit), the bound PR carries the graded work and
+      # the binding is current. DIVE-2057 still refuses: there the verifier graded
+      # the NEW PR's head, which the old bound PR does not carry. Fails closed — a
+      # read that does not answer keeps the refusal.
+      if [[ -n "$_bind_iter" ]] && (( _bind_iter < _cur_iter )) \
+         && _task_binding_carries_graded_sha "$_dref" "$result"; then
+        step "$ident: delivery binding ${_dref} was recorded at loop iteration ${_bind_iter} (now ${_cur_iter}), but its head carries the graded sha — the fix went into the same PR, so the binding is current (DIVE-8904)."
+        _task_store_audit_log "task.binding-current-by-graded-sha" ok 0 -- "$ident" "ref=$_dref bind_iter=$_bind_iter iter=$_cur_iter"
+      elif [[ -n "$_bind_iter" ]] && (( _bind_iter < _cur_iter )); then
         policy_refuse "$E_CONFLICT" done-with-stale-delivery-binding DIVE-2682 "$ident" \
-          "$ident cannot close: its delivery binding ${_dref} was recorded at loop iteration ${_bind_iter}, and the loop is now at ${_cur_iter}. The work bounced back to the maker and was re-delivered after that PR was bound, so closing here would grade a PR that does not contain the re-delivered work (DIVE-2057 is the clean instance of that). Re-point the binding to the PR carrying the CURRENT iteration — \`task deliver $ident --pr=https://github.com/<owner>/<repo>/pull/N\` — then \`task done\`."
+          "$ident cannot close: its delivery binding ${_dref} was recorded at loop iteration ${_bind_iter}, and the loop is now at ${_cur_iter}. The work bounced back to the maker and was re-delivered after that PR was bound, so closing here would grade a PR that does not contain the re-delivered work (DIVE-2057 is the clean instance of that). Re-point the binding to the PR carrying the CURRENT iteration — \`task deliver $ident --pr=https://github.com/<owner>/<repo>/pull/N\` — then \`task done\`. If the fix went into this SAME PR, state the sha you graded (\`graded-sha: <sha>\` in the result): when it is ${_dref}'s head the binding is accepted as current (DIVE-8904)."
       fi
     fi
     # DIVE-4899: EVERY BOUND PULL REQUEST, NOT JUST THE PRIMARY. The gate below
@@ -2603,6 +2616,26 @@ $_body"
        handoffAckAt:(if $ha=="" then null else $ha end)}' \
      --arg i "$id" --arg id "$ident" --arg s "$newstatus" \
      --arg h "$handoff_ack" --arg ha "$handoff_ack_at"
+}
+
+# DIVE-8904: _task_binding_carries_graded_sha <pr-ref> <result>
+# rc 0 only when the result states a `graded-sha:` AND that sha is the bound
+# PR's head or merge commit, read from the forge (the DIVE-2656 equality, not
+# ancestry, so a squash merge does not false-red it). Every other outcome —
+# no claim, no devteam plugin, a read that did not answer, a different sha —
+# is rc 1, so the DIVE-2682 refusal stands unless the match is MEASURED.
+_task_binding_carries_graded_sha() {
+  local ref="$1" result="$2" graded prshas head mc
+  declare -F _gate_graded_sha >/dev/null 2>&1 || return 1
+  declare -F _gate_pr_shas >/dev/null 2>&1 || return 1
+  graded=$(_gate_graded_sha "$result")
+  [[ -n "$graded" ]] || return 1
+  prshas=$(_gate_pr_shas "$ref" "$(_gate_gh_token 2>/dev/null)" \
+             "$(_gate_slug_from_url "$ref" 2>/dev/null)")
+  [[ "$prshas" == *"|"* ]] || return 1
+  head="${prshas%%|*}"; mc="${prshas##*|}"
+  head="${head,,}"; mc="${mc,,}"
+  [[ ( -n "$head" && "$head" == "$graded"* ) || ( -n "$mc" && "$mc" == "$graded"* ) ]]
 }
 
 # DIVE-6938: this stayed in the core when delivery.sh moved to the devteam plugin.
