@@ -2282,7 +2282,7 @@ cmd_auth_login() {
       cols=$(tput cols 2>/dev/null || echo 100); rows=$(tput lines 2>/dev/null || echo 30)
       [[ "$cols" =~ ^[1-9][0-9]*$ ]] || cols=100
       [[ "$rows" =~ ^[1-9][0-9]*$ ]] || rows=30
-      sudo -u claude -i env $extra_env \
+      sudo -u claude -i env $extra_env "$CLAUDE_FULL_SIGN_IN_LINK_ENV" \
         script -fq -c "stty cols $cols rows $rows >/dev/null 2>&1; $bin setup-token" "$log" \
         | _redact_oauth_stream || rc=$?
       local tok=""
@@ -2618,6 +2618,11 @@ auth_reap_quiet() {
   ( JSON_MODE=0 QUIET=1 cmd_auth_reap ) >/dev/null 2>&1 || true
 }
 
+# DIVE-8913: Claude Code v2.1.330 setup-token prints a short sign-in link
+# unless this is set; the vendor documents it for "a script reads values from
+# it". Older versions ignore it. Both setup-token spawns pass it.
+CLAUDE_FULL_SIGN_IN_LINK_ENV="CLAUDE_CODE_FULL_SIGN_IN_LINK=1"
+
 # Extract the OAuth URL from a claude setup-token PTY log. claude v2.1.119
 # emits the URL in two places:
 #   1. as the target of an OSC 8 hyperlink escape: `ESC]8;id=<id>;<URL>BEL<text>ESC]8;;BEL`
@@ -2629,15 +2634,25 @@ auth_reap_quiet() {
 # grep both had edge cases on the OSC delimiter (BEL isn't easy to express
 # portably, and earlier grep attempts stopped mid-URL at embedded CSI
 # escapes inserted by the animation frame).
+#
+# DIVE-8913: from v2.1.330 setup-token prints a SHORT link,
+# `https://claude.ai/oauth/authorize?<opaque>`, instead of the full
+# claude.com/cai one. We spawn it with CLAUDE_CODE_FULL_SIGN_IN_LINK=1
+# (CLAUDE_FULL_SIGN_IN_LINK_ENV) so the full link comes back, and this
+# extractor ALSO accepts the short form: it is an official working link, so if
+# the switch is ever dropped the owner still gets a sign-in URL instead of a
+# session that never reaches awaiting_code.
 extract_claude_url() {
   local log="$1"
   [[ -s "$log" ]] || return 1
   python3 - "$log" <<'PY' 2>/dev/null || true
 import re, sys
 data = open(sys.argv[1], 'rb').read()
+# The full claude.com link, or (v2.1.330+) the short claude.ai one.
+URL = rb'https://(?:claude\.com/|claude\.ai/oauth/authorize\?)'
 # OSC 8 hyperlink: ESC ] 8 ; <params> ; <URL> BEL <text> ESC ] 8 ; ; BEL
 # <URL> ends at the BEL (\x07) that precedes the visible text.
-m = re.search(rb'\x1b\]8;[^;]*;(https://claude\.com/[^\x07]+)\x07', data)
+m = re.search(rb'\x1b\]8;[^;]*;(' + URL + rb'[^\x07]+)\x07', data)
 if m:
     print(m.group(1).decode('utf-8', 'replace'))
     sys.exit(0)
@@ -2645,7 +2660,7 @@ if m:
 # future claude versions that drop the OSC 8 wrapper.
 clean = re.sub(rb'\x1b\[[0-9;]*[A-Za-z]', b'', data)
 clean = re.sub(rb'[\x07\r]', b'', clean)
-m = re.search(rb'https://claude\.com/[A-Za-z0-9._~:/?#=&%+_-]{20,600}', clean)
+m = re.search(URL + rb'[A-Za-z0-9._~:/?#=&%+_-]{20,600}', clean)
 if m:
     print(m.group(0).decode('utf-8', 'replace'))
 PY
@@ -2945,7 +2960,8 @@ cmd_auth_start() {
           "${oc_home}/.openclaw/agents/main/agent" 2>/dev/null || true
       fi
       login_cmd="$bin models auth login --provider openai --device-code --set-default" ;;
-    *)      login_cmd="$bin setup-token" ;;
+    *)      login_cmd="$bin setup-token"
+            extra_env="${extra_env:+$extra_env }$CLAUDE_FULL_SIGN_IN_LINK_ENV" ;;
   esac
 
   step "Starting device-code session $sid for $type${profile:+ (profile=$profile)}"
