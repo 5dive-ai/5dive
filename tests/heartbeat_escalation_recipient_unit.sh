@@ -163,7 +163,7 @@ drive() {
   local -a rec=(1 2); local idlist="DIVE-9001 DIVE-9002 " orphan="DIVE-9003 "
   local eident=DIVE-9005 etmpl=DIVE-8001 easg=claude-ivan etarget=claude-jane ehours=51
   local emsg="Recurring-stall ESCALATED:"
-  local _hdr="FLEET IDLE" total_stranded=4 stranded_todo=3 open_gates=1 since_secs=5400 parked_gates=0
+  local _hdr="FLEET IDLE" total_stranded=4 stranded_todo=3 open_gates=1 since_secs=5400 parked_gates=0 parked_todo=0
   local _act_detail="0 active" _tail="(detail)" eligible=6 last_ping="never"
   # DIVE-4826's two digest-owned sites. `subject/class/raw` are _hb_ops_digest_note's
   # own locals at the unwritable-spool fallback; `hdr/body` are the flush's composed
