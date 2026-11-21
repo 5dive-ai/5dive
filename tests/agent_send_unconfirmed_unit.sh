@@ -105,31 +105,43 @@ run_ask_text() {
   JSON_MODE=0 INJECT_RC="$1" USE_SCOPED="$2" cmd_ask ada ping --from=maker --timeout=1 --poll-secs=1
 }
 
-out=$(run_send_json 1)
+src=0; out=$(run_send_json 1) || src=$?
 is 'T1 send rc=1 keeps the envelope usable' true "$(jq -r '.ok' <<<"$out")"
 is 'T2 send rc=1 reports sent:false' false "$(jq -r '.data.sent' <<<"$out")"
 is 'T3 send rc=1 carries the shared reason' \
   'the composer still holds unsent text after two Enters — the payload was typed but the submit could not be verified (DIVE-4246; was the DIVE-147 paste-placeholder poll)' \
   "$(jq -r '.data.reason' <<<"$out")"
 
-out=$(run_deliver_json 1)
+drc=0; out=$(run_deliver_json 1) || drc=$?
 is 'T4 scoped delivery rc=1 reports delivered:false' false "$(jq -r '.data.delivered' <<<"$out")"
 is 'T5 scoped delivery rc=1 carries the same reason' \
   'the composer still holds unsent text after two Enters — the payload was typed but the submit could not be verified (DIVE-4246; was the DIVE-147 paste-placeholder poll)' \
   "$(jq -r '.data.reason' <<<"$out")"
 
-out=$(run_send_text 1)
+out=$(run_send_text 1) || true
 if [[ "$out" == *"OK — send to agent 'ada' is unconfirmed"* ]]; then
   ok_t 'T6 send rc=1 final prose carries the doubt'
 else
   bad_t 'T6 send rc=1 final prose still looks successful' "$out"
 fi
-out=$(run_deliver_text 1)
+out=$(run_deliver_text 1) || true
 if [[ "$out" == *"OK — delivery to agent 'ada' is unconfirmed"* ]]; then
   ok_t 'T7 scoped delivery rc=1 final prose carries the doubt'
 else
   bad_t 'T7 scoped delivery rc=1 final prose still looks successful' "$out"
 fi
+
+# DIVE-8957: an unconfirmed submit EXITS 12 (E_UNCONFIRMED) on both doors, so a
+# caller that reads only the exit code (ship-watch.sh) retries instead of
+# logging «told». The receipt itself is unchanged (T1-T7). A spooled message
+# keeps exit 0: the spool holds it.
+is 'T31 send rc=1 exits E_UNCONFIRMED (12), not 0' 12 "$src"
+is 'T32 scoped delivery rc=1 exits E_UNCONFIRMED (12), not 0' 12 "$drc"
+qrc=0; JSON_MODE=1 INJECT_RC=4 cmd_send ada ping --raw >/dev/null 2>&1 || qrc=$?
+is 'T33 send rc=4 (spooled) still exits 0' 0 "$qrc"
+qrc=0; JSON_MODE=1 INJECT_RC=4 cmd_deliver ada ping >/dev/null 2>&1 || qrc=$?
+is 'T34 scoped delivery rc=4 (spooled) still exits 0' 0 "$qrc"
+is 'T35 exit 12 classes as unconfirmed, not generic' unconfirmed "$(err_class_for 12)"
 
 # Positive controls: a confirmed submit keeps the existing public contract and
 # does not grow a misleading empty reason field.

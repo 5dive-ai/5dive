@@ -15,3 +15,4 @@ readonly E_NOT_RUNNING=8     # tmux session / systemd unit not active
 readonly E_PAIRING=9         # pair code not pending, invalid code
 readonly E_PERMISSION=10     # must run as root
 readonly E_TIMEOUT=11        # plugin didn't materialize within waitloop
+readonly E_UNCONFIRMED=12    # typed into the seat, submit not confirmed (DIVE-8957)
