@@ -1546,6 +1546,14 @@ cmd_self_update() {
   # Same bin seam as the health gate, so a fixture run never reaches the live CLI.
   # DIVE-7577: an update from a file skips the two once-per-box migrations
   # (older releases only; they may reach out). The local repair still runs.
+  # DIVE-9001: the fresh binary puts an existing task board behind the
+  # 5dive-board group (and installs the sudoers rule that lets seats reach it
+  # through the CLI). Local only, so it runs on an update from a file too. Every
+  # row stays: it changes the dir's group and mode, never the store.
+  if (( EUID == 0 )) && [[ -x "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" ]]; then
+    timeout 60 "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" task init >/dev/null 2>&1 \
+      || warn "task board lockdown did not finish (re-run: sudo 5dive task init)"
+  fi
   if [[ -n "$stage" ]] && (( EUID == 0 )) && [[ -x "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" ]]; then
     timeout 30 "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" chat e2e heal >/dev/null 2>&1 || true
   elif (( EUID == 0 )) && [[ -x "${HEALTH_GATE_BIN_DIR:-/usr/local/bin}/5dive" ]]; then

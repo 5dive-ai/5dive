@@ -75,6 +75,7 @@ unset _out_abs _repo_abs
 # ---------------------------------------------------------------------------
 CORE_FILES=(
   src/header.sh
+  src/lib/board_hop.sh
   src/lib/error_codes.sh
   src/lib/marketplace.sh
   src/lib/self.sh

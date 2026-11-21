@@ -687,6 +687,16 @@ jobs:
           set -o pipefail
           sudo -E env OU_REQUIRE_NETNS_ARM=1 bash tests/self_update_offline_unit.sh | tee root-arms-ou.txt
           grep -q '^ok   - NO NETWORK' root-arms-ou.txt
+      - name: board_cli_only_writer_unit as root, R arm required (DIVE-9001)
+        run: |
+          # The R arm installs this tree's bundle as /usr/local/bin/5dive, adds a
+          # group, a seat user and a sudoers file: disposable runner only.
+          set -o pipefail
+          sudo -E env BD_REQUIRE_ROOT_ARM=1 bash tests/board_cli_only_writer_unit.sh | tee root-arms-bd.txt
+          if grep -q '^skip - R' root-arms-bd.txt; then echo "R was skipped under root"; exit 1; fi
+          n=$(grep -c '^ok   - R' root-arms-bd.txt) || n=0
+          echo "R ok lines: $n"
+          test "$n" -ge 9
 
   rails-pristine:
     runs-on: ubuntu-latest
