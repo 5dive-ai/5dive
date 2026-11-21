@@ -252,8 +252,6 @@ Agents:
                                                      # steer, not a briefing) and budgeted at 3 per sender per hour;
                                                      # past the budget the send still goes, on the normal path, and
                                                      # the receipt says urgent:false.
-                                                     # Exit 12 = typed but NOT submitted (sent:false): retry later.
-                                                     # A busy seat's spooled send (queued:true) exits 0.
                                                      # --message-file is FIRST because it is the only form your shell
                                                      # cannot corrupt: the body is read VERBATIM (DIVE-2627), and '-'
                                                      # reads it from stdin, so no temp file is needed:
@@ -268,6 +266,8 @@ Agents:
                                                      # and a backtick-quoted CLI verb RUNS as you and is deleted from
                                                      # the text -- and the send still prints OK on both. Anything with
                                                      # code, currency, a path, a quote or a newline goes in a file.
+                                                     # Exit 12 = typed but NOT submitted (sent:false): retry later.
+                                                     # A busy seat's spooled send (queued:true) exits 0.
                                                      # inject a message (tmux send-keys + Enter).
                                                      # When called from another agent, auto-wraps as
                                                      # [5dive-msg from=<caller> id=<id>] so the
