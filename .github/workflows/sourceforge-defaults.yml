@@ -1,0 +1,67 @@
+# SourceForge's Windows and Mac download buttons, kept on the newest release.
+#
+# https://sourceforge.net/projects/fivedive/ imports every release of this repo
+# through its GitHub webhook, but the per-OS "Default Download For" ticks do not
+# carry over to the new folder. The Windows and Mac buttons kept serving the first
+# release they were set on (v0.137.1) while v0.140.2 was out (lodar, 2026-11-21).
+# This job ticks Windows on the Latest release's 5dive-setup.exe and Mac on its
+# 5dive.dmg, through SourceForge's Release API. Re-running it changes nothing.
+#
+# SOURCEFORGE_API_KEY is the fivedive account's Releases API key. To replace it,
+# go to sourceforge.net/auth/preferences/ > Releases API Key > Re-generate, then
+# run `gh secret set SOURCEFORGE_API_KEY`.
+#
+# A folder SourceForge has not imported yet returns 404: the job says so and the
+# next run (hourly, or after mac-app-mirror) sets it.
+name: sourceforge-defaults
+on:
+  workflow_run:
+    workflows: [mac-app-mirror]
+    types: [completed]
+  schedule:
+    - cron: "53 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sourceforge-defaults
+  cancel-in-progress: false
+
+jobs:
+  defaults:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Point Windows and Mac at the Latest release's installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SF_KEY: ${{ secrets.SOURCEFORGE_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SF_KEY}" ]]; then
+            echo "::warning::SOURCEFORGE_API_KEY is not set, so SourceForge's Windows/Mac buttons are not updated."
+            exit 0
+          fi
+          base="https://sourceforge.net/projects/fivedive"
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          # What the buttons serve now. Best effort: a failed read only means we set it again.
+          best="$(curl -sS -m 30 -H 'Accept: application/json' "$base/best_release.json" 2>/dev/null || true)"
+          for pair in windows:5dive-setup.exe mac:5dive.dmg; do
+            os="${pair%%:*}"; file="${pair#*:}"
+            have="$(jq -r --arg os "$os" '.platform_releases[$os].filename // ""' <<<"$best" 2>/dev/null || true)"
+            if [[ "$have" == "/$tag/$file" ]]; then
+              echo "$os: already $have"
+              continue
+            fi
+            # The key goes in on stdin, never on the command line.
+            code="$(printf '%s' "$SF_KEY" | curl -sS -m 30 -o /tmp/sf.json -w '%{http_code}' \
+              -H 'Accept: application/json' -X PUT -d "default=$os" \
+              --data-urlencode 'api_key@-' "$base/files/$tag/$file")"
+            case "$code" in
+              200) echo "$os: set to /$tag/$file (was ${have:-unknown})" ;;
+              404) echo "::notice::$os: /$tag/$file is not on SourceForge yet; the next run sets it." ;;
+              *)   echo "::error::$os: SourceForge answered HTTP $code for /$tag/$file"; head -c 300 /tmp/sf.json; echo; exit 1 ;;
+            esac
+          done
