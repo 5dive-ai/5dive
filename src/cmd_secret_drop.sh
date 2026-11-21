@@ -783,7 +783,10 @@ SECRET_HTTPS_WHY=""
 # viewer path gets the same closed page as a spent secret link.
 SECRET_HTTPS_VIEWER_PORT=3111
 
-_secret_https_get() { [[ -r "$SECRET_DROP_CONF" ]] && sed -n "s/^$1=//p" "$SECRET_DROP_CONF" | tail -1; }
+# No conf file is "no value", rc 0: a self-hosted box that never set up https has
+# none, and `m=$(_secret_https_get …)` under set -e would end `status` silently
+# (DIVE-8998, report 1321).
+_secret_https_get() { [[ -r "$SECRET_DROP_CONF" ]] || return 0; sed -n "s/^$1=//p" "$SECRET_DROP_CONF" | tail -1; }
 # The front's host (an IPv4 or a name), only in a shape safe for a Caddyfile and a URL.
 _secret_https_host() {
   local h; h=$(_secret_https_get SECRET_HTTPS_HOST)

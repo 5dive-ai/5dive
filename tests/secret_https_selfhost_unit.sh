@@ -150,6 +150,15 @@ url_of() { printf '%s' "$1" | jq -r '.data.url // empty' 2>/dev/null; }
 unitf="$SECRET_HTTPS_UNIT_DIR/5dive-secret-https.service"
 seed_gate DIVE-21 SHOP_API_KEY shop
 
+# --- H0: status on a box that never set up https (no conf file at all) ----------
+# DIVE-8998, report 1321: _secret_https_get returned 1 for a missing conf, and the
+# plain `m=$(...)` assignment ended `status` under the CLI's set -e with no output.
+# Run under set -e here because the real CLI is; without it the arm cannot go red.
+fresh
+out=$( ( set -e; _secret_https status ) 2>&1); rc=$?
+t  "H0a status with no conf file exits 0 under set -e" "0" "$rc"
+t  "H0b ... and says there is no https address yet (on: false)" "false" "$(printf '%s' "$out" | jq -r .data.on 2>/dev/null)"
+
 # --- H1: the first link turns on an IP certificate by itself --------------------
 fresh; export BOX_IP=192.0.2.10 TLS_OK_HOSTS=192.0.2.10
 out=$(link DIVE-21); rc=$?; url=$(url_of "$out")
