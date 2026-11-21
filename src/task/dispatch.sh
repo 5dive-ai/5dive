@@ -445,6 +445,12 @@ cmd_task() {
   # flag. Answered before the dispatch; see the block above.
   _task_devteam "$sub"
   if _task_help_intercept "$sub" "$@"; then return 0; fi
+  # DIVE-9004: a sandboxed seat reaches the board through its own self-scoped
+  # rail (src/task/self.sh); 125 means the rail does not apply to this caller.
+  local _ts_rc=0
+  # declare -F: a split-tree harness may source this file without self.sh.
+  declare -F _team_self_try >/dev/null && { _team_self_try "$sub" "$@" || _ts_rc=$?; } || _ts_rc=125
+  [[ "$_ts_rc" == 125 ]] || return "$_ts_rc"
   case "$sub" in
     init)            cmd_task_init "$@" ;;
     add|new)         cmd_task_add "$@" ;;

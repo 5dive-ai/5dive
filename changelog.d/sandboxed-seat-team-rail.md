@@ -1,0 +1,3 @@
+## Unreleased — fix(agents): a sandboxed agent can now do its own tasks and message its team
+
+A sandboxed agent sits outside the box's shared group on purpose, so it could not read the task board or send a message: the heartbeat handed it rows it could neither open nor close. It now gets one narrow root rail. Through it the agent reads the board, starts, closes, delivers and gates the rows assigned to it, files new rows as itself, and messages teammates. It still cannot touch other agents' rows, other seats' files, or the box's keys. Existing sandboxed agents get the rail on their next update.
