@@ -289,7 +289,7 @@ _bug_replies_drop() {
 # _bug_replies_poll <ledger> <now> — rc 1 when the API could not be asked
 # (network, 429, 5xx): stop for now, the rest is asked on the retry.
 _bug_replies_poll() {
-  local f="$1" now="$2" id tok at notice kind text rc=0
+  local f="$1" now="$2" id tok at notice notices kind text rc=0
   local -a drop=()
   while IFS=$'\t' read -r id tok at _; do
     [[ "$id" =~ ^[0-9]{1,12}$ && "$tok" =~ ^[0-9a-f]{64}$ && "$at" =~ ^[0-9]{1,12}$ ]] || continue
@@ -300,6 +300,7 @@ _bug_replies_poll() {
       404) _bug_replies_log "report ${id}: 5dive does not know this reply token — dropped"; drop+=("$id"); continue ;;
       *) _bug_replies_log "could not ask 5dive (HTTP ${_BUG_HTTP}) — retried in ${_BUG_REPLIES_RETRY_SEC}s"; rc=1; break ;;
     esac
+    notices=$(jq -c '.notices[]?' <<<"$_BUG_REPLY_BODY" 2>/dev/null) || notices=""
     while IFS= read -r notice; do
       [[ -n "$notice" ]] || continue
       kind=$(jq -r '.kind // empty' <<<"$notice" 2>/dev/null) || kind=""
@@ -307,7 +308,7 @@ _bug_replies_poll() {
       [[ -n "$text" ]] || continue
       _bug_replies_send "$id" "$text" || _bug_replies_keep "$id" "$text"
       [[ "$kind" == "fixed" ]] && drop+=("$id")
-    done < <(jq -c '.notices[]?' <<<"$_BUG_REPLY_BODY" 2>/dev/null)
+    done <<<"$notices"
   done < "$f"
   _bug_replies_drop "$f" "${drop[@]}"
   return "$rc"
@@ -317,20 +318,21 @@ _bug_replies_poll() {
 # every tick; the API is asked once per _BUG_REPLIES_EVERY_SEC, or again after
 # _BUG_REPLIES_RETRY_SEC when it could not be reached.
 _bug_replies_sweep() {
-  local now="${1:-$(date +%s)}" stamp last f
+  local now="${1:-$(date +%s)}" stamp last f ledgers
   [[ "${FIVE_BUG_REPLIES:-1}" != "0" ]] || return 0
   _bug_replies_flush_pending
   stamp="${STATE_DIR:-/var/lib/5dive}/bug-replies.last"
   last=$(cat "$stamp" 2>/dev/null || echo 0); [[ "$last" =~ ^[0-9]+$ ]] || last=0
   (( now - last >= _BUG_REPLIES_EVERY_SEC )) || return 0
   printf '%s\n' "$now" > "$stamp" 2>/dev/null || return 0
+  ledgers=$(_bug_replies_ledgers)
   while IFS= read -r f; do
     [[ -f "$f" && ! -L "$f" ]] || continue
     if ! _bug_replies_poll "$f" "$now"; then
       printf '%s\n' "$(( now - _BUG_REPLIES_EVERY_SEC + _BUG_REPLIES_RETRY_SEC ))" > "$stamp" 2>/dev/null || true
       break
     fi
-  done < <(_bug_replies_ledgers)
+  done <<<"$ledgers"
   return 0
 }
 
