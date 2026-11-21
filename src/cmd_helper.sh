@@ -1,67 +1,58 @@
-# -------- 5dive helper (DIVE-8819) --------
+# -------- 5dive helper (DIVE-8819, DIVE-8946) --------
 #
-# Every paid 5dive server gets one "5dive" helper seat, role "Help & setup". It
-# says hi once, answers how-to questions in two lines and suggests hires. It is
-# not a hire: the registry marks it `system: "helper"`, `agent list --json`
-# reports that field, and the plan's agent count (5dive-api plan-agent-cap) and
-# My team skip any seat that carries it.
+# DIVE-8946 (lodar 2026-11-21: «I mean they need to ask their own bot?»): a box
+# no longer gets a "5dive" helper seat. The owner of a server asks their own
+# agents, who can do the work (the helper could only point at support), and the
+# app shows Help & setup only to an account with no server. So:
 #
-#   5dive helper ensure      root: build the seat if this box should have one (idempotent)
-#   5dive helper status      eligible / seat / built / welcomed, for a person or --json
-#   (heartbeat tick)         _helper_tick: build it once, then welcome the owner once
+#   - NO NEW SEAT. Nothing builds one: not the tick, not `helper ensure`.
+#   - THE HANDOVER GOES TO THE FIRST HIRE. What the owner told the hosted helper
+#     before paying (GET /helper/handover: the business, 1-2 suggested hires) is
+#     given to the first agent they hired on the box, once, so nobody asks them
+#     what their business does again: a marked block in that agent's
+#     instructions file (every later session reads it) and one system notice
+#     (the session already running gets it now).
+#   - SEATS ALREADY BUILT (0.138.0-0.140.x) ARE LEFT AS THEY ARE: their persona
+#     refresh and their one welcome still run below. Retiring them is a
+#     separate decision.
+#
+#   5dive helper ensure      root: no longer builds; reports the seat's state
+#   5dive helper status      eligible / seat / built / welcomed / handover, for a person or --json
+#   (heartbeat tick)         _helper_tick: hand over once (no seat), or welcome once (a built seat)
 #
 # WHICH BOXES. A box that holds the demo AI account (demo-ai): the account a
-# paid my.5dive server is built with (5dive-api fivedive-box-key.ts). Self-hosted
-# and partner boxes have none, so they never get a helper. The seat runs on that
-# account and is its only user: an agent cannot build an agent on it (DIVE-6843),
-# and the helper is a standard seat, so it has no sudo to try with.
+# paid my.5dive server is built with (5dive-api fivedive-box-key.ts), the paid
+# path that writes the handover (provisionPaidBox). Self-hosted and partner
+# boxes have none and read nothing.
 #
-# WHEN. The heartbeat tick (root, every 5 minutes on every managed box) calls
-# _helper_tick, which is one stat once the greeting is out. A new server gets the
-# seat within a tick of its demo account landing; an existing one within a tick
-# of the nightly update that brings this CLI. The build runs detached in a
-# transient unit with a fixed name, so a slow create never holds the tick, and
-# two ticks cannot build it twice (systemd refuses a second unit of that name).
+# THE HANDOVER waits for the first hire (an unclaimed spare has none), then
+# reads GET /helper/handover with the box token. 200 = give it to that agent.
+# 404 = the owner told the helper nothing: done. Anything else is retried next
+# tick, at most HELPER_HANDOVER_TRIES times. A first hire older than
+# HELPER_HANDOVER_MAX_AGE (an old box whose seat build never finished) gets
+# nothing: days into the chat, a "what they told 5dive" note is stale.
+# <state>/helper/handed-over records it, so it happens once.
 #
-# ONCE. <state>/helper/built is written when the seat is built: if the owner
-# removes the seat, it is not built again. <state>/helper/welcomed is claimed
-# (noclobber) BEFORE the welcome is posted and dropped again only if the post
-# fails, so a restart, a second tick or an update never welcomes twice.
-#
-# THE WELCOME waits for an owner: the seat is running and the box has at least
-# one hire (an unclaimed spare has none). It reads GET /helper/handover with the
-# box token. 200 = the owner already said what the business does: name it and
-# suggest 1-2 hires. 404 = ask the one question. Anything else is retried next
-# tick, at most HELPER_HANDOVER_TRIES times, then it asks.
-#
-# DIVE-8850: the BOX posts the welcome, as the helper, into the owner's app chat
-# (POST /server/messages/event, the route the seat's own replies take). 0.138.0
-# handed the seat a notice and let the model choose to reply: on one box in
-# three it answered in its own terminal and the owner never saw it. The text is
-# fixed here, so no model sits between the tick and the owner's app. A sealed
-# chat (the owner already paired a device) gets it sealed by root, as the
-# helper. One reply_key, so a post the API stored but whose answer was lost is
-# not stored twice on the retry.
-#
-# 0.138.0 BOXES left <state>/helper/greeted (the notice went in, the reply may
-# not have) and no `welcomed`, so the tick runs again there. Any box is welcomed
-# unless the seat's own transcript shows it already called the app's reply tool
-# (it answered that notice, or the owner wrote to it first): that is the one
-# record on the box of a message it got out.
+# A BUILT SEAT's welcome (DIVE-8819/8850): it waits for an owner (the seat is
+# running and the box has a hire), reads the same handover, and the BOX posts
+# the fixed welcome into the owner's app chat as the helper (POST
+# /server/messages/event); a sealed chat gets it sealed by root. One reply_key,
+# so a post stored but whose answer was lost is not stored twice. A 0.138.0
+# seat whose transcript shows it already called the app's reply tool is not
+# welcomed again.
 
 HELPER_AGENT="${HELPER_AGENT:-helper}"
 HELPER_ACCOUNT="demo-ai"            # = CREATE_DEMO_AI_ACCOUNT (cmd_agent_create.sh)
 HELPER_SYSTEM="helper"              # the registry/list marker every count skips
-HELPER_UNIT="5dive-helper-ensure"
 HELPER_HANDOVER_TRIES="${HELPER_HANDOVER_TRIES:-12}"
-HELPER_BUILD_TRIES="${HELPER_BUILD_TRIES:-6}"   # a build that keeps failing stops after this many ticks
+HELPER_HANDOVER_MAX_AGE="${HELPER_HANDOVER_MAX_AGE:-172800}"   # 2 days: a first hire older than this gets no handover
 HELPER_REPLY_TOOL="mcp__plugin_dashboard_dashboard__reply"   # the seat's app reply (dashboard@5dive-plugins)
 HELPER_REPLY_KEY="helper-welcome"   # /server/messages/event dedupes a retry on it (DIVE-7713)
 
 _helper_dir()  { printf '%s/helper' "${HELPER_STATE_DIR:-$STATE_DIR}"; }
 _helper_self() { printf '%s' "${FIVEDIVE_SELF_BIN:-/usr/local/bin/5dive}"; }
 
-# The box should have a helper: it holds the demo AI account.
+# A paid 5dive box: it holds the demo AI account (and so has a handover to read).
 _helper_box_eligible() {
   [[ -n "${AUTH_PROFILES_DIR:-}" && -s "${AUTH_PROFILES_DIR}/${HELPER_ACCOUNT}/combined.env" ]]
 }
@@ -284,6 +275,93 @@ _helper_greet() {
   printf 'welcomed the owner in the app (%s)\n' "$([[ -n "$business" ]] && echo 'from the handover' || echo 'asked the question')"
 }
 
+# <reg> -> "<name>\t<type>\t<createdAt>" of the first agent the owner hired, or nothing.
+_helper_first_hire() {
+  jq -r '[.agents // {} | to_entries[] | select((.value.system // "") == "" and .key != "sysadmin")]
+         | sort_by(.value.createdAt // "") | .[0] // empty
+         | [.key, (.value.type // "claude"), (.value.createdAt // "")] | @tsv' <<<"$1" 2>/dev/null
+}
+
+HELPER_LEAD_BEGIN="<!-- 5dive: what your owner told 5dive before buying -->"
+HELPER_LEAD_END="<!-- end of what your owner told 5dive -->"
+
+# <business> <suggested> -> the block for the first hire's instructions file.
+_helper_lead_block() {
+  local business="${1//[<>]/}" suggested="$2" a b hire=""
+  IFS=', ' read -r a b <<<"$suggested"
+  [[ -n "$a" ]] && hire="$(_helper_cap "$a")${b:+ and $(_helper_cap "$b")}"
+  printf '%s\n' "$HELPER_LEAD_BEGIN" \
+    "## What your owner told 5dive before buying" "" \
+    "Before they bought this server, your owner told 5dive about their business: ${business}"
+  [[ -n "$hire" ]] && printf '%s\n' "5dive suggested they hire ${hire}."
+  printf '%s\n' "You know this already: never ask them what their business does. Use it when you plan work for them." \
+    "$HELPER_LEAD_END"
+}
+
+# <business> <suggested> -> the one notice the first hire's running session gets.
+_helper_lead_notice() {
+  local a b hire=""
+  IFS=', ' read -r a b <<<"$2"
+  [[ -n "$a" ]] && hire=" 5dive suggested they hire $(_helper_cap "$a")${b:+ and $(_helper_cap "$b")}."
+  printf '%s' "5dive: before buying, your owner told 5dive about their business: ${1//[<>]/}.${hire} It is in your instructions now. Never ask them again what their business does. No reply needed."
+}
+
+# <file> <block> -> the block appended once (a file that already holds it is left alone).
+_helper_lead_write() {
+  local md="$1" block="$2" user="$3" new=0
+  [[ -e "$md" ]] || new=1
+  if [[ -f "$md" ]] && grep -qF "$HELPER_LEAD_BEGIN" "$md" 2>/dev/null; then return 0; fi
+  mkdir -p "$(dirname "$md")" 2>/dev/null || return 1
+  { [[ -s "$md" ]] && printf '\n'; printf '%s\n' "$block"; } >>"$md" 2>/dev/null || return 1
+  (( new )) && chown "$user:$user" "$md" 2>/dev/null
+  return 0
+}
+
+# DIVE-8946: what the owner told the hosted helper goes to their first hire,
+# once. Prints one line when it did something.
+_helper_handover_to_lead() {
+  local d reg first lead type created age h="" rc=0 business="" suggested="" md tries=0
+  d=$(_helper_dir); reg="$1"
+  first=$(_helper_first_hire "$reg")
+  [[ -n "$first" ]] || return 0                     # no hire yet (an unclaimed spare)
+  IFS=$'\t' read -r lead type created <<<"$first"
+  if [[ -n "$created" ]] && created=$(date -d "$created" +%s 2>/dev/null); then
+    age=$(( $(date +%s) - created ))
+    if (( age > HELPER_HANDOVER_MAX_AGE )); then
+      printf '%s skipped: %s was hired %ss ago\n' "$(date -u +%FT%TZ)" "$lead" "$age" >"$d/handed-over"
+      return 0
+    fi
+  fi
+  h=$(_helper_handover) || rc=$?
+  if (( rc == 3 )); then
+    printf '%s nothing: the owner told 5dive nothing\n' "$(date -u +%FT%TZ)" >"$d/handed-over"
+    rm -f "$d/handover-tries"; return 0
+  fi
+  if (( rc != 0 )); then
+    read -r tries 2>/dev/null <"$d/handover-tries" || tries=0
+    [[ "$tries" =~ ^[0-9]+$ ]] || tries=0
+    tries=$((tries + 1)); printf '%s\n' "$tries" >"$d/handover-tries"
+    (( tries < HELPER_HANDOVER_TRIES )) && return 1
+    printf '%s gave up: the API did not answer %s times\n' "$(date -u +%FT%TZ)" "$tries" >"$d/handed-over"
+    rm -f "$d/handover-tries"; return 0
+  fi
+  IFS=$'\t' read -r business suggested <<<"$h"
+  if [[ -z "$business" ]]; then
+    printf '%s nothing: an empty handover\n' "$(date -u +%FT%TZ)" >"$d/handed-over"; return 0
+  fi
+  lazy_need persona_target
+  md=$(persona_target "$lead" "$type" 2>/dev/null) || md=""
+  # No instructions file for that agent type: the notice alone carries it.
+  if [[ -n "$md" ]] && ! _helper_lead_write "$md" "$(_helper_lead_block "$business" "$suggested")" "agent-${lead}"; then
+    return 1                                         # retried next tick
+  fi
+  "$(_helper_self)" agent _deliver --system-notice "$lead" "$(_helper_lead_notice "$business" "$suggested")" \
+    </dev/null >/dev/null 2>&1 || true
+  printf '%s to %s\n' "$(date -u +%FT%TZ)" "$lead" >"$d/handed-over"
+  rm -f "$d/handover-tries"
+  printf 'gave the handover to the first hire %s\n' "$lead"
+}
+
 # The heartbeat's step. Prints one line when it did something, nothing otherwise.
 _helper_tick() {
   local d reg seat
@@ -291,98 +369,50 @@ _helper_tick() {
   # DIVE-8898: a seat built with older how-to lines gets the new ones (one read
   # per tick once it is current; a box with no helper never gets past the stat).
   _helper_persona_stale "$d" && _helper_persona_refresh "$d" "${1:-}"
-  [[ -e "$d/welcomed" ]] && return 0
+  [[ -e "$d/welcomed" || -e "$d/handed-over" ]] && return 0
   _helper_box_eligible || return 0
   mkdir -p "$d" 2>/dev/null || return 1
   reg="${1:-$(registry_read 2>/dev/null)}"
-  seat=$(_helper_seat "$reg")
-  case "$seat" in
-    taken) return 0 ;;
-    none) [[ -e "$d/built" ]] && return 0 ;;   # built once and the owner removed it
-  esac
-  # No seat yet, or a seat whose build stopped half way (marked, no persona):
-  # `helper ensure` creates what is missing and finishes the rest.
+  # DIVE-8946: no seat is built any more. A box without a built one gives the
+  # handover to the first hire instead.
   if [[ ! -e "$d/built" ]]; then
-    _helper_build_spent && return 0
-    if systemd-run --unit="$HELPER_UNIT" --collect --quiet \
-         "$(_helper_self)" helper ensure >/dev/null 2>&1; then
-      printf 'building the helper seat (unit %s)\n' "$HELPER_UNIT"
-    fi
+    _helper_handover_to_lead "$reg"
     return 0
   fi
+  seat=$(_helper_seat "$reg")
+  [[ "$seat" == mine ]] || return 0                  # removed, or an owner's own agent named helper
   (( $(_helper_hires "$reg") > 0 )) || return 0
   _helper_running || return 0
   _helper_greet
 }
 
-# <state>/helper/build-tries: one per attempt, so a box where the create keeps
-# failing stops trying after HELPER_BUILD_TRIES ticks instead of every 5 minutes.
-_helper_build_spent() {
-  local n=0
-  read -r n 2>/dev/null <"$(_helper_dir)/build-tries" || n=0
-  [[ "$n" =~ ^[0-9]+$ ]] || n=0
-  (( n >= HELPER_BUILD_TRIES ))
-}
-
-# <seat> = none | mine. The system mark goes on right after the create, so a
-# build that stops later (persona, restart) still leaves a seat that is not a
-# hire and reads `mine`; the next tick finishes it (no `built` yet).
-_helper_build() {
-  local seat="$1" d f self
-  d=$(_helper_dir); self=$(_helper_self)
-  local n=0; read -r n 2>/dev/null <"$d/build-tries" || n=0; [[ "$n" =~ ^[0-9]+$ ]] || n=0
-  printf '%s\n' $((n + 1)) >"$d/build-tries"
-  if [[ "$seat" == none ]]; then
-    "$self" agent create "$HELPER_AGENT" --type=claude --auth-profile="$HELPER_ACCOUNT" \
-        --channels=dashboard --isolation=standard --no-heartbeat --no-team-bot \
-        --autonomy=standard </dev/null >&2 \
-      || return 1
-  fi
-  with_registry_lock _helper_mark || return 1
-  lazy_need persona_install_doc
-  f=$(mktemp) || return 1
-  _helper_persona >"$f"
-  persona_install_doc "$HELPER_AGENT" claude "$f" >&2 || { rm -f "$f"; return 1; }
-  rm -f "$f"
-  printf '%s\n' "$HELPER_PERSONA_REV" >"$d/persona-rev"
-  date -u +%FT%TZ >"$d/built"
-  "$self" agent restart "$HELPER_AGENT" </dev/null >/dev/null 2>&1 || true
-}
-
-_helper_mark() {
-  local reg
-  reg=$(registry_read) || return 1
-  jq --arg n "$HELPER_AGENT" --arg s "$HELPER_SYSTEM" \
-     '.agents[$n] += {system: $s, displayName: "5dive", role: "Help & setup"}' <<<"$reg" | registry_write
-}
-
+# DIVE-8946: no longer builds a seat. Kept as a verb so a caller that runs it
+# (an old script, a person) reads why instead of a usage error.
 cmd_helper_ensure() {
   require_root "helper ensure"
   local d reg seat
-  d=$(_helper_dir); mkdir -p "$d"
-  _helper_box_eligible || { ok "no helper: this box has no demo AI account" '{state:"not-eligible"}'; return 0; }
-  reg=$(registry_read)
+  d=$(_helper_dir)
+  reg=$(registry_read 2>/dev/null) || reg='{}'
   seat=$(_helper_seat "$reg")
-  case "$seat" in
-    mine)  [[ -e "$d/built" ]] && { ok "the helper seat is here" '{state:"present"}'; return 0; } ;;
-    taken) ok "no helper: an agent of yours is already named ${HELPER_AGENT}" '{state:"name-taken"}'; return 0 ;;
-    none)  [[ -e "$d/built" ]] && { ok "no helper: it was removed, so it stays removed" '{state:"removed"}'; return 0; } ;;
-  esac
-  _helper_build "$seat" || fail "$E_GENERIC" "could not build the helper seat (re-run: sudo 5dive helper ensure)"
-  ok "built the helper seat '${HELPER_AGENT}' (5dive, Help & setup)" '{state:"built"}'
+  if [[ "$seat" == mine ]]; then
+    ok "the helper seat is here (built before DIVE-8946; new boxes get none)" '{state:"present"}'
+  else
+    ok "no helper seat: new boxes get none, owners ask their own agents (DIVE-8946)" '{state:"not-built"}'
+  fi
 }
 
 cmd_helper_status() {
-  local d reg seat eligible=false built=false greeted=false
+  local d reg seat eligible=false built=false greeted=false handover=pending
   d=$(_helper_dir)
   _helper_box_eligible && eligible=true
   [[ -e "$d/built" ]] && built=true
   [[ -e "$d/welcomed" ]] && greeted=true
+  [[ -e "$d/handed-over" ]] && handover="done"
   reg=$(registry_read 2>/dev/null) || reg='{}'
   seat=$(_helper_seat "$reg")
-  ok "helper: eligible=$eligible seat=$seat built=$built greeted=$greeted" \
-     '{eligible:$e, seat:$s, built:$b, greeted:$g, agent:$n}' \
-     --argjson e "$eligible" --arg s "$seat" --argjson b "$built" --argjson g "$greeted" --arg n "$HELPER_AGENT"
+  ok "helper: eligible=$eligible seat=$seat built=$built greeted=$greeted handover=$handover" \
+     '{eligible:$e, seat:$s, built:$b, greeted:$g, handover:$h, agent:$n}' \
+     --argjson e "$eligible" --arg s "$seat" --argjson b "$built" --argjson g "$greeted" --arg h "$handover" --arg n "$HELPER_AGENT"
 }
 
 cmd_helper() {
@@ -394,10 +424,11 @@ cmd_helper() {
       cat <<'EOF'
 usage: 5dive helper ensure|status [--json]
 
-The "5dive" Help & setup seat on a paid 5dive server. It is not a hire.
+The "5dive" Help & setup seat. New boxes get none (DIVE-8946): the owner asks
+their own agents, and what they told 5dive before buying goes to their first hire.
 
-  5dive helper status   is this box eligible, is the seat here, built, welcomed
-  5dive helper ensure   root: build the seat if this box should have one
+  5dive helper status   is the seat here, built, welcomed; is the handover done
+  5dive helper ensure   root: reports the seat (it no longer builds one)
 EOF
       ;;
     *) fail "$E_USAGE" "usage: 5dive helper ensure|status [--json]" ;;
