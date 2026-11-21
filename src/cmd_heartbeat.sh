@@ -8610,7 +8610,7 @@ _hb_stall_sweep() {
                  AND COALESCE(first_started_at,created_at) <= datetime('now','-${_HB_STRANDED_HOURS} hours');")
 
   # (b) GAP#3 core — fleet-idle-while-actionable-work-is-open, persisting.
-  local in_prog running_loops stranded_todo open_gates parked_gates total_stranded
+  local in_prog running_loops stranded_todo open_gates parked_gates parked_todo total_stranded
   in_prog=$(db "SELECT COUNT(*) FROM tasks WHERE status='in_progress' AND kind='standard';" 2>/dev/null || echo 0)
   running_loops=$(db "SELECT COUNT(*) FROM loop_runs WHERE status='running';" 2>/dev/null || echo 0)
   [[ "$in_prog" =~ ^[0-9]+$ ]] || in_prog=0
@@ -8641,13 +8641,30 @@ _hb_stall_sweep() {
     #     DIVE-2122 own those shapes.)
     # The rule, if you add an aggregate here: name it after its predicate, not after
     # the concept the predicate approximates.
-    stranded_todo=$(db "SELECT COUNT(*) FROM tasks
-                        WHERE status='todo' AND kind='standard'
+    # DIVE-8965: a todo row assigned to a PERSON (an id in `humans`) is not
+    # stranded-actionable — the heartbeat never dispatches it and no seat can
+    # start it, so counting it paged the lead every ~25 min until the person
+    # acted (teal-fox, 2026-11-21: 32 alarms in ~15.5 h on one row). It moves to
+    # the parked-on-the-human context count instead (parked_todo below). Only a
+    # KNOWN person is excluded: an assignee that is neither seat nor human (a
+    # deleted seat, a sentinel) is genuinely stranded and keeps alarming.
+    # NOT EXISTS, not NOT IN: humans.id is a TEXT PRIMARY KEY, which SQLite lets
+    # be NULL, and one NULL id turns `NOT IN` into NULL for every row — the
+    # alarm would go silent fleet-wide.
+    local _todo_base="status='todo' AND kind='standard'
                           AND assignee IS NOT NULL AND assignee != ''
                           AND NOT (verifier IS NOT NULL AND maker_agent IS NOT NULL
                                    AND assignee=verifier
                                    AND handoff_delivered_at IS NOT NULL
-                                   AND handoff_ack_at IS NULL);" 2>/dev/null || echo 0)
+                                   AND handoff_ack_at IS NULL)"
+    local _to_human="EXISTS (SELECT 1 FROM humans h WHERE h.id = tasks.assignee)"
+    # Fails OPEN: if the humans-aware read errors, fall back to the pre-DIVE-8965
+    # count (over-alarm) rather than reading 0 (a silent alarm).
+    stranded_todo=$(db "SELECT COUNT(*) FROM tasks
+                        WHERE ${_todo_base} AND NOT ${_to_human};" 2>/dev/null) \
+      || stranded_todo=$(db "SELECT COUNT(*) FROM tasks WHERE ${_todo_base};" 2>/dev/null || echo 0)
+    parked_todo=$(db "SELECT COUNT(*) FROM tasks
+                      WHERE ${_todo_base} AND ${_to_human};" 2>/dev/null || echo 0)
     # A gate is STRANDED-actionable (counts toward the alarm) only when it's
     # fleet-actionable (tier<=1, an agent can clear it) OR it has never been
     # surfaced to the human at all (need_asked_at AND gate_pinged_at both
@@ -8682,6 +8699,8 @@ _hb_stall_sweep() {
     [[ "$stranded_todo" =~ ^[0-9]+$ ]] || stranded_todo=0
     [[ "$open_gates"    =~ ^[0-9]+$ ]] || open_gates=0
     [[ "$parked_gates"  =~ ^[0-9]+$ ]] || parked_gates=0
+    [[ "$parked_todo"   =~ ^[0-9]+$ ]] || parked_todo=0
+    # parked_todo, like parked_gates, is context only — never alarm input.
     total_stranded=$(( stranded_todo + open_gates ))
   fi
 
@@ -8759,7 +8778,7 @@ _hb_stall_sweep() {
             _tail="The session probe could not measure every agent, so this is a QUESTION, not a finding — is the fleet actually stalled? Check \`5dive task ls\` / \`5dive task inbox\`"
           fi
           _hb_escalate "stall-sweep" "task-engine" "fleet-stall" \
-              "${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} assigned-but-unstarted, ${open_gates} fleet-actionable gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops, ${parked_gates} parked on the human (context, not counted) — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244, labels DIVE-2207)." \
+              "${_hdr}: ${total_stranded} stranded actionable item(s) (${stranded_todo} assigned-but-unstarted, ${open_gates} fleet-actionable gate(s)) idle $((since_secs / 60))m+ with 0 in_progress and 0 running loops, $(( parked_gates + parked_todo )) parked on the human (${parked_gates} gate(s), ${parked_todo} todo row(s) assigned to a person; context, not counted) — and ${_act_detail}. ${_tail} (DIVE-1416 gap#3, session probe DIVE-2122, claim/probe honesty DIVE-2244, labels DIVE-2207)." \
         "$(_hb_ops_recipient)" || _esc_rc=$?
           # DIVE-7684: stamp the throttle only on a delivery. A failed send left
           # stall_alerted_at stamped, so the alarm went quiet for a window while

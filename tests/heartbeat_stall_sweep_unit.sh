@@ -503,6 +503,72 @@ for _ty in secret manual access; do
     || bad_t "B12 tier-1 ${_ty} still counted" "$_alert"
 done
 
+# --- B17..B21 DIVE-8965: a todo row assigned to a PERSON (an id in `humans`) is
+#     not stranded-actionable — no seat can start it, and counting it paged the
+#     teal-fox lead 32x in ~15.5 h on one row. It is context in the parked term.
+#     An assignee that is neither seat nor human must STILL alarm. todo_alert runs
+#     the sweep past the persistence window and prints the alert line ("" = none).
+db "INSERT OR IGNORE INTO humans (id, display_name, role) VALUES ('person1','Person One','owner');"
+todo_alert() {  # $@ assignees, one todo row each
+  reset_all
+  local a
+  for a in "$@"; do addt --assignee="$a" -- "todo for $a" >/dev/null; done
+  db "INSERT INTO task_prefs (key,value) VALUES ('stall_first_seen_at', datetime('now','-${_HB_STALL_MIN_MINUTES} minutes','-1 minutes'));"
+  : >"$SEND_LOG"; : >"$DIGEST_SPOOL"
+  _hb_stall_sweep >/dev/null 2>&1
+  grep $'^ops\t' "$SEND_LOG" | grep 'fleet-stall' | head -1
+}
+
+# --- B17: THE REPORTED ROW. One todo assigned to a person, nothing else -> silent.
+_alert=$(todo_alert person1)
+[[ -n "$(db "SELECT 1 FROM tasks WHERE assignee='person1' AND status='todo';")" ]] \
+  && ok_t "B17 fixture live: the person-assigned todo row exists" \
+  || bad_t "B17 fixture row missing — the arm below would pass vacuously" ""
+[[ -z "$_alert" ]] \
+  && ok_t "B17 a todo row assigned to a person alone does NOT raise the stall alert" \
+  || bad_t "B17 person-assigned todo still counted as assigned-but-unstarted" "$_alert"
+[[ -z "$(db "SELECT value FROM task_prefs WHERE key='stall_first_seen_at';")" ]] \
+  && ok_t "B17 ...and the stall clock is cleared, not left running on it" \
+  || bad_t "B17 stall clock still set" ""
+
+# --- B18: the person's row is rendered in the PARKED term. One seat todo makes the
+#     alert fire; the person's row must land in parked, not in the 1 that alarms.
+_alert=$(todo_alert person1 ops)
+[[ "$_alert" == *"1 stranded actionable item(s) (1 assigned-but-unstarted, 0 fleet-actionable gate(s))"* \
+   && "$_alert" == *"1 parked on the human (0 gate(s), 1 todo row(s) assigned to a person"* ]] \
+  && ok_t "B18 the person-assigned todo is counted as parked (1), not as assigned-but-unstarted" \
+  || bad_t "B18 wrong split for a person-assigned todo" "${_alert:-<no alert>}"
+
+# --- B19: negative control — the same row assigned to a SEAT (on the chart, not in
+#     humans) alarms exactly as before.
+_alert=$(todo_alert ops)
+[[ "$_alert" == *"1 stranded actionable item(s) (1 assigned-but-unstarted, 0 fleet-actionable gate(s))"* \
+   && "$_alert" == *"0 parked on the human"* ]] \
+  && ok_t "B19 a todo assigned to a seat still alarms (1 assigned-but-unstarted)" \
+  || bad_t "B19 seat-assigned todo dropped from stranded_todo" "${_alert:-<no alert>}"
+
+# --- B20: second negative — an assignee in NEITHER table (deleted seat, sentinel)
+#     is genuinely stranded and keeps alarming.
+_alert=$(todo_alert ghost-seat)
+[[ "$_alert" == *"1 stranded actionable item(s) (1 assigned-but-unstarted, 0 fleet-actionable gate(s))"* \
+   && "$_alert" == *"0 parked on the human"* ]] \
+  && ok_t "B20 a todo assigned to an id that is neither seat nor human still alarms" \
+  || bad_t "B20 unknown-assignee todo dropped from stranded_todo" "${_alert:-<no alert>}"
+
+# --- B21: a NULL humans.id (TEXT PRIMARY KEY allows it in SQLite) must not silence
+#     the alarm. This is what an `assignee NOT IN (SELECT id FROM humans)` predicate
+#     gets wrong: one NULL makes NOT IN unknown for every row.
+db "INSERT INTO humans (id, display_name) VALUES (NULL, 'null-id person');"
+if [[ -n "$(db "SELECT 1 FROM humans WHERE id IS NULL;")" ]]; then
+  _alert=$(todo_alert ghost-seat)
+  [[ "$_alert" == *"(1 assigned-but-unstarted, 0 fleet-actionable gate(s))"* ]] \
+    && ok_t "B21 a NULL id in humans does not silence the alarm for a non-human assignee" \
+    || bad_t "B21 NULL humans.id silenced stranded_todo" "${_alert:-<no alert>}"
+else
+  bad_t "B21 fixture: could not insert a NULL humans.id — the arm would be vacuous" ""
+fi
+db "DELETE FROM humans WHERE id IS NULL;"
+
 # =============================================================================
 # (c) gap#3 canary — pinger liveness
 # =============================================================================
