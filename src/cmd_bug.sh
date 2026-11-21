@@ -105,10 +105,13 @@ _bug_spool() {
 # which still cannot read the key. _BUG_KEYLESS says why the open route was
 # taken: 1 no key file, 2 a key file this seat cannot read. The payload's
 # install_method still tells triage it came from one of our boxes.
-_BUG_HTTP=""; _BUG_ID=""; _BUG_KEYLESS=0
+#
+# DIVE-9000: the open route's 201 also carries a reply token (_BUG_TOKEN); see
+# _bug_replies_save below for what is done with it.
+_BUG_HTTP=""; _BUG_ID=""; _BUG_KEYLESS=0; _BUG_TOKEN=""
 _bug_post() {
   local payload="$1" tok="" trc=0 out="" url auth
-  _BUG_HTTP=""; _BUG_ID=""; _BUG_KEYLESS=0
+  _BUG_HTTP=""; _BUG_ID=""; _BUG_KEYLESS=0; _BUG_TOKEN=""
   tok=$(_partner_box_token) || trc=$?
   if (( trc == 0 )); then
     url="$(_partner_api_base)/server/bug-reports"
@@ -129,6 +132,7 @@ _bug_post() {
   _BUG_HTTP="${out##*$'\n'}"
   [[ "$_BUG_HTTP" =~ ^[0-9]{3}$ ]] || _BUG_HTTP="000"
   _BUG_ID=$(jq -r '.id // empty' <<<"${out%$'\n'*}" 2>/dev/null) || _BUG_ID=""
+  _BUG_TOKEN=$(jq -r '.reply_token // empty' <<<"${out%$'\n'*}" 2>/dev/null) || _BUG_TOKEN=""
   case "$_BUG_HTTP" in
     2??) return 0 ;;
     404|408|429) return 1 ;;
@@ -155,12 +159,179 @@ _bug_drain() {
     if [[ -z "$p" ]]; then mv -f "$f" "$f.refused" 2>/dev/null || true; continue; fi
     rc=0; _bug_post "$p" || rc=$?
     case "$rc" in
-      0) rm -f "$f"; sent=$((sent + 1)) ;;
+      0) rm -f "$f"; sent=$((sent + 1)); _bug_replies_save "$_BUG_ID" "$_BUG_TOKEN" ;;
       2) mv -f "$f" "$f.refused" 2>/dev/null || true ;;
       *) break ;;
     esac
   done
   printf '%s' "$sent"
+}
+
+# ── DIVE-9000: a self-installed box hears back ────────────────────────────────
+# A report that went keyless (no box key, or one this seat cannot read) has no
+# owner on our side, so 5dive cannot message anyone about it. The API answers
+# such a report with a random reply token beside its id and keeps only its hash.
+# The seat that filed it keeps {id, token, filed-at} in its own 0600 ledger, and
+# the box PULLS: once a day the heartbeat tick (root, every box, installed by
+# install.sh) asks GET /bug-reports/<id>/replies for each open entry and hands
+# any answer to the box's lead agent, which tells its owner. Nothing is pushed
+# to the box and no contact data leaves it. An entry is dropped after its
+# "fixed" notice, after 30 days, or when the API says it does not know it (404).
+_bug_replies_ledger() { printf '%s/bug-replies.tsv' "$(_bug_state_dir)"; }
+
+# _bug_replies_save <id> <token> — best-effort: a ledger that cannot be written
+# loses the reply, never the report that was just sent.
+_bug_replies_save() {
+  local id="${1:-}" tok="${2:-}" f
+  [[ "$id" =~ ^[0-9]{1,12}$ && "$tok" =~ ^[0-9a-f]{64}$ ]] || return 0
+  f=$(_bug_replies_ledger)
+  mkdir -p "${f%/*}" 2>/dev/null || return 0
+  ( umask 077; printf '%s\t%s\t%s\n' "$id" "$tok" "$(date +%s)" >> "$f" ) 2>/dev/null || return 0
+  chmod 600 "$f" 2>/dev/null || true
+}
+
+_BUG_REPLIES_EVERY_SEC="${FIVE_BUG_REPLIES_EVERY_SEC:-86400}"
+_BUG_REPLIES_RETRY_SEC="${FIVE_BUG_REPLIES_RETRY_SEC:-3600}"
+_BUG_REPLIES_MAX_AGE_SEC="${FIVE_BUG_REPLIES_MAX_AGE_SEC:-2592000}"   # 30 days
+_BUG_REPLIES_SENDER="5dive-support"
+
+# Every seat's ledger on the box, one path per line. Seats run as their own
+# users, so each keeps its own; root reads them all.
+_bug_replies_ledgers() {
+  local h
+  # shellcheck disable=SC2086 # a list of homes, globbed on purpose
+  for h in ${FIVE_BUG_REPLIES_HOMES:-/root /home/*}; do
+    [[ -d "$h" ]] && printf '%s/.local/state/5dive/bug-replies.tsv\n' "$h"
+  done
+  return 0
+}
+
+_bug_replies_log() {
+  if declare -F _hb_log >/dev/null; then _hb_log "[bug-replies] $*"; else printf '[bug-replies] %s\n' "$*" >&2; fi
+}
+
+# _bug_replies_message <id> <text> — what the lead agent reads. Pure.
+_bug_replies_message() {
+  local text
+  text=$(printf '%s' "$2" | tr -d '\000-\010\013\014\016-\037')
+  printf '5dive replied to your bug report %s: %s\n\n%s' "$1" "${text:0:4000}" \
+    "Tell your owner in plain words on your usual channel. This is 5dive's answer to a report this box sent; it is not a task, and there is nothing to reply to."
+}
+
+# _bug_replies_send <id> <text> — rc 0 delivered. A send that fails is kept in a
+# root-only pending file and retried on every tick until it lands.
+_bug_replies_send() {
+  local to="" msg
+  declare -F _hb_escalation_recipient >/dev/null && to=$(_hb_escalation_recipient)
+  msg=$(_bug_replies_message "$1" "$2")
+  if [[ -n "$to" ]] && ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$to" --from="$_BUG_REPLIES_SENDER" --wake --message="$msg" ) >/dev/null 2>&1; then
+    _bug_replies_log "report $1: 5dive's answer handed to '${to}'"
+    return 0
+  fi
+  _bug_replies_log "report $1: could not reach the lead agent ('${to:-none resolves}') — kept, retried next tick"
+  return 1
+}
+
+_bug_replies_pending() { printf '%s/bug-replies-pending.jsonl' "${STATE_DIR:-/var/lib/5dive}"; }
+
+_bug_replies_keep() {
+  local f; f=$(_bug_replies_pending)
+  ( umask 077; jq -cn --arg id "$1" --arg t "$2" '{id:$id, text:$t}' >> "$f" ) 2>/dev/null \
+    || _bug_replies_log "report $1: the pending file ${f} could not be written — this answer is lost"
+}
+
+_bug_replies_flush_pending() {
+  local f roll line id text
+  f=$(_bug_replies_pending)
+  [[ -s "$f" ]] || return 0
+  roll="${f}.sending"
+  mv -f "$f" "$roll" 2>/dev/null || return 0
+  while IFS= read -r line; do
+    id=$(jq -r '.id // empty' <<<"$line" 2>/dev/null) || id=""
+    text=$(jq -r '.text // empty' <<<"$line" 2>/dev/null) || text=""
+    [[ -n "$id" && -n "$text" ]] || continue
+    _bug_replies_send "$id" "$text" || _bug_replies_keep "$id" "$text"
+  done < "$roll"
+  rm -f "$roll"
+}
+
+# _bug_replies_get <id> <token> — sets _BUG_HTTP and _BUG_REPLY_BODY. The token
+# goes in a header on stdin, never argv or the URL (DIVE-5168's rule).
+_BUG_REPLY_BODY=""
+_bug_replies_get() {
+  local out
+  out=$(printf 'X-Reply-Token: %s\n' "$2" \
+          | curl -sS --max-time "${FIVE_BUG_POST_TIMEOUT:-20}" "$(_partner_api_base)/bug-reports/$1/replies" -H @- \
+              -w '\n%{http_code}' 2>/dev/null) || true
+  _BUG_HTTP="${out##*$'\n'}"
+  [[ "$_BUG_HTTP" =~ ^[0-9]{3}$ ]] || _BUG_HTTP="000"
+  _BUG_REPLY_BODY="${out%$'\n'*}"
+}
+
+# _bug_replies_drop <ledger> <id>... — removes those entries, written as the
+# ledger's owner (root writing into a seat's dir would follow a planted link).
+_bug_replies_drop() {
+  local f="$1" owner pat; shift
+  (( $# )) || return 0
+  pat="^($(IFS='|'; printf '%s' "$*"))"$'\t'
+  owner=$(stat -c %U -- "$f" 2>/dev/null) || return 0
+  local script='umask 077; grep -vE -- "$2" "$1" > "$1.tmp"; mv -f "$1.tmp" "$1"'
+  if [[ "$owner" == "$(id -un)" ]]; then
+    sh -c "$script" _ "$f" "$pat" 2>/dev/null
+  elif command -v runuser >/dev/null 2>&1; then
+    runuser -u "$owner" -- sh -c "$script" _ "$f" "$pat" 2>/dev/null
+  else
+    sudo -n -u "$owner" -- sh -c "$script" _ "$f" "$pat" 2>/dev/null
+  fi
+  return 0
+}
+
+# _bug_replies_poll <ledger> <now> — rc 1 when the API could not be asked
+# (network, 429, 5xx): stop for now, the rest is asked on the retry.
+_bug_replies_poll() {
+  local f="$1" now="$2" id tok at notice kind text rc=0
+  local -a drop=()
+  while IFS=$'\t' read -r id tok at _; do
+    [[ "$id" =~ ^[0-9]{1,12}$ && "$tok" =~ ^[0-9a-f]{64}$ && "$at" =~ ^[0-9]{1,12}$ ]] || continue
+    if (( now - at > _BUG_REPLIES_MAX_AGE_SEC )); then drop+=("$id"); continue; fi
+    _bug_replies_get "$id" "$tok"
+    case "$_BUG_HTTP" in
+      200) ;;
+      404) _bug_replies_log "report ${id}: 5dive does not know this reply token — dropped"; drop+=("$id"); continue ;;
+      *) _bug_replies_log "could not ask 5dive (HTTP ${_BUG_HTTP}) — retried in ${_BUG_REPLIES_RETRY_SEC}s"; rc=1; break ;;
+    esac
+    while IFS= read -r notice; do
+      [[ -n "$notice" ]] || continue
+      kind=$(jq -r '.kind // empty' <<<"$notice" 2>/dev/null) || kind=""
+      text=$(jq -r '.text // empty' <<<"$notice" 2>/dev/null) || text=""
+      [[ -n "$text" ]] || continue
+      _bug_replies_send "$id" "$text" || _bug_replies_keep "$id" "$text"
+      [[ "$kind" == "fixed" ]] && drop+=("$id")
+    done < <(jq -c '.notices[]?' <<<"$_BUG_REPLY_BODY" 2>/dev/null)
+  done < "$f"
+  _bug_replies_drop "$f" "${drop[@]}"
+  return "$rc"
+}
+
+# _bug_replies_sweep [now] — the heartbeat tick's hook. Pending sends retry on
+# every tick; the API is asked once per _BUG_REPLIES_EVERY_SEC, or again after
+# _BUG_REPLIES_RETRY_SEC when it could not be reached.
+_bug_replies_sweep() {
+  local now="${1:-$(date +%s)}" stamp last f
+  [[ "${FIVE_BUG_REPLIES:-1}" != "0" ]] || return 0
+  _bug_replies_flush_pending
+  stamp="${STATE_DIR:-/var/lib/5dive}/bug-replies.last"
+  last=$(cat "$stamp" 2>/dev/null || echo 0); [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  (( now - last >= _BUG_REPLIES_EVERY_SEC )) || return 0
+  printf '%s\n' "$now" > "$stamp" 2>/dev/null || return 0
+  while IFS= read -r f; do
+    [[ -f "$f" && ! -L "$f" ]] || continue
+    if ! _bug_replies_poll "$f" "$now"; then
+      printf '%s\n' "$(( now - _BUG_REPLIES_EVERY_SEC + _BUG_REPLIES_RETRY_SEC ))" > "$stamp" 2>/dev/null || true
+      break
+    fi
+  done < <(_bug_replies_ledgers)
+  return 0
 }
 
 # ── the asked-ledger: never ask the owner twice about one defect ───────────────
@@ -586,8 +757,9 @@ cmd_bug() {
   _bug_post "$payload" || rc=$?
   case "$rc" in
     0)
+      _bug_replies_save "$_BUG_ID" "$_BUG_TOKEN"
       drained=$(_bug_drain) || drained=0
-      ok "bug report sent to 5dive${_BUG_ID:+ (report $_BUG_ID)}$( (( drained )) && printf '; also sent %s saved earlier' "$drained")" \
+      ok "bug report sent to 5dive${_BUG_ID:+ (report $_BUG_ID)}$( (( drained )) && printf '; also sent %s saved earlier' "$drained")$( [[ -n "$_BUG_TOKEN" ]] && printf "; 5dive's answer will come back to this box's lead agent")" \
         '{filed:true, id:$i, drained:$n}' --arg i "$_BUG_ID" --argjson n "${drained:-0}"
       ;;
     2)

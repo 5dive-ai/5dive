@@ -17,6 +17,10 @@
 # DIVE-7248 (5d): an unreadable key (a non-root seat on one of our boxes) -> the
 # open route too, and it drains what that seat spooled before; only if the open
 # route fails is it spooled, with the access reason.
+# DIVE-9000 (arm 9): a keyless report's reply token lands in the seat's 0600
+# ledger; the heartbeat's daily poll hands 5dive's answer to the lead agent once,
+# drops the entry after "fixed", after 30 days or on a 404, and keeps a send that
+# failed for the next tick.
 set -uo pipefail
 
 TMP=""; SRV_PID=""
@@ -36,7 +40,7 @@ if ! command -v python3 >/dev/null || ! command -v curl >/dev/null; then
 fi
 
 TMP=$(mktemp -d)
-mkdir -p "$TMP/reqs"
+mkdir -p "$TMP/reqs" "$TMP/gets" "$TMP/replies"
 export XDG_STATE_HOME="$TMP/state" FIVE_BUG_ASKED_LEDGER="$TMP/box-asked.tsv"
 export CONNECTORD_TOKEN="fake-box-token-0000" FIVE_BUG_POST_TIMEOUT=5
 SPOOL="$TMP/state/5dive/bug-spool"
@@ -65,7 +69,26 @@ class H(http.server.BaseHTTPRequestHandler):
             status = int(open(os.path.join(d, "status")).read().strip())
         except Exception:
             status = 201
-        out = json.dumps({"ok": True, "id": "42"} if status < 300 else {"error": "nope"}).encode()
+        ok = {"ok": True, "id": "42"}
+        if self.path == "/bug-reports": ok["reply_token"] = "ab" * 32
+        out = json.dumps(ok if status < 300 else {"error": "nope"}).encode()
+        self.send_response(status); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
+    # DIVE-9000: GET /bug-reports/<id>/replies serves $TMP/replies/<id> once.
+    def do_GET(self):
+        i = len(os.listdir(os.path.join(d, "gets")))
+        with open(os.path.join(d, "gets", "%03d.json" % i), "w") as f:
+            json.dump({"path": self.path, "token": self.headers.get("X-Reply-Token")}, f)
+        try:
+            status = int(open(os.path.join(d, "getstatus")).read().strip())
+        except Exception:
+            status = 200
+        rid = self.path.split("/")[2] if self.path.count("/") >= 3 else ""
+        rf = os.path.join(d, "replies", rid)
+        body = {"notices": []}
+        if status == 200 and os.path.exists(rf):
+            body = json.load(open(rf)); os.remove(rf)
+        out = json.dumps(body if status == 200 else {"error": "nope"}).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out))); self.end_headers(); self.wfile.write(out)
     def log_message(self, *a): pass
@@ -253,6 +276,71 @@ rm -f "$TMP"/reqs/*
 ( cmd_bug --verb=agent --exit=1 --what="broke with ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" --no-probes --file --owner-approved </dev/null ) >/dev/null 2>&1
 chk "a token-shaped --what is refused (E_USAGE)" "$E_USAGE" "$?"
 chk "...and nothing reached the endpoint" 0 "$(nreq)"
+
+# ── 9. DIVE-9000: a self-installed box hears back ─────────────────────────────
+LEDGER="$XDG_STATE_HOME/5dive/bug-replies.tsv"
+TOK=$(printf 'ab%.0s' $(seq 32))
+rm -f "$LEDGER" "$TMP"/reqs/*
+out=$(CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/none.env" cmd_bug --verb=task --exit=1 --what="hear back" --no-probes --file --owner-approved </dev/null 2>&1)
+chk "9a keyless filing exits 0" 0 "$?"
+chk "9a the ledger holds the id and the token" "42 $TOK" "$(cut -f1,2 "$LEDGER" | tr '\t' ' ')"
+chk "9a ...and is 0600" 600 "$(stat -c %a "$LEDGER")"
+[[ "$out" == *"5dive's answer will come back to this box's lead agent"* ]] && ok_t "9a the caller is told the answer comes back" || fail_t "9a text: $out"
+( CONNECTORD_TOKEN="" FIVE_CONNECTORD_ENV="$TMP/box.env" cmd_bug --verb=task --exit=1 --what="keyed" --no-probes --file --owner-approved </dev/null ) >/dev/null 2>&1
+chk "9a a keyed report (answered to its owner) adds no entry" 1 "$(wc -l < "$LEDGER")"
+
+# The poll, as the tick runs it: the seat's ledger under a fake home, a stubbed
+# lead and a recorded send.
+mkdir -p "$TMP/home1/.local/state/5dive" "$TMP/sd"
+mv "$LEDGER" "$TMP/home1/.local/state/5dive/bug-replies.tsv"
+L1="$TMP/home1/.local/state/5dive/bug-replies.tsv"
+export FIVE_BUG_REPLIES_HOMES="$TMP/home1" STATE_DIR="$TMP/sd"
+SENDS="$TMP/sends"; : > "$SENDS"; SEND_OK=1
+_hb_escalation_recipient() { printf 'lead'; }
+cmd_send() { (( SEND_OK )) || return 1; local m=""; for a in "$@"; do [[ "$a" == --message=* ]] && m="${a#--message=}"; done
+  printf '%s|%s|%s\n' "$1" "$(printf '%s ' "$@" | grep -o -- '--from=[^ ]*')" "${m%%$'\n'*}" >> "$SENDS"; }
+ngets() { find "$TMP/gets" -type f | wc -l; }
+NOW=$(date +%s)
+
+printf '{"notices":[{"kind":"update","text":"We found it: the spool path was wrong.","at":"2026-11-21T10:00:00Z"}]}' > "$TMP/replies/42"
+_bug_replies_sweep "$NOW" 2>/dev/null
+chk "9b one GET to the report's replies" "/bug-reports/42/replies" "$(jq -r .path "$TMP/gets/000.json")"
+chk "9b the token rides in X-Reply-Token, not the URL" "$TOK" "$(jq -r .token "$TMP/gets/000.json")"
+chk "9b the lead got it once, in plain words, from 5dive-support" \
+  "lead|--from=5dive-support|5dive replied to your bug report 42: We found it: the spool path was wrong." "$(cat "$SENDS")"
+chk "9b an update keeps the entry open" 1 "$(wc -l < "$L1")"
+
+_bug_replies_sweep "$((NOW + 600))" 2>/dev/null
+chk "9c the same day asks nothing more" 1 "$(ngets)"
+
+printf '{"notices":[{"kind":"fixed","text":"Fixed in 0.130.","at":"2026-11-22T10:00:00Z"}]}' > "$TMP/replies/42"
+_bug_replies_sweep "$((NOW + 86400))" 2>/dev/null
+chk "9d the next day: the fixed notice reaches the lead" 2 "$(wc -l < "$SENDS")"
+[[ "$(tail -n1 "$SENDS")" == *"report 42: Fixed in 0.130."* ]] && ok_t "9d ...with our text" || fail_t "9d send: $(tail -n1 "$SENDS")"
+chk "9d ...and the entry is dropped after fixed" 0 "$(grep -c . "$L1")"
+
+# 9e. a send that fails is kept and retried on the next tick, not lost.
+: > "$SENDS"; printf '43\t%s\t%s\n' "$TOK" "$NOW" > "$L1"
+printf '{"notices":[{"kind":"update","text":"Looking.","at":"2026-11-23T10:00:00Z"}]}' > "$TMP/replies/43"
+SEND_OK=0; _bug_replies_sweep "$((NOW + 2*86400))" 2>/dev/null
+chk "9e the failed send is kept in the pending file" 1 "$(wc -l < "$TMP/sd/bug-replies-pending.jsonl")"
+SEND_OK=1; _bug_replies_sweep "$((NOW + 2*86400 + 300))" 2>/dev/null
+chk "9e the next tick delivers it" "lead|--from=5dive-support|5dive replied to your bug report 43: Looking." "$(cat "$SENDS")"
+chk "9e ...and the pending file is empty" 0 "$(cat "$TMP/sd/bug-replies-pending.jsonl" 2>/dev/null | grep -c .)"
+
+# 9f. 30 days old: dropped unasked. A 404: dropped. A 503: kept, retried within the hour.
+D=$((NOW + 3*86400)); rm -f "$TMP"/gets/*
+printf '44\t%s\t%s\n45\t%s\t%s\n' "$TOK" "$((D - 31*86400))" "$TOK" "$D" > "$L1"
+echo 404 > "$TMP/getstatus"; _bug_replies_sweep "$D" 2>/dev/null
+chk "9f only the young entry was asked" "/bug-reports/45/replies" "$(jq -r .path "$TMP/gets/000.json")"
+chk "9f both are dropped (30 days, 404)" 0 "$(grep -c . "$L1")"
+printf '46\t%s\t%s\n' "$TOK" "$D" > "$L1"; echo 503 > "$TMP/getstatus"
+_bug_replies_sweep "$((D + 86400))" 2>/dev/null
+chk "9f a 503 keeps the entry" 1 "$(grep -c . "$L1")"
+rm -f "$TMP/getstatus"; n=$(ngets)
+_bug_replies_sweep "$((D + 86400 + 3600))" 2>/dev/null
+chk "9f ...and it is asked again an hour later, not a day" "$((n + 1))" "$(ngets)"
+unset FIVE_BUG_REPLIES_HOMES
 
 # ── 8. negative control: no GitHub route is left ──────────────────────────────
 chk "no 'gh issue create' left in cmd_bug.sh" 0 "$(grep -c 'gh issue create' src/cmd_bug.sh)"

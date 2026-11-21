@@ -10860,6 +10860,9 @@ cmd_heartbeat_tick() {
   # typed in this same tick, and before autosleep, which must not stop a seat
   # that just got mail.
   _hb_openagent_inbox_sweep "$now" || _hb_log "[openagent-inbox] pass errored (non-fatal)"
+  # DIVE-9000: 5dive's answers to this box's keyless bug reports, pulled once a
+  # day and handed to the lead agent (src/cmd_bug.sh, _bug_replies_sweep).
+  _bug_replies_sweep "$now" || _hb_log "[bug-replies] pass errored (non-fatal)"
   _hb_a2a_queue_sweep || _hb_log "[a2a-queue] pass errored (non-fatal)"
   _hb_autosleep_sweep "$now" || _hb_log "[autosleep] pass errored (non-fatal)"
   _hb_stuck_login_sweep "$now" "$reg" || _hb_log "[stuck-login] pass errored (non-fatal)"
