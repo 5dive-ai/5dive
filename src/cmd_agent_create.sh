@@ -101,8 +101,8 @@ create_agent_user() {
   fi
   # Admin gets sudo SCOPED to fleet-management ops (not blanket root). standard
   # gets a NARROW grant for real-time inter-agent send (DIVE-1065: ONLY the
-  # hardened `5dive agent _deliver` subcommand, nothing else). sandboxed gets no
-  # sudoers at all. All branches keep the visudo-validated discipline.
+  # hardened `5dive agent _deliver` subcommand, nothing else). sandboxed gets only its
+  # self-only rails, written by sync_sandboxed_chat_sudoers once the seat exists (DIVE-9004).
   if [[ "$isolation" == "admin" ]]; then
     write_admin_sudoers "$user"
   elif [[ "$isolation" == "standard" ]]; then
@@ -616,7 +616,8 @@ classify_sudo_grant() {
         # DIVE-8284: the two self-only web chat rails. Alone they are `chat-only`
         # (a sandboxed seat with web chat); beside any other scoped verb the seat
         # is still cli-scoped.
-        "/usr/local/bin/5dive _dashboard_relay"|"/usr/local/bin/5dive _chat_e2e") has_chat=1 ;;
+        # DIVE-9004: the sandboxed seat's own team rail joins them; same class.
+        "/usr/local/bin/5dive _dashboard_relay"|"/usr/local/bin/5dive _chat_e2e"|"/usr/local/bin/5dive _team_self") has_chat=1 ;;
         "/usr/local/bin/5dive"|"/usr/local/bin/5dive *") has_cli=1 ;;
         "/usr/local/bin/5dive agent _deliver"*|"/usr/local/bin/5dive agent _capture"*|\
         "/usr/local/lib/5dive/agent-list-snapshot"|\
@@ -696,7 +697,7 @@ sudo_grant_english() {
     root-all) printf 'any command, no restriction\n' ;;
     cli-root) printf 'the 5dive CLI only\n' ;;
     cli-scoped) printf 'a few named 5dive subcommands only\n' ;;
-    chat-only) printf 'its own web chat only\n' ;;
+    chat-only) printf 'its own tasks, team messages and web chat only\n' ;;
     none)     printf 'no sudo\n' ;;
     custom)   printf 'entries this CLI did not write\n' ;;
     *)        printf 'not measurable from here\n' ;;
@@ -984,58 +985,100 @@ write_standard_sudoers() {
   fi
 }
 
-# DIVE-8284: a sandboxed seat with web chat turned on, and nothing else.
+# DIVE-8284 + DIVE-9004: the sandboxed seat's self-only rails, and nothing else.
 #
-# A sandboxed seat holds no sudoers by design. But since DIVE-5690/5894 the
-# dashboard chat adapter reaches the app ONLY through root (`_dashboard_relay`),
-# and on an encrypted server opens and seals each message only through root
-# (`_chat_e2e`, DIVE-6878). Both were granted in the standard template alone, so
-# `channels=dashboard` on a sandboxed seat succeeded and the chat was silently
-# deaf (lodar's grok on chill-gorge, 2026-11-12).
+# A sandboxed seat holds no general sudo by design. Two things still have to
+# cross to root for it, each through ONE exact-path line with no argv:
 #
-# These two rails are SELF-ONLY: exact path, no args, no wildcard; each derives
-# the seat from SUDO_UID and acts as that seat only (reads, acks, replies, opens
-# and seals for itself). Neither gives the seat the box token, the box key, any
-# other seat, or any other command. So the drop-in carries exactly these two
-# lines, and exists only while the seat has the dashboard channel.
-# classify_sudo_grant reports it as `chat-only`, which still implies sandboxed.
+#   _team_self (DIVE-9004, always): the seat's own board rows and team messages.
+#     The board is root:claude 2770 and the seat is outside `claude`, so without
+#     this the heartbeat dispatched rows the seat could not read or close, and
+#     `agent send` had no route. The verb takes its operation on stdin, derives
+#     the seat from SUDO_UID, serves sandboxed seats only, and writes only rows
+#     assigned to the caller (src/task/self.sh).
+#   _dashboard_relay + _chat_e2e (DIVE-8284, only with the dashboard channel):
+#     the web chat adapter reaches the app only through root, and on an
+#     encrypted server opens and seals each message only through root.
+#
+# None of them gives the seat the box token, the box key, the shared group, any
+# other seat's files, or any other command. classify_sudo_grant reports this
+# file as `chat-only`, which still implies sandboxed.
 render_sandboxed_chat_sudoers() {
-  local user="$1"
+  local user="$1" channels="${2:-dashboard}"
   cat <<SUDOERS
-# Managed by 5dive (DIVE-8284). Web chat only, for sandboxed agent ${user}.
-# Do not edit by hand; written while the agent has the dashboard channel, removed when it does not.
+# Managed by 5dive (DIVE-8284, DIVE-9004). Self-only rails for sandboxed agent ${user}.
+# Do not edit by hand; rewritten when the agent's channels change.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _team_self
+SUDOERS
+  channel_in_list dashboard "$channels" || return 0
+  cat <<SUDOERS
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _dashboard_relay
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _chat_e2e
 SUDOERS
 }
 
-# sync_sandboxed_chat_sudoers <user> <channels> — write the chat-only drop-in when
-# <channels> includes dashboard, remove it when not. Removes only a file this
-# function wrote (byte-equal to the render): a hand-placed policy is left alone.
-# Prints one word: written | current | removed | absent | kept.
+# _sandboxed_sudoers_is_managed <file-content> — 0 when the content is a drop-in
+# this function family wrote (either era), so a rewrite never clobbers a
+# hand-placed policy.
+_sandboxed_sudoers_is_managed() {
+  [[ "$1" == '# Managed by 5dive (DIVE-8284). Web chat only, for sandboxed agent '* \
+  || "$1" == '# Managed by 5dive (DIVE-8284, DIVE-9004). Self-only rails for sandboxed agent '* ]]
+}
+
+# sync_sandboxed_chat_sudoers <user> <channels> — bring the seat's drop-in to the
+# render for <channels>. Writes a missing file or one this family wrote; leaves a
+# hand-placed policy alone. Prints one word: written | current | kept.
 sync_sandboxed_chat_sudoers() {
-  local user="$1" channels="${2:-none}" d="${SUDOERS_D:-/etc/sudoers.d}" f tmp want
+  local user="$1" channels="${2:-none}" d="${SUDOERS_D:-/etc/sudoers.d}" f tmp want cur
   f="${d}/${user}"
-  want=$(render_sandboxed_chat_sudoers "$user")
-  if channel_in_list dashboard "$channels"; then
-    if [[ -f "$f" && "$(cat -- "$f" 2>/dev/null)" == "$want" ]]; then printf 'current\n'; return 0; fi
-    tmp=$(mktemp)
-    printf '%s\n' "$want" > "$tmp"
-    chmod 440 "$tmp"
-    if visudo -cf "$tmp" >/dev/null 2>&1; then
-      chown root:root "$tmp" 2>/dev/null || true
-      mv "$tmp" "$f"
-      chmod 440 "$f"
-      printf 'written\n'
-    else
-      rm -f "$tmp"
-      fail "$E_GENERIC" "generated chat sudoers for ${user} failed visudo validation; aborting (no partial install)"
-    fi
-    return 0
+  want=$(render_sandboxed_chat_sudoers "$user" "$channels")
+  if [[ -e "$f" ]]; then
+    cur=$(cat -- "$f" 2>/dev/null)
+    [[ "$cur" == "$want" ]] && { printf 'current\n'; return 0; }
+    _sandboxed_sudoers_is_managed "$cur" || { printf 'kept\n'; return 0; }
   fi
-  if [[ ! -e "$f" ]]; then printf 'absent\n'; return 0; fi
-  if [[ "$(cat -- "$f" 2>/dev/null)" == "$want" ]]; then rm -f -- "$f"; printf 'removed\n'; return 0; fi
-  printf 'kept\n'
+  tmp=$(mktemp)
+  printf '%s\n' "$want" > "$tmp"
+  chmod 440 "$tmp"
+  if visudo -cf "$tmp" >/dev/null 2>&1; then
+    chown root:root "$tmp" 2>/dev/null || true
+    mv "$tmp" "$f"
+    chmod 440 "$f"
+    printf 'written\n'
+  else
+    rm -f "$tmp"
+    fail "$E_GENERIC" "generated sandboxed-seat sudoers for ${user} failed visudo validation; aborting (no partial install)"
+  fi
+}
+
+# DIVE-9004: the sandboxed seat's unit drop-in. Resource limits (as before) AND
+# its own primary group. The template unit runs every seat with `Group=claude`,
+# so a sandboxed seat's LIVE process held gid claude: measured on a test box
+# (hazy-fern, 2026-11-21) it could rw the whole board, read agents.json and list
+# every other seat's home (`agent-X:claude 0750`) — the filesystem sandbox
+# DIVE-1033 draws at the account was dissolved one layer up. The seat's own
+# group closes that; its board work and messages go through _team_self.
+render_sandboxed_isolation_dropin() {
+  local grp="$1"
+  printf '[Service]\nMemoryMax=512M\nCPUQuota=50%%\n# DIVE-9004: own group, not the template'"'"'s Group=claude (sandboxed seats stay outside the shared group)\nGroup=%s\n' "$grp"
+}
+
+# sync_sandboxed_isolation_dropin <name> — write the drop-in when it differs.
+# Prints written | current. The caller daemon-reloads; the new group binds at
+# the seat's next start.
+sync_sandboxed_isolation_dropin() {
+  local name="$1" d grp want f
+  d="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}/5dive-agent@${name}.service.d"
+  f="${d}/isolation.conf"
+  grp=$(id -gn "agent-${name}" 2>/dev/null) || grp=""
+  [[ -n "$grp" && "$grp" != claude ]] \
+    || fail "$E_GENERIC" "agent-${name} has no primary group of its own (got '${grp:-none}'); a sandboxed seat must not run as group claude"
+  want=$(render_sandboxed_isolation_dropin "$grp")
+  [[ -f "$f" && "$(cat -- "$f" 2>/dev/null)" == "$want" ]] && { printf 'current\n'; return 0; }
+  mkdir -p "$d"
+  printf '%s\n' "$want" > "$f"
+  chmod 644 "$f"
+  printf 'written\n'
 }
 
 # DIVE-4081: bring EXISTING standard seats forward when the managed sudoers
@@ -1085,16 +1128,23 @@ cmd_agent_reconcile_sudoers() {
   done < <(jq -r '.agents | to_entries[] | select(.value.isolation == "standard") | .key' <<<"$reg")
   # DIVE-8284: a sandboxed seat that already had web chat before its chat-only
   # drop-in existed gets it on this update; one without the channel loses it.
-  local chans sandboxed=0
+  local chans sandboxed=0 units=0
   while IFS=$'\t' read -r name chans; do
     [[ -n "$name" ]] || continue
     case "$(sync_sandboxed_chat_sudoers "agent-${name}" "$chans")" in
       written|removed) sandboxed=$((sandboxed + 1)) ;;
     esac
+    # DIVE-9004: and its unit's own group. A subshell: a seat whose account is
+    # gone (a registry orphan) is skipped, not allowed to end the pass.
+    id "agent-${name}" >/dev/null 2>&1 || continue
+    [[ "$( (sync_sandboxed_isolation_dropin "$name") 2>/dev/null)" == written ]] && units=$((units + 1))
   done < <(jq -r '.agents | to_entries[] | select(.value.isolation == "sandboxed") | "\(.key)\t\(.value.channels // "none")"' <<<"$reg")
-  ok "standard-seat sudoers reconciled: updated=${updated}, current=${current}, skipped=${skipped}; sandboxed chat grants changed=${sandboxed}" \
-     '{updated:($u|tonumber), current:($c|tonumber), skipped:($s|tonumber), sandboxedChat:($x|tonumber)}' \
-     --arg u "$updated" --arg c "$current" --arg s "$skipped" --arg x "$sandboxed"
+  # The new group binds at each seat's next start; install.sh restarts agents
+  # after this pass.
+  (( units == 0 )) || systemctl daemon-reload 2>/dev/null || true
+  ok "standard-seat sudoers reconciled: updated=${updated}, current=${current}, skipped=${skipped}; sandboxed chat grants changed=${sandboxed}; sandboxed units regrouped=${units}" \
+     '{updated:($u|tonumber), current:($c|tonumber), skipped:($s|tonumber), sandboxedChat:($x|tonumber), sandboxedUnits:($g|tonumber)}' \
+     --arg u "$updated" --arg c "$current" --arg s "$skipped" --arg x "$sandboxed" --arg g "$units"
 }
 
 # DIVE-4183: `agent grant <name> <merge|push|deploy>` — re-render ONE existing
@@ -4332,11 +4382,8 @@ cmd_create() {
   if [[ "$isolation" == "sandboxed" ]]; then
     # DIVE-8284: web chat on a sandboxed seat needs its two self-only rails.
     sync_sandboxed_chat_sudoers "agent-${name}" "$channels" >/dev/null
-    step "Applying sandbox resource limits for agent-${name}"
-    local dropin_dir="/etc/systemd/system/5dive-agent@${name}.service.d"
-    mkdir -p "$dropin_dir"
-    printf '[Service]\nMemoryMax=512M\nCPUQuota=50%%\n' > "${dropin_dir}/isolation.conf"
-    chmod 644 "${dropin_dir}/isolation.conf"
+    step "Applying sandbox resource limits and own group for agent-${name}"
+    sync_sandboxed_isolation_dropin "$name" >/dev/null
   fi
 
   # claude needs the onboarding preseed + settings the channel user got at

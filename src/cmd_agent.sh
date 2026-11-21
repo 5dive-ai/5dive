@@ -1029,7 +1029,8 @@ def classify_sudo(text, measurable):
                   command in ("/usr/local/bin/5dive sysadmin _broker", "/usr/local/bin/5dive --json sysadmin _broker")):
                 has_scoped = True
             elif (command == "/usr/local/bin/5dive _dashboard_relay" or
-                  command == "/usr/local/bin/5dive _chat_e2e"):
+                  command == "/usr/local/bin/5dive _chat_e2e" or
+                  command == "/usr/local/bin/5dive _team_self"):
                 # DIVE-8284: alone, the web chat rails of a sandboxed seat.
                 has_chat = True
             else:

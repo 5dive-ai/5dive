@@ -161,6 +161,7 @@ LAZY_FILES=(
   src/task/notify.sh
   src/task/inbox.sh
   src/task/answer.sh
+  src/task/self.sh
   src/task/doctor.sh
   src/task/rebalance.sh
   src/cmd_task.sh

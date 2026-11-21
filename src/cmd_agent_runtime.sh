@@ -3637,6 +3637,16 @@ cmd_send() {
   if (( wake )) && a2a_needs_scoped "$name"; then
     fail "$E_PERMISSION" "--wake needs admin/root; this caller holds only the a2a delivery grant — re-run via sudo, or file a task row"
   fi
+  # DIVE-9004: a sandboxed seat holds no `_deliver` grant; it crosses through its
+  # own team rail, which hands the same target and message to cmd_deliver as root
+  # (the message travels on stdin). 125 = the rail does not apply here.
+  local _ts_rc=125
+  if declare -F _team_self_send >/dev/null; then
+    _ts_rc=0
+    if (( urgent )); then _team_self_send --urgent "$name" "$message" || _ts_rc=$?
+    else _team_self_send "$name" "$message" || _ts_rc=$?; fi
+  fi
+  [[ "$_ts_rc" == 125 ]] || return "$_ts_rc"
   # DIVE-7164: `owner` is the box owner, not a seat. A seat with only the scoped
   # grant crosses to root through _deliver, which takes the same target. Below
   # the --wake refusals, so no exec into _deliver ever sits ahead of them.

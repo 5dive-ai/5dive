@@ -1372,6 +1372,16 @@ main() {
       # channel before the ordinary task functions authorize and sign the write.
       cmd_task_channel_delegated
       exit $? ;;
+    _team_self)
+      # DIVE-9004: hidden, privileged, SELF-SCOPED team rail for a sandboxed seat
+      # (task show|ls|start|done|cancel|deliver|need|add on its own rows, agent
+      # send). Reachable ONLY via the exact-path NOPASSWD line
+      # render_sandboxed_chat_sudoers writes; the operation travels on stdin and
+      # the seat is derived from SUDO_UID (src/task/self.sh). Audited as the
+      # verb it runs. Never advertised.
+      AUDIT_CMD="_team_self"; AUDIT_ARGS=()
+      cmd_team_self_delegated
+      exit $? ;;
     _audit_append)
       # DIVE-1268: hidden, privileged, APPEND-ONLY audit primitive. Reachable
       # ONLY via NOPASSWD sudo — the admin whole-CLI grant, or the scoped
