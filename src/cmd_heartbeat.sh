@@ -6818,7 +6818,14 @@ _HB_GATE_RENAG_BASE_WHERE="need_type IS NOT NULL AND need_answered_at IS NULL
   AND NOT (COALESCE(tier,2)=2 AND gate_pinged_at IS NULL
            AND COALESCE(gate_urgent,0)=0
            AND COALESCE(need_asked_at,updated_at,created_at) > datetime('now','-11 minutes'))
+  -- A tier-1 gate with a recommendation stops re-nagging at 48h because the TTL
+  -- pass applies the recommendation then. DIVE-8974: NOT for the human class —
+  -- DIVE-2235 stopped the TTL applying those, so without this carve-out a
+  -- tier-1 approval past 48h was reminded by nobody (box report 1297). Same
+  -- complement rule as the TTL pass's own predicates (2)/(3). (The fallback is
+  -- the same list, for harnesses that source this file without lib/tasks_db.sh.)
   AND NOT (tier=1 AND recommend IS NOT NULL
+           AND need_type NOT IN ${_GATE_HUMAN_CLASS_SQL:-('approval','secret','manual','access')}
            AND COALESCE(need_asked_at,updated_at,created_at) <= datetime('now','-48 hours'))
   -- DIVE-4911: THE BACKOFF. A reminder no bot could deliver stamps
   -- gate_renag_failed_at and waits the 24h cadence the reminder text promises,
@@ -6904,7 +6911,11 @@ _hb_gate_renag_batch() { # <recipient_agent|''> <comma-separated task ids> <rout
   local recipient="$1" idlist="$2" label="${3:-}"
   if ! _human_registry_active; then
     _hb_gate_renag_batch_one "$recipient" "$idlist" "$label"
-    return $?
+    # DIVE-8974: a miss backs off here too, as it does on the registry path
+    # (DIVE-4911). Unstamped, a gate nobody can reach sat in the pinger canary's
+    # set forever and tripped "batch looks dead" (box report 1297).
+    (( HB_RENAG_DELIVERED )) || _hb_gate_renag_backoff "$idlist" "${recipient:-no recipient}" "-"
+    return 0
   fi
   local line owner ids rc=0
   while IFS=$'\t' read -r owner ids; do
@@ -7406,8 +7417,9 @@ _hb_gate_renag_sweep() {
     [[ -n "$reviewer" ]] || reviewer=$(_gate_route_reviewer "$filer")
     [[ -n "$reviewer" ]] || reviewer=$(_task_resolve_coordinator "$filer")   # DIVE-4823: the filer's team
     if [[ -z "$reviewer" ]]; then
-      warn "gate re-nag for task row ${gid}: no org lead resolved; will retry next heartbeat"
+      warn "gate re-nag for task row ${gid}: no org lead resolved; will retry in 24h"
       _hb_log "[gate-renag] no org lead for T1 row ${gid} (filer=${filer:-unknown})"
+      _hb_gate_renag_backoff "$gid" "no org lead" "-"   # DIVE-8974: stamped, never silent
       continue
     fi
     lead_ids[$reviewer]+="${lead_ids[$reviewer]:+,}${gid}"

@@ -585,6 +585,68 @@ grep -q $'^ops\t.*pinger-liveness canary tripped' "$SEND_LOG" \
   && ok_t "C6 NEGATIVE CONTROL: back-off stamp 26h old (not re-stamped) -> canary trips" \
   || bad_t "C6 canary blind to a dead batch when the only stale gate is undeliverable" "$(cat "$SEND_LOG")"
 
+# --- C7-C9 (DIVE-8974, box report 1297): a tier-1 APPROVAL with a recommendation,
+#     past 48h. The TTL never applies a human-class gate (DIVE-2235) and the re-nag
+#     dropped every tier-1+recommendation gate at 48h, so after its last reminder
+#     nobody reminded or stamped it and it tripped "batch looks dead" for ever.
+#     These arms run a whole tick's gate passes (re-nag, TTL, stall) in a subshell
+#     with the channel layer stubbed, so no real bot or pane is reached.
+GATE_SEND_LOG="$TMP/gate_sends"
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('main','coordinator',NULL),('dev',NULL,'main');"
+t1_approval() {
+  reset_all; : >"$GATE_SEND_LOG"
+  local g; g=$(addt --assignee=dev -- "tier-1 approval, waiting 9 days")
+  db "UPDATE tasks SET status='blocked', need_type='approval', tier=1, recommend='approve',
+         ask='ship it?', created_by='dev', gate_filed_by='dev', routed_reviewer=NULL,
+         need_asked_at=datetime('now','-9 days'), gate_pinged_at=datetime('now','-8 days')
+       WHERE id=${g};"
+  printf '%s' "$g"
+}
+one_tick() { # <paired seat or ''>: every seat unpaired except the named one
+  ( PAIRED="$1"
+    _task_agent_channel() { [[ -n "$PAIRED" && "$1" == "$PAIRED" ]]; }
+    _task_chain_channel() { return 1; }
+    _task_send_gate_owner() {
+      printf '%s\n' "$3" >>"$GATE_SEND_LOG"
+      if [[ -n "$PAIRED" ]]; then TASK_SEND_DELIVERED=1; _task_stamp_confirmed_delivery "$3"
+      else TASK_SEND_DELIVERED=0; fi
+      return 0
+    }
+    _hb_gate_renag_sweep; _hb_gate_ttl_sweep; _hb_stall_sweep ) >/dev/null 2>&1
+}
+fresh() { db "SELECT COUNT(*) FROM tasks WHERE id=$1 AND $2 >= datetime('now','-5 minutes');"; }
+
+# C7: nobody paired (the box: the assignee has no bot, nor does its lead).
+g=$(t1_approval); : >"$SEND_LOG"; : >"$DIGEST_SPOOL"
+one_tick ""
+! grep -q 'pinger-liveness canary tripped' "$SEND_LOG" \
+  && [[ -z "$(db "SELECT value FROM task_prefs WHERE key='pinger_canary_alerted_at';")" ]] \
+  && ok_t "C7 a tier-1 approval past 48h that nobody can reach does not trip the canary" \
+  || bad_t "C7 [pinger-canary] TRIPPED on a tier-1 approval past 48h" "$(cat "$SEND_LOG")"
+[[ "$(fresh "$g" gate_renag_failed_at)" == 1 ]] \
+  && ok_t "C7 ...because the re-nag tried it and stamped the miss (gate_renag_failed_at = now)" \
+  || bad_t "C7 the gate was neither re-nagged nor stamped" \
+           "sends=$(tr '\n' ',' <"$GATE_SEND_LOG") row=$(db "SELECT gate_pinged_at||' / '||COALESCE(gate_renag_failed_at,'NULL') FROM tasks WHERE id=${g};")"
+
+# C8: the lead's bot works -> the approval is actually REMINDED again, not just quiet.
+g=$(t1_approval); : >"$SEND_LOG"; : >"$DIGEST_SPOOL"
+one_tick main
+[[ "$(fresh "$g" gate_pinged_at)" == 1 ]] && ! grep -q 'pinger-liveness canary tripped' "$SEND_LOG" \
+  && ok_t "C8 a reachable lead gets the daily reminder for a tier-1 approval past 48h (gate_pinged_at = now)" \
+  || bad_t "C8 tier-1 approval past 48h was not re-nagged" \
+           "sends=$(tr '\n' ',' <"$GATE_SEND_LOG") row=$(db "SELECT gate_pinged_at FROM tasks WHERE id=${g};")"
+
+# C9: NEGATIVE CONTROL — the miss stamp is 26h old and nothing re-stamped it: a dead
+#     batch must still trip. Stall sweep only, so nothing in the tick can re-stamp.
+g=$(t1_approval)
+db "UPDATE tasks SET gate_renag_failed_at=datetime('now','-26 hours'), gate_renag_failed_via='main' WHERE id=${g};"
+: >"$SEND_LOG"; : >"$DIGEST_SPOOL"
+_hb_stall_sweep >/dev/null 2>&1
+grep -q $'^ops\t.*pinger-liveness canary tripped' "$SEND_LOG" \
+  && ok_t "C9 NEGATIVE CONTROL: the same approval with a 26h-old, un-renewed miss stamp still trips" \
+  || bad_t "C9 canary blind to a dead batch on a tier-1 approval" "$(cat "$SEND_LOG")"
+db "DELETE FROM agents_org WHERE name IN ('main','dev');"
+
 
 # =============================================================================
 # (d) DIVE-2122 — the alarm must MEASURE idleness, not infer it from a proxy
