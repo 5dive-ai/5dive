@@ -10698,8 +10698,8 @@ cmd_heartbeat_tick() {
   tasks_db_init
   _HB_BALANCE_TICK_MOVED=0   # DIVE-6106: one balance move fleet-wide per tick
   local reg now; reg=$(registry_read); now=$(date +%s)
-  # DIVE-8819: the 5dive helper seat, built once and greeting once. One stat
-  # once it has greeted; never fatal to the tick.
+  # DIVE-8819/8946: the pre-sale handover to the first hire once (or a seat
+  # built before 8946 welcomes once). One stat once done; never fatal to the tick.
   if declare -F _helper_tick >/dev/null; then
     local _hb_helper; _hb_helper=$(lazy_need _helper_tick; _helper_tick "$reg" 2>&1) || true
     [[ -z "$_hb_helper" ]] || _hb_log "[helper] $(tr '\n' ';' <<<"$_hb_helper")"

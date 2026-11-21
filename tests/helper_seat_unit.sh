@@ -6,15 +6,17 @@
 #      post that is retried never produce a second message;
 #   3. the handover read: 200 skips the question and names the business, 404
 #      asks it, any other answer retries and asks only after the tries run out;
-#   4. which boxes: no demo AI = nothing; an owner's own agent named `helper` is
-#      left alone; a seat the owner removed is not built again; a build that keeps
-#      failing stops after its tries;
-#   5-8. the persona; the greeted claim against a racing tick; a build that stops
-#      after create is marked and resumed, never a hire; --help exits 0.
+#   4. which boxes: no demo AI = nothing; DIVE-8946: no box gets a new seat;
+#      an owner's own agent named `helper` is left alone;
+#   5-8. the persona; the greeted claim against a racing tick; a half-built seat
+#      is left as it is, never a hire; --help exits 0.
 #   9-11. DIVE-8850: the BOX posts the welcome into the app as the helper (no
 #      notice, no model in the path); a 0.138.0 box with `greeted` and no reply
 #      from its seat is welcomed once, one whose seat did reply is not; a sealed
 #      chat gets it sealed as the helper.
+#   13. DIVE-8946: with no seat built, the pre-sale handover goes to the owner's
+#      FIRST hire, once (a marked block in its instructions + one notice); 404,
+#      an API that stays down, an old first hire: nothing given, recorded once.
 # Throwaway STATE_DIR and fake 5dive / systemd-run / curl on PATH: no root, no
 # network, nothing on the live box is touched.
 # Run: bash tests/helper_seat_unit.sh
@@ -105,30 +107,24 @@ t 'the jq list builder reports system' 1 "$(grep -c 'system: (.value.system // n
 t 'the snapshot list builder reports system' 1 "$(grep -c '"system": value.get("system"),' src/cmd_agent.sh)"
 # The team export (cloud copy's source) leaves the box's system seats out.
 t 'the team export skips system seats' 1 "$(grep -c "select((.value.system // \"\") == \"\") | .key' <<<\"\$reg\"" src/cmd_compose.sh)"
-# _helper_mark writes the marker the seat test reads.
-fresh 1; reg_with "{$HELPER_ROW}" | jq '.agents.helper |= del(.system)' >"$REGISTRY"
-registry_write() { cat >"$REGISTRY"; }   # the real one chowns to root:claude
-IN_REGISTRY_LOCK=1 _helper_mark
-t 'mark sets system=helper' helper "$(jq -r '.agents.helper.system' "$REGISTRY")"
-t 'mark names it 5dive' '5dive|Help & setup' "$(jq -r '.agents.helper | "\(.displayName)|\(.role)"' "$REGISTRY")"
 
 echo '== 2. which boxes =='
 fresh 2 none
 t 'no demo AI: the tick does nothing' '' "$(_helper_tick "$(reg_with '{}')")"
 t 'no demo AI: nothing built' 0 "$(n_calls systemd-run)"
+# DIVE-8946: no box gets a new seat, from the tick or from ensure.
 fresh 3
 out=$(_helper_tick "$(reg_with '{}')")
-has 'a demo AI box with no seat starts the build' 'building the helper seat' "$out"
-has 'the build is the fixed transient unit' "--unit=5dive-helper-ensure" "$(cat "$CALLS")"
-fresh 4; mkdir -p "$STATE_DIR/helper"; date >"$STATE_DIR/helper/built"
+t 'a demo AI box with no seat: the tick builds nothing' '' "$out"
+t 'no build unit, no agent create' 0 "$(n_calls 'systemd-run\|agent create')"
+t 'the module never creates an agent' 0 "$(grep -c 'agent create' src/cmd_helper.sh)"
+t 'nor starts a build unit' 0 "$(grep -c 'systemd-run' src/cmd_helper.sh)"
+fresh 4; mkdir -p "$STATE_DIR/helper"; date >"$STATE_DIR/helper/built"; date >"$STATE_DIR/helper/welcomed"
 _helper_tick "$(reg_with "{$HIRE_ROW}")" >/dev/null
-t 'a seat the owner removed is not built again' 0 "$(n_calls systemd-run)"
-fresh 5
+t 'a seat the owner removed is not built again' 0 "$(n_calls 'systemd-run\|agent create')"
+fresh 5; built
 _helper_tick "$(reg_with '{"helper":{"type":"claude"},'"$HIRE_ROW"'}')" >/dev/null
 t "an owner's own helper agent is left alone" 0 "$(n_calls '5dive\|systemd-run\|curl')"
-fresh 6; mkdir -p "$STATE_DIR/helper"; echo 6 >"$STATE_DIR/helper/build-tries"
-_helper_tick "$(reg_with '{}')" >/dev/null
-t 'a build that failed its tries stops' 0 "$(n_calls systemd-run)"
 
 echo '== 3. the welcome waits for an owner, then goes out once =='
 fresh 7; built; FAKE_HTTP=404
@@ -203,10 +199,6 @@ for g in "$(_helper_greeting '' '')" "$(_helper_greeting 'a bakery' 'theo')"; do
   hasnt 'no greeting says On it' 'on it' "$g"
   hasnt 'no greeting says it messaged first' 'messaged you first' "$g"
 done
-# The seat is built standard (no sudo: it cannot run agent create) on demo-ai,
-# by root with no SUDO_UID, which the DIVE-6843 refusal lets through.
-has 'built as a standard seat on the demo AI' '--auth-profile="$HELPER_ACCOUNT" \' "$(grep -A1 'agent create "$HELPER_AGENT"' src/cmd_helper.sh)"
-has 'standard isolation' '--isolation=standard' "$(grep -A1 'agent create "$HELPER_AGENT"' src/cmd_helper.sh)"
 
 echo '== 6. the welcomed claim holds against a second sender =='
 # A tick that read the handover, then lost the race: another tick already wrote
@@ -216,31 +208,14 @@ FAKE_HTTP=404 _helper_greet >/dev/null
 t 'a claim already taken: no second post' 0 "$(n_calls '^post')"
 t 'the other claim is left as it was' 'claimed by the other tick' "$(cat "$STATE_DIR/helper/welcomed")"
 
-echo '== 7. a build that stops half way is still not a hire =='
-# agent create wrote the row, then the persona step failed.
-fresh 13; reg_with '{"helper":{"type":"claude"}}' >"$REGISTRY"
-registry_read() { cat "$REGISTRY"; }
-persona_install_doc() { printf 'persona %s\n' "$1" >>"$CALLS"; return "${FAKE_PERSONA_RC:-0}"; }
-IN_REGISTRY_LOCK=1 FAKE_PERSONA_RC=1 _helper_build none 2>/dev/null; rc=$?
-t 'the half build reports failure' 1 "$rc"
-t 'it is marked system=helper anyway' helper "$(jq -r '.agents.helper.system' "$REGISTRY")"
-t 'so it reads mine, not taken' mine "$(_helper_seat "$(cat "$REGISTRY")")"
-t 'and it is not a hire' 0 "$(_helper_hires "$(cat "$REGISTRY")")"
-t 'not built yet' no "$([[ -e "$STATE_DIR/helper/built" ]] && echo yes || echo no)"
-: >"$CALLS"
-out=$(_helper_tick "$(cat "$REGISTRY")")
-has 'the next tick resumes the build' 'building the helper seat' "$out"
-t 'and does not welcome from a seat with no persona' 0 "$(n_calls '^post')"
-: >"$CALLS"
-IN_REGISTRY_LOCK=1 _helper_build mine 2>/dev/null; rc=$?
-t 'finishing a marked seat succeeds' 0 "$rc"
-t 'finishing does not create the seat again' 0 "$(n_calls 'agent create')"
-t 'finishing installs the persona' 1 "$(n_calls 'persona helper')"
-t 'then it is built' yes "$([[ -e "$STATE_DIR/helper/built" ]] && echo yes)"
-fresh 14; reg_with '{}' >"$REGISTRY"
-IN_REGISTRY_LOCK=1 _helper_build none 2>/dev/null
-t 'a new build creates the seat' 1 "$(n_calls 'agent create helper')"
-unset -f registry_read persona_install_doc
+echo '== 7. a half-built seat (0.139.x) is left as it is, and is not a hire =='
+# agent create wrote the row and the mark, then the persona step failed: no built.
+fresh 13; REG='{"agents":{"helper":{"type":"claude","system":"helper"}}}'
+t 'it reads mine, not taken' mine "$(_helper_seat "$REG")"
+t 'and it is not a hire' 0 "$(_helper_hires "$REG")"
+out=$(FAKE_HTTP=404 _helper_tick "$REG")
+t 'the tick does not finish the build' 0 "$(n_calls 'agent create\|systemd-run\|persona')"
+t 'nor welcome from it' 0 "$(n_calls '^post')"
 
 echo '== 8. --help =='
 for h in --help -h help; do
@@ -289,7 +264,8 @@ t 'sealed chat but no box key here: no welcomed mark, retried next tick' no "$([
 t 'and nothing sealed' 0 "$(n_calls '^seal')"
 
 echo '== 11. no notice reaches the seat =='
-t 'the module never hands the seat the welcome' 0 "$(grep -c 'system-notice' src/cmd_helper.sh)"
+t 'the module never hands the seat the welcome' 0 "$(grep -c 'system-notice "$HELPER_AGENT"' src/cmd_helper.sh)"
+t 'its one notice goes to the first hire' 1 "$(grep -c 'system-notice "$lead"' src/cmd_helper.sh)"
 
 echo '== 12. a built seat gets the new how-to lines once (DIVE-8898) =='
 SEAT_MD="$TMP/seat-md/CLAUDE.md"
@@ -325,12 +301,61 @@ old_persona >"$SEAT_MD"
 _helper_tick "$(reg_with "{$HIRE_ROW}")" >/dev/null
 has 'a removed seat: its file is not rewritten' 'plane icon' "$(cat "$SEAT_MD")"
 t 'and the tick stops asking' "$HELPER_PERSONA_REV" "$(cat "$STATE_DIR/helper/persona-rev")"
-# a fresh build stamps the current rev, so the tick never refreshes it again
-fresh 22; mkdir -p "$STATE_DIR/helper"; reg_with "{$HELPER_ROW}" >"$REGISTRY"; registry_read() { cat "$REGISTRY"; }
-persona_install_doc() { return 0; }
-IN_REGISTRY_LOCK=1 _helper_build mine 2>/dev/null
-t 'a new build is stamped with this rev' "$HELPER_PERSONA_REV" "$(cat "$STATE_DIR/helper/persona-rev")"
-unset -f persona_target install registry_read persona_install_doc
+unset -f persona_target install
+
+echo '== 13. no seat: the handover goes to the first hire, once (DIVE-8946) =='
+LEAD_DIR="$TMP/lead"
+persona_target() { printf '%s/%s-%s.md' "$LEAD_DIR" "$1" "$2"; }
+now=$(date -Iseconds); old=$(date -Iseconds -d '-10 days'); earlier=$(date -Iseconds -d '-1 hour')
+REG=$(reg_with '{"sysadmin":{"type":"claude","createdAt":"'"$old"'"},"theo":{"type":"claude","createdAt":"'"$now"'"},"dude":{"type":"codex","createdAt":"'"$earlier"'"}}')
+HANDOVER='{"business":"a bakery <!-- x --> in Lyon","suggested":["theo","dude"],"asked_at":"2026-11-21T10:00:00Z"}'
+fresh 30; rm -rf "$LEAD_DIR"
+out=$(FAKE_HTTP=200 FAKE_BODY="$HANDOVER" _helper_tick "$REG")
+has 'it says what it did' 'gave the handover to the first hire dude' "$out"
+t 'the first hire is the earliest, never sysadmin' 1 "$(ls "$LEAD_DIR" 2>/dev/null | grep -c '^dude-codex.md$')"
+md=$(cat "$LEAD_DIR/dude-codex.md" 2>/dev/null)
+has 'its instructions name the business' 'told 5dive about their business: a bakery !-- x -- in Lyon' "$md"
+has 'and the suggested hires' '5dive suggested they hire Theo and Dude.' "$md"
+has 'and say never to ask again' 'never ask them what their business does' "$md"
+t 'one marked block' "$HELPER_LEAD_BEGIN|$HELPER_LEAD_END" "$(head -n1 <<<"$md")|$(tail -n1 <<<"$md")"
+has 'the running session gets one notice' '5dive agent _deliver --system-notice dude 5dive: before buying' "$(cat "$CALLS")"
+t 'one notice' 1 "$(n_calls '_deliver')"
+t 'nothing posted as a helper, no seat built' 0 "$(n_calls '^post\|agent create\|systemd-run')"
+t 'recorded' yes "$(grep -q 'to dude' "$STATE_DIR/helper/handed-over" && echo yes)"
+has 'status says done' 'handover=done' "$(cmd_helper_status 2>&1)"
+: >"$CALLS"; FAKE_HTTP=200 FAKE_BODY="$HANDOVER" _helper_tick "$REG" >/dev/null
+t 'a second tick reads and sends nothing' 0 "$(n_calls 'curl\|_deliver')"
+t 'the block is not doubled' 1 "$(grep -cF "$HELPER_LEAD_BEGIN" "$LEAD_DIR/dude-codex.md")"
+# The block goes under what the file already holds, which stays.
+fresh 31; rm -rf "$LEAD_DIR"; mkdir -p "$LEAD_DIR"; printf '# Theo\nkept line\n' >"$LEAD_DIR/theo-claude.md"
+FAKE_HTTP=200 FAKE_BODY='{"business":"a bakery","suggested":[]}' _helper_tick "$(reg_with '{"theo":{"type":"claude","createdAt":"'"$now"'"}}')" >/dev/null
+md=$(cat "$LEAD_DIR/theo-claude.md")
+t 'the file keeps its own lines first' '# Theo|kept line' "$(sed -n 1,2p <<<"$md" | paste -sd'|')"
+has 'then the block' "$HELPER_LEAD_BEGIN" "$md"
+hasnt 'no suggestion: no suggested line' 'suggested they hire' "$md"
+fresh 32; rm -rf "$LEAD_DIR"
+FAKE_HTTP=200 FAKE_BODY="$HANDOVER" _helper_tick "$(reg_with '{}')" >/dev/null
+t 'no hire yet (an unclaimed spare): nothing read' 0 "$(n_calls curl)"
+t 'and not recorded, so the first hire still gets it' no "$([[ -e "$STATE_DIR/helper/handed-over" ]] && echo yes || echo no)"
+fresh 33; FAKE_HTTP=404 _helper_tick "$REG" >/dev/null
+t '404 (told 5dive nothing): no notice' 0 "$(n_calls '_deliver')"
+t '404: recorded once' yes "$(grep -q nothing "$STATE_DIR/helper/handed-over" && echo yes)"
+fresh 34; HELPER_HANDOVER_TRIES=3
+for i in 1 2; do FAKE_HTTP=503 _helper_tick "$REG" >/dev/null; done
+t 'API down: not recorded while tries remain' no "$([[ -e "$STATE_DIR/helper/handed-over" ]] && echo yes || echo no)"
+FAKE_HTTP=503 _helper_tick "$REG" >/dev/null
+t 'API down past the tries: recorded, nothing sent' 'yes|0' "$(grep -q 'gave up' "$STATE_DIR/helper/handed-over" && echo yes)|$(n_calls '_deliver')"
+HELPER_HANDOVER_TRIES=12
+fresh 35; FAKE_HTTP=200 FAKE_BODY="$HANDOVER" _helper_tick "$(reg_with '{"theo":{"type":"claude","createdAt":"'"$old"'"}}')" >/dev/null
+t 'a first hire 10 days old (an old box): nothing read or sent' 0 "$(n_calls 'curl\|_deliver')"
+t 'and recorded as skipped' yes "$(grep -q skipped "$STATE_DIR/helper/handed-over" && echo yes)"
+fresh 36 none; FAKE_HTTP=200 FAKE_BODY="$HANDOVER" _helper_tick "$REG" >/dev/null
+t 'no demo AI (self-hosted, partner): nothing' 0 "$(n_calls 'curl\|_deliver')"
+fresh 37; built; FAKE_HTTP=200 FAKE_BODY="$HANDOVER" _helper_tick "$(reg_with "{$HELPER_ROW,$HIRE_ROW}")" >/dev/null
+t 'a box with a built seat: its welcome, not a second handover' '1|0' "$(n_calls '^post')|$(n_calls '_deliver')"
+out=$(require_root() { :; }; cmd_helper_ensure 2>&1)
+has 'ensure no longer builds' 'new boxes get none' "$out"
+unset -f persona_target
 
 echo "pass=$PASS fail=$FAIL"
 (( FAIL == 0 ))

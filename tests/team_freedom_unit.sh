@@ -156,7 +156,8 @@ t "T11 unknown level refused" "1" "$([[ $rc -ne 0 ]] && echo 1)"
 t "T12 valid_autonomy accepts full" "1" "$(grep -c 'son-of-anton|full)\$' "$SRC/cmd_agent_create.sh")"
 t "T12 launcher: full files no approval gates" "1" "$(grep -c 'Do not file approval gates' bin/5dive-agent-start)"
 t "T12 launcher: yolo still honors hard gates" "1" "$(grep -c 'You MUST still get a human.s explicit go before crossing a HARD GATE' bin/5dive-agent-start)"
-t "T12 helper seat opts out of the team level" "1" "$(grep -c -- '--autonomy=standard </dev/null' "$SRC/cmd_helper.sh")"
+# DIVE-8946: no helper seat is built any more, so there is no create to opt out.
+t "T12 no helper seat is created (nothing to opt out)" "0" "$(grep -c 'agent create' "$SRC/cmd_helper.sh")"
 
 # T13 — the real CLI runs under errexit: a clean set (no switch refused) and a
 # re-set (nothing to change) both exit 0 with the ok line, not a silent death.
