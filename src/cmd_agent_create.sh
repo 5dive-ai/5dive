@@ -1051,6 +1051,36 @@ sync_sandboxed_chat_sudoers() {
   fi
 }
 
+# DIVE-9004: the sandboxed seat's unit drop-in. Resource limits (as before) AND
+# its own primary group. The template unit runs every seat with `Group=claude`,
+# so a sandboxed seat's LIVE process held gid claude: measured on a test box
+# (hazy-fern, 2026-11-21) it could rw the whole board, read agents.json and list
+# every other seat's home (`agent-X:claude 0750`) — the filesystem sandbox
+# DIVE-1033 draws at the account was dissolved one layer up. The seat's own
+# group closes that; its board work and messages go through _team_self.
+render_sandboxed_isolation_dropin() {
+  local grp="$1"
+  printf '[Service]\nMemoryMax=512M\nCPUQuota=50%%\n# DIVE-9004: own group, not the template'"'"'s Group=claude (sandboxed seats stay outside the shared group)\nGroup=%s\n' "$grp"
+}
+
+# sync_sandboxed_isolation_dropin <name> — write the drop-in when it differs.
+# Prints written | current. The caller daemon-reloads; the new group binds at
+# the seat's next start.
+sync_sandboxed_isolation_dropin() {
+  local name="$1" d grp want f
+  d="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}/5dive-agent@${name}.service.d"
+  f="${d}/isolation.conf"
+  grp=$(id -gn "agent-${name}" 2>/dev/null) || grp=""
+  [[ -n "$grp" && "$grp" != claude ]] \
+    || fail "$E_GENERIC" "agent-${name} has no primary group of its own (got '${grp:-none}'); a sandboxed seat must not run as group claude"
+  want=$(render_sandboxed_isolation_dropin "$grp")
+  [[ -f "$f" && "$(cat -- "$f" 2>/dev/null)" == "$want" ]] && { printf 'current\n'; return 0; }
+  mkdir -p "$d"
+  printf '%s\n' "$want" > "$f"
+  chmod 644 "$f"
+  printf 'written\n'
+}
+
 # DIVE-4081: bring EXISTING standard seats forward when the managed sudoers
 # template grows a new narrow primitive. create_agent_user writes the canonical
 # policy for NEW seats, but a seat created before DIVE-3160 kept its old drop-in
@@ -1098,16 +1128,23 @@ cmd_agent_reconcile_sudoers() {
   done < <(jq -r '.agents | to_entries[] | select(.value.isolation == "standard") | .key' <<<"$reg")
   # DIVE-8284: a sandboxed seat that already had web chat before its chat-only
   # drop-in existed gets it on this update; one without the channel loses it.
-  local chans sandboxed=0
+  local chans sandboxed=0 units=0
   while IFS=$'\t' read -r name chans; do
     [[ -n "$name" ]] || continue
     case "$(sync_sandboxed_chat_sudoers "agent-${name}" "$chans")" in
       written|removed) sandboxed=$((sandboxed + 1)) ;;
     esac
+    # DIVE-9004: and its unit's own group. A subshell: a seat whose account is
+    # gone (a registry orphan) is skipped, not allowed to end the pass.
+    id "agent-${name}" >/dev/null 2>&1 || continue
+    [[ "$( (sync_sandboxed_isolation_dropin "$name") 2>/dev/null)" == written ]] && units=$((units + 1))
   done < <(jq -r '.agents | to_entries[] | select(.value.isolation == "sandboxed") | "\(.key)\t\(.value.channels // "none")"' <<<"$reg")
-  ok "standard-seat sudoers reconciled: updated=${updated}, current=${current}, skipped=${skipped}; sandboxed chat grants changed=${sandboxed}" \
-     '{updated:($u|tonumber), current:($c|tonumber), skipped:($s|tonumber), sandboxedChat:($x|tonumber)}' \
-     --arg u "$updated" --arg c "$current" --arg s "$skipped" --arg x "$sandboxed"
+  # The new group binds at each seat's next start; install.sh restarts agents
+  # after this pass.
+  (( units == 0 )) || systemctl daemon-reload 2>/dev/null || true
+  ok "standard-seat sudoers reconciled: updated=${updated}, current=${current}, skipped=${skipped}; sandboxed chat grants changed=${sandboxed}; sandboxed units regrouped=${units}" \
+     '{updated:($u|tonumber), current:($c|tonumber), skipped:($s|tonumber), sandboxedChat:($x|tonumber), sandboxedUnits:($g|tonumber)}' \
+     --arg u "$updated" --arg c "$current" --arg s "$skipped" --arg x "$sandboxed" --arg g "$units"
 }
 
 # DIVE-4183: `agent grant <name> <merge|push|deploy>` — re-render ONE existing
@@ -4345,11 +4382,8 @@ cmd_create() {
   if [[ "$isolation" == "sandboxed" ]]; then
     # DIVE-8284: web chat on a sandboxed seat needs its two self-only rails.
     sync_sandboxed_chat_sudoers "agent-${name}" "$channels" >/dev/null
-    step "Applying sandbox resource limits for agent-${name}"
-    local dropin_dir="/etc/systemd/system/5dive-agent@${name}.service.d"
-    mkdir -p "$dropin_dir"
-    printf '[Service]\nMemoryMax=512M\nCPUQuota=50%%\n' > "${dropin_dir}/isolation.conf"
-    chmod 644 "${dropin_dir}/isolation.conf"
+    step "Applying sandbox resource limits and own group for agent-${name}"
+    sync_sandboxed_isolation_dropin "$name" >/dev/null
   fi
 
   # claude needs the onboarding preseed + settings the channel user got at

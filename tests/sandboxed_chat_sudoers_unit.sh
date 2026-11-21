@@ -108,6 +108,22 @@ is "standard seat is not given the chat-only file" \
   "$([[ -e "$SUDOERS_D/agent-std" ]] && echo present || echo gone)" "gone"
 is "reconcile counts two sandboxed changes" "$(grep -o 'sandboxed chat grants changed=[0-9]*' <<<"$out")" "sandboxed chat grants changed=2"
 
+echo "== unit drop-in: the seat's own group (DIVE-9004) =="
+export SYSTEMD_UNIT_DIR="$TMP/units"
+id() { case "$*" in "-gn agent-sandy") echo agent-sandy ;; "-gn agent-bad") echo claude ;; *) command id "$@" ;; esac; }
+DI="$SYSTEMD_UNIT_DIR/5dive-agent@sandy.service.d/isolation.conf"
+is "drop-in: written" "$(sync_sandboxed_isolation_dropin sandy)" "written"
+is "drop-in: sets the seat's own group" "$(grep -c '^Group=agent-sandy$' "$DI")" "1"
+is "drop-in: keeps the resource limits" "$(grep -cE '^(MemoryMax=512M|CPUQuota=50%)$' "$DI")" "2"
+is "drop-in: again is current" "$(sync_sandboxed_isolation_dropin sandy)" "current"
+printf '[Service]\nMemoryMax=512M\nCPUQuota=50%%\n' >"$DI"
+is "drop-in: a pre-9004 file (no Group=) is rewritten" "$(sync_sandboxed_isolation_dropin sandy)" "written"
+out=$( (sync_sandboxed_isolation_dropin bad) 2>&1 ); rc=$?
+is "drop-in: a seat whose primary group is claude is refused, never written" "$([[ $rc -ne 0 && ! -e "$SYSTEMD_UNIT_DIR/5dive-agent@bad.service.d/isolation.conf" ]] && echo refused || echo written)" "refused"
+is "create writes the drop-in through the one helper" "$(grep -c 'sync_sandboxed_isolation_dropin "$name" >/dev/null' "$SRC/cmd_agent_create.sh")" "1"
+is "reconcile regroups existing sandboxed units" "$(grep -c 'sync_sandboxed_isolation_dropin "$name") 2>/dev/null' "$SRC/cmd_agent_create.sh")" "1"
+unset -f id
+
 echo "== wiring =="
 is "agent config syncs on a channels change for a sandboxed seat" \
   "$(grep -c 'sync_sandboxed_chat_sudoers "agent-${name}" "$channels_changed_to"' "$SRC/cmd_agent_config.sh")" "1"

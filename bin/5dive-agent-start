@@ -20,9 +20,17 @@ NAME="${1:-${AGENT_NAME:-}}"
 [[ -n "$NAME" ]] || { echo "usage: 5dive-agent-start <name>" >&2; exit 2; }
 
 ENV_FILE="/var/lib/5dive/agents.d/${NAME}.env"
-[[ -r "$ENV_FILE" ]] || { echo "no env file: $ENV_FILE" >&2; exit 2; }
-# shellcheck disable=SC1090
-source "$ENV_FILE"
+# DIVE-9004: a sandboxed seat runs outside group claude, so it cannot read its
+# own env file (root:claude 0640). systemd already read that same file as root
+# (EnvironmentFile=-/var/lib/5dive/agents.d/%i.env) and put its values in this
+# environment, so use them. Only a seat with neither the file nor the values
+# has nothing to start from.
+if [[ -r "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+elif [[ -z "${AGENT_TYPE:-}" ]]; then
+  echo "no env file: $ENV_FILE (and no AGENT_TYPE from the unit's EnvironmentFile)" >&2; exit 2
+fi
 
 TYPE="${AGENT_TYPE:?AGENT_TYPE missing}"
 CHANNELS="${AGENT_CHANNELS:-none}"

@@ -144,7 +144,18 @@ _team_self_try() {
       *) out+=("$a") ;;
     esac
   done
-  printf '%s\0' "${out[@]}" | sudo -n "$TEAM_SELF_BIN" _team_self
+  _team_self_cross "${out[@]}"
+}
+
+# _team_self_cross <op> <arg>... — the one crossing. On a non-zero exit the root
+# side has ALREADY printed its reason, so mark it reported: otherwise this
+# process's own backstop overprints "exited N without reporting a reason … a bug
+# in the CLI" under a plain refusal (measured on the test box, DIVE-9004).
+_team_self_cross() {
+  local rc=0
+  printf '%s\0' "$@" | sudo -n "$TEAM_SELF_BIN" _team_self || rc=$?
+  (( rc == 0 )) || mark_reported
+  return "$rc"
 }
 
 # _team_self_send [--urgent] <agent> <message> — cmd_send's crossing for a seat
@@ -152,5 +163,5 @@ _team_self_try() {
 _team_self_send() {
   _team_self_available || return 125
   sudo -n -l "$TEAM_SELF_BIN" agent _deliver x y >/dev/null 2>&1 && return 125
-  printf '%s\0' send "$@" | sudo -n "$TEAM_SELF_BIN" _team_self
+  _team_self_cross send "$@"
 }

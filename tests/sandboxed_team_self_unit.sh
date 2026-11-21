@@ -106,6 +106,15 @@ else
   [[ "$(cat "$WIRE")" == "[b'done', b'$MINE', b'--result=done from a file']" ]] && ok "--result-file is read by the seat and crosses inlined; close->done" || bad "inline" "$(cat "$WIRE")"
   out=$( (_team_self_try set-body "$MINE" --body=x) 2>&1 ); rc=$?
   [[ $rc != 0 && $rc != 125 && "$out" == *"not on a sandboxed seat's team rail"* ]] && ok "an off-rail verb fails with a plain sentence, not EACCES" || bad "off-rail" "rc=$rc $out"
+  sudo() { if [[ "$2" == "-l" ]]; then [[ "$4" == "_team_self" ]] && return 0 || return 1; fi; cat >/dev/null; echo "Error: refused" >&2; return 10; }
+  REP="$TMP/reported"; FIVE_REPORTED_FLAG="$REP"; rm -f "$REP"
+  _team_self_try done "$MINE" --result=x >/dev/null 2>&1; rc=$?
+  [[ $rc == 10 && -e "$REP" ]] && ok "a root refusal propagates its rc and is marked reported (no false 'bug in the CLI' backstop)" || bad "refusal reported" "rc=$rc reported=$([[ -e $REP ]] && echo y || echo n)"
+  sudo() {
+    if [[ "$2" == "-l" ]]; then [[ "$4" == "_team_self" ]] && return 0 || return 1; fi
+    printf '%s\n' "$*" >>"$CALLS"
+    python3 -c 'import sys; print(sys.stdin.buffer.read().split(b"\0")[:-1])' >"$WIRE"
+  }
   _team_self_send main "hi" >/dev/null
   [[ "$(cat "$WIRE")" == "[b'send', b'main', b'hi']" ]] && ok "agent send crosses as send <agent> <message>" || bad "send wire" "$(cat "$WIRE")"
 fi
