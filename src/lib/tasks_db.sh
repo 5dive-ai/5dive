@@ -2,14 +2,15 @@
 # -------- tasks + org store (sqlite) --------
 #
 # A light, host-shared task queue + agent org-chart, kept SEPARATE from the
-# root-only agent registry. It lives in a GROUP-WRITABLE subdir so any agent
-# (every agent-<x> user is in group `claude`) can add/list/update tasks
-# WITHOUT sudo — these are high-frequency, low-risk operations, unlike
-# `agent create` which provisions Linux users and stays root-only.
+# root-only agent registry. Any agent can add/list/update tasks without
+# typing sudo — but since DIVE-9001 only through the CLI: the board dir is
+# root:5dive-board 2770, no agent is in that group, and the CLI re-runs itself
+# with the group for board verbs (src/lib/board_hop.sh). An agent's own
+# sqlite3 cannot open the file.
 #
-# Storage: /var/lib/5dive/tasks/tasks.db (sqlite, WAL). The dir is 2770
-# root:claude (setgid) and we run under umask 0002 so the .db plus its
-# -wal/-shm sidecars stay group-writable for the next agent's connection.
+# Storage: /var/lib/5dive/tasks/tasks.db (sqlite, WAL). The dir is setgid and
+# we run under umask 0002 so the .db plus its -wal/-shm sidecars stay
+# group-writable for the next connection.
 
 # DIVE-1475: honor direct env overrides too (a test may set TASKS_DB straight),
 # same isolation rationale as STATE_DIR in header.sh. Unset -> the live defaults.
@@ -2020,11 +2021,17 @@ tasks_db_init() {
   # than at each of those call sites.
   _tasks_store_fence "CREATE TABLE"
   umask 0002
+  # DIVE-9001: a seat that reached a locked board WITHOUT the hop (a verb not on
+  # FIVEDIVE_BOARD_VERBS, or a build outside /usr/local/bin) must say so here.
+  # Past this line sqlite3 would fail, the board would look absent, and the
+  # DIVE-1479 recovery below would try to restore a board that is fine.
+  if [[ $EUID -ne 0 && -d "$TASKS_DIR" && ! -x "$TASKS_DIR" ]]; then
+    fail "$E_PERMISSION" "cannot open the task board: only the 5dive CLI opens it, and '5dive ${CURRENT_VERB:-?}' did not run with the board group (DIVE-9001). If this is a board command, add it to FIVEDIVE_BOARD_VERBS in src/lib/board_hop.sh."
+  fi
   if [[ ! -d "$TASKS_DIR" ]]; then
     if [[ $EUID -eq 0 ]]; then
       mkdir -p "$TASKS_DIR"
-      chown root:claude "$TASKS_DIR"
-      chmod 2770 "$TASKS_DIR"
+      board_lockdown "$TASKS_DIR"
     else
       fail "$E_PERMISSION" "tasks store not initialised — run once: sudo 5dive task init"
     fi

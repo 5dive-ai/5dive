@@ -1213,5 +1213,8 @@ _task_print_children() {
 cmd_task_init() {
   require_root "task init"
   tasks_db_init
+  # DIVE-9001: also the step self-update runs from the fresh binary, so an
+  # existing board is put behind the 5dive-board group on update.
+  board_lockdown "$TASKS_DIR"
   ok "tasks store ready at $TASKS_DB" '{path:$p}' --arg p "$TASKS_DB"
 }

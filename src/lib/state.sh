@@ -36,14 +36,14 @@ ensure_state() {
   [[ -f "$REGISTRY_LOCK" ]] || : > "$REGISTRY_LOCK"
   chown root:claude "$REGISTRY_LOCK"
   chmod 640 "$REGISTRY_LOCK"
-  # Group-writable tasks/org store (unlike the rest of STATE_DIR, which is
-  # root-only): the shared task queue is meant to be used by every agent
-  # without sudo. 2770 + setgid keeps the db and its -wal/-shm sidecars
-  # owned by group claude and writable across agent users. tasks_db_init
-  # (re)applies the schema lazily on first use.
+  # The tasks/org store. DIVE-9001: on the production board this is
+  # root:5dive-board 2770, a group no agent is in, and the CLI reaches it by
+  # re-running itself with that group (src/lib/board_hop.sh). Any other store
+  # (a harness, a scratch dir) keeps the old root:claude 2770. setgid keeps the
+  # db and its -wal/-shm sidecars in the dir's group. tasks_db_init (re)applies
+  # the schema lazily on first use.
   mkdir -p "$TASKS_DIR"
-  chown root:claude "$TASKS_DIR"
-  chmod 2770 "$TASKS_DIR"
+  board_lockdown "$TASKS_DIR"
   audit_init
 }
 
