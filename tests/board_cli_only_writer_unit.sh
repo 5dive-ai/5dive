@@ -87,25 +87,39 @@ has()  { case "$2" in *"$1"*) return 0;; *) return 1;; esac; }
   warn() { :; }
   # shellcheck source=/dev/null
   source "$REPO/src/lib/board_hop.sh"
-  s="$(board_sudoers_render)"
   f=0
-  has '%claude ALL=(:5dive-board) NOPASSWD: FIVEDIVE_BOARD_CLI' "$s" || { echo "no group rule"; f=1; }
-  # The hop's own symlink, never /usr/local/bin/5dive: that name would put these
-  # Defaults on every root `sudo 5dive` too.
-  has 'Cmnd_Alias FIVEDIVE_BOARD_CLI = /usr/local/lib/5dive/5dive-board'$'\n' "$s" || { echo "alias is not the hop link alone"; f=1; }
-  has '/usr/local/bin/5dive' "$s" && { echo "names the CLI binary itself"; f=1; }
-  ek="$(grep '^Defaults!FIVEDIVE_BOARD_CLI env_keep' <<<"$s")"
-  for v in PATH BASH_ENV LD_ ENV= PYTHON SHELLOPTS _BIN; do
-    has "$v" "$ek" && { echo "env_keep carries $v"; f=1; }
+  for variant in full portable; do
+    s="$(board_sudoers_render "$variant")"
+    has '%claude ALL=(:5dive-board) NOPASSWD: FIVEDIVE_BOARD_CLI' "$s" || { echo "$variant: no group rule"; f=1; }
+    # The hop's own symlink, never /usr/local/bin/5dive (that name would put these
+    # Defaults on every root `sudo 5dive` too), and only with --board-hopped, so
+    # sudo refuses `sudo -g 5dive-board <hop> gh ...` before the CLI even starts.
+    has 'Cmnd_Alias FIVEDIVE_BOARD_CLI = /usr/local/lib/5dive/5dive-board --board-hopped *'$'\n' "$s" \
+      || { echo "$variant: alias is not the hop link bound to --board-hopped"; f=1; }
+    has '/usr/local/bin/5dive' "$s" && { echo "$variant: names the CLI binary itself"; f=1; }
+    ek="$(grep '^Defaults!FIVEDIVE_BOARD_CLI env_keep' <<<"$s")"
+    for v in PATH BASH_ENV LD_ ENV= PYTHON SHELLOPTS _BIN; do
+      has "$v" "$ek" && { echo "$variant: env_keep carries $v"; f=1; }
+    done
+    # Only ever a group runas: never a user runas, never ALL commands.
+    grep -E '^[^#].*NOPASSWD' <<<"$s" | grep -vq '(:5dive-board)' && { echo "$variant: a non-group runas"; f=1; }
+    printf '%s\n' "$s" >"$TMP/sudoers-$variant"
   done
-  # Only ever a group runas: never a user runas, never ALL commands.
-  grep -E '^[^#].*NOPASSWD' <<<"$s" | grep -vq '(:5dive-board)' && { echo "a non-group runas"; f=1; }
-  if command -v visudo >/dev/null 2>&1; then
-    printf '%s\n' "$s" >"$TMP/sudoers"
-    visudo -cf "$TMP/sudoers" >/dev/null 2>&1 || { echo "visudo rejects it"; f=1; }
-  fi
+  has 'pam_session' "$(<"$TMP/sudoers-portable")" && { echo "portable carries a sudo-only setting"; f=1; }
+  # Every visudo here: the box's own, plus any named in BD_EXTRA_VISUDO (e.g. an
+  # unpacked sudo-rs visudo on a box that runs sudo). The portable variant must
+  # pass every one; the full one must pass classic sudo (it is what a sudo box
+  # installs). visudo's own words are printed on failure.
+  for vb in $(command -v visudo 2>/dev/null) ${BD_EXTRA_VISUDO:-}; do
+    rs=0; has 'sudo-rs' "$("$vb" --version 2>&1)" && rs=1
+    out="$("$vb" -cf "$TMP/sudoers-portable" 2>&1)" || { echo "$vb rejects the portable rule: $out"; f=1; }
+    if (( ! rs )); then
+      out="$("$vb" -cf "$TMP/sudoers-full" 2>&1)" || { echo "$vb (sudo) rejects the full rule: $out"; f=1; }
+    fi
+    echo "visudo checked: $vb ($( ((rs)) && echo sudo-rs || echo sudo ))"
+  done
   exit $f
-) && ok "U3 the sudoers rule is group-only, names only the hop link, and keeps no PATH/BASH_ENV/LD_*/*_BIN" \
+) && ok "U3 both sudoers variants are group-only, name only the hop link bound to --board-hopped, keep no PATH/BASH_ENV/LD_*/*_BIN, and pass visudo" \
   || bad "U3 sudoers render"
 
 out=$(
@@ -194,11 +208,13 @@ else
     || bad "R6 CLI path: id=$id4 assign rc=$ra done rc=$rd row=[$row]"
   # 5. the hop cannot be turned into anything else.
   o=$(as "sudo -n -g 5dive-board /usr/local/lib/5dive/5dive-board gh pr view 1" 2>&1); r1=$?
+  o4=$(as "sudo -n -g 5dive-board /usr/local/lib/5dive/5dive-board --board-hopped gh pr view 1" 2>&1); r4=$?
   o2=$(as "sudo -n -g 5dive-board /usr/bin/sqlite3 /var/lib/5dive/tasks/tasks.db 'select 1'" 2>&1); r2=$?
   o3=$(as "sudo -n -g 5dive-board /usr/local/bin/5dive task ls" 2>&1); r3=$?
-  (( r1 == 10 )) && has 'task-board group' "$o" && (( r2 != 0 && r3 != 0 )) \
-    && ok "R7 sudo -g gives only the hop link, and inside it only board verbs (gh refused 10; raw sqlite3 and the bare binary refused by sudo)" \
-    || bad "R7 hop widened: gh rc=$r1 [$o] sqlite3 rc=$r2 [$o2] bare rc=$r3 [$o3]"
+  (( r1 != 0 && r1 != 10 )) && ! has 'task-board group' "$o" && (( r4 == 10 )) && has 'task-board group' "$o4" \
+    && (( r2 != 0 && r3 != 0 )) \
+    && ok "R7 sudo -g gives only '<hop> --board-hopped', and inside it only board verbs (hop without --board-hopped, raw sqlite3 and the bare binary refused by sudo; --board-hopped gh refused 10)" \
+    || bad "R7 hop widened: no-flag gh rc=$r1 [$o] flagged gh rc=$r4 [$o4] sqlite3 rc=$r2 [$o2] bare rc=$r3 [$o3]"
   as "printf '%s\n' \"UPDATE tasks SET title='PWNED';\" > ~/.sqliterc"
   as "5dive task ls >/dev/null 2>&1"
   pw=$(sqlite3 /var/lib/5dive/tasks/tasks.db "select count(*) from tasks where title='PWNED'")
