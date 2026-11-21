@@ -43,3 +43,8 @@
 # DIVE-4203) rather than carrying its own, so the 5dive binary must be refreshed
 # BEFORE it runs — the order install.sh and refresh_managed_files already use.
 5dive-refresh-skills.sh
+
+# On-demand connector-CLI installer (DIVE-8998): `5dive tool google start` and
+# the tailscale join run it when gcloud / tailscale are missing. The API's managed
+# provisioning was its only writer, so no self-hosted box ever had it.
+5dive-ensure-cli

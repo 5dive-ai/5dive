@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# 5dive-ensure-cli — install a connector CLI on first use.
+#
+# DIVE-8998: THIS FILE IS THE SOURCE OF TRUTH. It is a host-scripts.manifest
+# entry, so install.sh (curl-install, the .deb, `5dive self-update`) and the
+# managed fleet's nightly both install it. Before, only the API repo's managed
+# provisioning wrote it (5dive-api scripts/inc/5dive-ensure-cli.sh), so every
+# self-hosted box refused `5dive tool google start` and a tailscale join with
+# "no installer" (report 1322). The API copy is to be dropped once the fleet pin
+# carries this file; until then both writers ship the same bytes. The apt-lock
+# probe below was an @include there and is inlined here (no build step).
+#
+# Called from the dashboard's per-connector command (server-connectors/config.ts)
+# right before the CLI's login flow. Idempotent: if the tool is already on PATH
+# it exits 0 immediately. Designed for the claude-user shelld terminal context
+# (NOPASSWD sudo) so the heavy installs that used to run unconditionally in
+# 5dive-post-install.service can defer until the user actually wants them.
+#
+# Usage: 5dive-ensure-cli <vercel|wrangler|elevenlabs|neon|fly|doppler|tailscale|stripe|aws|gcloud>
+
+set -e
+TOOL="${1:?usage: 5dive-ensure-cli <vercel|wrangler|elevenlabs|neon|fly|doppler|tailscale|stripe|aws|gcloud>}"
+
+# DIVE-3804. Same window as the chat relay: the dashboard offers connectors the
+# moment the box reports ready, while the deferred post-install
+# (5dive-post-install.service) still holds the dpkg lock. doppler, tailscale,
+# stripe and gcloud all shell out to a vendor script that runs apt, and a
+# lock collision surfaces to the customer as a raw dpkg error inside a login
+# flow. scripts/inc/apt-lock-timeout.sh makes apt wait; this covers a box that
+# has not taken that drop-in yet, and prints a reason for the pause.
+# --- Is the dpkg/apt lock held right now? (DIVE-3804 follow-up) ---
+# Sourced into BOTH on-demand installers by @include. It was written twice —
+# once in 5dive-buzz-relay-install.sh with an apt-get fallback, once in
+# 5dive-ensure-cli.sh without one — and quinn caught the pair diverging before
+# either had drifted further. Two copies of one decision is the defect class, so
+# there is now one copy.
+#
+# fuser is the cheap read, but psmisc is not guaranteed: a box that lacks it
+# must not silently conclude "lock free" and walk straight into the failure this
+# whole change exists to prevent. `apt-get check` takes the same locks and exits
+# non-zero when it cannot get them, with the timeout forced to 0 so the PROBE
+# never blocks (it is asking a question, not waiting for an answer).
+apt_lock_held() {
+  if command -v fuser >/dev/null 2>&1; then
+    fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1
+    return
+  fi
+  ! apt-get check -o DPkg::Lock::Timeout=0 >/dev/null 2>&1
+}
+
+# Waits up to 15 min. Previously this returned 0 the moment `fuser` was missing,
+# so a box without psmisc skipped the wait entirely and hit the very failure the
+# wait exists to prevent (quinn, DIVE-3804 review). It now shares the relay's
+# probe, which falls back to `apt-get check`.
+wait_for_apt() {
+  local waited=0
+  apt_lock_held || return 0
+  echo "Waiting for the server to finish its first-boot setup before installing ${TOOL}..."
+  while apt_lock_held && [ "$waited" -lt 900 ]; do
+    sleep 5
+    waited=$((waited + 5))
+  done
+  return 0
+}
+
+case "$TOOL" in
+  vercel|wrangler)
+    command -v "$TOOL" >/dev/null 2>&1 && exit 0
+    export NVM_DIR="$HOME/.nvm"
+    # shellcheck disable=SC1091
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+    npm install -g "$TOOL"
+    ;;
+  elevenlabs)
+    # Binary is `elevenlabs`; npm package is `@elevenlabs/cli`.
+    command -v elevenlabs >/dev/null 2>&1 && exit 0
+    export NVM_DIR="$HOME/.nvm"
+    # shellcheck disable=SC1091
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+    npm install -g @elevenlabs/cli
+    ;;
+  neon)
+    # Binary is `neonctl`; npm package is `neonctl`.
+    command -v neonctl >/dev/null 2>&1 && exit 0
+    export NVM_DIR="$HOME/.nvm"
+    # shellcheck disable=SC1091
+    [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+    npm install -g neonctl
+    ;;
+  fly)
+    # Installs flyctl (aka `fly`) into ~/.fly/bin via the official script.
+    # The connector command exports ~/.fly/bin onto PATH before calling it.
+    [ -x "$HOME/.fly/bin/flyctl" ] && exit 0
+    command -v flyctl >/dev/null 2>&1 && exit 0
+    curl -fsSL https://fly.io/install.sh | sh
+    ;;
+  doppler)
+    command -v doppler >/dev/null 2>&1 && exit 0
+    wait_for_apt
+    # Official installer needs root to drop the binary in /usr/local/bin.
+    curl -Ls --tlsv1.2 --proto "=https" --retry 3 https://cli.doppler.com/install.sh | sudo -n sh
+    ;;
+  tailscale)
+    command -v tailscale >/dev/null 2>&1 && exit 0
+    wait_for_apt
+    curl -fsSL https://tailscale.com/install.sh | sudo -n sh
+    sudo -n systemctl enable --now tailscaled 2>/dev/null || true
+    ;;
+  stripe)
+    command -v stripe >/dev/null 2>&1 && exit 0
+    wait_for_apt
+    sudo -n bash -e <<'STRIPE'
+curl -fsSL https://packages.stripe.dev/api/security/keypair/stripe-cli-gpg/public \
+  | gpg --dearmor --yes -o /usr/share/keyrings/stripe.gpg
+echo "deb [signed-by=/usr/share/keyrings/stripe.gpg] https://packages.stripe.dev/stripe-cli-debian-local stable main" \
+  > /etc/apt/sources.list.d/stripe.list
+apt-get update -qq
+apt-get install -y -qq stripe
+STRIPE
+    ;;
+  aws)
+    command -v aws >/dev/null 2>&1 && exit 0
+    ARCH=$(uname -m)
+    case "$ARCH" in
+      x86_64)  AWS_URL="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" ;;
+      aarch64) AWS_URL="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" ;;
+      *) echo "5dive-ensure-cli: unsupported arch $ARCH for AWS CLI" >&2; exit 1 ;;
+    esac
+    curl -fsSL "$AWS_URL" -o /tmp/awscliv2.zip
+    unzip -q -o /tmp/awscliv2.zip -d /tmp
+    sudo -n /tmp/aws/install --update
+    rm -rf /tmp/aws /tmp/awscliv2.zip
+    ;;
+  gcloud)
+    command -v gcloud >/dev/null 2>&1 && exit 0
+    wait_for_apt
+    sudo -n bash -e <<'GCLOUD'
+curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+  | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg
+echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+  > /etc/apt/sources.list.d/google-cloud-sdk.list
+apt-get update -qq
+apt-get install -y -qq google-cloud-cli
+GCLOUD
+    ;;
+  *)
+    echo "5dive-ensure-cli: unknown tool '$TOOL'" >&2
+    echo "  available: vercel wrangler elevenlabs neon fly doppler tailscale stripe aws gcloud" >&2
+    exit 1
+    ;;
+esac

@@ -110,6 +110,28 @@ check_installed() {
 miss=$(check_installed "$names")
 [[ -z "$miss" ]] && ok_t "every manifest name landed 0755" || bad_t "every manifest name landed 0755" "missing/wrong-mode:$miss"
 
+echo "# DIVE-8998: a curl-install box gets the connector-CLI installer"
+# report 1322: `tool google start` (and the tailscale join) run
+# /usr/local/bin/5dive-ensure-cli, which only the API's managed provisioning
+# wrote, so every self-hosted box refused Google sign-in. install.sh --upgrade
+# (self-update, the .deb's setup) runs this same block, so an existing box gets
+# it on its next update.
+grep -qxF 5dive-ensure-cli <<< "$names" && ok_t "the manifest names 5dive-ensure-cli" \
+  || bad_t "the manifest names 5dive-ensure-cli" "a self-hosted box would have no gcloud/tailscale installer"
+cmp -s "$BIN_DIR/5dive-ensure-cli" bin/5dive-ensure-cli && [[ -x "$BIN_DIR/5dive-ensure-cli" ]] \
+  && ok_t "the install leaves an executable 5dive-ensure-cli, byte-identical to bin/" \
+  || bad_t "the install leaves an executable 5dive-ensure-cli" "$(ls -l "$BIN_DIR" 2>&1)"
+EC_STUB=$(mktemp -d); printf '#!/bin/sh\nexit 0\n' > "$EC_STUB/gcloud"; printf '#!/bin/sh\nexit 0\n' > "$EC_STUB/tailscale"
+printf '#!/bin/sh\necho SUDO-CALLED; exit 9\n' > "$EC_STUB/sudo"; chmod 755 "$EC_STUB"/*
+for tool in gcloud tailscale; do
+  o=$(PATH="$EC_STUB:/usr/bin:/bin" "$BIN_DIR/5dive-ensure-cli" "$tool" 2>&1); r=$?
+  [[ $r -eq 0 && "$o" != *SUDO-CALLED* ]] && ok_t "installed 5dive-ensure-cli $tool: present already -> rc 0, no sudo" \
+    || bad_t "installed 5dive-ensure-cli $tool short-circuits" "rc=$r out=$o"
+done
+o=$(PATH="$EC_STUB:/usr/bin:/bin" "$BIN_DIR/5dive-ensure-cli" nosuchtool 2>&1); r=$?
+[[ $r -eq 1 && "$o" == *"unknown tool"* ]] && ok_t "an unknown tool is refused (rc 1)" || bad_t "unknown tool refused" "rc=$r out=$o"
+rm -rf "$EC_STUB"
+
 echo "# a poisoned manifest entry is REJECTED, not sanitised"
 run_block $'5dive-refresh-skills.sh\n../../etc/cron.d/evil\n/usr/local/bin/abs\n.hidden\ntwo words' > "$LOG" 2>&1; OUT=$(cat "$LOG")
 [[ -f "$BIN_DIR/5dive-refresh-skills.sh" ]] && ok_t "the good entry still installs" || bad_t "the good entry still installs" "$OUT"

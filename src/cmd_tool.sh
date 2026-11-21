@@ -343,7 +343,8 @@ _tool_rm() {
 #   cancel -> tear the login down
 #
 # gcloud is not preinstalled: start runs /usr/local/bin/5dive-ensure-cli gcloud
-# (the API repo's on-demand installer, apt google-cloud-cli) DETACHED and returns
+# (bin/5dive-ensure-cli, a host-scripts.manifest entry, so install.sh and every
+# update put it on a self-hosted box too, DIVE-8998; apt google-cloud-cli) DETACHED and returns
 # `installing`; the poll that sees it finish starts the login. A cancel never
 # stops an install half-way: killing apt mid-install leaves dpkg to repair.
 TOOL_GOOGLE_ID="google"

@@ -104,6 +104,7 @@ jobs:
           SHEBANG_FILES=(install.sh bin/5dive-agent-start build.sh
                          bin/5dive-stage-fork-plugins.sh
                          bin/5dive-refresh-plugins.sh bin/5dive-refresh-skills.sh
+                         bin/5dive-ensure-cli
                          scripts/*.sh)
           # These carry a bash shebang; let shellcheck read it.
           for f in "${SHEBANG_FILES[@]}"; do
