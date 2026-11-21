@@ -235,5 +235,5 @@ else
 fi
 
 echo
-if (( fails )); then echo "FAILED: $fails"; exit 1; fi
+(( fails == 0 )) || { echo "FAILED: $fails"; exit 1; }
 echo "all passed"
