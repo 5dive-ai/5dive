@@ -3001,6 +3001,9 @@ cmd_deliver() {
          + (if $ur == "1" then {urgent:($ue=="1"), urgent_requested:true} else {} end)
          + {reason:$r})' \
        --arg n "$target" --arg s "$s" --arg t "$tier" --arg r "$_reason" --arg q "$_queued" --arg ur "$urgent" --arg ue "$urgent_eff"
+    # DIVE-8957: as in cmd_send — the scoped caller's `send` execs into here, so
+    # its exit code is this one. Unconfirmed is non-zero; queued stays 0.
+    (( _queued )) || { mark_reported; return "$E_UNCONFIRMED"; }
   fi
 }
 
@@ -4035,6 +4038,12 @@ cmd_send() {
          + (if ($hh|length) > 0 then {halt_hint:"5dive agent halt \($n)"} else {} end)
          + {reason:$reason})' \
        --arg n "$name" --arg p "$payload" --arg s "$sender" --arg i "$msg_id" --arg rc "$reply_to_chat" --arg rm "$reply_to_msg" --arg w "$woken" --arg rd "$AGENT_WAKE_READY" --arg reason "$_reason" --arg q "$_queued" --arg ur "$urgent" --arg ue "$urgent_eff" --arg hh "$_halt_hint"
+    # DIVE-8957: an unconfirmed submit EXITS NON-ZERO. The receipt above is the
+    # same, but a caller that reads only the exit code (ship-watch.sh: `if 5dive
+    # agent send …; then log told`) logged «olivia told» twice on 2026-11-21 for
+    # messages that sat typed and unsent 20-90 min. Queued stays 0: the spool
+    # holds the message and types it at the seat's next idle.
+    (( _queued )) || { mark_reported; return "$E_UNCONFIRMED"; }
   fi
 }
 

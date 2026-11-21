@@ -3388,10 +3388,18 @@ _hb_composer_clear() {
 # sites already do, as their DIVE-4242/4246 hygiene step), so a composer that
 # was single-line costs one read here and no extra keystroke. Returns 0 =
 # composer read empty, 1 = text survived; sets _HB_COMPOSER_UNSENT either way.
+#
+# DIVE-8957: C-u kills one WRAPPED screen line, not one logical line (measured,
+# CC 2.1.330 at 68 cols: one C-u took the last visual row of a one-line draft).
+# A scrolled draft reports its hidden rows (`[↑ N more lines]`), so the bound
+# grows to cover them; capped, so a misread pane still stops.
 _hb_composer_scrub() {
-  local name="$1" i
-  for (( i = 0; i < ${_HB_SCRUB_MAX:-12}; i++ )); do
+  local name="$1" i max="${_HB_SCRUB_MAX:-12}" re='^\[↑ ([0-9]+) more lines\]'
+  for (( i = 0; i < max; i++ )); do
     _hb_verify_submit "$name" && return 0
+    if [[ "$_HB_COMPOSER_UNSENT" =~ $re ]] && (( i + BASH_REMATCH[1] + 12 > max )); then
+      max=$(( i + BASH_REMATCH[1] + 12 )); max=$(( max > 200 ? 200 : max ))
+    fi
     sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" BSpace 2>/dev/null || true
     sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
   done
@@ -3668,6 +3676,31 @@ _hb_composer_unsent() {
   local name="$1" raw blk line="" l c esc=$'\e' first=1 bordered=0
   local -a cont=()
   raw=$(sudo -u "agent-${name}" tmux capture-pane -e -p -t "agent-${name}" 2>/dev/null) || { printf ''; return 0; }
+  # DIVE-8957 — A SCROLLED COMPOSER HAS NO GLYPH ON SCREEN. A draft taller than
+  # the composer's viewport scrolls: Claude Code drops the `❯` line off the top
+  # and writes the hidden count into the composer's TOP rule instead —
+  # `─── ↑ 2 more ───…` (the `↑ N more` run is DIM). Measured on a live CC 2.1.330
+  # pane at 68x24, the size every seat here runs at: a ~530-char vouched send
+  # filled the composer, the pane carried no `❯` at all, and the read below
+  # returned EMPTY — so an Enter swallowed by the paste ingest read as a submit,
+  # no retry Enter was sent, and `agent send` said "sent" (olivia, 2026-11-21
+  # 04:40Z and 05:45Z: two QA-WATCH messages sat typed for 20-90 min). So a rule
+  # line carrying `↑ N more` BELOW the last `❯` is a draft, and what it reports is
+  # the hidden count plus the visible lines up to the bottom rule.
+  local scr
+  scr=$(sed -E "s/${esc}\[[0-9;?]*[A-Za-z]//g" <<<"$raw" | awk '
+    /❯/ { g = NR }
+    /^─+ +↑ [0-9]+ more/ { s = NR; m = $0; sub(/^─+ +↑ /, "", m); sub(/ more.*/, "", m) }
+    END { if (s > g) print s " " m }')
+  if [[ -n "$scr" ]]; then
+    local vis
+    vis=$(sed -E "s/${esc}\[[0-9;?]*[A-Za-z]//g" <<<"$raw" | awk -v s="${scr%% *}" '
+      NR > s && /^─/ { exit }
+      NR > s { gsub(/\xc2\xa0/, " "); sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); if ($0 != "") o = o (o == "" ? "" : " ") $0 }
+      END { printf "%s", o }')
+    printf '[↑ %s more lines] %s' "${scr#* }" "$vis"
+    return 0
+  fi
   # The block from the LAST `❯` line to the end of the pane; no glyph on the pane
   # = empty composer, not a fatal probe.
   blk=$(awk '/❯/ { b = "" ; f = 1 } f { b = b $0 "\n" } END { printf "%s", b }' <<<"$raw")

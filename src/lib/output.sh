@@ -12,6 +12,7 @@ err_class_for() {
     9)  echo pairing ;;
     10) echo permission ;;
     11) echo timeout ;;
+    12) echo unconfirmed ;;
     *)  echo generic ;;
   esac
 }
