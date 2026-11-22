@@ -1,26 +1,20 @@
 {
-  "date": "2026-11-21",
-  "generatedAtUtc": "2026-11-21T02:01:31Z",
+  "date": "2026-11-22",
+  "generatedAtUtc": "2026-11-22T02:01:27Z",
   "window": {
     "days": 30,
-    "from": "2026-10-22",
-    "to": "2026-11-20",
+    "from": "2026-10-23",
+    "to": "2026-11-21",
     "basis": "each task counts once, on the UTC day of its last task.done; the window is the whole days before the publish date"
   },
   "totals": {
-    "shipped": 2154,
-    "reviewed": 1082,
-    "firstTry": 578,
-    "sentBack": 504,
-    "sendBacks": 708
+    "shipped": 2205,
+    "reviewed": 1123,
+    "firstTry": 614,
+    "sentBack": 509,
+    "sendBacks": 717
   },
   "days": [
-    {
-      "date": "2026-10-22",
-      "reviewed": 21,
-      "firstTry": 9,
-      "sentBack": 12
-    },
     {
       "date": "2026-10-23",
       "reviewed": 27,
@@ -194,36 +188,42 @@
       "reviewed": 32,
       "firstTry": 19,
       "sentBack": 13
+    },
+    {
+      "date": "2026-11-21",
+      "reviewed": 62,
+      "firstTry": 45,
+      "sentBack": 17
     }
   ],
   "reasons": {
     "basis": "one fixed category per send-back, by rule from the reviewer's finding; no match or no preserved finding = other. Sums to totals.sendBacks.",
-    "total": 708,
+    "total": 717,
     "categories": [
       {
         "key": "conflict",
         "label": "Clashes with newer work",
-        "count": 38
+        "count": 39
       },
       {
         "key": "safety",
         "label": "Safety or privacy",
-        "count": 32
+        "count": 38
       },
       {
         "key": "writing",
         "label": "Unclear writing",
-        "count": 143
+        "count": 142
       },
       {
         "key": "tests",
         "label": "Failing tests",
-        "count": 325
+        "count": 334
       },
       {
         "key": "proof",
         "label": "No proof it works",
-        "count": 57
+        "count": 54
       },
       {
         "key": "ask",
@@ -233,7 +233,7 @@
       {
         "key": "other",
         "label": "Other",
-        "count": 83
+        "count": 80
       }
     ]
   },
