@@ -40,4 +40,6 @@ Your agents keep running. Only the app link goes.
 
 ## Signed releases
 
-Coming. Each release will be signed, and your server will refuse an update whose signature does not check out. Until then, review [`install.sh`](install.sh) before you run it as root.
+**Update files are signed.** Each release publishes an update file (`5dive-offline-<version>.tar`) for servers with no internet. `5dive self-update --from=<file>` checks its signature against 5dive's offline root key, which ships inside 5dive, and refuses a file that is unsigned, changed, signed by an expired key or by a revoked one. On since v0.125.0.
+
+**Online updates are not signed yet.** `5dive self-update` and `install.sh` download over HTTPS from GitHub and check a SHA-256 published in the same place. That catches a broken or swapped download, but not someone who controls our GitHub account. Until online updates are signed too, review [`install.sh`](install.sh) before you run it as root.
