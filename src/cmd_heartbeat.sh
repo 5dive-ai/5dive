@@ -2679,6 +2679,19 @@ _hb_bg_shell_sweep() {
 # gone. _PR_BG_SWEPT keeps the roster loop from sweeping the seat a second time
 # in the same tick (two done ticks in one would halve the grace).
 _PR_BG_SWEPT=""
+# DIVE-9079: the pending-restart pass summary. The "restart HELD … desiredState=
+# stopped" explanation belongs to the PARKED count only — printed unconditionally
+# it blamed every deferred or bounced seat on a registry/unit mismatch, and two
+# canary boxes each lost a round ruling out a parked-seat regression on it. Same
+# guard `5dive update`'s summary uses (src/cmd_selfupdate.sh). The `${...:-0}`
+# defaults stay: see the comment at the call site.
+_hb_pending_restart_summary() {
+  (( ${_PR_FIRED:-0} || ${_PR_DEFERRED:-0} || ${_PR_CLEARED:-0} || ${_PR_FAILED:-0} || ${_PR_PARKED:-0} )) || return 0
+  local parked="${_PR_PARKED:-0} left parked"
+  (( ${_PR_PARKED:-0} )) && parked+=" (restart held until the registry and the unit agree, desiredState=stopped)"
+  _hb_log "[pending-restart] pass done — ${_PR_FIRED:-0} bounced, ${_PR_DEFERRED:-0} still deferred (${_PR_OVERDUE:-0} overdue), ${_PR_CLEARED:-0} cleared, ${_PR_FAILED:-0} failed, ${parked}"
+}
+
 _hb_pending_restart_reap() {
   local dir f name
   _PR_BG_SWEPT=""
@@ -10882,8 +10895,7 @@ cmd_heartbeat_tick() {
   # read under `set -u` is fatal, which would abort the whole wake loop rather
   # than skip a log line. Exactly the heartbeat-never-woke bug class this pass is
   # isolated against, entering through the isolation's own summary.
-  (( ${_PR_FIRED:-0} || ${_PR_DEFERRED:-0} || ${_PR_CLEARED:-0} || ${_PR_FAILED:-0} || ${_PR_PARKED:-0} )) \
-    && _hb_log "[pending-restart] pass done — ${_PR_FIRED:-0} bounced, ${_PR_DEFERRED:-0} still deferred (${_PR_OVERDUE:-0} overdue), ${_PR_CLEARED:-0} cleared, ${_PR_FAILED:-0} failed, ${_PR_PARKED:-0} left parked — restart HELD until the registry and the unit agree (desiredState=stopped)"
+  _hb_pending_restart_summary
   # DIVE-2102: renew capability rows from the installed sudoers files. Without
   # this the 7d TTL expires every row and the registry converges on permanently
   # empty. Isolated like every other sweep — and note the failure direction is
