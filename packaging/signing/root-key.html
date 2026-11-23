@@ -86,8 +86,11 @@
       Update key (CLI updates)</label>
     <label class="check"><input type="radio" name="which" value="office" autocomplete="off">
       Office app key (the app an office server serves)</label>
+    <label class="check"><input type="radio" name="which" value="team" autocomplete="off">
+      Premium team key (signs the paid teams 5dive sells)</label>
     <p id="p-update">This is the update key from the 5dive team. Leave it as it is unless they sent you a new one.</p>
     <p id="p-office" hidden>Paste the office app key the 5dive team sent you.</p>
+    <p id="p-team" hidden>Paste the premium team key the 5dive team sent you.</p>
     <textarea id="t-upd" autocomplete="off" spellcheck="false"></textarea>
     <label for="n-days">Valid for (days)</label>
     <input type="number" id="n-days" value="365" min="1" max="3650" autocomplete="off">
@@ -190,6 +193,7 @@ function parseRevokedIds(text) {
 const KEY_KINDS = {
   update: { kind: "5dive-signing-key", file: "signing-key", field: "signing_key" },
   office: { kind: "5dive-office-app-key", file: "office-key", field: "office_key" },
+  team: { kind: "5dive-team-key", file: "team-key", field: "team_key" },
 };
 // Exact bytes the boxes verify: compact JSON, keys in this order.
 function signingKeyJson(pem, keyId, notAfter, kind = KEY_KINDS.update.kind) {
@@ -209,8 +213,10 @@ async function buildPublicFile(master, update, days, serial, revokedText, nowMs,
   if (!k) throw new Error("Choose which key you are approving.");
   const ids = parseRevokedIds(revokedText);
   if (update.keyId === master.fingerprint) throw new Error("That key is the master key itself. Use the key from 5dive.");
-  if (which === "office" && update.keyId === (await importUpdateKey(DEFAULT_UPDATE_KEY)).keyId)
-    throw new Error("That is the update key, not the office app key. Paste the office app key from 5dive.");
+  if (which !== "update" && update.keyId === (await importUpdateKey(DEFAULT_UPDATE_KEY)).keyId)
+    throw new Error(which === "team"
+      ? "That is the update key, not the premium team key. Paste the premium team key from 5dive."
+      : "That is the update key, not the office app key. Paste the office app key from 5dive.");
   if (ids.includes(update.keyId)) throw new Error("You are blocking the same key you are approving.");
   const notAfter = Math.floor(nowMs / 1000) + wholeNumber(days, 1, 3650, "Days") * 86400;
   const sk = enc.encode(signingKeyJson(update.pem, update.keyId, notAfter, k.kind));
@@ -276,10 +282,10 @@ $("b-load-next").onclick = () => { $("t-load").value = ""; show("s-update"); };
 
 const which = () => document.querySelector("input[name=which]:checked").value;
 document.querySelectorAll("input[name=which]").forEach(r => r.onchange = () => {
-  const office = which() === "office", t = $("t-upd");
-  $("p-update").hidden = office; $("p-office").hidden = !office;
-  if (office && t.value === DEFAULT_UPDATE_KEY) t.value = "";      // no default office key: paste 5dive's
-  if (!office && !t.value.trim()) t.value = DEFAULT_UPDATE_KEY;
+  const w = which(), other = w !== "update", t = $("t-upd");
+  $("p-update").hidden = other; $("p-office").hidden = w !== "office"; $("p-team").hidden = w !== "team";
+  if (other && t.value === DEFAULT_UPDATE_KEY) t.value = "";       // no default office/team key: paste 5dive's
+  if (!other && !t.value.trim()) t.value = DEFAULT_UPDATE_KEY;
   $("err").textContent = "";
 });
 $("b-upd-next").onclick = guard(async () => {
@@ -290,7 +296,7 @@ $("b-upd-next").onclick = guard(async () => {
 $("b-sign").onclick = guard(async () => {
   const w = which();
   const file = await buildPublicFile(master, update, $("n-days").value, $("n-serial").value, $("t-rev").value, Date.now(), w);
-  const name = w === "office" ? "5dive-master-key-PUBLIC-office.json" : "5dive-master-key-PUBLIC.json";
+  const name = w === "update" ? "5dive-master-key-PUBLIC.json" : `5dive-master-key-PUBLIC-${w}.json`;
   $("b-pub").onclick = () => download(name, file, "application/json");
   $("out-fp").textContent = master.fingerprint;
   show("s-out");

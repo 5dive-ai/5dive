@@ -2984,7 +2984,9 @@ usage: 5dive team import <slug|path|file.tar.gz> [--auth-profile=<name>] [--type
   <slug> resolves in the marketplace registry (<org>/5dive-marketplace, teams/),
   read live — a template published there works on this box with no update.
   A path is used as-is, and is the offline / bring-your-own route. A .tar.gz
-  from 'team export' brings the whole team, every member's pack included.
+  from 'team export' brings the whole team, every member's pack included. A
+  premium team file (bought from 5dive) is checked first: it must be signed by
+  5dive, and the import says whose copy it is.
   Either way the template is saved as the team's manifest at
   ${STATE_DIR:-/var/lib/5dive}/teams/<slug>.5dive.yaml, every role is told that path, and
   'team ps' prints it. Edit it there to change policy (e.g. channel tiers).
@@ -3662,7 +3664,7 @@ HELP
   [[ -z "$lang" || -n "$(_compose_kickoff_lang_norm "$lang")" ]] \
     || fail "$E_USAGE" "unknown --lang: $lang (known: ru, en, zh)"
 
-  local file="" resolve_rc=0 template_dir="" reg_idx=""
+  local file="" resolve_rc=0 template_dir="" reg_idx="" premium_json=""
   if [[ -n "$template_src" ]]; then
     # DIVE-6088: the template is handed in (5dive-api reads it from a partner's
     # private registry, which this box has no credential for). The registry is
@@ -3693,10 +3695,17 @@ HELP
       0) : ;;
       2) rm -rf "$template_dir"; fail "$E_VALIDATION" "refusing $ref: it holds a path outside the file or a link — a team file never does. Nothing was imported." ;;
       3) rm -rf "$template_dir"; fail "$E_VALIDATION" "$ref is not a team file (made by: 5dive team export <team>). One agent's pack imports with: 5dive agent import $ref --as=<name>" ;;
+      4) local _pwhy; _pwhy=$(cat "$template_dir/.premium-why" 2>/dev/null); rm -rf "$template_dir"
+         fail "$E_VALIDATION" "refusing $ref: ${_pwhy:-this premium team file did not verify}. Nothing was imported." ;;
       *) rm -rf "$template_dir"; fail "$E_VALIDATION" "cannot read $ref (not a readable .tar.gz)" ;;
     esac
     ref="$bundle_slug"
     file="$template_dir/team.5dive.yaml"
+    # DIVE-9109: a premium file verified — say who signed it and whose copy it is.
+    if [[ -f "$template_dir/.premium.json" ]]; then
+      premium_json=$(cat "$template_dir/.premium.json")
+      step "$(jq -r '"signed by 5dive: premium team \(.team) \(.version), licensed to \(.buyer.name // "") (account \(.buyer.account))"' <<<"$premium_json")"
+    fi
   else
     # Fetched here rather than inside the resolver, so the same index also
     # names the project key below (DIVE-7289: an old name keeps its key).
@@ -3879,6 +3888,8 @@ HELP
   [[ -n "$template_dir" ]] && rm -rf "$template_dir"
   (( _up_rc == 0 )) || return "$_up_rc"
   _team_seat_map_write "$slug_key" "$COMPOSE_SEAT_MAP" || true
+  # DIVE-9109: keep the signed label of a premium team (version, buyer) on the box.
+  [[ -n "$premium_json" ]] && _team_premium_record "$premium_json"
   # DIVE-5769: who is in this team, under the names the roster came up with.
   if [[ -n "$slug_key" && -n "$spec_for_prefix" ]]; then
     local _final="$spec_for_prefix"

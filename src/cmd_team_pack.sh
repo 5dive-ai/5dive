@@ -26,6 +26,70 @@
 TEAM_BUNDLE_KIND="5dive-team"
 TEAM_BUNDLE_FORMAT=1
 
+# -------- DIVE-9109: a PREMIUM team file — signed by 5dive, stamped with its buyer
+#
+# A paid team is not on the public registry. Its buyer gets ONE .gz that wraps a
+# normal team bundle (above):
+#
+#   manifest.json        {"format":1,"kind":"5dive-premium-team","team":<slug>,
+#                         "version":"X.Y.Z","buyer":{"account":<id>,"name":<name>},
+#                         "issued_at":<epoch>,"files":{"payload/team.tar.gz":<sha256>},
+#                         "trust":{"team_key","team_key_sig","revoked","revoked_sig"}}
+#   manifest.sig         raw ed25519 over manifest.json's exact bytes, by the team key
+#   payload/team.tar.gz  the team bundle; its own manifest.json repeats the buyer
+#                        (licensed_to), so a copy with the wrapper torn off still
+#                        names who it was sold to
+#
+# The team key is trusted ONLY through 5dive's root, certified for this one kind
+# (5dive-team-key): the update key, the office app key and an expired or revoked
+# key are refused (_ou_chain, src/lib/offline_update.sh). A box without the root
+# refuses every premium file. packaging/premium-team/build.sh makes one.
+# Deliberately no DRM: the file can be passed on; the signature says it came
+# from 5dive, the stamp says whose copy it was.
+TEAM_PREMIUM_KIND="5dive-premium-team"
+
+# <outer-dir> -> 0 when the unpacked premium wrapper in <outer-dir> verifies:
+# exactly its three members, the team key through the root, the signature, the
+# manifest and the payload's sha256. 1 = refused, _OU_WHY says why in plain words.
+# <outer-dir> was unpacked by _pack_safe_extract (no links, no traversal).
+_team_premium_verify() {
+  local d="$1" meta root rrc=0 m members want got
+  _OU_WHY=""
+  command -v openssl >/dev/null 2>&1 || { _OU_WHY="openssl is not installed, so the signature cannot be checked"; return 1; }
+  members=$(cd "$d" && find . -mindepth 1 -printf '%y %P\n' 2>/dev/null | LC_ALL=C sort | tr '\n' ';')
+  [[ "$members" == "d payload;f manifest.json;f manifest.sig;f payload/team.tar.gz;" ]] \
+    || { _OU_WHY="the file holds something other than its manifest, signature and team"; return 1; }
+  meta=$(mktemp -d) || { _OU_WHY="internal: could not stage the check"; return 1; }
+  chmod 700 "$meta"
+  cp "$d/manifest.json" "$meta/manifest.json" || { rm -rf "$meta"; _OU_WHY="could not read the manifest"; return 1; }
+  root="$meta/root.pem"
+  _ou_root_key "$root" || rrc=$?
+  if (( rrc != 0 )); then
+    (( rrc == 2 )) || _OU_WHY="this server holds no 5dive root key, so it cannot check a premium team file — update 5dive first"
+    rm -rf "$meta"; return 1
+  fi
+  _ou_chain "$meta" "$root" team_key || { rm -rf "$meta"; return 1; }
+  if ! _ou_sig_ok "$meta/certified.pem" "$meta/manifest.json" "$d/manifest.sig"; then
+    rm -rf "$meta"; _OU_WHY="the signature does not match the team key 5dive's root key certified — the file was changed or was not made by 5dive"; return 1
+  fi
+  m="$meta/manifest.json"
+  if ! jq -e --arg k "$TEAM_PREMIUM_KIND" '.format == 1 and .kind == $k
+         and (.team|type == "string" and test("^[a-z0-9][a-z0-9-]{0,63}$"))
+         and (.version|type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+         and (.buyer.account|type == "string" and length > 0) and (.buyer.name|type == "string")
+         and (.issued_at|type == "number")
+         and (.files|type == "object") and ((.files|keys) == ["payload/team.tar.gz"])' "$m" >/dev/null 2>&1; then
+    rm -rf "$meta"; _OU_WHY="the manifest is not a premium team manifest this 5dive reads"; return 1
+  fi
+  want=$(jq -r '.files["payload/team.tar.gz"]' "$m"); got=$(_ou_sha256 "$d/payload/team.tar.gz")
+  if [[ ! "$want" =~ ^[0-9a-f]{64}$ || "$got" != "$want" ]]; then
+    rm -rf "$meta"; _OU_WHY="the team was changed after the file was signed — refused"; return 1
+  fi
+  _ou_keep_revoked
+  rm -rf "$meta"
+  return 0
+}
+
 # <file> -> 0 when it is a gzip file (a team bundle candidate), else 1.
 _team_is_bundle() {
   local f="$1" magic
@@ -34,12 +98,50 @@ _team_is_bundle() {
   [[ "$magic" == "1f8b" ]]
 }
 
+# <signed-label-json> -> $STATE_DIR/premium-teams/<team>.json: which version of
+# a premium team this box runs and whose copy it is. A box that cannot write it
+# still has the team; it warns.
+_team_premium_record() {
+  local j="$1" team dir
+  team=$(jq -r '.team // empty' <<<"$j" 2>/dev/null)
+  [[ "$team" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 0
+  dir="${STATE_DIR:-/var/lib/5dive}/premium-teams"
+  if mkdir -p "$dir" 2>/dev/null && printf '%s\n' "$j" >"$dir/$team.json.tmp.$$" 2>/dev/null \
+     && mv -f "$dir/$team.json.tmp.$$" "$dir/$team.json"; then
+    return 0
+  fi
+  rm -f "$dir/$team.json.tmp.$$" 2>/dev/null
+  warn "could not record premium team $team's label in $dir (the team is imported)"
+  return 0
+}
+
 # <file> <dir> -> unpack a team bundle into <dir>, print its team slug.
-# Return: 0 ok; 1 not readable; 2 unsafe member; 3 not a team bundle.
+# Return: 0 ok; 1 not readable; 2 unsafe member; 3 not a team bundle;
+# 4 a premium team file that did not verify (<dir>/.premium-why says why).
+# A premium file that verifies leaves its signed manifest at <dir>/.premium.json
+# and the team it wraps unpacked in <dir>, exactly like a plain bundle.
 _team_bundle_unpack() {
-  local f="$1" dir="$2" rc=0 slug
+  local f="$1" dir="$2" rc=0 slug outer
   _pack_safe_extract "$f" "$dir" || { rc=$?; return "$rc"; }
   [[ -f "$dir/manifest.json" && ! -L "$dir/manifest.json" ]] || return 3
+  if [[ "$(jq -r '.kind // empty' "$dir/manifest.json" 2>/dev/null)" == "$TEAM_PREMIUM_KIND" ]]; then
+    outer=$(mktemp -d) || return 1
+    find "$dir" -mindepth 1 -maxdepth 1 -exec mv -t "$outer" -- {} + || { rm -rf "$outer"; return 1; }
+    if ! _team_premium_verify "$outer"; then
+      printf '%s' "$_OU_WHY" >"$dir/.premium-why"; rm -rf "$outer"; return 4
+    fi
+    _pack_safe_extract "$outer/payload/team.tar.gz" "$dir" || { rc=$?; rm -rf "$outer"; return "$rc"; }
+    # The stamp inside the team must name the same buyer as the signed wrapper.
+    if [[ -f "$dir/manifest.json" && ! -L "$dir/manifest.json" ]] \
+       && ! jq -e --slurpfile o "$outer/manifest.json" \
+            '.team == $o[0].team and .licensed_to.account == $o[0].buyer.account' "$dir/manifest.json" >/dev/null 2>&1; then
+      printf '%s' "the team inside this file does not match its signed label (team or buyer) — refused" >"$dir/.premium-why"
+      rm -rf "$outer"; return 4
+    fi
+    jq 'del(.trust)' "$outer/manifest.json" >"$dir/.premium.json" 2>/dev/null
+    rm -rf "$outer"
+    [[ -f "$dir/manifest.json" && ! -L "$dir/manifest.json" ]] || return 3
+  fi
   [[ -f "$dir/team.5dive.yaml" && ! -L "$dir/team.5dive.yaml" ]] || return 3
   [[ "$(jq -r '.kind // empty' "$dir/manifest.json" 2>/dev/null)" == "$TEAM_BUNDLE_KIND" ]] || return 3
   slug=$(jq -r '.team // empty' "$dir/manifest.json" 2>/dev/null)
