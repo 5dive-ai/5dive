@@ -1141,7 +1141,10 @@ cmd_task_ls() {
     # last_fired timestamp, reading as a live driver that fired recently.
     # --all lifts the filter for an audit view of every template regardless
     # of whether the scheduler still sees it.
-    (( all )) || where+=" AND schedule IS NOT NULL AND status='todo'"
+    # DIVE-9121: a job that paused itself after failing stays listed (status
+    # blocked, failure_pause set in --json) so the app can show it with Resume;
+    # it is still not something the scheduler fires.
+    (( all )) || where+=" AND schedule IS NOT NULL AND (status='todo' OR (parked_at IS NOT NULL AND EXISTS (SELECT 1 FROM task_prefs fp WHERE fp.key='loop.fails.'||tasks.ident AND json_valid(fp.value) AND json_extract(fp.value,'\$.paused_at') IS NOT NULL)))"
     order="ORDER BY id"
   else
     where+=" AND kind='standard'"
@@ -1266,10 +1269,12 @@ cmd_task_ls() {
     # dbfmt flattens newlines, so a `--` would comment out the rest of the query.
     # DIVE-8692: a loop's self-improving switch and its current score (the
     # score of the last run on its kept text), for the app's Tasks screens.
+    # DIVE-9121: failure_pause {failed, why, paused_at} on a job that paused
+    # itself after failing runs (only while its template is still parked).
     local _ri_cols="" _ri_jq="."
     if (( recurring )); then
-      _ri_cols=", CASE WHEN (SELECT value FROM task_prefs WHERE key='loop.improve.'||tasks.ident)='on' THEN 1 ELSE 0 END AS self_improving, (SELECT json_extract(value,'\$.kept_score') FROM task_prefs WHERE key='loop.improve.state.'||tasks.ident AND json_valid(value)) AS score"
-      _ri_jq='map(.self_improving = (.self_improving == 1) | .score = (.score // null))'
+      _ri_cols=", CASE WHEN (SELECT value FROM task_prefs WHERE key='loop.improve.'||tasks.ident)='on' THEN 1 ELSE 0 END AS self_improving, (SELECT json_extract(value,'\$.kept_score') FROM task_prefs WHERE key='loop.improve.state.'||tasks.ident AND json_valid(value)) AS score, CASE WHEN tasks.parked_at IS NOT NULL THEN (SELECT value FROM task_prefs WHERE key='loop.fails.'||tasks.ident AND json_valid(value) AND json_extract(value,'\$.paused_at') IS NOT NULL) END AS failure_pause"
+      _ri_jq='map(.self_improving = (.self_improving == 1) | .score = (.score // null) | .failure_pause = (if .failure_pause then (.failure_pause | fromjson | {failed: .n, why, paused_at}) else null end))'
     fi
     rows=$(dbfmt -json "SELECT id, ident, title, status, priority, assignee, created_by, parent_id, created_at, done_at, body, result, delivery_ref, merge_owner, merge_hold_reason, need_type, ask, need_options, recommend, precedent_ref, precedent_kind, need_answer, need_answered_at, need_answered_by, need_answered_relay, need_answered_tap_uid, need_expires_at, need_quote, need_quote_file, gate_pinged_at, tier, gate_mode, kind, schedule, schedule_tz, last_fired_at, last_skipped_at, last_skip_reason, on_overlap, overlap_bound, parked_at, park_reason, wake_at, project_key, maker_agent, verifier, review_mode,
              CASE WHEN maker_agent IS NOT NULL AND assignee=verifier AND status NOT IN ('done','cancelled')
