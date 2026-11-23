@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 18.0s measured (core-pristine-confirm shard 2, run 35041808914, 2026-09-16; the shard was 18s over its 300s cap and this file alone covers it): a cross-harness pack/memory export-import integration arm, slow by construction and not a per-change guard on a core code path — the nightly sweep (1320s budget) runs it every night.
+# TIER: nightly — 29.4s measured (full-pristine shard 3, pristine-s3, run 45182211572, 2026-11-23; 20.0-26.9s on 18 other full-pristine jobs in the DIVE-3188 window; DIVE-9125 widened it from the 18.0s claim of 2026-09-16): a cross-harness pack/memory export-import integration arm, slow by construction and not a per-change guard on a core code path — the nightly sweep (1320s budget) runs it every night.
 # DIVE-4541 isolated unit harness for CROSS-HARNESS memory on export/import.
 #
 # The defect this grades: `5dive agent export codex --memory=raw` refused with
