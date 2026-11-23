@@ -47,15 +47,15 @@ run_summary() {
 
 # ---- arm 1 --------------------------------------------------------------------
 out="$(run_summary - _PR_DEFERRED=1 _PR_OVERDUE=1 _PR_PARKED=0)"
-line="$(printf '%s\n' "$out" | grep '\[pending-restart\] pass done')"
-if [ -n "$line" ] && ! printf '%s' "$line" | grep -qiE 'held|desiredState'; then
+line="$(grep '\[pending-restart\] pass done' <<<"$out")"
+if [ -n "$line" ] && ! grep -qiE 'held|desiredState' <<<"$line"; then
   ok_t "arm 1: 0 parked, 1 deferred -> summary logged with no HELD/desiredState"
 else
   bad_t "arm 1: 0 parked must not name the parked cause" "got: $out"
 fi
 out="$(run_summary - _PR_FIRED=1 _PR_PARKED=0)"
-line="$(printf '%s\n' "$out" | grep '\[pending-restart\] pass done')"
-if [ -n "$line" ] && ! printf '%s' "$line" | grep -qiE 'held|desiredState'; then
+line="$(grep '\[pending-restart\] pass done' <<<"$out")"
+if [ -n "$line" ] && ! grep -qiE 'held|desiredState' <<<"$line"; then
   ok_t "arm 1b: 0 parked, 1 bounced -> no HELD/desiredState (chill-gorge's line)"
 else
   bad_t "arm 1b: 0 parked, 1 bounced must not name the parked cause" "got: $out"
@@ -63,7 +63,7 @@ fi
 
 # ---- arm 2 --------------------------------------------------------------------
 out="$(run_summary - _PR_DEFERRED=1 _PR_PARKED=1)"
-if printf '%s' "$out" | grep -qE '1 left parked \(restart held until the registry and the unit agree, desiredState=stopped\)$'; then
+if grep -qE '1 left parked \(restart held until the registry and the unit agree, desiredState=stopped\)$' <<<"$out"; then
   ok_t "arm 2: 1 parked -> explanation attached to '1 left parked'"
 else
   bad_t "arm 2: the parked explanation must follow '1 left parked'" "got: $out"
@@ -71,14 +71,14 @@ fi
 
 # ---- arm 3: negative control --------------------------------------------------
 pre="$TMP/prefix.sh"
-prefix_line="$(git show origin/main:src/cmd_heartbeat.sh 2>/dev/null \
-  | grep -A1 -F '(( ${_PR_FIRED:-0} || ${_PR_DEFERRED:-0}' | head -2)"
-if [ -z "$prefix_line" ] || ! printf '%s' "$prefix_line" | grep -q 'restart HELD'; then
+base_src="$(git show origin/main:src/cmd_heartbeat.sh 2>/dev/null)"
+prefix_line="$(grep -m1 -A1 -F '(( ${_PR_FIRED:-0} || ${_PR_DEFERRED:-0}' <<<"$base_src")"
+if [ -z "$prefix_line" ] || ! grep -q 'restart HELD' <<<"$prefix_line"; then
   echo "SKIP - arm 3: origin/main no longer carries the pre-fix line (nothing to control against)"
 else
   printf '_hb_pending_restart_summary() {\n%s\n}\n' "$prefix_line" >"$pre"
   out="$(run_summary "$pre" _PR_DEFERRED=1 _PR_OVERDUE=1 _PR_PARKED=0)"
-  if printf '%s' "$out" | grep -q 'pass done' && printf '%s' "$out" | grep -qiE 'held|desiredState'; then
+  if grep -q 'pass done' <<<"$out" && grep -qiE 'held|desiredState' <<<"$out"; then
     ok_t "arm 3: NEGATIVE CONTROL — the pre-fix line logs HELD with 0 parked (arm 1 would fail on it)"
   else
     bad_t "arm 3: the pre-fix line was expected to log HELD with 0 parked" "got: $out"
