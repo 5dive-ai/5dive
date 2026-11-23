@@ -528,6 +528,7 @@ _loop_score_request() {
             WHERE t.id=${id} AND t.status IN ('done','cancelled') AND p.${_LOOP_TPL_PRED//body/p.body};" 2>/dev/null)
   [[ -n "$row" ]] || return 0
   IFS=$'\x1f' read -r rident st tid tident <<<"$row"
+  _loop_fail_tick "$id" "$st" "$tid" "$tident" || true
   if [[ -n "$(_loop_pref_get "loop.outcome.${tident}")" ]]; then
     [[ "$st" == "done" && -z "$(_loop_pref_get "loop.score.${rident}")" ]] || return 0
     local tpl; tpl=$(db "SELECT id||x'1f'||COALESCE(assignee,'') FROM tasks WHERE ident=$(sqlq "$tident");")
@@ -1215,23 +1216,136 @@ cmd_task_loop_outcome() {
      '{loop:$t, outcome:{cmd:$c}, auto:false}' --arg t "$tident" --arg c "$cmd"
 }
 
-# `task loop resume <loop>` — the owner's tap on a paused outcome loop.
+# Unpark a paused loop's template: back to todo unless a dependency still holds
+# it, so the materializer fires it at its next time.
+_loop_tpl_unpark() {  # <template id>
+  db "UPDATE tasks SET parked_at=NULL, park_reason=NULL, wake_at=NULL,
+        status=CASE WHEN status='blocked' AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=$1)
+                    THEN 'todo' ELSE status END
+      WHERE id=$1 AND status NOT IN ('done','cancelled');"
+}
+
+# `task loop resume <loop>` — the owner's tap on a paused loop: paused by its
+# outcome (DIVE-5777) or by failing runs (DIVE-9121).
 _loop_outcome_resume() {  # <template id> <template ident> -> 0 resumed, 1 was not paused
   local tid="$1" tident="$2" st
   st=$(_loop_pref_get "loop.outcome.${tident}")
   [[ -n "$(jq -r '.paused_at // ""' <<<"$st" 2>/dev/null)" ]] || return 1
-  db "UPDATE tasks SET parked_at=NULL, park_reason=NULL, wake_at=NULL,
-        status=CASE WHEN status='blocked' AND NOT EXISTS (SELECT 1 FROM task_deps WHERE task_id=${tid})
-                    THEN 'todo' ELSE status END
-      WHERE id=${tid} AND status NOT IN ('done','cancelled');"
+  _loop_tpl_unpark "$tid"
   _loop_pref_set "loop.outcome.${tident}" "$(jq -c --arg n "$(db "SELECT datetime('now');")" 'del(.paused_at) | .since=$n' <<<"$st")"
 }
 cmd_task_loop_resume() {
   tasks_db_init
-  local tid tident
+  local tid tident by_outcome=0 by_fails=0
   _loop_tpl_resolve "${1:-}"; tid="$_LOOP_TID"; tident="$_LOOP_TIDENT"
-  _loop_outcome_resume "$tid" "$tident" || fail "$E_VALIDATION" "${tident} is not paused by its outcome"
-  ok "resumed ${tident}; it has ${_LOOP_OUTCOME_FLAT_DAYS} days for its number to rise" '{loop:$t, paused:false}' --arg t "$tident"
+  _loop_outcome_resume "$tid" "$tident" && by_outcome=1
+  _loop_fail_resume "$tid" "$tident" && by_fails=1
+  (( by_outcome || by_fails )) || fail "$E_VALIDATION" "${tident} is not paused by its outcome or by failed runs"
+  if (( by_outcome )); then
+    ok "resumed ${tident}; it has ${_LOOP_OUTCOME_FLAT_DAYS} days for its number to rise" '{loop:$t, paused:false}' --arg t "$tident"
+  else
+    ok "resumed ${tident}; it runs at its next time and its failure count starts over" '{loop:$t, paused:false}' --arg t "$tident"
+  fi
+}
+
+# ───────────── DIVE-9121 a scheduled job that keeps failing pauses itself ─────────────
+# A loop (a recurring template) whose runs fail ${_LOOP_FAIL_PAUSE_AT} times in a
+# row is parked exactly like an outcome pause (the materializer fires only
+# status='todo' templates), and the owner is told ONCE, in that agent's own
+# chat, what went wrong and how to resume. A run that goes done resets the count.
+# State:  loop.fails.<template ident>  {"n","why","last_at","paused_at","told"}
+# Failed = cancelled AFTER it started: the seat gave up on it (broken, impossible,
+# errored out). A run cancelled before it ever started is an owner's tidy-up and
+# counts neither way; the stall ladder's auto-cancel writes its row directly and
+# never reaches here. Webhook triggers are not schedules (each event is an
+# ordinary row) and a browser routine on a schedule IS a loop, so this covers it.
+_LOOP_FAIL_PAUSE_AT=3
+
+# What went wrong, for the owner: the run's own result, first line and first
+# sentence, without task numbers, commit ids or file paths. No stack traces.
+_loop_fail_plain() {
+  local s="${1%%$'\n'*}"
+  s=$(sed -E 's/(^|[^[:alnum:]])[A-Z][A-Z0-9]+-[0-9]+([^[:alnum:]]|$)/\1\2/g;
+              s/(^|[^[:alnum:]])[0-9a-f]{7,40}([^[:alnum:]]|$)/\1\2/g;
+              s#(^|[[:space:]])~?/[^[:space:]]*[^[:space:][:punct:]]#\1#g;
+              s/[`*_]//g; s/\([[:space:][:punct:]]*\)//g; s/[[:space:]]+/ /g;
+              s/^[[:space:][:punct:]]+//; s/[[:space:]]+([,.;:])/\1/g; s/[[:space:]]+$//' <<<"$s")
+  s="${s%%. *}"; s="${s%.}"
+  [[ -n "${s//[[:space:][:punct:]]/}" ]] || s="it stopped without saying why"
+  _loop_clip "$s"
+}
+
+# Called by _loop_score_request for every closed run of a loop.
+_loop_fail_tick() {  # <run id> <run status> <template id> <template ident>
+  local id="$1" rst="$2" tid="$3" tident="$4" st paused n why started
+  st=$(_loop_pref_get "loop.fails.${tident}")
+  paused=$(jq -r '.paused_at // ""' <<<"$st" 2>/dev/null)
+  # Paused, but the template is no longer parked: resumed by hand (`task unpark`).
+  if [[ -n "$paused" && "$(_loop_outcome_resumed_sql "$tid")" == "1" ]]; then
+    _loop_pref_del "loop.fails.${tident}"; st=""; paused=""
+  fi
+  if [[ "$rst" == "done" ]]; then
+    # A success resets the count. One that was already running when the job
+    # paused does not resume it: only the owner does.
+    [[ -n "$st" && -z "$paused" ]] && _loop_pref_del "loop.fails.${tident}"
+    return 0
+  fi
+  started=$(db "SELECT CASE WHEN status='cancelled' AND started_at IS NOT NULL THEN 1 ELSE 0 END FROM tasks WHERE id=${id};")
+  [[ "$started" == "1" && -z "$paused" ]] || return 0
+  why=$(_loop_fail_plain "$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};")")
+  n=$(( $(jq -r '.n // 0' <<<"${st:-"{}"}" 2>/dev/null || echo 0) + 1 ))
+  st=$(jq -cn --argjson n "$n" --arg w "$why" '{n:$n, why:$w, last_at:(now|todate)}')
+  _loop_pref_set "loop.fails.${tident}" "$st"
+  (( n >= _LOOP_FAIL_PAUSE_AT )) || return 0
+  _loop_fail_pause "$tid" "$tident" "$st"
+}
+
+_loop_fail_pause() {  # <template id> <template ident> <state json>
+  local tid="$1" tident="$2" st="$3" n why ttitle seat text told=0
+  n=$(jq -r '.n' <<<"$st"); why=$(jq -r '.why' <<<"$st")
+  db "UPDATE tasks SET status='blocked', parked_at=datetime('now'), wake_at=NULL,
+        park_reason=$(sqlq "paused itself: its last ${n} runs failed in a row (DIVE-9121). Resume: 5dive task loop resume ${tident}")
+      WHERE id=${tid} AND status NOT IN ('done','cancelled')
+        AND (need_type IS NULL OR need_answered_at IS NOT NULL);"
+  [[ "$(db "SELECT CASE WHEN parked_at IS NULL THEN 0 ELSE 1 END FROM tasks WHERE id=${tid};")" == "1" ]] || return 0
+  ttitle=$(db "SELECT COALESCE(title,'') FROM tasks WHERE id=${tid};")
+  seat=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${tid};")
+  text="⏸ \"${ttitle}\" is paused. It failed ${n} times in a row.
+
+Last time: ${why}.
+
+To start it again, say \"resume\", or tap Resume in the app under Tasks."
+  if [[ -n "$seat" ]] && _task_agent_channel "$seat" 2>/dev/null; then
+    _task_send_owner "$text" "" "" || true
+    [[ "${TASK_SEND_DELIVERED:-0}" == "1" ]] && told=1
+  fi
+  _loop_pref_set "loop.fails.${tident}" "$(jq -c --argjson t "$told" '.paused_at=(now|todate) | .told=($t == 1)' <<<"$st")"
+  [[ -n "$seat" ]] || return 0
+  # The seat learns why, so "resume" from its owner means something to it.
+  ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$seat" --from="task-engine" \
+      --message="⏸ Your scheduled job ${tident} (\"${ttitle}\") paused itself: its last ${n} runs failed. Last: ${why}. If your owner says resume: 5dive task loop resume ${tident}" ) >/dev/null 2>&1 || true
+  (( told )) && return 0
+  # No bot of this seat took the message: the seat sends it itself, once.
+  local title="Tell your owner ${tident} paused after ${n} failed runs"
+  [[ "$(db "SELECT COUNT(*) FROM tasks WHERE title=$(sqlq "$title") AND status NOT IN ('done','cancelled');")" == "0" ]] || return 0
+  ( JSON_MODE=1 cmd_task_add "$title" --materialized --review=none --fresh --from=loop \
+      --assignee="$seat" --priority=high \
+      --body="Your scheduled job ${tident} (\"${ttitle}\") paused itself: its last ${n} runs failed, and the runtime could not reach your owner.
+
+1. Send your owner this ONE message, where you normally talk to them, as it is:
+
+${text}
+
+2. If they say resume: 5dive task loop resume ${tident}
+3. Close this row with task done once the message is sent." ) >/dev/null 2>&1 || true
+  return 0
+}
+
+_loop_fail_resume() {  # <template id> <template ident> -> 0 resumed, 1 was not paused
+  local tid="$1" tident="$2"
+  [[ -n "$(jq -r '.paused_at // ""' <<<"$(_loop_pref_get "loop.fails.${tident}")" 2>/dev/null)" ]] || return 1
+  _loop_tpl_unpark "$tid"
+  _loop_pref_del "loop.fails.${tident}"
 }
 
 cmd_task_loop() {
@@ -1278,7 +1392,7 @@ DIVE-5777 outcome loops (score by a number, not an opinion):
                                                 3 days: the loop pauses and its lead tells the owner once.
                                                 Self-improvement stays off.
   loop outcome <loop> --check | --clear         read the number now | go back to signal scores
-  loop resume <loop>                            restart a paused loop with a fresh 3 days (Apply does too)
+  loop resume <loop>                            restart a paused loop: one paused by its outcome gets a fresh 3 days (Apply does too); one paused after 3 failed runs in a row runs at its next time
 HELP
     ;;
     *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|feedback|rate|review|suggest|apply|dismiss|revert|auto|improve|outcome|resume)" ;;
