@@ -35,6 +35,7 @@ Compose (declarative agents via 5dive.yaml):
   5dive ps   [-f file]                               # show declared agents' state
   5dive export [-o file]                             # dump the live fleet to a v2 5dive.yaml
   5dive team import <slug|path> [--auth-profile=]    # provision a whole company template in one call
+  5dive team export <team> [-o f.tar.gz] [--with-memory]  # the whole team as ONE file; team import <file> brings it back
   5dive team ls                                      # list bundled team templates
   5dive team freedom [ask|balanced|yolo] [--agent=<n>] [--json]   # how much each agent does without asking you
   # Default file: 5dive.yaml or 5dive.yml in cwd.
