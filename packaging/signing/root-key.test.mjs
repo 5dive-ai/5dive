@@ -97,6 +97,12 @@ check("same key approved as update key: kind 5dive-signing-key (the kind follows
 const dflt = JSON.parse(await P.buildPublicFile(m, officeKey, 90, 1, "", now));
 check("default choice is the update key", "signing_key_json_b64" in dflt && !("office_key_json_b64" in dflt));
 check("NEG: 5dive's update key refused as the office app key", await throwsAsync(async () => P.buildPublicFile(m, await P.importUpdateKey(P.DEFAULT_UPDATE_KEY), 90, 1, "", now, "office")));
+// --- premium team key (DIVE-9109): same root, its own kind and file names ---
+const tfb = JSON.parse(await P.buildPublicFile(m, officeKey, 90, 1, "", now, "team"));
+check("team bundle: team_key_* fields", JSON.stringify(Object.keys(tfb)) === JSON.stringify(["root_pubkey_pem", "root_fingerprint", "team_key_json_b64", "team_key_sig_b64", "revoked_json_b64", "revoked_sig_b64"]));
+check("team kind table: files team-key.json/.sig, kind 5dive-team-key", P.KEY_KINDS.team.file === "team-key" && P.KEY_KINDS.team.kind === "5dive-team-key");
+check("team-key.json carries kind 5dive-team-key", JSON.parse(Buffer.from(tfb.team_key_json_b64, "base64")).kind === "5dive-team-key");
+check("NEG: the update key is refused as the team key", await throwsAsync(() => P.buildPublicFile(m, { pem: P.DEFAULT_UPDATE_KEY, keyId: keyIdOssl }, 90, 1, "", now, "team")));
 check("NEG: unknown key choice refused", await throwsAsync(() => P.buildPublicFile(m, officeKey, 90, 1, "", now, "other")));
 
 // --- "I already have a master key" ---
