@@ -144,6 +144,7 @@ LAZY_FILES=(
   src/cmd_watch.sh
   src/cmd_wall.sh
   src/cmd_compose.sh
+  src/cmd_team_pack.sh
   src/cmd_whoami.sh
   src/cmd_box_config.sh
   src/cmd_local_only.sh

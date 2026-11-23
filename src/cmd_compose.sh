@@ -40,6 +40,10 @@
 #                                          # fetched from (a signed link 5dive-api
 #                                          # mints for a partner's private pack);
 #                                          # needs pack:, which stays the persona
+#       pack_file:      packs/<name>.tar.gz # DIVE-9107: this seat's pack as a file
+#                                          # next to the yaml (a `team export`
+#                                          # bundle); relative, never leaves the
+#                                          # yaml's folder
 #       loops:                             # DIVE-4022 — recurring work this role owns
 #         - id: weekly-brief               #   stable key (a-z0-9-), the reconcile key
 #           title: "Ship the weekly brief" #   the recurring task's title
@@ -117,12 +121,16 @@ KNOWN = {
              # of a bare create — the pack supplies persona+skills+model/effort.
     "pack_url", # DIVE-6088: the seat's pack by link (agent import --from-url), for
              # a partner's private pack. `pack:` still names the persona.
+    "pack_file", # DIVE-9107: the seat's pack as a file beside the yaml (a team
+             # export bundle). `pack:` is optional: a custom agent has none.
     "can_push", # DIVE-6543: the push grant is the seat's, not the box's.
     "prefer_type", # DIVE-7080: the harness a seat takes when the box can sign it in.
     "prefer_why",  # DIVE-7080: what that harness gets the owner, in their words.
 }
 if "pack_url" in defaults:
     print("error: 'pack_url' is one seat's pack link — it cannot be a default", file=sys.stderr); sys.exit(3)
+if "pack_file" in defaults:
+    print("error: 'pack_file' is one seat's pack — it cannot be a default", file=sys.stderr); sys.exit(3)
 
 agents = data["agents"]
 # Merge defaults under each agent (agent keys win). None spec → empty map.
@@ -153,6 +161,16 @@ for name, spec in agents.items():
             print(f"error: agent '{name}': pack_url needs pack: (the persona it imports)", file=sys.stderr); sys.exit(3)
         if not isinstance(pu, str) or not re.fullmatch(r"https://\S+", pu):
             print(f"error: agent '{name}': pack_url must be an https link", file=sys.stderr); sys.exit(3)
+    pf = m.get("pack_file")
+    if pf is not None:
+        # DIVE-9107: a bundle is untrusted input. The file sits inside the
+        # unpacked bundle, so the path may not climb out of it or be absolute.
+        if (not isinstance(pf, str) or pf.startswith("/") or "\\" in pf
+                or any(part in ("", "..") for part in pf.split("/"))
+                or not re.search(r"\.(tar\.gz|tgz)$", pf)):
+            print(f"error: agent '{name}': pack_file must be a relative path to a .tar.gz inside the team's folder", file=sys.stderr); sys.exit(3)
+        if pu is not None:
+            print(f"error: agent '{name}': pack_file and pack_url both name the pack — keep one", file=sys.stderr); sys.exit(3)
 data["agents"] = merged
 
 # DIVE-6543: push is per seat. A team that names its pushers means everyone
@@ -461,9 +479,14 @@ _compose_import_args() {
   # DIVE-6088: a seat with a pack link imports from it, as a single partner hire
   # does; `pack:` (the persona) is what adoption and pack-sync key on, and the
   # import records that same slug off the link's <slug>.tar.gz.
-  local pack_url; pack_url=$(jq -r '.pack_url // empty' <<<"$spec")
+  local pack_url pack_file
+  pack_url=$(jq -r '.pack_url // empty' <<<"$spec")
+  pack_file=$(jq -r '.pack_file // empty' <<<"$spec")
   if [[ -n "$pack_url" ]]; then
     printf '%s\n' "--from-url=${pack_url}"
+  elif [[ -n "$pack_file" ]]; then
+    # DIVE-9107: a team bundle's pack, a file beside the yaml.
+    printf '%s\n' "$(_compose_resolve_path "$pack_file" "$spec_dir")"
   else
     printf '%s\n' "$pack"
   fi
@@ -574,6 +597,29 @@ _compose_preflight_pack_urls() {
     if [[ $'\n'"$listing"$'\n' != *$'\n'manifest.json$'\n'* && $'\n'"$listing"$'\n' != *$'\n'./manifest.json$'\n'* ]]; then
       printf "the '%s' seat's link from %s is not a character pack (no manifest.json)" "$seat" "$host"
       return 1
+    fi
+  done <<<"$pairs"
+  return 0
+}
+
+# DIVE-9107: every seat's pack_file is a regular file inside the yaml's folder
+# with a manifest.json, before the first seat is created. The parser already
+# refused an absolute or climbing path; this refuses one that resolves outside
+# anyway (a symlinked folder) and a missing or non-pack file, naming the seat.
+_compose_preflight_pack_files() {
+  local spec="$1" spec_dir="$2" pairs seat rel abs base listing
+  pairs=$(jq -r '.agents | to_entries[] | select((.value.pack_file // "") != "") | "\(.key)\t\(.value.pack_file)"' <<<"$spec" 2>/dev/null) || pairs=""
+  [[ -n "$pairs" ]] || return 0
+  base=$(realpath -e "$spec_dir" 2>/dev/null) || { printf 'the team folder %s cannot be read' "$spec_dir"; return 1; }
+  while IFS=$'\t' read -r seat rel; do
+    [[ -n "$seat" && -n "$rel" ]] || continue
+    abs=$(realpath -e "$base/$rel" 2>/dev/null) || abs=""
+    if [[ -z "$abs" || "$abs" != "$base"/* || ! -f "$abs" || -L "$base/$rel" ]]; then
+      printf "the '%s' seat's pack %s is not in the team's folder" "$seat" "$rel"; return 1
+    fi
+    listing=$(tar -tzf "$abs" 2>/dev/null) || listing=""
+    if [[ $'\n'"$listing"$'\n' != *$'\n'manifest.json$'\n'* && $'\n'"$listing"$'\n' != *$'\n'./manifest.json$'\n'* ]]; then
+      printf "the '%s' seat's pack %s is not a character pack (no manifest.json)" "$seat" "$rel"; return 1
     fi
   done <<<"$pairs"
   return 0
@@ -1841,7 +1887,8 @@ _compose_apply_newest_login() {
     || { printf '%s\n' "$spec"; return 0; }
   jq --arg a "$ACCOUNT_DEFAULT_ACCOUNT" --arg t "$ACCOUNT_DEFAULT_TYPE" '
     .agents |= with_entries(
-      if ((.value.pack // "") == "") and ((.value.auth_profile // "") == "")
+      if ((.value.pack // "") == "") and ((.value.pack_file // "") == "")
+         and ((.value.auth_profile // "") == "")
          and ((.value.provider // "") == "") and ((.value.api_key // "") == "")
          and ((.value.prefer_type // "") == "")
          and (((.value.type // "claude") == "claude") or (.value.type == "codex"))
@@ -2046,6 +2093,9 @@ HELP
     local _pf
     _pf=$(_compose_preflight_pack_urls "$spec") || fail "$E_VALIDATION" "${_pf} — no agent was created"
   fi
+  local _pff
+  _pff=$(_compose_preflight_pack_files "$spec" "$(realpath "$(dirname "$file")")") \
+    || fail "$E_VALIDATION" "${_pff} — no agent was created"
   # DIVE-4822: namespace the roster BEFORE anything reads it — the preflight, the
   # create loop and the loops pass must all see ONE set of names, or half the run
   # provisions `ceo` and the other half looks for `start-ceo`. Refuse on overflow
@@ -2208,13 +2258,15 @@ HELP
     local agent_spec pack_slug
     agent_spec=$(jq -c --arg n "$name" '.agents[$n]' <<<"$spec")
     pack_slug=$(jq -r '.pack // empty' <<<"$agent_spec")
+    # DIVE-9107: a seat whose pack is a file in a team bundle imports it too.
+    local pack_file; pack_file=$(jq -r '.pack_file // empty' <<<"$agent_spec")
     # DIVE-8181: a team import's lead starts with the app's chat on (people talk
     # to the team through the lead); members stay as they were. A pack seat's
     # type is the pack's, so the import decides it there (FIVEDIVE_HIRE_CHAT).
     local hire_chat=0
     if [[ -n "${COMPOSE_TEAM_KEY:-}" && -n "$_hire_lead" && "$name" == "$_hire_lead" ]]; then
       hire_chat=lead
-      if [[ -z "$pack_slug" ]]; then
+      if [[ -z "$pack_slug" && -z "$pack_file" ]]; then
         # The channels create would get: the spec's, else the one its token implies.
         local _lead_ch
         _lead_ch=$(jq -r 'if (.channels // "") != "" then .channels
@@ -2228,11 +2280,11 @@ HELP
     if [[ "$(jq -r '.prefer_applied // false' <<<"$agent_spec")" == "true" ]]; then
       step "[$name] on $(jq -r '.type' <<<"$agent_spec") with account '$(jq -r '.auth_profile' <<<"$agent_spec")': the team asks for it there, and this box is signed in to it"
     fi
-    if [[ -n "$pack_slug" ]]; then
+    if [[ -n "$pack_slug" || -n "$pack_file" ]]; then
       # DIVE-536: spec references a character pack → import it (pack supplies
       # persona+skills+model/effort); wiring below still applies org/goals/overrides.
       verb=import
-      step "[$name] importing character pack '$pack_slug'"
+      step "[$name] importing character pack '${pack_slug:-$pack_file}'"
       mapfile -t args < <(_compose_import_args "$agent_spec" "$name" "$pack_slug" "$spec_dir" "$type_override")
       FIVEDIVE_HIRE_CHAT="$hire_chat" bash "$self" agent import "${args[@]}" || brought_up=0
       (( brought_up )) && _compose_pack_extra_skills "$agent_spec" "$name" "$self"
@@ -2916,10 +2968,11 @@ _team_assert_schema() {
 # flags it documents (--type, --telegram-token) live on `team import`.
 _team_usage() {
   cat >&2 <<HELP
-usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
+usage: 5dive team import <slug|path|file.tar.gz> [--auth-profile=<name>] [--type=<harness>]
                                    [--telegram-token=<bot-token>|-] [--prefix=<p>]
                                    [--start-now] [--template=<path>|-]
                                    [--lang=ru|en|zh]
+       5dive team export <team> [-o <file.tar.gz>] [--with-memory]   the whole team as one file
        5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
        5dive team plan    [<lead>]                    what is waiting for your yes
@@ -2930,7 +2983,8 @@ usage: 5dive team import <slug|path> [--auth-profile=<name>] [--type=<harness>]
   Provision a whole company-structure template in one call (wraps 5dive up).
   <slug> resolves in the marketplace registry (<org>/5dive-marketplace, teams/),
   read live — a template published there works on this box with no update.
-  A path is used as-is, and is the offline / bring-your-own route.
+  A path is used as-is, and is the offline / bring-your-own route. A .tar.gz
+  from 'team export' brings the whole team, every member's pack included.
   Either way the template is saved as the team's manifest at
   ${STATE_DIR:-/var/lib/5dive}/teams/<slug>.5dive.yaml, every role is told that path, and
   'team ps' prints it. Edit it there to change policy (e.g. channel tiers).
@@ -3286,7 +3340,7 @@ _team_persist_manifest() {
   # world-readable and kept, so it is saved without them (comments kept when
   # the links sit one per line, as 5dive-api writes them). No clean copy, no save.
   local clean=""
-  if grep -q 'pack_url' "$src" 2>/dev/null; then
+  if grep -qE 'pack_(url|file)' "$src" 2>/dev/null; then
     clean=$(mktemp) || return 1
     _team_strip_pack_urls "$src" "$clean" || { rm -f "$clean"; return 1; }
     src="$clean"
@@ -3318,7 +3372,8 @@ data = yaml.safe_load(text)
 for spec in ((data or {}).get("agents") or {}).values():
     if isinstance(spec, dict):
         spec.pop("pack_url", None)
-lined = re.sub(r"(?m)^[ \t]*pack_url:[^\n]*\n?", "", text)
+        spec.pop("pack_file", None)   # DIVE-9107: a bundle's file, gone after import
+lined = re.sub(r"(?m)^[ \t]*pack_(url|file):[^\n]*\n?", "", text)
 try:
     same = yaml.safe_load(lined) == data
 except yaml.YAMLError:
@@ -3444,6 +3499,7 @@ cmd_team() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     import) : ;;
+    export)  cmd_team_export "$@"; return $? ;;   # DIVE-9107
     plan)    _team_plan "$@"; return $? ;;
     freedom) cmd_team_freedom "$@"; return $? ;;   # DIVE-8853
     start)   _team_release start "$@"; return $? ;;
@@ -3571,7 +3627,7 @@ HELP
     -h|--help|"" )
       _team_usage
       return 0 ;;
-    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, ps, ls, plan, start, decline, leave, rm)" ;;
+    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, export, ps, ls, plan, start, decline, leave, rm)" ;;
   esac
 
   local ref="" profile="" type_override="" tg_token="" tg_token_set=0
@@ -3626,6 +3682,21 @@ HELP
       rm -rf "$template_dir"; fail "$E_NOT_FOUND" "template file not found: $template_src"
     fi
     [[ -s "$file" ]] || { rm -rf "$template_dir"; fail "$E_USAGE" "the template is empty"; }
+  elif _team_is_bundle "$ref"; then
+    # DIVE-9107: a team bundle (`team export`). It skipped registry signing, so
+    # _team_bundle_unpack refuses traversal and link members before extracting.
+    # Its manifest names the team; every seat's pack is a file inside it.
+    local bundle_slug bundle_rc=0
+    template_dir=$(mktemp -d) || fail "$E_GENERIC" "could not stage the team file"
+    bundle_slug=$(_team_bundle_unpack "$ref" "$template_dir") || bundle_rc=$?
+    case "$bundle_rc" in
+      0) : ;;
+      2) rm -rf "$template_dir"; fail "$E_VALIDATION" "refusing $ref: it holds a path outside the file or a link — a team file never does. Nothing was imported." ;;
+      3) rm -rf "$template_dir"; fail "$E_VALIDATION" "$ref is not a team file (made by: 5dive team export <team>). One agent's pack imports with: 5dive agent import $ref --as=<name>" ;;
+      *) rm -rf "$template_dir"; fail "$E_VALIDATION" "cannot read $ref (not a readable .tar.gz)" ;;
+    esac
+    ref="$bundle_slug"
+    file="$template_dir/team.5dive.yaml"
   else
     # Fetched here rather than inside the resolver, so the same index also
     # names the project key below (DIVE-7289: an old name keeps its key).
