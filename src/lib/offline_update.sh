@@ -161,10 +161,12 @@ _ou_key_id() { # <pubkey.pem> — sha256 of the DER SubjectPublicKeyInfo
 # file verifies (empty = nothing to keep). 1 = refused, _OU_WHY says why.
 # DIVE-8809: <field> office_key checks an office app file's certificate instead
 # (kind 5dive-office-app-key): the kind is signed in, so neither key can sign
-# for the other. Default signing_key: an update file, unchanged.
+# for the other. Default signing_key: an update file, unchanged. DIVE-9109:
+# team_key checks a premium team file (kind 5dive-team-key) the same way.
 _ou_chain() {
   local meta="$1" root="$2" m="$1/manifest.json" t="$1/trust" k v f="${3:-signing_key}" kind=5dive-signing-key
   [[ "$f" == office_key ]] && kind=5dive-office-app-key
+  [[ "$f" == team_key ]] && kind=5dive-team-key   # DIVE-9109: a premium team file
   _OU_KEEP_REVOKED=""
   jq -e '.trust | type == "object"' "$m" >/dev/null 2>&1 \
     || { _OU_WHY="this file is not signed by 5dive's root key (it carries no certificate for its signing key)"; return 1; }
@@ -181,6 +183,7 @@ _ou_chain() {
   if ! jq -e --arg kind "$kind" '.format == 1 and .kind == $kind and (.key_id|type == "string")
          and (.pubkey|type == "string") and (.not_after|type == "number")' "$t/$f" >/dev/null 2>&1; then
     if [[ "$f" == office_key ]]; then _OU_WHY="this file's key is not certified for the office app (only 5dive's office app key may sign one) — refused"
+    elif [[ "$f" == team_key ]]; then _OU_WHY="this file's key is not certified for premium teams (only 5dive's team key may sign one) — refused"
     else _OU_WHY="the signing key certificate in this file is not in a format this 5dive reads"; fi
     return 1
   fi
