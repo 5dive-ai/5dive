@@ -66,8 +66,10 @@ ROW="$(jq -c '.agents[] | select(.name=="beta")' <<<"$OUT")"
 [[ "$(jq -r '.fiveHourPct' <<<"$ROW")" == "19" && "$(jq -r '.sevenDayPct' <<<"$ROW")" == "29" ]] \
   && ok_t "freshest included Codex snapshot supplies the existing 5h/7d columns" \
   || bad_t "rate-limit mapping" "$ROW"
-[[ "$(jq -r '.coverage.agentsExpected' <<<"$OUT")" == "2" && "$(jq -r '.coverage.complete' <<<"$OUT")" == "true" ]] \
-  && ok_t "coverage follows registry types (claude+codex), not guessed directories" \
+# gamma is an opencode seat (collected since DIVE-9127) with no opencode.db:
+# idle, still expected, and its codex-shaped tree is not read.
+[[ "$(jq -r '.coverage.agentsExpected' <<<"$OUT")" == "3" && "$(jq -r '.coverage.complete' <<<"$OUT")" == "true" ]] \
+  && ok_t "coverage follows registry types, not guessed directories" \
   || bad_t "registry-keyed coverage" "$(jq -c .coverage <<<"$OUT")"
 [[ "$(jq -r '[.agents[].name] | index("gamma")' <<<"$OUT")" == "null" ]] \
   && ok_t "codex-shaped files do not enroll a non-codex registry seat" \

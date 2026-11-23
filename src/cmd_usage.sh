@@ -116,8 +116,24 @@ try:
     reg = json.load(open(registry))
 except Exception:
     reg = {"agents": {}}
-agents = {n: a for n, a in reg.get("agents", {}).items()
-          if a.get("type", "claude") in ("claude", "codex")}
+# THE type -> collector table. A type is collected iff it has a transcript root
+# here; every other registered type lands in coverage.unsupported (DIVE-9127).
+# Before that, an `opencode`/`pi`/`hermes` seat was dropped at this line, before
+# coverage was formed: the report said complete:true over a population that
+# never included it, and the budget check passed it as a confident zero.
+TRANSCRIPT_ROOT = {
+    "claude":   (".claude", "projects"),
+    "codex":    (".codex", "sessions"),
+    "opencode": (".local", "share", "opencode"),   # opencode.db (SQLite, 1.x)
+}
+agents = {}
+unsupported = []
+for n, a in reg.get("agents", {}).items():
+    t = a.get("type", "claude")
+    if t in TRANSCRIPT_ROOT:
+        agents[n] = a
+    else:
+        unsupported.append({"name": n, "type": t})
 
 # DIVE-2069: is this the PRODUCTION store? Computed once, from the registry we were
 # handed — no env var a harness has to remember to set. See the fence below.
@@ -334,6 +350,82 @@ def list_codex_sessions(sessions_root):
         level = next_level
     return out, None
 
+def list_opencode_db(data_dir):
+    """-> ([db path] or [], reason). OpenCode 1.x keeps every message in one
+    SQLite file, <data>/opencode.db (measured on 1.15.13: the old
+    storage/message/*.json tree is migrated into it and not written again).
+
+    A data dir with a pre-SQLite storage/message tree and no database is NOT
+    idle: those JSON files are usage this reader does not parse, so it is
+    reported as unread rather than counted as zero.
+    """
+    db = os.path.join(data_dir, "opencode.db")
+    try:
+        os.stat(db)
+        return [db], None
+    except OSError as e:
+        if e.errno != errno.ENOENT:
+            return [], "opencode.db unreadable: %s" % (e.strerror or e.errno)
+    try:
+        os.listdir(os.path.join(data_dir, "storage", "message"))
+        return [], "OpenCode storage predates its SQLite database (update OpenCode); not read"
+    except OSError as e:
+        if e.errno in (errno.ENOENT, errno.ENOTDIR):
+            return [], None
+        return [], "opencode storage unreadable: %s" % (e.strerror or e.errno)
+
+def read_opencode_db(db, since, models, turns):
+    """Add one OpenCode seat's in-window tokens to `models` and `turns`.
+    -> None, or the reason the read was incomplete.
+
+    An assistant message carries tokens{input,output,reasoning,cache{read,
+    write}} and modelID; input EXCLUDES cache reads (disjoint, like Claude's
+    usage, not Codex's subset). Each `step-finish` part is one model call with
+    its own tokens, so when a message has them they are summed — the message's
+    own `tokens` is then only its last step. Reasoning bills as output.
+    The window is the message's time_created (epoch ms).
+    """
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=5)
+        try:
+            msgs = con.execute("SELECT id, session_id, time_created, data FROM message "
+                               "WHERE time_created >= ?", (since * 1000,)).fetchall()
+            steps = {}
+            for mid, pdata in con.execute(
+                    "SELECT p.message_id, p.data FROM part p JOIN message m ON m.id = p.message_id "
+                    "WHERE m.time_created >= ? AND p.data LIKE '%step-finish%'", (since * 1000,)):
+                try:
+                    po = json.loads(pdata)
+                except Exception:
+                    continue
+                if po.get("type") == "step-finish" and isinstance(po.get("tokens"), dict):
+                    steps.setdefault(mid, []).append(po["tokens"])
+        finally:
+            con.close()
+    except sqlite3.Error as e:
+        return "opencode.db unreadable: %s" % e
+    for mid, sid, created, data in msgs:
+        try:
+            o = json.loads(data)
+        except Exception:
+            continue
+        if o.get("role") != "assistant":
+            continue
+        model = o.get("modelID") or "unknown"
+        ts = int(created) // 1000
+        for t in steps.get(mid) or [o.get("tokens") or {}]:
+            cache = t.get("cache") or {}
+            i  = nonnegative_int(t.get("input"))
+            ot = nonnegative_int(t.get("output")) + nonnegative_int(t.get("reasoning"))
+            cc = nonnegative_int(cache.get("write"))
+            cr = nonnegative_int(cache.get("read"))
+            if not (i or ot or cc or cr):
+                continue
+            m = models.setdefault(model, {"in":0,"out":0,"cc":0,"cr":0,"turns":0})
+            m["in"] += i; m["out"] += ot; m["cc"] += cc; m["cr"] += cr; m["turns"] += 1
+            turns.append((ts, ot, i+ot+cc, i+ot+cc+cr, cr, sid))
+    return None
+
 def nonnegative_int(value):
     try:
         return max(0, int(value or 0))
@@ -390,9 +482,7 @@ goal_pins = {}
 for name, meta in agents.items():
     home = home_of(name)
     agent_type = meta.get("type", "claude")
-    transcript_root = (os.path.join(home, ".codex", "sessions")
-                       if agent_type == "codex"
-                       else os.path.join(home, ".claude", "projects"))
+    transcript_root = os.path.join(home, *TRANSCRIPT_ROOT[agent_type])
     readable, why = probe_readable(home, transcript_root)
     if not readable:
         unreadable.append({"name": name, "reason": why})
@@ -419,6 +509,7 @@ for name, meta in agents.items():
     # not a low scorer. Same destination as an unreadable home or file — never a
     # silent short total sitting inside coverage.complete=true.
     sessions, why = (list_codex_sessions(transcript_root) if agent_type == "codex"
+                     else list_opencode_db(transcript_root) if agent_type == "opencode"
                      else list_sessions(transcript_root))
     if why is not None:
         unreadable.append({"name": name, "reason": why})
@@ -429,6 +520,14 @@ for name, meta in agents.items():
     five_r = seven_r = None
     newest_codex_rate_limit_ts = -1
     for path in sessions:
+        if agent_type == "opencode":
+            # A WAL database: the main file's mtime lags its -wal, so the
+            # mtime shortcut below would skip a seat that is working right now.
+            # The window is applied in SQL instead.
+            why = read_opencode_db(path, since, models, turns)
+            if why:
+                denied = denied or why
+            continue
         try:
             if os.path.getmtime(path) < since:   # whole file predates window
                 continue
@@ -1120,10 +1219,14 @@ print(json.dumps({
     # total from one agent's slice. Sets READ vs sets that EXIST — the count
     # never travels without it.
     "coverage": {
-        "agentsExpected": len(agents),
+        # DIVE-9127: EVERY registered agent is expected, including types no
+        # collector reads. Those are named in `unsupported` and keep the read
+        # from claiming complete: their burn is unknown, never zero.
+        "agentsExpected": len(agents) + len(unsupported),
         "agentsRead": len(agents) - len(unreadable),
         "unreadable": unreadable,
-        "complete": not unreadable,
+        "unsupported": unsupported,
+        "complete": not unreadable and not unsupported,
     },
 }))
 PY
@@ -1366,13 +1469,23 @@ usage_coverage_note() {
       elif ($c.complete == true) then empty
       else
         ($c.unreadable // []) as $u
-        | "  ⚠ PARTIAL READ — " + (($c.agentsRead // 0)|tostring) + " of "
-          + (if $c.agentsExpected == null then "?" else ($c.agentsExpected|tostring) end)
-          + " agent transcript sets readable from here. This is NOT the fleet:"
-        , ("    every figure below omits or understates " +
-           (($u[:3] | map(.name + " (" + (.reason // "unreadable") + ")") | join("; ")))
-           + (if ($u|length) > 3 then " … +" + ((($u|length)-3)|tostring) + " more" else "" end) + ".")
-        , "    Re-run as root for a company-wide view."
+        | ($c.unsupported // []) as $x
+        # DIVE-9127: an older collector says complete:false only for unreadable
+        # seats, so an empty $x with no $u still renders the PARTIAL banner.
+        | (if ($u|length) > 0 or ($x|length) == 0 then
+            "  ⚠ PARTIAL READ — " + (($c.agentsRead // 0)|tostring) + " of "
+            + (if $c.agentsExpected == null then "?" else ($c.agentsExpected|tostring) end)
+            + " agent transcript sets readable from here. This is NOT the fleet:"
+          , ("    every figure below omits or understates " +
+             (($u[:3] | map(.name + " (" + (.reason // "unreadable") + ")") | join("; ")))
+             + (if ($u|length) > 3 then " … +" + ((($u|length)-3)|tostring) + " more" else "" end) + ".")
+          , "    Re-run as root for a company-wide view."
+          else empty end)
+        , (if ($x|length) > 0 then
+            "  ⚠ NO VISIBILITY — 5dive cannot read usage for "
+            + ($x | map(.name + " (" + (.type // "?") + ")") | join(", "))
+            + " yet. Their burn is unknown, not zero."
+          else empty end)
       end' <<<"$1"
 }
 
@@ -1547,6 +1660,11 @@ usage_render_agent() {
   # agent X" reads as "X was idle" when what actually happened is that this
   # caller was not allowed to look at X's transcripts.
   blind=$(jq -c --arg n "$agent" '(.coverage.unreadable // [])[] | select(.name == $n)' <<<"$data")
+  # DIVE-9127: a type no collector reads is no visibility, not "idle or typo".
+  local unsup
+  unsup=$(jq -r --arg n "$agent" '(.coverage.unsupported // [])[] | select(.name == $n) | .type' <<<"$data")
+  [[ -n "$unsup" ]] && fail "$E_GENERIC" \
+    "5dive cannot read $unsup usage yet — no visibility, not zero ('$agent')"
   if [[ -z "$row" ]]; then
     [[ -n "$blind" ]] && fail "$E_PERMISSION" \
       "cannot read '$agent' transcripts: $(jq -r '.reason // "unreadable"' <<<"$blind") — this is NOT 'no usage', it is no visibility (try: sudo 5dive usage $agent)"
@@ -1849,7 +1967,9 @@ cmd_usage_budget_check() {
   # the check would report "ok" for an agent it never read. A partial burn is
   # still a FLOOR, so a crossing stays a real crossing and still fires; it is
   # only the "ok" verdict that is unearned, and that becomes "unknown".
-  local blind; blind=$(jq -c '[(.coverage.unreadable // [])[]|{key:.name,value:true}]|from_entries' <<<"$data")
+  # DIVE-9127: a seat whose type no collector reads is blind by construction —
+  # it has no burn entry at all, so without this it was the same confident 0.
+  local blind; blind=$(jq -c '[((.coverage.unreadable // []) + (.coverage.unsupported // []))[]|{key:.name,value:true}]|from_entries' <<<"$data")
 
   # Evaluate each budgeted agent → decisions[] with what alerts/stops to fire,
   # plus the updated store and the state cache. jq does the classification; bash
@@ -1980,7 +2100,7 @@ cmd_usage_budget_check() {
       '{ok:true,data:{checked:$c,soft:$s,hard:$h,stopped:$st,unknown:$u,dryRun:($dry==1),coverage:$cov}}'
   else
     echo "budget check: ${checked} agent(s) — ${n_soft} soft, ${n_hard} at ceiling, ${n_stop} stopped$( ((dry)) && echo ' (dry-run)')"
-    (( n_unknown > 0 )) && echo "  ⚠ ${n_unknown} NOT checked — transcripts unreadable from here, burn is unknown (not 0): ${unknown_names}"
+    (( n_unknown > 0 )) && echo "  ⚠ ${n_unknown} NOT checked — transcripts unreadable from here or a type 5dive cannot read yet, burn is unknown (not 0): ${unknown_names}"
   fi
   # DIVE-2751 (found by main2 on iteration 1): third instance, and the one with a
   # live caller. The test above is INVERTED relative to health — n_unknown == 0 is
@@ -2032,7 +2152,9 @@ cmd_cost() {
   rows=$(jq -c "$USAGE_BNORM"'
     (reduce .agents[] as $a ({}; .[$a.name]=$a.total)) as $burn
     | (reduce .agents[] as $a ({}; .[$a.name]=$a.quota)) as $burnq
-    | ([(.coverage.unreadable // [])[]|{key:.name,value:(.reason // "unreadable")}]|from_entries) as $blind
+    | ([(.coverage.unreadable // [])[]|{key:.name,value:(.reason // "unreadable")}]
+       + [(.coverage.unsupported // [])[]|{key:.name,value:("5dive cannot read " + (.type // "this type") + " usage yet")}]
+       |from_entries) as $blind
     | [ ( ($budgets|keys) + ($burn|keys) + ($blind|keys) ) | unique[] as $n
         | ($budgets[$n] // null) as $raw
         | (if $raw==null then null else ($raw|bnorm) end) as $b
