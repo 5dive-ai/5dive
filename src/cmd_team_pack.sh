@@ -119,7 +119,7 @@ _team_premium_record() {
 
 # <a> <b> (X.Y.Z each) -> prints -1, 0 or 1.
 _team_semver_cmp() {
-  local -a a b; local i
+  local -a a=() b=(); local i
   IFS=. read -r -a a <<<"$1"; IFS=. read -r -a b <<<"$2"
   for i in 0 1 2; do
     (( 10#${a[i]:-0} < 10#${b[i]:-0} )) && { echo -1; return 0; }
