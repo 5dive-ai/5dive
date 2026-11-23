@@ -8,8 +8,9 @@
 # Arms:
 #   1. _PR_PARKED=0, other counters >0 -> summary logged, no HELD/desiredState
 #   2. _PR_PARKED=1 -> the explanation sits right after "1 left parked"
-#   3. NEGATIVE CONTROL: arm 1 against origin/main's pre-fix line (read through
-#      git, the clause unconditional) must FAIL
+#   3. NEGATIVE CONTROL: arm 1 against the pre-fix line, read from the PINNED
+#      parent of the fix (tests/lib/pinned_baseline.sh, DIVE-2229) — must FAIL.
+#      Not a branch ref: once the fix merged, the branch IS the fix (DIVE-9085)
 #   4. only src/cmd_heartbeat.sh sourced, `set -u`, counters unset -> nothing
 #      logged and the shell does not abort
 # Run: bash tests/pending_restart_summary_held_clause_unit.sh
@@ -20,6 +21,8 @@ set -uo pipefail
   || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT   # DIVE-2692
 cd "$(dirname "$0")/.." || exit 1
+. tests/lib/pinned_baseline.sh \
+  || printf 'pinned baseline helper: UNRESOLVED (tests/lib/pinned_baseline.sh not reachable)\n' >&2
 
 TMP="$(mktemp -d /tmp/pr-summary-held.XXXXXX)"
 PASS=0; FAIL=0
@@ -71,17 +74,22 @@ fi
 
 # ---- arm 3: negative control --------------------------------------------------
 pre="$TMP/prefix.sh"
-base_src="$(git show origin/main:src/cmd_heartbeat.sh 2>/dev/null)"
-prefix_line="$(grep -m1 -A1 -F '(( ${_PR_FIRED:-0} || ${_PR_DEFERRED:-0}' <<<"$base_src")"
-if [ -z "$prefix_line" ] || ! grep -q 'restart HELD' <<<"$prefix_line"; then
-  echo "SKIP - arm 3: origin/main no longer carries the pre-fix line (nothing to control against)"
+PRE_FIX_REF="7cdde7fa5e48500960bdc8df5c45fbc24bc9c6f4"   # main immediately before DIVE-9079 merged (PR #1759)
+base_file="$TMP/cmd_heartbeat.pre-fix.sh"
+if ! pinned_blob "$PRE_FIX_REF" src/cmd_heartbeat.sh "$base_file"; then
+  bad_t "arm 3: pinned pre-fix baseline $PRE_FIX_REF did not resolve" "the negative control did not run — NOT a pass (fetch-depth: 0, or network to fetch the one commit)"
 else
-  printf '_hb_pending_restart_summary() {\n%s\n}\n' "$prefix_line" >"$pre"
-  out="$(run_summary "$pre" _PR_DEFERRED=1 _PR_OVERDUE=1 _PR_PARKED=0)"
-  if grep -q 'pass done' <<<"$out" && grep -qiE 'held|desiredState' <<<"$out"; then
-    ok_t "arm 3: NEGATIVE CONTROL — the pre-fix line logs HELD with 0 parked (arm 1 would fail on it)"
+  prefix_line="$(grep -m1 -A1 -F '(( ${_PR_FIRED:-0} || ${_PR_DEFERRED:-0}' "$base_file")"
+  if [ -z "$prefix_line" ] || ! grep -q 'restart HELD' <<<"$prefix_line"; then
+    bad_t "arm 3: the pinned pre-fix tree must carry the unconditional HELD line" "got: ${prefix_line:-<nothing matched>}"
   else
-    bad_t "arm 3: the pre-fix line was expected to log HELD with 0 parked" "got: $out"
+    printf '_hb_pending_restart_summary() {\n%s\n}\n' "$prefix_line" >"$pre"
+    out="$(run_summary "$pre" _PR_DEFERRED=1 _PR_OVERDUE=1 _PR_PARKED=0)"
+    if grep -q 'pass done' <<<"$out" && grep -qiE 'held|desiredState' <<<"$out"; then
+      ok_t "arm 3: NEGATIVE CONTROL — the pre-fix line logs HELD with 0 parked (arm 1 would fail on it)"
+    else
+      bad_t "arm 3: the pre-fix line was expected to log HELD with 0 parked" "got: $out"
+    fi
   fi
 fi
 
