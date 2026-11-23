@@ -233,7 +233,7 @@ HELP
   local stage; stage=$(mktemp -d) || fail "$E_GENERIC" "no temp dir"
   mkdir -p "$stage/packs"
   local agents="{}" type pslug role mgr model effort instr loops pf err obj counts kept
-  local -a exp_args
+  local -a exp_args=()
   for i in "${!names[@]}"; do
     n="${names[$i]}"; mgr="${mgrs[$i]}"
     # A manager outside the team is not this team's edge (the far side would
