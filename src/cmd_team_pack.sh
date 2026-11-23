@@ -115,6 +115,103 @@ _team_premium_record() {
   return 0
 }
 
+# -------- DIVE-9116: a premium team UPDATED in place ---------------------------
+
+# <a> <b> (X.Y.Z each) -> prints -1, 0 or 1.
+_team_semver_cmp() {
+  local -a a b; local i
+  IFS=. read -r -a a <<<"$1"; IFS=. read -r -a b <<<"$2"
+  for i in 0 1 2; do
+    (( 10#${a[i]:-0} < 10#${b[i]:-0} )) && { echo -1; return 0; }
+    (( 10#${a[i]:-0} > 10#${b[i]:-0} )) && { echo 1; return 0; }
+  done
+  echo 0
+}
+
+# <signed-label-json> <allow-downgrade:0|1> -> is this file an update of a premium
+# team already on this box? Prints the INSTALLED version (an update) or nothing
+# (a fresh install: no label, or the team was removed since). rc 1 = refused, and
+# what it printed says why. The same team and the same buyer are required; the
+# version must be newer unless <allow-downgrade>.
+_team_premium_update_from() {
+  local j="$1" allow="${2:-0}" team f old new oacct nacct oname cmp
+  team=$(jq -r '.team // empty' <<<"$j" 2>/dev/null)
+  [[ "$team" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || return 0
+  f="${STATE_DIR:-/var/lib/5dive}/premium-teams/$team.json"
+  [[ -f "$f" && ! -L "$f" ]] || return 0
+  [[ -n "$(_team_installed_lead "$team" 2>/dev/null)" ]] || return 0
+  old=$(jq -r '.version // empty' "$f" 2>/dev/null); oacct=$(jq -r '.buyer.account // empty' "$f" 2>/dev/null)
+  oname=$(jq -r '.buyer.name // empty' "$f" 2>/dev/null)
+  new=$(jq -r '.version' <<<"$j"); nacct=$(jq -r '.buyer.account' <<<"$j")
+  if [[ ! "$old" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || -z "$oacct" ]]; then
+    printf "this server's record of premium team %s cannot be read (%s)" "$team" "$f"; return 1
+  fi
+  if [[ "$nacct" != "$oacct" ]]; then
+    printf "premium team %s on this server is licensed to %s (account %s), and this file to account %s — a team updates only from a file for the same buyer" \
+      "$team" "${oname:-another buyer}" "$oacct" "$nacct"; return 1
+  fi
+  cmp=$(_team_semver_cmp "$new" "$old")
+  if (( cmp <= 0 && ! allow )); then
+    if (( cmp == 0 )); then printf 'premium team %s is already at %s on this server' "$team" "$old"
+    else printf 'this file is premium team %s %s, older than the %s on this server — to go back, add --allow-downgrade' "$team" "$new" "$old"; fi
+    return 1
+  fi
+  printf '%s' "$old"
+}
+
+# 5dive team update <team> [--allow-downgrade] — ask 5dive for the newest version
+# of a premium team this server's account is entitled to, and apply it in place.
+# GET <api>/server/premium-teams/<team>/latest?have=<version> with the box token:
+# 200 = the buyer's signed file (then `team import` checks and applies it, exactly
+# as a file brought by hand), 204 = nothing newer, 402/403 = the subscription
+# ended, 404 = no such premium team for this account. An offline box imports the
+# file by hand.
+_team_premium_update_online() {
+  local team="" allow=0 a f have tok trc=0 url out http rc=0
+  for a in "$@"; do
+    case "$a" in
+      --allow-downgrade) allow=1 ;;
+      --json) ;;
+      -h|--help)
+        printf '%s\n' "usage: 5dive team update <team> [--allow-downgrade]" \
+          "  Bring a premium team bought from 5dive up to its newest version: personas," \
+          "  skills, roles and loops move; every agent keeps its memory, channels and bot." \
+          "  Needs this server online. Offline: 5dive team import <newer file>" >&2
+        return 0 ;;
+      -*) fail "$E_USAGE" "unknown flag: $a (usage: 5dive team update <team> [--allow-downgrade])" ;;
+      *)  [[ -z "$team" ]] && team="$a" || fail "$E_USAGE" "usage: 5dive team update <team> [--allow-downgrade]" ;;
+    esac
+  done
+  [[ "$team" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || fail "$E_USAGE" "usage: 5dive team update <team> [--allow-downgrade]"
+  require_root "team update"
+  f="${STATE_DIR:-/var/lib/5dive}/premium-teams/$team.json"
+  [[ -f "$f" ]] || fail "$E_NOT_FOUND" "'$team' is not a premium team on this server (only a team bought from 5dive updates this way)"
+  have=$(jq -r '.version // empty' "$f" 2>/dev/null)
+  if declare -F local_only_on >/dev/null && local_only_on; then
+    fail "$E_VALIDATION" "this server works offline, so it cannot ask 5dive for a newer $team. Bring the newer file and run: 5dive team import <file>"
+  fi
+  lazy_need _partner_box_token
+  tok=$(_partner_box_token) || trc=$?
+  (( trc == 0 )) && [[ -n "$tok" ]] || fail "$E_PERMISSION" "this server has no 5dive sign-in to ask with. Import the newer file by hand: 5dive team import <file>"
+  url="$(five_api_base)/server/premium-teams/$team/latest?have=${have}"
+  out=$(mktemp --suffix=.gz) || fail "$E_GENERIC" "could not stage the download"
+  # The bearer goes in on STDIN (-H @-), never argv (DIVE-5168).
+  http=$(printf 'Authorization: Bearer %s\n' "$tok" \
+           | curl -sS --max-time "${FIVE_TEAM_UPDATE_TIMEOUT:-120}" -H @- -o "$out" -w '%{http_code}' "$url" 2>/dev/null) || true
+  case "${http:-000}" in
+    200) ;;
+    204) rm -f "$out"; ok "premium team $team is up to date (${have:-unknown version})" '{team:$t, version:$v, updated:false}' --arg t "$team" --arg v "$have"; return 0 ;;
+    402|403) rm -f "$out"; fail "$E_PERMISSION" "the subscription to premium team $team has ended for this account — renew it to get updates. The team on this server keeps working." ;;
+    404) rm -f "$out"; fail "$E_NOT_FOUND" "5dive has no premium team $team for this server's account" ;;
+    *)   rm -f "$out"; fail "$E_GENERIC" "could not reach 5dive for premium team $team (HTTP ${http:-000}) — try again later, or import the newer file by hand" ;;
+  esac
+  local -a iargs=(import "$out")
+  (( allow )) && iargs+=(--allow-downgrade)
+  ( cmd_team "${iargs[@]}" ) || rc=$?
+  rm -f "$out"
+  return "$rc"
+}
+
 # <file> <dir> -> unpack a team bundle into <dir>, print its team slug.
 # Return: 0 ok; 1 not readable; 2 unsafe member; 3 not a team bundle;
 # 4 a premium team file that did not verify (<dir>/.premium-why says why).

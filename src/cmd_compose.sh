@@ -714,6 +714,9 @@ _compose_write_role_md() {
 
   [[ -n "$share_team" ]] && block+="$(_team_share_marker "$share_team" end)"$'\n'
 
+  # DIVE-9116: a premium team update swaps this block in place instead.
+  if [[ "${COMPOSE_ROLE_BLOCK_ONLY:-0}" == 1 ]]; then _COMPOSE_ROLE_BLOCK="$block"; return 0; fi
+
   # DIVE-2223: land the block in the file THIS harness reads. It used to go to
   # ~/.claude/CLAUDE.md for every type, which on a codex/opencode/pi/antigravity
   # seat is a write that succeeds into a path with no consumer. An unmapped type
@@ -721,6 +724,105 @@ _compose_write_role_md() {
   local type
   type=$(jq -r '.type // "claude"' <<<"$agent")
   persona_append_block "$name" "$type" "$block" || true
+}
+
+# -------- DIVE-9116: a premium team moves to a newer signed file, in place ----
+#
+# `team import <newer premium file>` over the installed team does not create a
+# second copy and does not leave the seats alone (the plain re-import does): each
+# member's persona and pack skills move to the new pack (`agent update
+# --from-pack=<file>`, the deliberate overwrite), its role block is swapped for the
+# new role text, and its title and manager follow the new chart. Memory, channels,
+# bot, logins, model and effort are not touched: nothing here writes them. Loops
+# follow in _compose_apply_loops. Set by `team import` (dynamic scope) to the
+# version the team is moving FROM.
+
+# <persona-file> <new-block-file> -> the file with its LAST role block replaced
+# by the new one, on stdout. The block runs from the last "## Role" heading
+# before the last "## Reporting" heading to the next heading that is not
+# "## Team manifest" (or a 5dive marker, or the end). Rc 3 = no role block (the
+# caller appends instead). The same boundary `team export` reads role text by.
+_team_role_block_swap() {
+  python3 -I - "$1" "$2" <<'PY2'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="surrogateescape").read()
+block = open(sys.argv[2], encoding="utf-8", errors="surrogateescape").read()
+lines = text.split("\n")
+rep = max((i for i, l in enumerate(lines) if l.rstrip() == "## Reporting"), default=-1)
+role = max((i for i, l in enumerate(lines[:max(rep, 0)]) if re.fullmatch(r"## Role(: .*)?", l.rstrip())), default=-1)
+if rep < 0 or role < 0:
+    sys.exit(3)
+end = len(lines)
+for i in range(rep + 1, len(lines)):
+    l = lines[i]
+    if l.startswith("<!-- ") or (re.match(r"#{1,2} ", l) and l.rstrip() != "## Team manifest"):
+        end = i
+        break
+head = "\n".join(lines[:role]).rstrip("\n")
+tail = "\n".join(lines[end:])
+out = (head + block) if head else block.lstrip("\n")
+if tail.strip():
+    out = out.rstrip("\n") + "\n\n" + tail
+sys.stdout.write(out)
+PY2
+}
+
+# <spec> <name> <spec_dir> -> swap the seat's role block for the spec's. Read and
+# written AS the agent (_pack_as / _pack_write_as), like the pack sync. 0 = the
+# file changed, 1 = unchanged or could not be written (warned).
+_compose_replace_role_md() {
+  local spec="$1" name="$2" spec_dir="$3" type md stage rc=0
+  local _COMPOSE_ROLE_BLOCK=""
+  COMPOSE_ROLE_BLOCK_ONLY=1 _compose_write_role_md "$spec" "$name" "$spec_dir"
+  [[ -n "$_COMPOSE_ROLE_BLOCK" ]] || return 1
+  type=$(jq -r --arg n "$name" '.agents[$n].type // "claude"' <<<"$spec")
+  md=$(persona_target "$name" "$type" 2>/dev/null) || { warn "[$name] no instructions file for type $type — role text not updated"; return 1; }
+  stage=$(mktemp -d) || return 1
+  printf '%s' "$_COMPOSE_ROLE_BLOCK" >"$stage/block"
+  _pack_as "$name" cat -- "$md" >"$stage/old" 2>/dev/null || : >"$stage/old"
+  _team_role_block_swap "$stage/old" "$stage/block" >"$stage/new" || rc=$?
+  if (( rc == 3 )); then
+    { cat "$stage/old"; cat "$stage/block"; } >"$stage/new"   # no role block yet: append, as create does
+  elif (( rc != 0 )); then
+    rm -rf "$stage"; warn "[$name] could not read its role text — not updated"; return 1
+  fi
+  if cmp -s "$stage/old" "$stage/new"; then rm -rf "$stage"; return 1; fi
+  if _pack_write_as "$name" "$stage/new" "$md" 644; then
+    rm -rf "$stage"; step "[$name] role text moved to the new version"; return 0
+  fi
+  rm -rf "$stage"; warn "[$name] could not write the new role text to $md"; return 1
+}
+
+# <spec> <name> <spec_dir> <self> -> move ONE installed seat to the new version.
+# 0 = moved (or nothing differed), 1 = some part failed (warned).
+_compose_premium_refresh_seat() {
+  local spec="$1" name="$2" spec_dir="$3" self="$4" agent_spec pack_file role mgr bad=0
+  agent_spec=$(jq -c --arg n "$name" '.agents[$n]' <<<"$spec")
+  pack_file=$(jq -r '.pack_file // empty' <<<"$agent_spec")
+  role=$(jq -r '.role // empty' <<<"$agent_spec")
+  mgr=$(jq -r '.reports_to // empty | if type=="array" then (.[0] // "") else . end' <<<"$agent_spec")
+  if [[ -n "$pack_file" ]]; then
+    # The path is inside the unpacked team (_compose_preflight_pack_files).
+    local _uerr=""
+    if _uerr=$(bash "$self" agent update "$name" "--from-pack=$spec_dir/$pack_file" </dev/null 2>&1 >/dev/null); then
+      step "[$name] persona and skills moved to the new version"
+    else
+      warn "[$name] its persona and skills could not be moved to the new version${_uerr:+ ($(tail -n 1 <<<"$_uerr"))} — re-run the same import to retry"
+      bad=1
+    fi
+    _compose_pack_extra_skills "$agent_spec" "$name" "$self"
+    [[ -n "${COMPOSE_NAME_MAP:-}" ]] && { _compose_rename_persona_file "$name" "$(jq -r '.type // "claude"' <<<"$agent_spec")" "$COMPOSE_NAME_MAP" || true; }
+  fi
+  if [[ -n "$role" || -n "$mgr" ]]; then
+    local -a oargs=(org set "$name")
+    [[ -n "$role" ]] && oargs+=("--role=$role")
+    [[ -n "$mgr"  ]] && oargs+=("--manager=$mgr")
+    bash "$self" "${oargs[@]}" </dev/null >/dev/null 2>&1 || { warn "[$name] org set failed"; bad=1; }
+  fi
+  if _compose_replace_role_md "$spec" "$name" "$spec_dir"; then
+    _pending_restart_mark "$name" "premium team updated (DIVE-9116)" >/dev/null 2>&1 || true
+  fi
+  return "$bad"
 }
 
 # Apply the v2 role wiring for one freshly-created agent: model, effort, org
@@ -1165,6 +1267,20 @@ _compose_apply_loops() {
     ceiling=$(jq -r '.ceiling // empty' <<<"$L")
     key="${pack:-$lid}"
 
+    if [[ -n "${COMPOSE_PREMIUM_UPDATE:-}" && -z "$pack" && -n "$lid" ]] && valid_cron_expr "$cron" 2>/dev/null; then
+      # DIVE-9116: a premium update moves its own declared loops (matched by
+      # marker, never a hand-made row) to the new title, prompt and schedule.
+      local ubody="${prompt}" uchg
+      [[ -n "$ubody" ]] && ubody+=$'\n\n'
+      ubody+="— $(_compose_loop_marker "$lid") runs on '${cron}'."
+      [[ -n "$ceiling" ]] && ubody+=" advisory budget: ${ceiling} tokens/run (bound hard with: 5dive usage budget $name)."
+      uchg=$(db "UPDATE tasks SET title=$(sqlq "$title"), body=$(sqlq "$ubody"), schedule=$(sqlq "$cron")
+                 WHERE kind='recurring' AND assignee=$(sqlq "$name")
+                   AND body LIKE '%'||$(sqlq "$(_compose_loop_marker "$lid")")||'%'
+                   AND (title IS NOT $(sqlq "$title") OR body IS NOT $(sqlq "$ubody") OR schedule IS NOT $(sqlq "$cron"));
+                 SELECT changes();" 2>/dev/null | tail -1)
+      [[ "${uchg:-0}" =~ ^[1-9] ]] && step "[$name] loop '$lid' moved to the new version"
+    fi
     if _compose_loop_present "$name" "$key" "$title"; then
       step "[$name] loop '$key' already present — leaving it alone"
       ((existing++)) || true
@@ -2194,6 +2310,14 @@ HELP
     fi
     local exists
     exists=$(jq --arg n "$name" '.agents[$n] != null' <<<"$reg")
+    if [[ "$exists" == "true" ]] && [[ -n "${COMPOSE_PREMIUM_UPDATE:-}" && -n "${COMPOSE_TEAM_KEY:-}" ]] \
+       && _team_is_member "$COMPOSE_TEAM_KEY" "$name"; then
+      # DIVE-9116: the installed premium team moves to the new file's version.
+      step "[$name] moving from ${COMPOSE_PREMIUM_UPDATE} to the new version — memory, channels and bot stay"
+      _compose_premium_refresh_seat "$spec" "$name" "$spec_dir" "$self" || ((errors++)) || true
+      if bash "$self" agent start "$name" >/dev/null 2>&1; then ((started++)) || true; else ((skipped++)) || true; fi
+      continue
+    fi
     if [[ "$exists" == "true" ]]; then
       step "[$name] already exists — ensuring started"
       # DIVE-5498: the SAME persona, solo on this box, JOINS this team — role,
@@ -2973,6 +3097,7 @@ usage: 5dive team import <slug|path|file.tar.gz> [--auth-profile=<name>] [--type
                                    [--start-now] [--template=<path>|-]
                                    [--lang=ru|en|zh]
        5dive team export <team> [-o <file.tar.gz>] [--with-memory]   the whole team as one file
+       5dive team update <team> [--allow-downgrade]   a premium team to its newest version
        5dive team ps [<slug|path>] [--type=<harness>]
        5dive team ls
        5dive team plan    [<lead>]                    what is waiting for your yes
@@ -2986,7 +3111,10 @@ usage: 5dive team import <slug|path|file.tar.gz> [--auth-profile=<name>] [--type
   A path is used as-is, and is the offline / bring-your-own route. A .tar.gz
   from 'team export' brings the whole team, every member's pack included. A
   premium team file (bought from 5dive) is checked first: it must be signed by
-  5dive, and the import says whose copy it is.
+  5dive, and the import says whose copy it is. A NEWER premium file for a team
+  already here updates it in place (personas, skills, roles, loops; every
+  agent's memory, channels and bot stay); an older or the same version is
+  refused unless --allow-downgrade. 'team update <team>' fetches the newest.
   Either way the template is saved as the team's manifest at
   ${STATE_DIR:-/var/lib/5dive}/teams/<slug>.5dive.yaml, every role is told that path, and
   'team ps' prints it. Edit it there to change policy (e.g. channel tiers).
@@ -3502,6 +3630,7 @@ cmd_team() {
   case "$sub" in
     import) : ;;
     export)  cmd_team_export "$@"; return $? ;;   # DIVE-9107
+    update)  _team_premium_update_online "$@"; return $? ;;   # DIVE-9116
     plan)    _team_plan "$@"; return $? ;;
     freedom) cmd_team_freedom "$@"; return $? ;;   # DIVE-8853
     start)   _team_release start "$@"; return $? ;;
@@ -3629,14 +3758,15 @@ HELP
     -h|--help|"" )
       _team_usage
       return 0 ;;
-    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, export, ps, ls, plan, start, decline, leave, rm)" ;;
+    *) fail "$E_USAGE" "unknown team subcommand: $sub (try: import, export, update, ps, ls, plan, start, decline, leave, rm)" ;;
   esac
 
   local ref="" profile="" type_override="" tg_token="" tg_token_set=0
-  local name_prefix="" prefix_set=0 start_now=0 template_src="" lang=""
+  local name_prefix="" prefix_set=0 start_now=0 template_src="" lang="" allow_downgrade=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --start-now)      start_now=1 ;;   # DIVE-5729: skip the lead's plan-first hold
+      --allow-downgrade) allow_downgrade=1 ;;   # DIVE-9116: a premium team may go back
       --lang=*)         lang="${1#--lang=}" ;;   # DIVE-6484: the owner's language
       --lang)           lang="$2"; shift ;;
       --template=*)     template_src="${1#--template=}" ;;   # DIVE-6088
@@ -3664,7 +3794,7 @@ HELP
   [[ -z "$lang" || -n "$(_compose_kickoff_lang_norm "$lang")" ]] \
     || fail "$E_USAGE" "unknown --lang: $lang (known: ru, en, zh)"
 
-  local file="" resolve_rc=0 template_dir="" reg_idx="" premium_json=""
+  local file="" resolve_rc=0 template_dir="" reg_idx="" premium_json="" COMPOSE_PREMIUM_UPDATE=""
   if [[ -n "$template_src" ]]; then
     # DIVE-6088: the template is handed in (5dive-api reads it from a partner's
     # private registry, which this box has no credential for). The registry is
@@ -3705,6 +3835,12 @@ HELP
     if [[ -f "$template_dir/.premium.json" ]]; then
       premium_json=$(cat "$template_dir/.premium.json")
       step "$(jq -r '"signed by 5dive: premium team \(.team) \(.version), licensed to \(.buyer.name // "") (account \(.buyer.account))"' <<<"$premium_json")"
+      # DIVE-9116: over the installed team this is an UPDATE in place.
+      local _pwhy=""
+      COMPOSE_PREMIUM_UPDATE=$(_team_premium_update_from "$premium_json" "$allow_downgrade") || {
+        _pwhy="$COMPOSE_PREMIUM_UPDATE"; rm -rf "$template_dir"; fail "$E_VALIDATION" "refusing $ref: ${_pwhy}. Nothing was changed."; }
+      [[ -n "$COMPOSE_PREMIUM_UPDATE" ]] \
+        && step "premium team $(jq -r .team <<<"$premium_json") is installed at ${COMPOSE_PREMIUM_UPDATE} — updating it in place to $(jq -r .version <<<"$premium_json"); each agent keeps its memory, channels and bot"
     fi
   else
     # Fetched here rather than inside the resolver, so the same index also

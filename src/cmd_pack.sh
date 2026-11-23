@@ -4755,13 +4755,13 @@ _pack_reclaim_claudemd() {
   fi
 }
 
-# _pack_sync_one <agent> <url> <dry:0|1> <restart:0|1> [<marketplace-slug>] [<reclaim:0|1>]
+# _pack_sync_one <agent> <url> <dry:0|1> <restart:0|1> [<marketplace-slug>] [<reclaim:0|1>] [<pack-file>]
 # — one JSON result on stdout. The slug names the pack for an agent hired before the
 # record existed (5dive-api knows it; the box does not). <reclaim> is `agent update`
 # (DIVE-7275): what the nightly leaves as drift is brought to the pack's version.
 # rc 0 = synced or nothing to do; 1 = could not sync this agent.
 _pack_sync_one() {
-  local name="$1" url="$2" dry="$3" restart="$4" mslug="${5:-}" reclaim="${6:-0}"
+  local name="$1" url="$2" dry="$3" restart="$4" mslug="${5:-}" reclaim="${6:-0}" pfile="${7:-}"
   local res; res=$(jq -nc --arg n "$name" '{name:$n, status:"error"}')
   _ps_out() { jq -c "$@" <<<"$res"; }
   local reg rec src slug tgz="" rc
@@ -4779,7 +4779,27 @@ _pack_sync_one() {
     fi
     src="marketplace"; slug="$mslug"
   fi
-  if [[ -n "$url" ]]; then
+  if [[ -n "$pfile" ]]; then
+    # DIVE-9116: a pack FILE on this box (a premium team update carries every
+    # member's pack inside it). Copied first: the stage below deletes its input.
+    [[ -f "$pfile" && ! -L "$pfile" ]] || { _ps_out '.reason = "the pack file is not a regular file on this box"'; return 1; }
+    tgz=$(mktemp --suffix=.tar.gz) && cp -- "$pfile" "$tgz" \
+      || { rm -f "$tgz"; _ps_out '.reason = "could not read the pack file"'; return 1; }
+    local fslug=""
+    if fslug=$(tar -xzOf "$tgz" manifest.json 2>/dev/null || tar -xzOf "$tgz" ./manifest.json 2>/dev/null); then
+      fslug=$(jq -r '.pack.slug // empty | strings' <<<"$fslug" 2>/dev/null) || fslug=""
+      [[ "$fslug" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || fslug=""
+    else
+      fslug=""
+    fi
+    if [[ -n "$slug" && -n "$fslug" && "$slug" != "$fslug" ]]; then
+      rm -f "$tgz"
+      _ps_out --arg a "$slug" --arg b "$fslug" '.reason = "this agent was hired from pack \($a), the file is for \($b) — refusing to overlay another pack"'
+      return 1
+    fi
+    [[ -n "$src" ]] || src="file"
+    [[ -n "$slug" ]] || slug="$fslug"
+  elif [[ -n "$url" ]]; then
     local uslug; uslug=$(_pack_url_slug "$url")
     [[ "$url" =~ ^https://[^[:space:]]+$ && -n "$uslug" ]] \
       || { _ps_out '.reason = "--from-url must be an https link to <slug>.tar.gz"'; return 1; }
@@ -4986,11 +5006,12 @@ cmd_pack_sync() {
 #   - bot binding, chat, memory, auth and persona.yaml edits are not touched;
 #   - the record is rewritten, so the nightly pack-sync takes it from here.
 # --from-pack alone uses the pack recorded at import; =<https-link> or =<slug>
-# names it. An agent with no recorded pack and no named one is refused.
+# names it; =<file.tar.gz> (DIVE-9116) applies a pack file already on this box. An agent with no recorded pack and no named one is refused.
 cmd_agent_update() {
   require_root "agent update"
   local name="" from="" have_from=0 dry=0 restart=1 url="" mslug=""
-  local usage="usage: 5dive agent update <name> --from-pack[=<https-link>|<slug>] [--dry-run] [--no-restart]"
+  local usage="usage: 5dive agent update <name> --from-pack[=<https-link>|<slug>|<file.tar.gz>] [--dry-run] [--no-restart]"
+  local pfile=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --from-pack)   have_from=1 ;;
@@ -5007,6 +5028,10 @@ cmd_agent_update() {
   local reg; reg=$(registry_read)
   jq -e --arg n "$name" '.agents[$n]' <<<"$reg" >/dev/null 2>&1 || fail "$E_NOT_FOUND" "no agent named '$name'"
   if [[ "$from" == https://* ]]; then url="$from"
+  elif [[ "$from" == */* || "$from" == *.tar.gz ]]; then
+    # DIVE-9116: a pack file on this box — what a premium team update applies.
+    [[ -f "$from" ]] || fail "$E_NOT_FOUND" "no pack file at $from"
+    pfile=$(realpath -e -- "$from")
   elif [[ -n "$from" ]]; then mslug="$from"
   elif ! jq -e --arg n "$name" '.agents[$n].pack.slug // empty' <<<"$reg" >/dev/null 2>&1; then
     fail "$E_VALIDATION" "'$name' was not hired from a pack — there is nothing to update it from (name one: --from-pack=<link|slug>)"
@@ -5014,7 +5039,7 @@ cmd_agent_update() {
     fail "$E_VALIDATION" "'$name' came from a partner pack link — pass a fresh one: --from-pack=<https-link>"
   fi
   local line rc=0
-  line=$(_pack_sync_one "$name" "$url" "$dry" "$restart" "$mslug" 1) || rc=1
+  line=$(_pack_sync_one "$name" "$url" "$dry" "$restart" "$mslug" 1 "$pfile") || rc=1
   if (( ! JSON_MODE )); then
     step "$(jq -r '"\(.name): \(.status)" + (if .reason then " — \(.reason)" else "" end)
       + (if (.added|length? // 0) > 0 then "; added \(.added|join(","))" else "" end)
