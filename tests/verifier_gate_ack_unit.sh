@@ -376,14 +376,19 @@ for _pol in never delivered-only; do
 done
 pol_as unset
 
-# The converse, so the arms above are not vacuous: WITHOUT the row override, the
-# current default does close the row outright. This is the arm that documents the
-# blast radius rather than leaving it to be rediscovered.
+# The converse, so the arms above are not vacuous: WITHOUT the row override, a
+# verify=never box closes the row outright. This is the arm that documents the
+# blast radius rather than leaving it to be rediscovered. (DIVE-9175: it used to
+# run on the unset default, delivered-only, and asserted that a NAMED reviewer
+# was closed past there. That was the defect: a named reviewer now binds on
+# delivered-only by itself, so only `never` still needs the row's --verify.)
+pol_as never
 N=$(printf '%s' "$(as maker cmd_task_add "no row override" --assignee=maker --verifier=reviewer --accept="x")" | jq -r '.data.ident')
 as maker cmd_task_done "$N" --result="built it" >/dev/null
 delivered_p "$N" \
-  && bad_t "CONVERSE unset default still handed off" "the pin above is vacuous: box_verify_policy=$(box_verify_policy) produced a handoff with no --verify, so these arms would survive a regression" \
-  || ok_t "CONVERSE without --verify the unset default closes outright — the pin is load-bearing"
+  && bad_t "CONVERSE verify=never still handed off" "the pin above is vacuous: box_verify_policy=$(box_verify_policy) produced a handoff with no --verify, so these arms would survive a regression" \
+  || ok_t "CONVERSE without --verify a verify=never box closes outright — the pin is load-bearing"
+pol_as unset
 
 echo "-----"
 echo "verifier_gate_ack_unit: $PASS passed, $FAIL failed"

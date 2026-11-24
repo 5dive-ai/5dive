@@ -116,9 +116,25 @@ _task_verify_grants() {  # <task-id> [ignore-skip]
   forced=$(db "SELECT COALESCE(verify_forced,0) FROM tasks WHERE id=${id};" 2>/dev/null || printf 0)
   ref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
   [[ -n "$ref" ]] && bound=1
+  # DIVE-9175: A REVIEWER SOMEONE NAMED STANDS IN FOR A DELIVERY. `delivered-only`
+  # defers the BOX-DEFAULT grader until there is a pull request to grade; it was
+  # never meant to drop a seat the filer named (`--review=<seat>` / `--verifier=`),
+  # and it did: on a report or research row (no PR, ever) the maker's `task done`
+  # closed past the named reviewer — 6 of 6 desk rows in the DIVE-9083 trial.
+  # `seat:` is written only by a hand-named reviewer (task add) or `task verifier`,
+  # so it is the row's own record that someone chose this grader. `never` still
+  # refuses: that branch ignores <bound>, so the spend cap is untouched.
+  bound=$(( bound | $(_task_review_seat_named "$id") ))
   [[ "$optout" == "1" && "$ignore_skip" != "1" ]] && ov="skip"
   [[ "$forced" == "1" ]] && ov="force"
   verify_grants_grader "$(box_verify_policy)" "$ov" "$bound"
+}
+
+# `_task_review_seat_named <task-id>` — prints 1 when the row's review mode is a
+# seat someone named (review_mode='seat:<agent>'), else 0. See DIVE-9175 above.
+_task_review_seat_named() {  # <task-id>
+  local m; m=$(db "SELECT COALESCE(review_mode,'') FROM tasks WHERE id=${1};" 2>/dev/null || printf '')
+  [[ "$m" == seat:?* ]] && printf 1 || printf 0
 }
 
 # `_task_verify_row_source <task-id>` — the provenance string for `task show`.
