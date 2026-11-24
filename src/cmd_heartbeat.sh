@@ -2041,6 +2041,30 @@ _hb_seat_advanced() {
   return 1
 }
 
+# DIVE-9183 — the start of the window the rung-2 sibling hold reads: the time
+# this row was last handed to the seat BEFORE the current wake, floored at rung 1.
+#
+# Read from `runs`, NOT from lifecycle_events: the dispatcher's task.started emit
+# keys its idem on the task (_hb_claim_task), so the ledger holds the FIRST claim
+# only and "the second-newest task.started" does not exist. Every dispatcher
+# claim opens a run (run_open, after the reclaim closed the previous one), so
+# runs.started_at is one row per hand-out. Strictly before the row's own
+# started_at excludes the run this wake's claim just opened; a NULL started_at
+# (the claim did not land) falls back to now, i.e. the newest run.
+#
+# Only ever NARROWS the old window: max(esc_at, previous hand-out). No run
+# history (a pre-runs store, an unreadable table) => esc_at, the old behaviour.
+_hb_rung2_since() {
+  local tid="$1" esc_at="$2" name="$3" asg="${4:-}" seats prev=""
+  [[ "${tid:-}" =~ ^[0-9]+$ ]] || { printf '%s' "$esc_at"; return 0; }
+  seats="$(sqlq "$name")"
+  [[ -n "$asg" && "$asg" != "$name" ]] && seats="${seats},$(sqlq "$asg")"
+  prev=$(db "SELECT COALESCE(MAX(started_at),'') FROM runs
+              WHERE task_id=${tid} AND agent IN (${seats})
+                AND started_at < COALESCE((SELECT started_at FROM tasks WHERE id=${tid}), datetime('now'));" 2>/dev/null || echo "")
+  if [[ -n "$prev" && "$prev" > "$esc_at" ]]; then printf '%s' "$prev"; else printf '%s' "$esc_at"; fi
+}
+
 _hb_nudge_enforce() {
   local name="$1" tid="$2" tident="$3" nudge_n="$4"
   [[ "${nudge_n:-}" =~ ^[0-9]+$ ]] || return 0
@@ -2068,7 +2092,15 @@ _hb_nudge_enforce() {
   # already past an `urgent` 2N of 16 and both rungs would fire on one wake, which
   # is not a ladder. One rung per wake, and rung 2 means "a further N fruitless
   # wakes after we escalated and said so in the body".
-  if [[ -n "$esc_at" ]] && (( nudge_n >= esc_n + n )) && [[ -z "$park_at" ]]; then
+  #
+  # DIVE-9183: the per-task counter RESTARTS whenever the row leaves todo between
+  # two marks (an unpark, a gate-ttl return), while esc_n keeps the count rung 1
+  # fired at, days ago. nudge_n < esc_n can only mean a restart, and then every
+  # one of those nudge_n wakes came after rung 1 — so the base is 0, not esc_n.
+  # Measured on teal-fox: restarted at 1, esc_n=16, rung 2 armed only at #24.
+  local base="$esc_n"
+  (( nudge_n < esc_n )) && base=0
+  if [[ -n "$esc_at" ]] && (( nudge_n >= base + n )) && [[ -z "$park_at" ]]; then
     # A row waiting on an UNANSWERED HUMAN GATE is not starved — the wait is on a
     # person, and its nudges are the gate's own renag. NEITHER rung-2 lever
     # applies: parking over a gate destroys it (DIVE-1453) and reassigning it
@@ -2087,8 +2119,17 @@ _hb_nudge_enforce() {
     # nothing, and leave the counter alone — we did not act, so nothing may read
     # as if we had. Logged rather than silent because a silent hold is
     # indistinguishable from a ladder that never armed.
-    if _hb_seat_advanced "$name" "$tid" "$esc_at" "$asg"; then
-      _hb_log "[nudge-enforce] ${tident} rung 2 HELD: assignee '${asg:-$name}' advanced other rows since rung 1 (${esc_at}) — queued behind its own work, not starved; nothing written, nothing sent, counter left intact"
+    #
+    # DIVE-9183: the window is THIS stuck stretch, not "since rung 1". Rung 1 is
+    # once per row and never cleared, so a row escalated days ago was held by
+    # any row the seat touched at any point since — teal-fox handed one urgent
+    # row to an idle seat 27 times in 16h while this hold cited 11-19. `since` is
+    # the previous hand-out of this row to this seat (see _hb_rung2_since), so a
+    # seat busy elsewhere still holds, and a seat that idled on it does not.
+    local since
+    since=$(_hb_rung2_since "$tid" "$esc_at" "$name" "$asg")
+    if _hb_seat_advanced "$name" "$tid" "$since" "$asg"; then
+      _hb_log "[nudge-enforce] ${tident} rung 2 HELD: assignee '${asg:-$name}' advanced other rows since this row was last handed to it (${since}; rung 1 ${esc_at}) — queued behind its own work, not starved; nothing written, nothing sent, counter left intact"
       return 0
     fi
 
