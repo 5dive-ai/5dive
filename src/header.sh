@@ -478,6 +478,21 @@ HERMES_SDK_STEP="{ (cd /home/claude/.hermes/hermes-agent && ./venv/bin/python -c
 # and then linked nothing (main, DIVE-8669 iteration 1).
 CLAUDE_NPM_FALLBACK="{ echo 'claude: the native installer left no /home/claude/.local/bin/claude; installing it from npm instead' >&2; . /home/claude/.nvm/nvm.sh; { command -v npm >/dev/null 2>&1 || nvm install 24 >/dev/null; } && npm install -g @anthropic-ai/claude-code && _cc=\"\$(npm prefix -g)/bin/claude\" && [[ -x \"\${_cc}\" ]] && mkdir -p /home/claude/.local/bin && ln -sfn \"\${_cc}\" /home/claude/.local/bin/claude; }"
 
+# DIVE-9173: `npm install -g <pkg>` that rides out an npm publish race. npm makes
+# a new release's MAIN package installable before its per-platform package has
+# propagated, so for a few minutes after a publish the install fails. Measured:
+# @openai/codex 0.172.0 published 00:09:39Z, our install at ~00:12Z exited 1,
+# the same install at 04:00Z worked. A customer hiring in that window got "codex
+# install failed". So on failure: wait 60s and try again, then 180s and try a
+# last time. A real failure (no network, bad package) still fails, ~4 min later,
+# well inside the install job's 900s cap. Prints a recipe fragment, no bare
+# $var in it (the recipe runs through sudo -i; see CLAUDE_NPM_FALLBACK).
+npm_install_retry() {
+  local cmd="npm install -g $1" note="npm install of $1 failed; a release published minutes ago can need a few minutes on npm."
+  printf "{ %s || { echo '%s Retrying in 60s.' >&2; sleep 60; %s; } || { echo '%s Last try in 180s.' >&2; sleep 180; %s; }; }" \
+    "$cmd" "$note" "$cmd" "$note" "$cmd"
+}
+
 # Installer recipe per type. Run as `claude` user via `sudo -u claude -i bash -lc <recipe>`
 # so $HOME/.nvm and PATH resolve correctly. Empty string => no automated installer
 # (caller must hand-install). Idempotent: each recipe checks first.
@@ -566,7 +581,9 @@ declare -A TYPE_INSTALL=(
   # the -x short-circuit and reinstall @latest in place; without it (the
   # provisioning path) an existing codex is left untouched. \$-escaped so the
   # var expands when the recipe runs under `bash -lc`, not at array-definition time.
-  [codex]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/codex ]]; } || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @openai/codex@latest && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(npm prefix -g)/bin/codex\" /home/claude/.local/bin/codex && [[ -x /home/claude/.local/bin/codex ]]; }"
+  # DIVE-9173: the npm step retries twice (60s, 180s) through npm_install_retry,
+  # for the minutes after OpenAI publishes a release (see the helper above).
+  [codex]="{ [[ -z \"\${FORCE_INSTALL:-}\" ]] && [[ -x /home/claude/.local/bin/codex ]]; } || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && $(npm_install_retry @openai/codex@latest) && mkdir -p /home/claude/.local/bin && ln -sfn \"\$(npm prefix -g)/bin/codex\" /home/claude/.local/bin/codex && [[ -x /home/claude/.local/bin/codex ]]; }"
   # opencode.ai's installer drops the binary at ~/.opencode/bin/opencode and
   # only adds it to PATH via .bashrc — but bash -lc skips .bashrc on
   # non-interactive shells, so neither the verify check below nor the agent
@@ -651,7 +668,7 @@ declare -A TYPE_INSTALL=(
   # resolves on every box (the systemd unit uses TYPE_BIN's path directly, and
   # bash -lc skips .bashrc so npm's bin dir isn't on PATH). Idempotent via the
   # -x guard. \$-escaped so npm prefix expands when the recipe runs under bash -lc.
-  [pi]="[[ -x /home/claude/.local/bin/pi ]] || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && npm install -g @earendil-works/pi-coding-agent && mkdir -p /home/claude/.local/bin && ln -sf \"\$(npm prefix -g)/bin/pi\" /home/claude/.local/bin/pi; }"
+  [pi]="[[ -x /home/claude/.local/bin/pi ]] || { . /home/claude/.nvm/nvm.sh && nvm install 24 >/dev/null && $(npm_install_retry @earendil-works/pi-coding-agent) && mkdir -p /home/claude/.local/bin && ln -sf \"\$(npm prefix -g)/bin/pi\" /home/claude/.local/bin/pi; }"
 )
 
 # vercel-labs/skills CLI agent ID per 5dive type. `npx skills add --agent <id>`
