@@ -179,10 +179,14 @@ code=$(curl -s -o "$TMP/bad.html" -w '%{http_code}' --data-urlencode "k0=ak-1" -
 DETAIL="code=$code tools=$(cat "$TOOLS_ENV_FILE" 2>/dev/null | grep -c X_) link=$(ls "$SECRET_DROP_DIR" | wc -l)"
 check "P3 one bad box saves NOTHING (no key lands) and the link still works" \
   test "$code" == 400 -a "$(grep -c '^export X_' "$TOOLS_ENV_FILE" 2>/dev/null || echo 0)" == 0 -a "$(ls "$SECRET_DROP_DIR" | wc -l)" -eq 1 -a -z "$(col DIVE-1 need_answered_at)"
-code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "k0=ak-1" --data-urlencode "k1=" \
+DETAIL="boxes=$(grep -o '<textarea [^>]*name=k[0-9]' "$TMP/bad.html" | wc -l) page=$(sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$TMP/bad.html" | head -c 400)"
+check "P3b DIVE-9212: the refusal shows the four boxes again, empty, under the rule" \
+  bash -c '[[ "$(grep -o "<textarea [^>]*name=k[0-9][^>]*></textarea>" "$1" | wc -l)" == 4 ]] && grep -q "Not saved." "$1" && ! grep -qE "ak-1|has space|at-3|ats-4" "$1"' _ "$TMP/bad.html"
+code=$(curl -s -o "$TMP/empty.html" -w '%{http_code}' --data-urlencode "k0=ak-1" --data-urlencode "k1=" \
   --data-urlencode "k2=at-3" --data-urlencode "k3=ats-4" "$B/$tok")
-DETAIL="code=$code"
-check "P4 an empty box is refused before the box is asked, link kept" test "$code" == 400 -a "$(ls "$SECRET_DROP_DIR" | wc -l)" -eq 1
+DETAIL="code=$code boxes=$(grep -o '<textarea [^>]*name=k[0-9]' "$TMP/empty.html" | wc -l)"
+check "P4 an empty box is refused before the box is asked, link kept, four boxes shown again" \
+  bash -c '[[ "$1" == 400 && "$(ls "$2" | wc -l)" == 1 && "$(grep -o "<textarea [^>]*name=k[0-9]" "$3" | wc -l)" == 4 ]] && grep -q "Every box is needed" "$3"' _ "$code" "$SECRET_DROP_DIR" "$TMP/empty.html"
 code=$(curl -s -o "$TMP/ok.html" -w '%{http_code}' --data-urlencode "k0=ak-1" --data-urlencode "k1=aks-2" \
   --data-urlencode "k2=at-3" --data-urlencode "k3=ats-4" "$B/$tok")
 DETAIL="code=$code at=$(col DIVE-1 need_answered_at) by=$(col DIVE-1 need_answered_by) tools=$(grep '^export X_' "$TOOLS_ENV_FILE" 2>/dev/null | cut -d= -f1 | tr '\n' ' ') page=$(sed 's/<[^>]*>/ /g' "$TMP/ok.html" | tr -s ' ' | tail -c 200)"
