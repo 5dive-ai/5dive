@@ -119,7 +119,10 @@ I_OPEN=$(new_row "open row" --review=seat:researcher)
 r=$(line_of "$I_OPEN" review); v=$(line_of "$I_OPEN" verify)
 [[ "$r" == "review: seat:researcher — graded by researcher in its own session" ]] \
   && ok_t "an OPEN row prints the filing-time cost note unchanged" || bad_t "open row unchanged" "got: $r"
-[[ "$v" == *"no grader yet"* ]] && ok_t "an OPEN row keeps 'no grader yet'" || bad_t "open verify unchanged" "got: $v"
+# DIVE-9175: a NAMED seat binds on delivered-only without a delivery, so the open
+# row says who grades it instead of promising a grader that arrives with a PR.
+[[ "$v" == *"the reviewer named on this row grades it"* && "$v" != *"no grader yet"* ]] \
+  && ok_t "an OPEN named-seat row says the named reviewer grades it (DIVE-9175)" || bad_t "open named-seat verify line" "got: $v"
 # none: its cost note already says nobody grades it.
 I_NONE=$(new_row "none row" --review=none)
 close_row "$I_NONE" done

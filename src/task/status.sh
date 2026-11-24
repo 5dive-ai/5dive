@@ -896,6 +896,14 @@ _task_status_cmd() {
         policy_refuse "$E_CONFLICT" done-over-delivered-loop DIVE-2007 "$ident" \
           "$ident is DELIVERED to verifier '${_vfier}' (iteration ${_iter}, maker '${_maker}') and has NOT been graded — a 'task done' from '${_actor}' would close it ungraded, which is the maker grading its own work (writer != grader, DIVE-477). Only '${_vfier}' can grade it. To CORRECT the result text do NOT re-run done: send the correction to '${_vfier}' (5dive agent send ${_vfier} \"...\") and let them fold it in. Real exits: '5dive task reject $ident --feedback="FINDING/FIX/VERIFY"' (verifier bounces it back), '5dive task verify $ident --no-done --cmd=\"<acceptance test>\"' (record machine evidence and hold at graded->merge), or '5dive task cancel $ident --result=...' (abandon)."
       fi
+      # DIVE-9175: THE VERIFIER'S CLOSE RUNS THE STORED CHECK. A row filed with
+      # `--verify=<cmd>` carried that command into the handoff and nothing on this
+      # path ever read it, so a pack's QA gate ("the check must pass before the
+      # reviewer closes") held only if the reviewer remembered `task verify`.
+      if [[ -n "$_maker" && "$_actor" == "$_vfier" \
+            && "$_st" != "done" && "$_st" != "cancelled" ]]; then
+        _task_stored_check_at_close "$id" "$ident" "$_actor"
+      fi
     fi
   fi
   # DIVE-555 gate enforcement (DIVE-393/394 class): a `task done` must NOT close
@@ -3660,4 +3668,57 @@ _task_merge_owner() {
   local id="$1" who
   who=$(db "SELECT COALESCE(NULLIF(maker_agent,''), COALESCE(assignee,'?')) FROM tasks WHERE id=${id};" 2>/dev/null)
   printf '%s' "${who:-?}"
+}
+
+# DIVE-9175: _task_stored_check_at_close <id> <ident> <actor>
+#
+# The verifier's `task done` on a delivered row that stores a verify_command must
+# see that command green before the row closes. Two ways to be green:
+#   1. the row's LATEST verify record is a PASS of this exact command that carries
+#      a `graded-sha:` stamp. Only on a row bound to a pull request: the stamp is
+#      issued only when the tree matched the PR head (_verify_grade_line), and the
+#      DIVE-1830 merge gate further down refuses a graded sha that is not the
+#      merged one, so a stale PASS cannot close a re-delivered head.
+#   2. otherwise, run it now, in the caller's working tree (the same contract as
+#      `task verify`). Red is refused with the output; nothing is written.
+# A row with no stored command is untouched.
+_task_stored_check_at_close() {  # <id> <ident> <actor>
+  local id="$1" ident="$2" actor="${3:-}" cmd dref res
+  cmd=$(db "SELECT COALESCE(verify_command,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  [[ -n "${cmd//[[:space:]]/}" ]] || return 0
+  dref=$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+  if [[ -n "$dref" ]]; then
+    res=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
+    if _task_result_stamped_pass "$res" "$cmd"; then
+      declare -F _task_store_audit_log >/dev/null 2>&1 \
+        && _task_store_audit_log "task.stored-check-at-close" ok 0 -- "$ident" "actor=${actor} recorded-pass ref=${dref}"
+      return 0
+    fi
+  fi
+  local out rc t="${FIVE_DONE_CHECK_TIMEOUT:-900}"
+  [[ "$t" =~ ^[1-9][0-9]*$ ]] || t=900
+  if out=$(timeout "$t" bash -c "$cmd" 2>&1); then rc=0; else rc=$?; fi
+  if (( rc == 0 )); then
+    printf '%s: stored check passed at close (exit 0): %s (DIVE-9175)\n' "$ident" "$cmd" >&2
+    declare -F _task_store_audit_log >/dev/null 2>&1 \
+      && _task_store_audit_log "task.stored-check-at-close" ok 0 -- "$ident" "actor=${actor} ran rc=0"
+    return 0
+  fi
+  (( rc == 124 )) && out+=$'\n'"[timed out after ${t}s]"
+  local tail_out; tail_out=$(printf '%s\n' "$out" | tail -n 25)
+  policy_refuse "$E_CONFLICT" done-over-red-stored-check DIVE-9175 "$ident" \
+    "$ident stores a check, and it FAILED (exit ${rc}) in $(pwd), so the close is refused: this row's reviewer closes it only on a green check (DIVE-9175). Command: ${cmd}"$'\n'"--- output tail ---"$'\n'"${tail_out}"$'\n'"Exits: run it from the tree it grades (the PR checkout) and close again; send it back with '5dive task reject $ident --feedback=\"FINDING/FIX/VERIFY\"'; or record the run with '5dive task verify $ident --no-done'."
+}
+
+# _task_result_stamped_pass <result> <cmd> — 0 when the LAST verify record in the
+# row's result is a PASS of exactly <cmd> AND that record carries a graded-sha.
+# Any later FAIL, a PASS of a different command, or no stamp reads as "not green".
+_task_result_stamped_pass() {  # <result> <cmd>
+  local res="$1" cmd="$2" pass='✅ verify PASS (exit 0): ' failm='❌ verify FAIL (exit ' after
+  declare -F _gate_graded_sha >/dev/null 2>&1 || return 1
+  after="${res##*"$pass"}"
+  [[ "$after" != "$res" ]] || return 1
+  [[ "${after#*"$failm"}" == "$after" ]] || return 1
+  [[ "$after" == "$cmd" || "$after" == "$cmd"$'\n'* ]] || return 1
+  [[ -n "$(_gate_graded_sha "${after#"$cmd"}" 2>/dev/null)" ]]
 }

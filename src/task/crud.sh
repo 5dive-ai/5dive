@@ -789,7 +789,11 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     fail "$E_VALIDATION" "--verify and --no-verify contradict each other — pass one (DIVE-4251)"
   fi
   local _vp_grants=0
-  verify_grants_grader "$_vp_policy" "$_vp_override" 0 && _vp_grants=1
+  # DIVE-9175: a reviewer NAMED here (`--verifier=` / `--review=<seat>`, the only
+  # writers of verifier_pinned at this point) stands in for the delivery a
+  # `delivered-only` box waits for, so it binds now instead of deferring. Only
+  # the box-default grader defers. `never` ignores <bound>, so it still caps.
+  verify_grants_grader "$_vp_policy" "$_vp_override" "$verifier_pinned" && _vp_grants=1
   # `delivered-only` with no override is NOT a refusal, it is a DEFERRAL, and the
   # two must not read the same downstream: the filer is told the grader arrives
   # with the delivery rather than told there is none.
@@ -1011,7 +1015,9 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     # The three box-policy states, each said plainly. `delivered-only` is the one
     # that is neither "graded" nor "ungraded" yet, so it gets its own sentence
     # instead of being folded into either.
-    if (( _vp_deferred )); then
+    if [[ "$_vp_policy" == "delivered-only" && -z "$_vp_override" ]] && (( verifier_pinned && _vp_grants )); then
+      verify_note+=" · verify=delivered-only (box default), but '${verifier}' was named on this row, so the maker's 'task done' hands it to them, pull request or not (DIVE-9175)"
+    elif (( _vp_deferred )); then
       verify_note=" · verify=delivered-only (box default) — no grader yet; one is attached when you bind a delivery ('task deliver --pr=…'), and a grader session grades it then. Demand one now with --verify."
     elif [[ "$_vp_policy" == "never" && -z "$_vp_override" && "$kind" == "standard" ]]; then
       verify_note=" · verify=never (box default) — 'task done' closes it outright, no grader session. Demand a grade for one row with --verify."
@@ -1663,7 +1669,16 @@ cmd_task_show() {
     if [[ "$_sh_kind" == "standard" ]]; then
       local _sh_pol _sh_src _sh_eff
       _sh_pol=$(box_verify_policy); _sh_src=$(_task_verify_row_source "$id")
-      if _task_verify_grants "$id"; then _sh_eff="a grader grades this delivery"
+      # DIVE-9175: on delivered-only, a reviewer named on an unbound row grades
+      # it with no delivery at all; "this delivery" would describe a PR that
+      # a report row never has.
+      local _sh_named=0
+      [[ "$_sh_pol" == "delivered-only" && "$_sh_src" == "box default" \
+         && "$(_task_review_seat_named "$id")" == 1 \
+         && -z "$(db "SELECT COALESCE(delivery_ref,'') FROM tasks WHERE id=${id};" 2>/dev/null)" ]] && _sh_named=1
+      if _task_verify_grants "$id"; then
+        if (( _sh_named )); then _sh_eff="the reviewer named on this row grades it when the maker runs task done, pull request or not"
+        else _sh_eff="a grader grades this delivery"; fi
       elif [[ "$_sh_pol" == "delivered-only" && "$_sh_src" == "box default" ]]; then
         _sh_eff="no grader yet — one is attached when a delivery is bound (task deliver --pr=…)"
       else _sh_eff="no grader; 'task done' closes it outright"; fi
@@ -1678,6 +1693,8 @@ cmd_task_show() {
       if [[ ( "$_sh_cst" == "done" || "$_sh_cst" == "cancelled" ) && "$_sh_grd" != "1" \
             && "$_sh_eff" == "no grader yet"* ]]; then
         _sh_eff="closed without a grader (no delivery was bound, so none was attached)"
+      elif [[ ( "$_sh_cst" == "done" || "$_sh_cst" == "cancelled" ) && "$_sh_grd" != "1" ]] && (( _sh_named )); then
+        _sh_eff="closed without a grader (it closed before the named reviewer graded it)"
       fi
       echo; echo "verify: ${_sh_pol} (${_sh_src}) — ${_sh_eff}"
       # DIVE-4559: the size rule is part of the answer to "will this be graded",
