@@ -596,11 +596,111 @@ _hb_nudge_enforce dev 31 DIVE-9031 32 >/dev/null 2>&1
 # rung 2 consulting it. Assert the call sits inside rung 2 and AFTER the gate
 # hold, so the two holds cannot be reordered into one that shadows the other.
 _gate=$(grep -n 'rung 2 HELD: unanswered human gate' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1) || _gate=""
-_seat=$(grep -n 'if _hb_seat_advanced "\$name" "\$tid" "\$esc_at"' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1) || _seat=""
+_seat=$(grep -n 'if _hb_seat_advanced "\$name" "\$tid" "\$since"' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1) || _seat=""
 _free=$(grep -n 'local free="" target="" cand lane' "$SRC/cmd_heartbeat.sh" | cut -d: -f1 | head -1) || _free=""
 [[ -n "$_gate" && -n "$_seat" && -n "$_free" ]] && (( _seat > _gate && _seat < _free )) \
   && ok_t "rung 2 CONSULTS the seat-advance hold, after the gate hold and before any lever — a helper nobody calls is the original bug" \
   || bad_t "rung 2 consults the seat-advance hold in place" "gate=[${_gate:-none}] seat=[${_seat:-none}] levers=[${_free:-none}]"
+
+# ---------------------------------------------------------------------------
+# 12j-12m — DIVE-9183. The sibling hold's window was "since rung 1", and rung 1
+#     is once per row and never cleared. On teal-fox an urgent row escalated on
+#     11-19 was handed to an idle seat 27 times on 11-23, and every rung-2 arm
+#     was HELD by rows that seat had touched at some point in those four days.
+#     The window is now THIS stuck stretch: since the row was last handed to the
+#     seat (its previous dispatcher run), floored at rung 1.
+#
+#     Fixtured as the live path leaves it: the row is in_progress, claimed NOW,
+#     with one `runs` row per hand-out (the dispatcher claim opens a run; the
+#     task.started ledger event is first-claim-only, so it cannot carry this).
+# ---------------------------------------------------------------------------
+handed() {  # $1 id, then hand-out offsets ('-10 hours' ...); the last is the current claim
+  local id="$1" off i=0; shift
+  for off in "$@"; do
+    i=$((i+1))
+    db "INSERT INTO runs (id,task_id,ident,agent,started_at,status)
+        VALUES ($(sqlq "run-$id-$i"),$id,'x','dev',datetime('now',$(sqlq "$off")),'abandoned');"
+  done
+  db "UPDATE runs SET status='running' WHERE id=$(sqlq "run-$id-$i");
+      UPDATE tasks SET status='in_progress', started_at=datetime('now',$(sqlq "$off")) WHERE id=$id;"
+}
+acted() { [[ "$(col "$1" nudge_parked_at)" != "NULL" && "$(notes "$1")" == "1" ]] && echo 1 || echo 0; }
+stale_rung1() { db "UPDATE tasks SET nudge_escalated_at=datetime('now','-3 days'), nudge_escalated_n=$2 WHERE id=$1;"; }
+
+# 12j — the teal-fox shape. Rung 1 three days ago; dev touched another row two
+# days ago; since then this row was handed to dev again and again with nothing
+# in between. Rung 2 must ACT. RED on the pre-fix tree (held by the 2-day-old row).
+mk_row 32 'DIVE-9032' high 32
+db "DELETE FROM runs;"
+stale_rung1 32 16
+busy creative; busy dev2; busy main
+db "INSERT INTO tasks (ident,title,status,kind,assignee,created_at,updated_at)
+    VALUES ('DIVE-9032-old','dev touched this two days ago','done','standard','dev',
+            datetime('now','-5 days'),datetime('now','-2 days'));"
+handed 32 '-10 hours' '-8 hours' '-6 hours' '-4 hours' '-2 hours' '+0 seconds'
+_HB_LOG_CAP="$TMP/9183.log"; : >"$_HB_LOG_CAP"
+_hb_log() { printf '%s\n' "$1" >>"$_HB_LOG_CAP"; }
+_hb_nudge_enforce dev 32 DIVE-9032 32 >/dev/null 2>&1
+_hb_log() { :; }
+[[ "$(acted 32)" == "1" ]] \
+  && ok_t "DIVE-9183: seat work from BEFORE this stuck stretch does not hold rung 2 — an idle seat handed the row again and again is starved, rung 2 acts" \
+  || bad_t "DIVE-9183: stale seat work held rung 2" "parked=[$(col 32 nudge_parked_at)] notes=[$(notes 32)] log=[$(cat "$_HB_LOG_CAP")]"
+
+# 12k — NEGATIVE CONTROL. Same fixture, plus dev delivered another row BETWEEN
+# the last two hand-outs. That seat is working its queue: rung 2 HOLDS, on the
+# fixed tree as on the old one.
+mk_row 33 'DIVE-9033' high 32
+db "DELETE FROM runs;"
+stale_rung1 33 16
+busy creative; busy dev2; busy main
+db "INSERT INTO tasks (ident,title,status,kind,assignee,created_at,updated_at)
+    VALUES ('DIVE-9033-old','dev touched this two days ago','done','standard','dev',
+            datetime('now','-5 days'),datetime('now','-2 days'));
+    INSERT INTO lifecycle_events (kind,ident,actor,authority,idem_key,ts)
+    VALUES ('task.delivered','DIVE-9033-other','dev','self','idem-9033-deliver',datetime('now','-1 hours'));"
+handed 33 '-10 hours' '-8 hours' '-6 hours' '-4 hours' '-2 hours' '+0 seconds'
+_HB_LOG_CAP="$TMP/9183b.log"; : >"$_HB_LOG_CAP"
+_hb_log() { printf '%s\n' "$1" >>"$_HB_LOG_CAP"; }
+_hb_nudge_enforce dev 33 DIVE-9033 32 >/dev/null 2>&1
+_hb_log() { :; }
+[[ "$(col 33 nudge_parked_at)" == "NULL" && "$(notes 33)" == "0" && "$(col 33 assignee)" == "dev" ]] \
+  && ok_t "DIVE-9183 control: a seat that delivered other work since this row was last handed to it still HOLDS rung 2" \
+  || bad_t "DIVE-9183 control: current-stretch work holds rung 2" "parked=[$(col 33 nudge_parked_at)] notes=[$(notes 33)]"
+case "$(cat "$_HB_LOG_CAP")" in
+  *"rung 2 HELD"*"last handed to it"*) ok_t "the hold names the hand-out it measured from, not rung 1 alone" ;;
+  *) bad_t "the hold narrates its real window" "log: [$(cat "$_HB_LOG_CAP")]" ;;
+esac
+
+# 12l — the window never WIDENS past rung 1: a previous hand-out OLDER than rung
+# 1 floors at rung 1, so the 12a shape (advance after rung 1) still holds.
+mk_row 34 'DIVE-9034' high 32
+db "DELETE FROM runs;"
+stamp_rung1 34 16
+busy creative; busy dev2; busy main
+db "INSERT INTO tasks (ident,title,status,kind,assignee,created_at,updated_at)
+    VALUES ('DIVE-9034-other','dev worked this 30 min ago','in_progress','standard','dev',
+            datetime('now','-3 days'),datetime('now','-30 minutes'));"
+handed 34 '-2 days' '+0 seconds'
+_hb_nudge_enforce dev 34 DIVE-9034 32 >/dev/null 2>&1
+[[ "$(col 34 nudge_parked_at)" == "NULL" && "$(notes 34)" == "0" ]] \
+  && ok_t "DIVE-9183: a hand-out older than rung 1 floors the window at rung 1 — the fix only narrows the hold" \
+  || bad_t "DIVE-9183: window floored at rung 1" "parked=[$(col 34 nudge_parked_at)] notes=[$(notes 34)]"
+
+# 12m — the counter RESTARTED after an unpark (esc_n=16 from the old stretch,
+# the registry count back at 1). Urgent N=8: rung 2 arms at the 8th fruitless
+# wake of the new stretch, not at 16+8. RED on the pre-fix tree.
+mk_row 35 'DIVE-9035' urgent 7
+db "DELETE FROM runs;"
+stale_rung1 35 16
+busy creative; busy dev2; busy main
+_hb_nudge_enforce dev 35 DIVE-9035 7 >/dev/null 2>&1
+[[ "$(col 35 nudge_parked_at)" == "NULL" && "$(notes 35)" == "0" ]] \
+  && ok_t "DIVE-9183: restarted counter, 7 of N=8 — rung 2 not yet armed" \
+  || bad_t "DIVE-9183: restarted counter armed early" "parked=[$(col 35 nudge_parked_at)] notes=[$(notes 35)]"
+_hb_nudge_enforce dev 35 DIVE-9035 8 >/dev/null 2>&1
+[[ "$(acted 35)" == "1" ]] \
+  && ok_t "DIVE-9183: restarted counter (esc_n=16) arms rung 2 at N=8, not at 16+8" \
+  || bad_t "DIVE-9183: restarted counter arms at N" "parked=[$(col 35 nudge_parked_at)] notes=[$(notes 35)]"
 
 # ---------------------------------------------------------------------------
 # 13. THE LATCH RACE (quinn, iteration 2 reject). "Once per row" was decided in
