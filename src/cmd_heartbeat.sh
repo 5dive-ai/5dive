@@ -5714,6 +5714,11 @@ _hb_nudge_text() { # <agent> <task_id> <task_ident>
   local _hb_done="'5dive task done ${task_ident} --result=\"<1-2 self-contained sentences; the creator and the dashboard read this field>\"'"
   _hb_is_schema_row "$task_id" 2>/dev/null \
     && _hb_done="'5dive task done ${task_ident} --result-file=<a file holding ONLY the JSON object this row asks for>' (the result IS that JSON, read by a program: no summary sentence, no path to it, no code fence)"
+  # DIVE-9171: a run of a scheduled job that found nothing says so (--empty),
+  # so two quiet runs in a row reach the owner as "it may be broken", not silence.
+  [[ "$task_id" =~ ^[0-9]+$ ]] \
+    && [[ "$(db "SELECT COUNT(*) FROM tasks WHERE id=${task_id} AND from_template_id IS NOT NULL;" 2>/dev/null)" == "1" ]] \
+    && _hb_done+=" (this is a run of a scheduled job: if it found nothing for your owner, add --empty rather than staying silent)"
   local nudge="/goal ${task_ident} — your only row this turn; ${_hb_read}. TERMINAL, then stop: DONE — ${_hb_done} (on a row that carries a verifier the same verb DELIVERS instead, and delivered is terminal for you); GATED — '5dive task need ${task_ident} --type=decision|approval|secret|manual --ask=\"<one crisp question>\"' if it needs a human (decision: --options=\"<first choice>|<second choice>\"; decision/approval: --recommend=\"<answer>\"; secret: --secret-key=<KEY> --connector=tools); CANCELLED — '5dive task cancel ${task_ident} --result=\"<why>\"' only if the row is genuinely impossible. Self-audit before you close. The rest of the contract (gate vs cancel, the ask's shape, single-row scope, maker/verifier separation, the knowledge clause) is in /home/claude/projects/CLAUDE.md under \"Task lifecycle\" — read it ONCE per session, it is not repeated here. Stop after ${_hb_turns} turns."
   # DIVE-6433: the gate's chrome follows the owner's language (_gate_t), but the
   # ask and options are this agent's own words. On a box whose owner writes in

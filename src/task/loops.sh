@@ -529,6 +529,12 @@ _loop_score_request() {
   [[ -n "$row" ]] || return 0
   IFS=$'\x1f' read -r rident st tid tident <<<"$row"
   _loop_fail_tick "$id" "$st" "$tid" "$tident" || true
+  # DIVE-9171: an empty run (`task done --empty`) counts toward "found nothing
+  # twice"; a run with something in it ends the streak. src/task/heal.sh loads
+  # only when one of the two keys is there.
+  if [[ "$st" == "done" ]] && [[ -n "$(_loop_pref_get "loop.empty.run.${rident}")$(_loop_pref_get "loop.empty.${tident}")" ]]; then
+    _loop_improve_call _loop_heal_empty_tick "$tid" "$tident" "$rident" || true
+  fi
   if [[ -n "$(_loop_pref_get "loop.outcome.${tident}")" ]]; then
     [[ "$st" == "done" && -z "$(_loop_pref_get "loop.score.${rident}")" ]] || return 0
     local tpl; tpl=$(db "SELECT id||x'1f'||COALESCE(assignee,'') FROM tasks WHERE ident=$(sqlq "$tident");")
@@ -540,6 +546,15 @@ _loop_score_request() {
   # DIVE-8692: the switch is read HERE, so a run of a loop with self-improvement
   # off never loads src/task/improve.sh (a lazy module; see its header).
   [[ "$(_loop_pref_get "loop.improve.${tident}")" != "on" ]] || _loop_improve_call _loop_improve_kick "$tident" "$rident" || true
+  # DIVE-9171: the weekly self-improving turn, for a loop not already improving
+  # after every run. Loads heal.sh only once a week (or to start the clock); the
+  # 7 is heal.sh's _LOOP_WEEKLY_DAYS, which is not loaded here.
+  if [[ "$st" == "done" && "$(_loop_pref_get "loop.improve.${tident}")" != "on" \
+        && "$(_loop_pref_get "loop.improve.weekly.${tident}")" != "off" ]] \
+     && [[ "$(db "SELECT COUNT(*) FROM task_prefs WHERE key=$(sqlq "loop.improve.weekly_at.${tident}")
+                 AND julianday('now') - julianday(value) < 7;")" == "0" ]]; then
+    _loop_improve_call _loop_heal_weekly_kick "$tident" "$rident" || true
+  fi
   return 0
 }
 
@@ -1296,7 +1311,11 @@ _loop_fail_tick() {  # <run id> <run status> <template id> <template ident>
   n=$(( $(jq -r '.n // 0' <<<"${st:-"{}"}" 2>/dev/null || echo 0) + 1 ))
   st=$(jq -cn --argjson n "$n" --arg w "$why" '{n:$n, why:$w, last_at:(now|todate)}')
   _loop_pref_set "loop.fails.${tident}" "$st"
-  (( n >= _LOOP_FAIL_PAUSE_AT )) || return 0
+  if (( n < _LOOP_FAIL_PAUSE_AT )); then
+    # DIVE-9171: not paused yet, so try it once more in a few minutes.
+    [[ "$(_loop_pref_get "loop.heal.${tident}")" == "off" ]] || _loop_improve_call _loop_heal_retry "$id" "$tid" "$tident" || true
+    return 0
+  fi
   _loop_fail_pause "$tid" "$tident" "$st"
 }
 
@@ -1365,6 +1384,7 @@ cmd_task_loop() {
     improve)        _loop_improve_call cmd_task_loop_improve "$@" ;;
     outcome)        cmd_task_loop_outcome "$@" ;;
     resume)         cmd_task_loop_resume "$@" ;;
+    heal)           _loop_improve_call cmd_task_loop_heal "$@" ;;
     -h|--help|help) cat <<'HELP'
 5dive task loop start --title=<name> --steps=<json>   |   loop ls [--all]
 DIVE-5564 loop scores (a loop = a scheduled task):
@@ -1392,10 +1412,17 @@ DIVE-5777 outcome loops (score by a number, not an opinion):
                                                 3 days: the loop pauses and its lead tells the owner once.
                                                 Self-improvement stays off.
   loop outcome <loop> --check | --clear         read the number now | go back to signal scores
+DIVE-9171 self-healing loops (on by default, per loop):
+  loop heal <loop> [on|off] [--owner=yes|no|auto]   a failed run is tried again once, ~15 min later; a loop that
+                                                messages its owner and closes empty twice in a row (task done
+                                                --empty) tells the owner, in one line, that it may be broken.
+                                                --owner overrides whether the loop counts as messaging its owner
+  loop improve <loop> weekly                    self-improving once a week, never growing the text (the default
+                                                for a loop that messages its owner; `off` turns it off)
   loop resume <loop>                            restart a paused loop: one paused by its outcome gets a fresh 3 days (Apply does too); one paused after 3 failed runs in a row runs at its next time
 HELP
     ;;
-    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|feedback|rate|review|suggest|apply|dismiss|revert|auto|improve|outcome|resume)" ;;
+    *) fail "$E_USAGE" "unknown loop command: $sub (try: start|ls|scores|score|feedback|rate|review|suggest|apply|dismiss|revert|auto|improve|outcome|resume|heal)" ;;
   esac
 }
 

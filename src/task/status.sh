@@ -280,6 +280,7 @@ _task_done_merge_pending_guard() {
 _task_status_cmd() {
   local newstatus="$1" extra="$2" verb="$3"; shift 3
   tasks_db_init
+  local _TASK_CLOSE_EMPTY=0   # DIVE-9171 --empty
   local result="" want_result=0 notify=0 no_preflight=0 force_merge_gate=0 keep_wt=0 no_graded_sha=0
   local no_pr=0                          # DIVE-2096: "this close REPORTS ON a PR, it delivers none"
   local append_result=0 force_result=0   # DIVE-2464
@@ -339,6 +340,10 @@ _task_status_cmd() {
       # adds their half); --force-result is the rare "the prior text was wrong"
       # replace, and it is audited because it is the only lossy one.
       --append-result) append_result=1 ;;
+      # DIVE-9171: a run of a scheduled job that ran and had nothing for the
+      # owner. Two in a row on a loop that messages its owner tell the owner,
+      # in one line, that it may be broken (src/task/heal.sh).
+      --empty)         _TASK_CLOSE_EMPTY=1 ;;
       --force-result)  force_result=1 ;;
       # DIVE-4144: see _task_route_to_verifier. Accepted on the close verbs
       # because `task done` is the verb a maker actually re-delivers with.
@@ -358,6 +363,15 @@ _task_status_cmd() {
   done
   [[ ${#positional[@]} -gt 0 ]] || fail "$E_USAGE" "usage: 5dive task $verb <id|TASK-N> [--result=<text>] [--notify]"
   resolve_task_id "${positional[0]}"; local id="$RESOLVED_TASK_ID" ident="$RESOLVED_TASK_IDENT"
+  if [[ "${_TASK_CLOSE_EMPTY:-0}" == "1" ]]; then
+    [[ "$verb" == "done" ]] || fail "$E_USAGE" "--empty goes with task done: a run that ran and found nothing for your owner"
+    [[ "$(db "SELECT COUNT(*) FROM tasks WHERE id=${id} AND from_template_id IS NOT NULL;")" == "1" ]] \
+      || fail "$E_VALIDATION" "--empty is for a run of a scheduled job; ${ident} is not one"
+    if (( ! want_result )); then
+      result="Ran; found nothing new for the owner."; want_result=1; result_src="--result"; _TASK_RAW_RESULT="$result"
+    fi
+    _loop_pref_set "loop.empty.run.${ident}" 1
+  fi
   # DIVE-2179: `task done` on a live, unacknowledged handoff must stamp the SAME
   # ack the DIVE-1378 `start` block stamps below — even when this `done` is about
   # to be REFUSED further down (DIVE-2464/DIVE-477/DIVE-2007/DIVE-555, or the
