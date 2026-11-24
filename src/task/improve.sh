@@ -59,7 +59,14 @@ _LOOP_IMPROVE_RUNS_KEPT=20
 _LOOP_IMPROVE_REACH_RX='post|posts|posted|posting|tweet|tweets|reply|replies|comment|comments|send|sends|sent|sending|email|emails|e-mail|mail|message|messages|dm|dms|notify|notifies|telegram|slack|discord|whatsapp|sms|text them|call|phone|recipient|recipients|cc|bcc|forward|share|shares|tool|tools|plugin|plugins|mcp|install|installs|api|apis|webhook|sudo|ssh|buy|buys|purchase|purchases|pay|pays|paid|order|orders|book|subscribe|sign up|signup|register|account|accounts|login|log in'
 _LOOP_IMPROVE_PROMPT_HEAD='You improve a recurring agent job one small step at a time. Grade its last run, then propose at most ONE small change to its instructions.'
 
-_loop_improve_on() { [[ "$(_loop_pref_get "loop.improve.${1}")" == "on" ]]; }
+# DIVE-9171: _LOOP_IMPROVE_MODE=weekly is the once-a-week turn src/task/heal.sh
+# starts for an owner-facing loop. Same engine, three differences: it reads the
+# week's runs, not one; its one change may only merge or drop text (never append,
+# never longer); and its switch is loop.improve.weekly (heal.sh).
+_loop_improve_on() {
+  [[ "$(_loop_pref_get "loop.improve.${1}")" == "on" ]] && return 0
+  [[ "${_LOOP_IMPROVE_MODE:-}" == "weekly" ]] && _loop_improve_call _loop_heal_weekly_on "$1"
+}
 _loop_improve_state() { local s; s=$(_loop_pref_get "loop.improve.state.${1}"); jq -e 'type=="object"' <<<"$s" >/dev/null 2>&1 && printf '%s' "$s" || printf '{}'; }
 _loop_improve_log() { local s; s=$(_loop_pref_get "loop.improve.log.${1}"); jq -e 'type=="array"' <<<"$s" >/dev/null 2>&1 && printf '%s' "$s" || printf '[]'; }
 
@@ -323,7 +330,15 @@ _loop_improve_prompt() {
     printf 'CRITERIA: none are set. Derive 3 to 5 short criteria from the instructions (what a good run of this job delivers). They will be reused for every later run.\n\n'
   fi
   printf 'WHAT THE LAST RUN REPORTED:\n<<<\n%s\n>>>\n\n' "${work:-(nothing reported)}"
-  if (( want )); then
+  if (( want )) && [[ "${_LOOP_IMPROVE_MODE:-}" == "weekly" ]]; then
+    cat <<EOF
+This is the weekly review: grade the last run, reading the whole week above. Then propose ONE change that makes the instructions SHORTER or keeps them the same length: merge two lines that say the same thing into one, or drop the weakest line (the one the week shows does not help). Never add a line.
+- find: an exact phrase copied from the instructions, at most ${_LOOP_IMPROVE_MAX_CHARS} characters, that appears once; replace: its new, shorter wording ("" to drop it).
+- It must NOT widen what the job may do: no new spending or buying, no posting or publishing, no new people or places to send anything to, no new tools, accounts or installs.
+- "change" is a label the owner reads on a phone: at most 8 plain words, e.g. "Drops the repeated weather line".
+- No line is weak: set "proposal" to null.
+EOF
+  elif (( want )); then
     cat <<EOF
 Then propose ONE small change to the instructions that would raise the LOWEST criterion next run.
 - It is either a replacement (find: an exact phrase copied from the instructions, at most ${_LOOP_IMPROVE_MAX_CHARS} characters, that appears once; replace: its new wording, at most ${_LOOP_IMPROVE_MAX_CHARS} characters) or one added sentence (find: "", replace: the sentence).
@@ -424,6 +439,10 @@ _loop_improve_tick_locked() {
   rbody=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${rid};")
   rwork=$(db "SELECT COALESCE(result,'') FROM tasks WHERE id=${rid};")
   rwork+=$(_loop_improve_runtime_note "$tident" "$rcreated")
+  if [[ "${_LOOP_IMPROVE_MODE:-}" == "weekly" ]]; then
+    rwork+=$'\n\nTHE WEEK (newest first; each run, how it ended, what it reported):\n'
+    rwork+=$(_loop_improve_call _loop_heal_week_digest "$tid")
+  fi
 
   # Which criteria. The loop's own, else the ones derived on the first tick.
   local crit accept derived=""
@@ -547,11 +566,15 @@ _loop_improve_commit() {
       id=$(jq -r '.next_id // 1' <<<"$state"); state=$(jq -c '.next_id = ((.next_id // 1) + 1)' <<<"$state")
       cur=$(db "SELECT body FROM tasks WHERE id=${tid};")
       local status="trying" why=""
-      if [[ -z "${repl//[[:space:]]/}" || -z "${change//[[:space:]]/}" ]]; then status="refused"; why="empty change"
+      local weekly=0; [[ "${_LOOP_IMPROVE_MODE:-}" == "weekly" ]] && weekly=1
+      if (( weekly )) && [[ -z "$find" ]]; then status="refused"; why="the weekly change may only merge or drop text, never add a line"
+      elif (( weekly )) && [[ -z "${change//[[:space:]]/}" ]]; then status="refused"; why="empty change"
+      elif (( ! weekly )) && [[ -z "${repl//[[:space:]]/}" || -z "${change//[[:space:]]/}" ]]; then status="refused"; why="empty change"
       elif (( ${#find} > _LOOP_IMPROVE_MAX_CHARS || ${#repl} > _LOOP_IMPROVE_MAX_CHARS )); then status="refused"; why="not a small change (over ${_LOOP_IMPROVE_MAX_CHARS} characters)"
       elif widened=$(_loop_improve_widens "$cur" "$repl" "$find"); then status="refused"; why="would widen what the loop may do: ${widened}"
       elif ! new=$(_loop_improve_apply_change "$cur" "$find" "$repl"); then status="refused"; why="the text to change is not in the instructions exactly once"
       elif [[ "$new" == "$cur" ]]; then status="refused"; why="no change"
+      elif (( weekly )) && (( ${#new} > ${#cur} )); then status="refused"; why="the weekly change would make the instructions longer"
       fi
       if [[ "$status" == "trying" ]]; then
         db "UPDATE tasks SET body=$(sqlq "$new") WHERE id=${tid};"
@@ -633,7 +656,21 @@ cmd_task_loop_improve() {
       _loop_pref_set "loop.improve.${tident}" on
       ok "self-improving on for ${tident}: after each run it grades the run, tries one small change, and keeps it only if the next run scores higher" \
          '{loop:$t, self_improving:true}' --arg t "$tident" ;;
+    weekly)
+      # DIVE-9171: once a week, never growing the text. Every-run improving, if
+      # it was on, stops first (its open trial is taken back, as `off` does).
+      [[ -z "$(_loop_pref_get "loop.outcome.${tident}")" ]] \
+        || fail "$E_VALIDATION" "${tident} is scored by its outcome, and its next lane is the owner's call: self-improvement stays off (DIVE-5777)"
+      if [[ "$(_loop_pref_get "loop.improve.${tident}")" == "on" ]]; then
+        ( cmd_task_loop_improve "$tident" off ) >/dev/null 2>&1 || fail "$E_GENERIC" "${tident} is busy recording a run; try again in a minute"
+      fi
+      _loop_pref_set "loop.improve.weekly.${tident}" on
+      ok "weekly self-improving on for ${tident}: once a week it reads the week's runs and makes at most one change, which only merges or drops a line" \
+         '{loop:$t, self_improving:false, weekly_improve:true}' --arg t "$tident" ;;
     off)
+      # DIVE-9171: off is off for the weekly turn too (an owner-facing loop
+      # has it by default, so off is stored, not deleted).
+      _loop_pref_set "loop.improve.weekly.${tident}" off
       # The state lock: a tick mid-grade writes under it too, and re-checks the
       # switch there, so once off holds it no tick can apply anything after.
       _loop_improve_lock "$tident" state || fail "$E_GENERIC" "${tident} is busy recording a run; try again in a minute"
@@ -683,11 +720,17 @@ cmd_task_loop_improve() {
          '{loop:$t, undone:($i|tonumber), also_undone:$a}' --arg t "$tident" --arg i "$eid" --argjson a "$UNDO_ALSO" ;;
     tick)
       local run=""
-      [[ "${1:-}" == --run=* ]] && run="${1#--run=}"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --run=*)  run="${1#--run=}" ;;
+          --weekly) _LOOP_IMPROVE_MODE=weekly ;;   # DIVE-9171, started by heal.sh
+        esac
+        shift
+      done
       local out rc=0
       out=$(_loop_improve_tick "$tident" "$run") || rc=$?
       (( rc == 0 )) || fail "$E_GENERIC" "$out"
       ok "$out" '{loop:$t, message:$m}' --arg t "$tident" --arg m "$out" ;;
-    *) fail "$E_USAGE" "usage: 5dive task loop improve <loop> on|off|log [--json]|undo <id>|tick [--run=<run>]" ;;
+    *) fail "$E_USAGE" "usage: 5dive task loop improve <loop> on|weekly|off|log [--json]|undo <id>|tick [--run=<run>]" ;;
   esac
 }
