@@ -1135,6 +1135,10 @@ cmd_agent_switch() {
       token=$(_switch_tg_token "$home" "$from")
     fi
     [[ -n "$token" ]] || token=$(_switch_tg_token "$home" "$to")
+    # DIVE-9216: a seat whose bot was attached before the per-seat .env reconcile
+    # (DIVE-4609) has its token only in the box's connector copy, the one the unit
+    # loads and telegram-info reads.
+    [[ -n "$token" ]] || token=$({ sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "${CONNECTORS_DIR}/telegram-${name}.env" 2>/dev/null || true; } | head -1)
     [[ -n "$token" ]] || fail "$E_VALIDATION" "agent '$name' has channels=telegram but no bot token on disk — reconnect the bot first"
     if [[ "$to" == codex ]]; then
       codex_plugin_dir >/dev/null \

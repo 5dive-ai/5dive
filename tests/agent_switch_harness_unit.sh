@@ -48,6 +48,7 @@ bad_t() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 # ------------------------------------------------------------------ fixtures
 export SWITCH_HOME_ROOT="$TMP/home"
 AUTH_PROFILES_DIR="$TMP/profiles"; ENV_DIR="$TMP/agents.d"; STATE_DIR="$TMP/state"
+CONNECTORS_DIR="$TMP/connectors"; mkdir -p "$CONNECTORS_DIR"   # never the host's /etc/5dive/connectors
 mkdir -p "$AUTH_PROFILES_DIR/claudeacct" "$AUTH_PROFILES_DIR/chatgpt/codex" "$AUTH_PROFILES_DIR/empty" "$ENV_DIR" "$STATE_DIR"
 printf 'CLAUDE_CODE_OAUTH_TOKEN=sk-test\n' >"$AUTH_PROFILES_DIR/claudeacct/combined.env"
 : >"$AUTH_PROFILES_DIR/chatgpt/combined.env"
@@ -495,6 +496,29 @@ w=$(switch_harness_warning Dude grok claude); w2=$(switch_harness_warning Theo c
    && "$w2" == "Moving Theo to your Grok plan switches it from Claude Code to Grok. Its memory and instructions are converted; this chat's history is not. You can switch back any time." ]] \
   && ok_t "G15 the sentence names Grok both ways" || bad_t "G15 warning" "$w | $w2"
 unset FIVE_GROK_OFF_MARKER
+
+# =========================================================== T: token only in the connector copy (DIVE-9216)
+# A Claude seat whose bot was attached before DIVE-4609 has no per-seat
+# ~/.claude/channels/telegram/.env; its token lives only in the box's
+# $CONNECTORS_DIR/telegram-<name>.env (what the unit loads, what telegram-info reads).
+# On origin/main the switch refused it: "no bot token on disk".
+TH="$SWITCH_HOME_ROOT/agent-tess"; mkdir -p "$TH/.claude"; printf 'Tess line.\n' >"$TH/.claude/CLAUDE.md"
+TOKEN_T='7000000003:AAtttttttttttttttttttttttttttttttt'
+printf 'TELEGRAM_BOT_TOKEN=%s\n' "$TOKEN_T" >"$CONNECTORS_DIR/telegram-tess.env"
+jq '.agents.tess = {"type":"claude","channels":"telegram","authProfile":"claudeacct","isolation":"standard"}' "$TMP/reg" >"$TMP/reg.t" && mv "$TMP/reg.t" "$TMP/reg"
+rc=$(run cmd_agent_switch tess --to=codex --account=chatgpt)
+[[ "$rc" == 0 && "$(jq -r .agents.tess.type "$TMP/reg")" == codex && ! -e "$TH/.claude/channels/telegram/.env" ]] \
+  && [[ "$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$TH/.codex/channels/telegram/.env" 2>/dev/null)" == "$TOKEN_T" ]] \
+  && ok_t "T1 a Claude seat with its bot token only in the connector copy switches to codex and keeps that bot (RED on main: refused)" \
+  || bad_t "T1 connector-only token" "rc=$rc err=$(tail -3 "$TMP/err")"
+UH="$SWITCH_HOME_ROOT/agent-una"; mkdir -p "$UH/.claude"; printf 'Una line.\n' >"$UH/.claude/CLAUDE.md"
+jq '.agents.una = {"type":"claude","channels":"telegram","authProfile":"claudeacct","isolation":"standard"}' "$TMP/reg" >"$TMP/reg.t" && mv "$TMP/reg.t" "$TMP/reg"
+snap_reg=$(sha256sum <"$TMP/reg")
+rc=$(run cmd_agent_switch una --to=codex --account=chatgpt)
+[[ "$rc" != 0 ]] && grep -q "agent 'una' has channels=telegram but no bot token on disk" "$TMP/err" \
+  && [[ "$(sha256sum <"$TMP/reg")" == "$snap_reg" && ! -e "$UH/.codex/channels/telegram/.env" ]] \
+  && ok_t "T2 a seat with no token anywhere (seat files nor connector copy) is still refused, nothing changed" \
+  || bad_t "T2 tokenless refusal" "rc=$rc err=$(tail -3 "$TMP/err")"
 
 # =========================================================== D: a seat switching ITSELF (DIVE-8371)
 # kos runs `sudo 5dive agent switch kos` from inside 5dive-agent@kos.service. On
