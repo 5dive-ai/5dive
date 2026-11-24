@@ -65,7 +65,11 @@ _LOOP_IMPROVE_PROMPT_HEAD='You improve a recurring agent job one small step at a
 # never longer); and its switch is loop.improve.weekly (heal.sh).
 _loop_improve_on() {
   [[ "$(_loop_pref_get "loop.improve.${1}")" == "on" ]] && return 0
-  [[ "${_LOOP_IMPROVE_MODE:-}" == "weekly" ]] && _loop_improve_call _loop_heal_weekly_on "$1"
+  if [[ "${_LOOP_IMPROVE_MODE:-}" == "weekly" ]]; then
+    _loop_improve_call _loop_heal_weekly_on "$1"
+    return
+  fi
+  return 1
 }
 _loop_improve_state() { local s; s=$(_loop_pref_get "loop.improve.state.${1}"); jq -e 'type=="object"' <<<"$s" >/dev/null 2>&1 && printf '%s' "$s" || printf '{}'; }
 _loop_improve_log() { local s; s=$(_loop_pref_get "loop.improve.log.${1}"); jq -e 'type=="array"' <<<"$s" >/dev/null 2>&1 && printf '%s' "$s" || printf '[]'; }
