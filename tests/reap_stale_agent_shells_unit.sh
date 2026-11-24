@@ -385,56 +385,71 @@ fi
 # --- DIVE-9184: an environ that `-r` passes and open() refuses prints NOTHING --
 # Every successful `task done` printed "/proc/<pid>/environ: Permission denied":
 # bash applies `<file` before `2>/dev/null`, so a refused open reached the caller.
-# `-r` is access(); root holds CAP_DAC_OVERRIDE so it passes, while open() also
-# needs the ptrace check (CAP_SYS_PTRACE for another uid's process) and is refused.
-# Staged for real: root with CAP_SYS_PTRACE dropped, reading a `nobody` process.
-# The MUTANT re-runs the same pid through the pre-fix redirect order, so the arm
-# is shown able to see the defect (RED before the fix), not vacuously quiet.
+# `-r` is access(), and it can pass while open() is refused (on a box: root's
+# CAP_DAC_OVERRIDE passes access(), the ptrace check refuses the open).
+# _mut9184 is the pre-fix function, literally: each arm runs it on the same input
+# so the arm is shown able to see the defect, not vacuously quiet.
+_mut9184() {
+  local p="$1" env_raw
+  [[ -r "/proc/$p/environ" ]] || return 1
+  env_raw=$(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null) || return 1
+  grep -qE '^(FIVEDIVE|5DIVE)_KEEP_ALIVE=' <<<"$env_raw"
+}
+# _9184_run <fn> <pid> — the function's stderr and its rc, folded onto one line.
+_9184_run() { local e; e=$( { "$1" "$2"; echo "rc=$?" >&3; } 3>&1 2>&1 >/dev/null ); echo "" $e; }
+
+# PORTABLE arm (every host, no privilege): a unix socket file passes `-r`, and
+# open() on it fails (ENXIO). `p` is a path segment, so `../<dir>` reaches it.
+_d9184=$(mktemp -d)
+mkdir -p "$_d9184/sock" "$_d9184/keep"
+if python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$_d9184/sock/environ" 2>/dev/null \
+   && [[ -r "/proc/..$_d9184/sock/environ" ]]; then
+  is "DIVE-9184: an environ -r passes and open() refuses returns 1 with EMPTY stderr" \
+     "$(_9184_run _reap_keep_alive_env "..$_d9184/sock")" " rc=1"
+  _m=$(_9184_run _mut9184 "..$_d9184/sock")
+  if [[ "$_m" == *"No such device or address"*" rc=1" ]]; then
+    ok "DIVE-9184 MUTANT: the pre-fix redirect order prints the open error on the same input"
+  else
+    bad "DIVE-9184 MUTANT: pre-fix order printed no open error (got: $_m) — the arm above is vacuous"
+  fi
+  printf 'PATH=/usr/bin\0FIVEDIVE_KEEP_ALIVE=1\0' >"$_d9184/keep/environ"
+  is "DIVE-9184 NEGATIVE CONTROL: a readable FIVEDIVE_KEEP_ALIVE=1 environ still returns 0" \
+     "$(_9184_run _reap_keep_alive_env "..$_d9184/keep")" " rc=0"
+else
+  bad "DIVE-9184 STAGING: could not make a socket file that -r passes — the portable arm grades nothing"
+fi
+rm -rf "$_d9184"
+
+# REAL /proc arm, where the kernel refuses it: root with CAP_SYS_PTRACE dropped
+# reading a `nobody` process. Measured: poke-two (6.8) refuses the open; GitHub's
+# runner kernel opens it anyway (CI it.2, CapEff without bit 19, OPEN=ok), so
+# there it is a named SKIP and the portable arm above carries the grade.
 if sudo -n true 2>/dev/null && command -v setpriv >/dev/null 2>&1; then
-  # The staged `nobody` sleep is only refusable AFTER its exec: between fork and
-  # setresuid it is still a root process the reader may open, which is a vacuous
-  # green (CI it.1). So wait for the exec'd argv, then PROVE the refusal with a
-  # bare open before grading anything. The mutant is the pre-fix line, literally.
   # shellcheck disable=SC2016
   _r9184=$(sudo -n setpriv --inh-caps=-sys_ptrace --bounding-set=-sys_ptrace \
-    bash -c '
+    bash -c "$(declare -f _mut9184 _9184_run)"'
       . src/lib/reap.sh
-      _mut9184() {
-        local p="$1" env_raw
-        [[ -r "/proc/$p/environ" ]] || return 1
-        env_raw=$(tr "\0" "\n" <"/proc/$p/environ" 2>/dev/null) || return 1
-        grep -qE "^(FIVEDIVE|5DIVE)_KEEP_ALIVE=" <<<"$env_raw"
-      }
       setpriv --reuid=65534 --regid=65534 --clear-groups sleep 30 & v=$!
       for _i in $(seq 1 50); do [[ "$(tr "\0" " " </proc/$v/cmdline 2>/dev/null)" == "sleep 30 " && "$(stat -c %u /proc/$v 2>/dev/null)" == 65534 ]] && break; sleep 0.1; done
-      echo "DIAG: uid=$(stat -c %u /proc/$v 2>/dev/null) argv=$(tr "\0" " " </proc/$v/cmdline 2>/dev/null) $(grep CapEff /proc/self/status)"
+      echo "DIAG: uid=$(stat -c %u /proc/$v 2>/dev/null) $(grep CapEff /proc/self/status)"
       [[ -r /proc/$v/environ ]] && echo "R=pass" || echo "R=fail"
       ( : <"/proc/$v/environ" ) 2>/dev/null && echo "OPEN=ok" || echo "OPEN=refused"
-      # Unquoted $e/$m below on purpose: word-splitting folds the captured stderr and
-      # the rc line onto one line, which is what the parent reads back.
-      e=$( { _reap_keep_alive_env "$v"; echo "rc=$?" >&3; } 3>&1 2>&1 >/dev/null ); echo "FIX:" $e
-      m=$( { _mut9184 "$v"; echo "rc=$?" >&3; } 3>&1 2>&1 >/dev/null ); echo "MUT:" $m
-      FIVEDIVE_KEEP_ALIVE=1 sleep 30 & k=$!
-      for _i in $(seq 1 50); do [[ "$(tr "\0" " " </proc/$k/cmdline 2>/dev/null)" == "sleep 30 " ]] && break; sleep 0.1; done
-      _reap_keep_alive_env "$k"; echo "OWN=$?"
-      kill "$v" "$k" 2>/dev/null
+      echo "FIX:$(_9184_run _reap_keep_alive_env "$v")"
+      echo "MUT:$(_9184_run _mut9184 "$v")"
+      kill "$v" 2>/dev/null
     ' 2>&1)
-  _fix=$(sed -n 's/^FIX://p' <<<"$_r9184")
-  _mut=$(sed -n 's/^MUT://p' <<<"$_r9184")
   if [[ "$_r9184" != *R=pass* || "$_r9184" != *OPEN=refused* ]]; then
-    bad "DIVE-9184 STAGING: need -r to pass AND open() to be refused on the staged environ, or the arm grades nothing (out: ${_r9184//$'\n'/ | })"
+    printf '  SKIP DIVE-9184 real-/proc arm: this kernel does not refuse the staged open (%s)\n' "${_r9184//$'\n'/ | }"
   else
-    is "DIVE-9184: open-refused environ returns 1 with EMPTY stderr" "$_fix" " rc=1"
-    if [[ "$_mut" == *"Permission denied"*" rc=1" ]]; then
-      ok "DIVE-9184 MUTANT: the pre-fix redirect order prints Permission denied on the same pid (arm can see the defect)"
-    else
-      bad "DIVE-9184 MUTANT: pre-fix order did not print the error (got: $_mut) — the arm above is vacuous"
-    fi
-    is "DIVE-9184 NEGATIVE CONTROL: a readable FIVEDIVE_KEEP_ALIVE=1 environ still returns 0" \
-       "$(sed -n 's/^OWN=//p' <<<"$_r9184")" "0"
+    is "DIVE-9184 real /proc: open-refused environ returns 1 with EMPTY stderr" \
+       "$(sed -n 's/^FIX://p' <<<"$_r9184")" " rc=1"
+    _m=$(sed -n 's/^MUT://p' <<<"$_r9184")
+    [[ "$_m" == *"Permission denied"*" rc=1" ]] \
+      && ok "DIVE-9184 real /proc MUTANT: the pre-fix order prints Permission denied on the same pid" \
+      || bad "DIVE-9184 real /proc MUTANT: pre-fix order printed nothing (got: $_m) — the arm above is vacuous"
   fi
 else
-  printf '  SKIP DIVE-9184 open-refused arm: needs passwordless sudo and setpriv to stage root without CAP_SYS_PTRACE\n'
+  printf '  SKIP DIVE-9184 real-/proc arm: needs passwordless sudo and setpriv\n'
 fi
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
