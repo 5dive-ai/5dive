@@ -1444,8 +1444,28 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
         # weaken a guard. The cost is instead made VISIBLE and asserted —
         # tests/task_merge_gate_anon_rail_unit.sh T9 pins how many requests one
         # graded close spends, so a future change that multiplies it is caught.
-        _state=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
-        _merged=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
+        # DIVE-9192: a COMMIT URL (a direct-to-main repo has no pull request) is
+        # read by the ONE landing reader, `_merge_landed_probe`, never by `gh pr
+        # view` — the second, pull-only reader DIVE-5758 says must not exist.
+        # Measured on DIVE-9106: merge-landed recorded the sha on the default
+        # branch, then this gate refused the close as "merge is UNKNOWN".
+        # MERGED carries the landed sha (read again by the DIVE-2656 check below),
+        # OPEN carries the probe's reason as the state, UNKNOWN leaves it empty.
+        local _cu_landed="" _cu_commit=0
+        if declare -F _task_is_commit_url >/dev/null 2>&1 && _task_is_commit_url "$_dref" \
+           && declare -F _merge_landed_probe >/dev/null 2>&1; then
+          _cu_commit=1
+          local _clp _clrest
+          _clp=$(_merge_landed_probe "$_dref" "$(_gate_slug_from_url "$_dref")" 2>/dev/null) || _clp=""
+          _clrest="${_clp#*$'\x1f'}"; _state=""; _merged=""
+          case "${_clp%%$'\x1f'*}" in
+            MERGED) _state=MERGED; _cu_landed="${_clrest%%$'\x1f'*}"; _merged="${_clrest#*$'\x1f'}" ;;
+            OPEN)   _state="${_clrest:-not on the default branch}" ;;
+          esac
+        else
+          _state=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.state' 2>/dev/null || echo "")
+          _merged=$(_gate_gh "$_ghtok" 0 pr view "$_dref" --json state,mergedAt -q '.mergedAt' 2>/dev/null || echo "")
+        fi
         # DIVE-2720: NORMALISE the literal 'null' to empty, at CAPTURE, so every
         # reader below inherits it. `gh -q .state` renders a MISSING .state as the
         # four-character string 'null' — not empty — so a SUCCESSFUL query with an
@@ -1476,7 +1496,9 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
           if ! _gate_gh_credentialed "$_ghtok"; then
             _gate_refuse_no_rail "$ident" "$_dref"
           fi
-          policy_refuse "$E_CONFLICT" done-pr-state-unresolved DIVE-2318 "$ident" "$ident cannot close: gh could not read $_dref, so the merge is UNKNOWN, not absent — check by hand (gh pr view $_dref --json state,mergedAt) and re-run, or task cancel to abandon."
+          local _ur_hint="gh pr view $_dref --json state,mergedAt"
+          (( _cu_commit )) && _ur_hint="5dive task merge-landed $ident"
+          policy_refuse "$E_CONFLICT" done-pr-state-unresolved DIVE-2318 "$ident" "$ident cannot close: gh could not read $_dref, so the merge is UNKNOWN, not absent — check by hand ($_ur_hint) and re-run, or task cancel to abandon."
         fi
         # DIVE-4137: THE MERGE IS THE STEP WHERE GRADED WORK SITS.
         #
@@ -1650,6 +1672,7 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
             # Keyed on ATTRIBUTION, because that is the operand that accepts; ancestry
             # is appended as context and is never the stated reason.
             local _cu_why="" _cu_fix="merge it, then task done"
+            (( _cu_commit )) && _cu_fix="that commit is not on the default branch — land it there (or re-point the binding with \`task deliver $ident --pr=<url>\`), then task done"
             case "$_cu_attr" in
               0) _cu_why=" NO commit subject on main names $ident, so the work has not landed by another route either." ;;
               bound:*) _cu_why=" No commit subject on main names $ident within the scan bound (${_cu_attr#bound:} COMMITS WALKED in $_cu_slug) — main's history was NOT exhausted, so this is unresolved, not ruled out; re-run, or raise FIVE_GATE_ANCESTRY_SCAN." ;;
@@ -1695,7 +1718,10 @@ $_body" 2>/dev/null | sed 's/^.*|/#/' | head -3 | paste -sd, - || true)
         local _graded; _graded=$(_gate_graded_sha "$result")
         if [[ -n "$_graded" ]]; then
           local _prshas _headsha _mcsha
-          _prshas=$(_gate_pr_shas "$_dref" "$_ghtok" "$(_gate_slug_from_url "$_dref")")
+          # DIVE-9192: a landed commit's head IS the sha the probe read on the
+          # default branch; `pr view` has nothing to say about it.
+          if [[ -n "$_cu_landed" ]]; then _prshas="$_cu_landed|$_cu_landed"
+          else _prshas=$(_gate_pr_shas "$_dref" "$_ghtok" "$(_gate_slug_from_url "$_dref")"); fi
           _headsha="${_prshas%%|*}"; _mcsha="${_prshas##*|}"
           _headsha="${_headsha,,}"; _mcsha="${_mcsha,,}"
           if [[ -z "$_headsha" && -z "$_mcsha" ]]; then
