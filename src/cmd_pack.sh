@@ -1646,6 +1646,8 @@ USAGE
 }
 
 # Sanitized per-agent config from the registry — config only, never tokens.
+# DIVE-9196: authProfile is always null. It names a sign-in on THIS box (like a
+# token's location), so a recipient's seat bound to it comes up unsigned.
 _pack_agent_config() {
   local name="$1" reg
   reg=$(registry_read)
@@ -1655,7 +1657,7 @@ _pack_agent_config() {
     type, isolation,
     channels: (.channels // "none"),
     workdir,
-    authProfile: (.authProfile // null)
+    authProfile: null
   }' <<<"$reg"
 }
 
@@ -3733,11 +3735,12 @@ cmd_import() {
   [[ -n "$orig_name" ]] && _pack_rename_persona "$stage" "$orig_name" "$as"
 
   # Derive create inputs from the manifest; explicit flags win.
-  local type isolation m_workdir m_profile model effort
+  local type isolation m_workdir model effort
   type=$(jq -r '.config.type // empty'         "$stage/manifest.json")
   isolation=$(jq -r '.config.isolation // empty' "$stage/manifest.json")
   m_workdir=$(jq -r '.config.workdir // empty'    "$stage/manifest.json")
-  m_profile=$(jq -r '.config.authProfile // empty' "$stage/manifest.json")
+  # DIVE-9196: a pack's .config.authProfile is never read. Older packs carry
+  # the exporter's sign-in name; this box's own defaults below pick the account.
   model=$(jq -r '.config.model // empty'         "$stage/manifest.json")
   effort=$(jq -r '.config.effort // empty'       "$stage/manifest.json")
   # DIVE-1317: explicit runtime flags override the pack's baked-in config so a
@@ -3801,7 +3804,6 @@ cmd_import() {
     fail "$E_VALIDATION" "this pack cannot be imported onto a '$type' agent — ${_why}. It lands on: ${_lands[*]:-(nothing on this box)}"
   fi
   [[ -n "$workdir" ]] || workdir="$m_workdir"
-  [[ -n "$profile" ]] || profile="$m_profile"
   # DIVE-7152: a hire that names no account and no harness goes to the login
   # the owner added last, and its harness follows it: add ChatGPT next to Claude
   # and the next pack hired runs on Codex there. Only onto a harness the pack
