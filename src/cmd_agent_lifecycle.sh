@@ -275,6 +275,22 @@ cmd_rm() {
                          WHERE x.team=team_members.team AND x.agent=$(sqlq "$name"))
       WHERE reports_to=$(sqlq "$name");
       DELETE FROM team_members WHERE agent=$(sqlq "$name");" 2>/dev/null || true
+  # DIVE-9206: and its work. Its schedules (a Proactive check-in among them)
+  # kept firing for a seat that was gone, into open rows no seat could take, and
+  # the client's Tasks showed them under a name no longer on the team. Cancel
+  # every unfinished row it owns, templates included; the result says why.
+  # Best-effort: a board write never fails the remove.
+  step "Cancelling its schedules and open tasks"
+  local _tasks_cancelled
+  _tasks_cancelled=$(db "UPDATE tasks
+        SET status='cancelled', result='agent removed',
+            done_at=COALESCE(done_at, datetime('now')), updated_at=datetime('now')
+      WHERE assignee=$(sqlq "$name") AND status NOT IN ('done','cancelled');
+      SELECT changes();" 2>/dev/null) || _tasks_cancelled=""
+  [[ "$_tasks_cancelled" =~ ^[0-9]+$ ]] || _tasks_cancelled=0
+  # Its Proactive level and log go with it, so a new seat of the same name
+  # starts at the box default instead of a stranger's.
+  db "DELETE FROM task_prefs WHERE key IN ($(sqlq "proactive.agent.${name}"), $(sqlq "proactive.log.${name}"));" 2>/dev/null || true
   # Drop any paperclip-shared symlinks pointing into this agent's profile
   # and re-seed from another agent of the same type if one remains. Best-
   # effort — never fails the remove.
@@ -304,10 +320,11 @@ cmd_rm() {
   # DIVE-5807: what the seat still ran when it was removed, and its routes.
   local _procs_state="${_RM_PROCS_DISPOSITION:-none}" _routes_state="${_RM_ROUTES_DISPOSITION:-none}"
   ok "agent '$name' removed." \
-     '{name:$n, removed:true, user:{disposition:$us}, group:{name:$gn, disposition:$gs}, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end)), files:{disposition:$fs}, processes:{disposition:$ps}, routes:{disposition:$rs}}' \
+     '{name:$n, removed:true, user:{disposition:$us}, group:{name:$gn, disposition:$gs}, home:({disposition:$hs} + (if $hp == "" then {} else {path:$hp} end)), files:{disposition:$fs}, processes:{disposition:$ps}, routes:{disposition:$rs}, tasks:{cancelled:($tc|tonumber)}}' \
      --arg n "$name" --arg us "$_user_state" --arg gs "$_group_state" \
      --arg gn "${AGENT_SHARED_GROUP:-claude}" --arg hs "$_home_state" --arg hp "$_home_path" \
-     --arg fs "$_files_state" --arg ps "$_procs_state" --arg rs "$_routes_state"
+     --arg fs "$_files_state" --arg ps "$_procs_state" --arg rs "$_routes_state" \
+     --arg tc "$_tasks_cancelled"
 }
 
 # DIVE-345: move a path aside as <path>.disabled-<ts> (reversible) if present.

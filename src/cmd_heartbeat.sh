@@ -6376,6 +6376,20 @@ _hb_materialize_recurring() {
     if [[ -n "$last_fired" ]] && ! [[ "$last_fired" < "$minute_start" ]]; then
       continue
     fi
+    # DIVE-9206: a template whose assignee is no longer a seat does not fire.
+    # `agent rm` cancels a removed seat's templates now, but one left by an
+    # older remove fired twice a day into a row no seat could take. Asked only
+    # when the roster was actually read: an unreadable registry holds nothing.
+    if [[ -n "$assignee" ]]; then
+      _task_roster
+      if [[ "$_TASK_ROSTER_STATE" == "ok" ]] && ! _task_roster_has "$assignee"; then
+        stamp_err=$(db "UPDATE tasks SET last_skipped_at=datetime('now'), last_skip_reason='assignee not a seat' WHERE id=${tid};" 2>&1) \
+          || _hb_log "[materializer] $(_hb_ident "$tid") last_skipped_at stamp FAILED: ${stamp_err//$'\n'/ }" \
+          || true
+        _hb_log "[materializer] $(_hb_ident "$tid") slot at ${minute_start} NOT fired — its assignee '${assignee}' is not a seat on this box. Cancel it (5dive task cancel $(_hb_ident "$tid")) or give it a seat (5dive task assign $(_hb_ident "$tid") <agent>) (DIVE-9206)"
+        continue
+      fi
+    fi
     # DIVE-8718: an agent's "Check in with you" loop does not start once that
     # agent has sent today's cap of first messages. The cap is enforced here and
     # in `agent proactive claim`, never by the loop's text, which the improver

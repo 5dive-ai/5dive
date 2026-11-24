@@ -82,6 +82,14 @@ printf '63\n' > "$STATE_DIR/memory-consolidate/agy.notx"
 printf '1\n'  > "$STATE_DIR/memory-consolidate/agy.stamp"
 printf '63\n' > "$STATE_DIR/memory-consolidate/creative.notx"
 
+# DIVE-9206: agy's work. A Proactive check-in template, an open instance of it,
+# an in-progress row, and a row it already finished. creative's open row and its
+# Proactive prefs are the control.
+db "INSERT INTO tasks (title, assignee, created_by, kind, schedule, status) VALUES ('Check in with you', 'agy', 'agy', 'recurring', '0 9,17 * * *', 'todo');"
+db "INSERT INTO tasks (title, assignee, created_by, status) VALUES ('agy open', 'agy', 'agy', 'todo'), ('agy working', 'agy', 'agy', 'in_progress'), ('creative open', 'creative', 'creative', 'todo');"
+db "INSERT INTO tasks (title, assignee, created_by, status, result) VALUES ('agy finished', 'agy', 'agy', 'done', 'shipped');"
+db "INSERT INTO task_prefs(key,value) VALUES ('proactive.agent.agy','{\"level\":\"little\"}'), ('proactive.log.agy','[]'), ('proactive.agent.creative','{\"level\":\"little\"}');"
+
 # --- exercise ----------------------------------------------------------------
 cmd_rm agy >"$TMP/out" 2>"$TMP/err"
 
@@ -149,6 +157,17 @@ fi
 [[ -e "$STATE_DIR/memory-consolidate/creative.notx" ]] \
   && ok_t "CONTROL: another seat's counter is untouched" \
   || bad_t "CONTROL: agent rm wiped a seat it was not removing"
+
+# 6b. DIVE-9206: its schedules and open rows are cancelled, so its check-in
+#     stops firing for a seat that is gone. A finished row keeps its result.
+eq_c() { if [[ "$2" == "$3" ]]; then ok_t "$1"; else bad_t "$1" "want [$3] got [$2]"; fi; }
+eq_c "agent rm cancels the removed seat's template and open rows (DIVE-9206)" \
+  "$(db "SELECT title||'='||status||'/'||COALESCE(result,'') FROM tasks WHERE assignee='agy' ORDER BY id;" | paste -sd,)" \
+  "Check in with you=cancelled/agent removed,agy open=cancelled/agent removed,agy working=cancelled/agent removed,agy finished=done/shipped"
+eq_c "the receipt counts the cancelled rows" "$(jq -r '.data.tasks.cancelled // "MISSING"' "$TMP/out")" "3"
+eq_c "CONTROL: another seat's open row is untouched" "$(db "SELECT status FROM tasks WHERE title='creative open';")" "todo"
+eq_c "agent rm drops the seat's Proactive level and log, not another seat's" \
+  "$(db "SELECT key FROM task_prefs WHERE key GLOB 'proactive.*' ORDER BY key;" | paste -sd,)" "proactive.agent.creative"
 
 # 7. DIVE-5609: a removed ROOT has no manager to hand its reports to: they become roots.
 #    Last, because it removes 'creative', the control seat of arm 6.
