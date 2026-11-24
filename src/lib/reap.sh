@@ -248,7 +248,11 @@ _reap_is_agent_shell() {
 _reap_keep_alive_env() {
   local p="$1" env_raw
   [[ -r "/proc/$p/environ" ]] || return 1
-  env_raw=$(tr '\0' '\n' <"/proc/$p/environ" 2>/dev/null) || return 1
+  # DIVE-9184: stderr redirect FIRST. Bash applies redirects left to right, so with
+  # `<file 2>/dev/null` a refused open() (access() can pass `-r` above while the
+  # kernel's ptrace check still refuses the open) printed "Permission denied" to the
+  # caller of every successful `task done`.
+  env_raw=$(tr '\0' '\n' 2>/dev/null <"/proc/$p/environ") || return 1
   grep -qE '^(FIVEDIVE|5DIVE)_KEEP_ALIVE=' <<<"$env_raw"
 }
 

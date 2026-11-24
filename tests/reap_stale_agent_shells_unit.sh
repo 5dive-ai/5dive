@@ -382,5 +382,49 @@ fi
 # disowned at staging, so it is no longer a job this shell can wait for.
 [[ -z "$holder" ]] || kill -TERM "$holder" 2>/dev/null || true
 
+# --- DIVE-9184: an environ that `-r` passes and open() refuses prints NOTHING --
+# Every successful `task done` printed "/proc/<pid>/environ: Permission denied":
+# bash applies `<file` before `2>/dev/null`, so a refused open reached the caller.
+# `-r` is access(); root holds CAP_DAC_OVERRIDE so it passes, while open() also
+# needs the ptrace check (CAP_SYS_PTRACE for another uid's process) and is refused.
+# Staged for real: root with CAP_SYS_PTRACE dropped, reading a `nobody` process.
+# The MUTANT re-runs the same pid through the pre-fix redirect order, so the arm
+# is shown able to see the defect (RED before the fix), not vacuously quiet.
+if sudo -n true 2>/dev/null && command -v setpriv >/dev/null 2>&1; then
+  # shellcheck disable=SC2016
+  _r9184=$(sudo -n setpriv --inh-caps=-sys_ptrace --bounding-set=-sys_ptrace \
+    bash -c '
+      . src/lib/reap.sh
+      setpriv --reuid=65534 --regid=65534 --clear-groups sleep 30 & v=$!
+      for _i in 1 2 3 4 5 6 7 8 9 10; do [[ "$(stat -c %u /proc/$v 2>/dev/null)" == 65534 ]] && break; sleep 0.1; done
+      [[ -r /proc/$v/environ ]] && echo "R=pass" || echo "R=fail"
+      # Unquoted $e/$m below on purpose: word-splitting folds the captured stderr and
+      # the rc line onto one line, which is what the parent reads back.
+      e=$( { _reap_keep_alive_env "$v"; echo "rc=$?" >&3; } 3>&1 2>&1 >/dev/null ); echo "FIX:" $e
+      eval "$(declare -f _reap_keep_alive_env | sed "s|2> /dev/null < \"/proc/\$p/environ\"|< \"/proc/\$p/environ\" 2> /dev/null|; s|^_reap_keep_alive_env|_mut9184|")"
+      m=$( { _mut9184 "$v"; echo "rc=$?" >&3; } 3>&1 2>&1 >/dev/null ); echo "MUT:" $m
+      FIVEDIVE_KEEP_ALIVE=1 sleep 30 & k=$!
+      for _i in 1 2 3 4 5 6 7 8 9 10; do [[ "$(tr "\0" " " </proc/$k/cmdline 2>/dev/null)" == "sleep 30 " ]] && break; sleep 0.1; done
+      _reap_keep_alive_env "$k"; echo "OWN=$?"
+      kill "$v" "$k" 2>/dev/null
+    ' 2>&1)
+  _fix=$(sed -n 's/^FIX://p' <<<"$_r9184")
+  _mut=$(sed -n 's/^MUT://p' <<<"$_r9184")
+  if [[ "$_r9184" != *R=pass* ]]; then
+    bad "DIVE-9184 STAGING: -r did not pass on the refused environ — the arm grades nothing (out: $_r9184)"
+  else
+    is "DIVE-9184: open-refused environ returns 1 with EMPTY stderr" "$_fix" " rc=1"
+    if [[ "$_mut" == *"Permission denied"*" rc=1" ]]; then
+      ok "DIVE-9184 MUTANT: the pre-fix redirect order prints Permission denied on the same pid (arm can see the defect)"
+    else
+      bad "DIVE-9184 MUTANT: pre-fix order did not print the error (got: $_mut) — the arm above is vacuous"
+    fi
+    is "DIVE-9184 NEGATIVE CONTROL: a readable FIVEDIVE_KEEP_ALIVE=1 environ still returns 0" \
+       "$(sed -n 's/^OWN=//p' <<<"$_r9184")" "0"
+  fi
+else
+  printf '  SKIP DIVE-9184 open-refused arm: needs passwordless sudo and setpriv to stage root without CAP_SYS_PTRACE\n'
+fi
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 (( fail == 0 ))
