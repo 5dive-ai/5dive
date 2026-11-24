@@ -391,27 +391,38 @@ fi
 # The MUTANT re-runs the same pid through the pre-fix redirect order, so the arm
 # is shown able to see the defect (RED before the fix), not vacuously quiet.
 if sudo -n true 2>/dev/null && command -v setpriv >/dev/null 2>&1; then
+  # The staged `nobody` sleep is only refusable AFTER its exec: between fork and
+  # setresuid it is still a root process the reader may open, which is a vacuous
+  # green (CI it.1). So wait for the exec'd argv, then PROVE the refusal with a
+  # bare open before grading anything. The mutant is the pre-fix line, literally.
   # shellcheck disable=SC2016
   _r9184=$(sudo -n setpriv --inh-caps=-sys_ptrace --bounding-set=-sys_ptrace \
     bash -c '
       . src/lib/reap.sh
+      _mut9184() {
+        local p="$1" env_raw
+        [[ -r "/proc/$p/environ" ]] || return 1
+        env_raw=$(tr "\0" "\n" <"/proc/$p/environ" 2>/dev/null) || return 1
+        grep -qE "^(FIVEDIVE|5DIVE)_KEEP_ALIVE=" <<<"$env_raw"
+      }
       setpriv --reuid=65534 --regid=65534 --clear-groups sleep 30 & v=$!
-      for _i in 1 2 3 4 5 6 7 8 9 10; do [[ "$(stat -c %u /proc/$v 2>/dev/null)" == 65534 ]] && break; sleep 0.1; done
+      for _i in $(seq 1 50); do [[ "$(tr "\0" " " </proc/$v/cmdline 2>/dev/null)" == "sleep 30 " && "$(stat -c %u /proc/$v 2>/dev/null)" == 65534 ]] && break; sleep 0.1; done
+      echo "DIAG: uid=$(stat -c %u /proc/$v 2>/dev/null) argv=$(tr "\0" " " </proc/$v/cmdline 2>/dev/null) $(grep CapEff /proc/self/status)"
       [[ -r /proc/$v/environ ]] && echo "R=pass" || echo "R=fail"
+      ( : <"/proc/$v/environ" ) 2>/dev/null && echo "OPEN=ok" || echo "OPEN=refused"
       # Unquoted $e/$m below on purpose: word-splitting folds the captured stderr and
       # the rc line onto one line, which is what the parent reads back.
       e=$( { _reap_keep_alive_env "$v"; echo "rc=$?" >&3; } 3>&1 2>&1 >/dev/null ); echo "FIX:" $e
-      eval "$(declare -f _reap_keep_alive_env | sed "s|2> /dev/null < \"/proc/\$p/environ\"|< \"/proc/\$p/environ\" 2> /dev/null|; s|^_reap_keep_alive_env|_mut9184|")"
       m=$( { _mut9184 "$v"; echo "rc=$?" >&3; } 3>&1 2>&1 >/dev/null ); echo "MUT:" $m
       FIVEDIVE_KEEP_ALIVE=1 sleep 30 & k=$!
-      for _i in 1 2 3 4 5 6 7 8 9 10; do [[ "$(tr "\0" " " </proc/$k/cmdline 2>/dev/null)" == "sleep 30 " ]] && break; sleep 0.1; done
+      for _i in $(seq 1 50); do [[ "$(tr "\0" " " </proc/$k/cmdline 2>/dev/null)" == "sleep 30 " ]] && break; sleep 0.1; done
       _reap_keep_alive_env "$k"; echo "OWN=$?"
       kill "$v" "$k" 2>/dev/null
     ' 2>&1)
   _fix=$(sed -n 's/^FIX://p' <<<"$_r9184")
   _mut=$(sed -n 's/^MUT://p' <<<"$_r9184")
-  if [[ "$_r9184" != *R=pass* ]]; then
-    bad "DIVE-9184 STAGING: -r did not pass on the refused environ — the arm grades nothing (out: $_r9184)"
+  if [[ "$_r9184" != *R=pass* || "$_r9184" != *OPEN=refused* ]]; then
+    bad "DIVE-9184 STAGING: need -r to pass AND open() to be refused on the staged environ, or the arm grades nothing (out: ${_r9184//$'\n'/ | })"
   else
     is "DIVE-9184: open-refused environ returns 1 with EMPTY stderr" "$_fix" " rc=1"
     if [[ "$_mut" == *"Permission denied"*" rc=1" ]]; then
