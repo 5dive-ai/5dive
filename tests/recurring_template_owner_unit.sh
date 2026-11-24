@@ -12,7 +12,8 @@
 # Arms: A filing stamps the filer; B a template that is already unassigned (filed
 # before this fix) fires to its filer; C an explicit assignee is kept; D a filer
 # that is not a seat falls to the coordinator; E no seat and no coordinator is
-# logged, not silent; F a non-seat filer stays unassigned at filing.
+# logged, not silent; F a non-seat filer stays unassigned at filing; G (DIVE-9206)
+# an assignee that is no longer a seat holds the slot, unless the roster is unreadable.
 # Run: bash tests/recurring_template_owner_unit.sh   (no root, no network)
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -106,6 +107,19 @@ db "UPDATE tasks SET status='blocked' WHERE id=${t_e};"
 OUT=$( (cmd_task_add "relay reminder" --recurring="* * * * *" --from=telegram) 2>&1 ); RC=$?
 eq_t "F1: filed (rc 0)" "$RC" 0
 eq_t "F2: a non-seat filer is not stamped as owner" "$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE title='relay reminder';")" ""
+
+# ── G. DIVE-9206: the assignee is no longer a seat (removed by an older rm) ──
+t_g=$(mk_tmpl "Check in with you" "rt-kostya" "rt-kostya")
+only "$t_g"; fire
+eq_t "G1: a template whose assignee is not a seat does not fire" "$(inst_count "$t_g")" 0
+eq_t "G2: ... the skip is stamped with its cause" "$(db "SELECT COALESCE(last_skip_reason,'') FROM tasks WHERE id=${t_g};")" "assignee not a seat"
+has_t "G3: ... and the pass says so" "$(cat "$LOG")" "its assignee 'rt-kostya' is not a seat"
+# G4: a roster that could not be read holds nothing: the slot fires as before.
+mv "$STATE_DIR/agents.json" "$STATE_DIR/agents.json.away"; _TASK_ROSTER_STATE=""
+db "UPDATE tasks SET last_fired_at=NULL WHERE id=${t_g};"; fire
+eq_t "G4: an unreadable registry does not hold the slot" "$(inst_count "$t_g")" 1
+mv "$STATE_DIR/agents.json.away" "$STATE_DIR/agents.json"; _TASK_ROSTER_STATE=""
+db "UPDATE tasks SET status='blocked' WHERE id=${t_g};"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
