@@ -1308,6 +1308,33 @@ def keys_form(d, who, ask):
             "in <code>%s</code>, and this link then stops working. Expires at %s UTC.</small></p>"
             % (html.escape(d["connector"]), time.strftime("%H:%M", time.gmtime(int(d["expires"])))))
 
+# DIVE-9212: the form a live link shows, by what _peek says it is. The GET page
+# and every "Not saved" page render it, so a refused paste always leaves a field.
+def link_form(d):
+    if d.get("save"):
+        return "Save %s" % d["save"], save_form(d)
+    who = html.escape(d.get("agent") or "Your agent")
+    ask = d.get("ask") or ""
+    if len(d.get("keys") or []) > 1:
+        return "Provide %s" % d["key"], keys_form(d, who, ask)
+    body = ("<h1>%s needs %s</h1>" % (who, html.escape(d["key"])) +
+            ("<p class=ask>%s</p>" % html.escape(ask) if ask else "") +
+            "<form method=post autocomplete=off>"
+            # A textarea masked by CSS, never type=password: browsers offer to save every
+            # password field, and this value is not the owner's login (lodar 10-02). A
+            # textarea because some values are long or span lines (a PEM key, JSON, the
+            # three labelled lines OVH shows), and a one-line input flattens newlines
+            # to spaces (DIVE-5384).
+            "<textarea name=value class=secret rows=6 autocomplete=off autocapitalize=off "
+            "autocorrect=off spellcheck=false data-1p-ignore data-lpignore=true data-bwignore "
+            "required autofocus aria-label='Paste the value'></textarea>"
+            "<button type=submit>Save on the server</button></form>"
+            "<p><small>This page is served by your own server. The value goes only there, "
+            "saved as <code>%s</code> in <code>%s.env</code>, and this link then stops working. "
+            "Expires at %s UTC.</small></p>" % (html.escape(d["key"]), html.escape(d["connector"]),
+            time.strftime("%H:%M", time.gmtime(int(d["expires"])))))
+    return "Provide %s" % d["key"], body
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "5dive"
     sys_version = ""
@@ -1352,6 +1379,13 @@ class Handler(BaseHTTPRequestHandler):
         code, title, msg = GONE.get(rc, (500, "Something went wrong", "Nothing was saved. Try the link again in a minute."))
         if rc in (4, 11): record_fail(self.client())
         return self.send_page(code, page(title, "<h1>%s</h1><p>%s</p>" % (title, msg)))
+    def refused(self, d, msg):
+        # DIVE-9212: a refusal on a live link shows the rule ABOVE the same form,
+        # never pre-filled, so the owner can paste again without the chat message.
+        # 400 on the POST, so a refresh is the browser's own "submit again?" prompt,
+        # and resubmitting only repeats the refusal.
+        return self.send_page(400, page("Not saved", "<p class='tip warn' role=alert><b>Not saved.</b> "
+            "%s The link still works.</p>" % msg + link_form(d)[1]))
     def token_hash(self):
         m = TOKEN.match(self.path.split("?", 1)[0])
         return hashlib.sha256(m.group(1).encode()).hexdigest() if m else None
@@ -1367,29 +1401,7 @@ class Handler(BaseHTTPRequestHandler):
         rc, out = run(["_peek", "--hash=" + h])
         if rc != 0: return self.gone(rc)
         d = json.loads(out).get("data", {})
-        if d.get("save"):
-            return self.send_page(200, page("Save %s" % d["save"], save_form(d)))
-        who = html.escape(d.get("agent") or "Your agent")
-        ask = d.get("ask") or ""
-        if len(d.get("keys") or []) > 1:
-            return self.send_page(200, page("Provide %s" % d["key"], keys_form(d, who, ask)))
-        body = ("<h1>%s needs %s</h1>" % (who, html.escape(d["key"])) +
-                ("<p class=ask>%s</p>" % html.escape(ask) if ask else "") +
-                "<form method=post autocomplete=off>"
-                # A textarea masked by CSS, never type=password: browsers offer to save every
-                # password field, and this value is not the owner's login (lodar 10-02). A
-                # textarea because some values are long or span lines (a PEM key, JSON, the
-                # three labelled lines OVH shows), and a one-line input flattens newlines
-                # to spaces (DIVE-5384).
-                "<textarea name=value class=secret rows=6 autocomplete=off autocapitalize=off "
-                "autocorrect=off spellcheck=false data-1p-ignore data-lpignore=true data-bwignore "
-                "required autofocus aria-label='Paste the value'></textarea>"
-                "<button type=submit>Save on the server</button></form>"
-                "<p><small>This page is served by your own server. The value goes only there, "
-                "saved as <code>%s</code> in <code>%s.env</code>, and this link then stops working. "
-                "Expires at %s UTC.</small></p>" % (html.escape(d["key"]), html.escape(d["connector"]),
-                time.strftime("%H:%M", time.gmtime(int(d["expires"])))))
-        return self.send_page(200, page("Provide %s" % d["key"], body))
+        return self.send_page(200, page(*link_form(d)))
     do_HEAD = do_GET
     def do_POST(self):
         if limited(self.client()):
@@ -1439,31 +1451,28 @@ class Handler(BaseHTTPRequestHandler):
         else:
             value = field("value").strip()
         form = None
-        if not value:
-            return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>%s The link still works.</p>"
-                % ("The card number, expiry and security code are each needed." if card else
-                   "Every box is needed, one line each." if multi else
-                   "Each of login and password is needed, one line each." if pair else "Nothing was pasted.")))
         rc, out = run(["_peek", "--hash=" + h])
         if rc != 0:
             value = None
             return self.gone(rc)
         what = json.loads(out).get("data", {})
+        if not value:
+            return self.refused(what, "The card number, expiry and security code are each needed." if card else
+                                "Every box is needed, one line each." if multi else
+                                "Each of login and password is needed, one line each." if pair else "Nothing was pasted.")
         if pair != bool(what.get("pair")) or card != bool(what.get("card")) \
                 or (multi and value.count("\n") != len(what.get("keys") or [])) \
                 or (not multi and len(what.get("keys") or []) > 1):
             # A form from another page: never write half an item into this one.
             value = None
-            return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>Open the link again and use "
-                "the form it shows. The link still works.</p>"))
+            return self.refused(what, "That form was from another page. Use this one.")
         rc, out = run(["_redeem", "--hash=" + h], stdin=value.encode())
         value = None
         if rc == 3:
             # DIVE-6727: name the rule the paste broke (static, from _peek, by the
             # gate's connector), never the value and never what the write said.
             rule = what.get("rule") or "The server refused that value."
-            return self.send_page(400, page("Not saved", "<h1>Not saved</h1><p>%s</p>"
-                "<p>The link still works.</p>" % html.escape(rule)))
+            return self.refused(what, html.escape(rule))
         if rc == 6:
             # Saved, but the task row did not take the clear: never claim the task
             # moved. DIVE-5772: never ask the owner to do anything either — the box

@@ -271,9 +271,20 @@ code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "value=again" "$B
   && ok_t "L5f the link is dead after one use (404, nothing written)" \
   || bad_t "L5f the link is dead after one use (404, nothing written)" "code=$code"
 out=$(mint DIVE-11); tok=$(tok_of "$out")
-code=$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode "value=" "$B/$tok")
+code=$(curl -s -o "$TMP/empty.html" -w '%{http_code}' --data-urlencode "value=" "$B/$tok")
 [[ "$code" == 400 && -f "$SECRET_DROP_DIR/$(hash_of "$tok")" ]] && ok_t "L5g an empty paste is refused and keeps the link" \
   || bad_t "L5g an empty paste is refused and keeps the link" "code=$code"
+# DIVE-9212 (box report 1402): every "Not saved" page on a live link shows the
+# same form again under the rule; text alone left a phone owner with no field.
+has_form() { grep -q '<form method=post' "$1" && grep -q "<textarea $2" "$1"; }
+has_form "$TMP/empty.html" 'name=value class=secret' && grep -q 'Nothing was pasted. The link still works.' "$TMP/empty.html" \
+  && ok_t "L5g2 the empty-paste page shows the paste box again under 'Nothing was pasted'" \
+  || bad_t "L5g2 the empty-paste page shows the paste box again" "$(sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$TMP/empty.html" | head -c 400)"
+code=$(curl -s -o "$TMP/mismatch.html" -w '%{http_code}' --data-urlencode "login=x" --data-urlencode "password=y" "$B/$tok")
+[[ "$code" == 400 && -f "$SECRET_DROP_DIR/$(hash_of "$tok")" ]] && has_form "$TMP/mismatch.html" 'name=value class=secret' \
+  && ! grep -q 'name=password' "$TMP/mismatch.html" \
+  && ok_t "L5g3 a form from another page is refused with THIS link's form (one paste box, no password box), link kept" \
+  || bad_t "L5g3 the mismatch page shows this link's form" "code=$code $(sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$TMP/mismatch.html" | head -c 400)"
 code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$B/$tok")
 [[ "$code" == 405 ]] && ok_t "L5h other methods -> 405" || bad_t "L5h other methods -> 405" "code=$code"
 codes=""
@@ -856,6 +867,10 @@ r1=$(body_of "$TMP/r1.html")
    && -f "$SECRET_DROP_DIR/$(hash_of "$tok")" ]] \
   && ok_t "L15a ACCEPTANCE: 'a b' into a tools link -> the page names the tools rule (one line, no spaces or ' mark), the link still works" \
   || bad_t "L15a the refusal names the tools rule" "code=$code body=$r1"
+has_form "$TMP/r1.html" 'name=value class=secret' && grep -q '<textarea name=value[^>]*></textarea>' "$TMP/r1.html" \
+  && [[ "$r1" == *"Not saved."*"with no spaces and no"*"<form method=post"* ]] \
+  && ok_t "L15a2 DIVE-9212 ACCEPTANCE: the refused page shows the rule ABOVE a fresh, empty paste box, so the owner can retry in place" \
+  || bad_t "L15a2 the refused page shows the rule above a fresh paste box" "body=$r1"
 wait_for_line "DIVE-671: your owner's paste for DEMO_API_KEY" "$SENDS6727"
 msg=$(grep -F 'DIVE-671:' "$SENDS6727")
 [[ "$msg" == "mailer --wake --message=DIVE-671: your owner's paste for DEMO_API_KEY on the secure link was refused at "*" UTC; nothing was saved and the link still works. The rule the page showed them: It must be one line, with no spaces"*"Do not file a new gate"* ]] \
@@ -1015,6 +1030,10 @@ code2=$(curl -s -o "$TMP/p3.html" -w '%{http_code}' --data-urlencode "login=$PL"
   && [[ "$(saved_val GITHUB)" == old-one-value ]] && ! grep -q '^GITHUB__' "$SAVED" \
   && ok_t "L17e a two-line password or a bad 2FA key is refused whole (nothing written), with the rule, and the link still works" \
   || bad_t "L17e pair refusal" "code=$code code2=$code2 env=$(cat "$SAVED")"
+has_form "$TMP/p3.html" 'id=f-login name=login' && has_form "$TMP/p3.html" 'id=f-password name=password' && has_form "$TMP/p3.html" 'id=f-totp name=totp' \
+  && ! grep -qF -- "$PL" "$TMP/p3.html" \
+  && ok_t "L17e2 the pair refusal shows Login, Password and 2FA boxes again, empty (the login is not pre-filled)" \
+  || bad_t "L17e2 the pair refusal re-shows the pair form" "$(sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$TMP/p3.html" | head -c 500)"
 code=$(curl -s -o "$TMP/p4.html" -w '%{http_code}' --data-urlencode "login=$PL" --data-urlencode "password=$PP" --data-urlencode "totp=$PS" "$B7/$tp")
 [[ "$code" == 200 && ! -f "$SECRET_DROP_DIR/$hp" ]] && grep -q 'sign in with it' "$TMP/p4.html" \
   && [[ "$(saved_val GITHUB__LOGIN)" == "$PL" && "$(saved_val GITHUB__PASSWORD)" == "$PP" && "$(saved_val GITHUB__2FA)" == "$SEED" ]] \
@@ -1164,6 +1183,10 @@ c3=$(cpost c4 "$CN" "$CE" 12 "$CH"); c4=$(cpost c5 "$CN" "$CE" "" "$CH")
   && [[ "$(saved_val VISA)" == old-visa ]] && ! grep -q '^VISA__' "$SAVED" \
   && ok_t "L18c a mistyped number (Luhn), a past expiry, a 2-digit code or an empty box: refused whole, with the rule, nothing written, link still live" \
   || bad_t "L18c card refusal" "codes=$c1 $c2 $c3 $c4 env=$(grep '^VISA' "$SAVED")"
+has_form "$TMP/c2.html" 'id=f-number inputmode=numeric name=number' && has_form "$TMP/c5.html" 'id=f-cvc inputmode=numeric name=cvc' \
+  && grep -q 'Use a separate virtual card' "$TMP/c2.html" && ! grep -qF -- "$CH" "$TMP/c2.html" \
+  && ok_t "L18c2 a card refusal (rule or empty box) shows the card form again, caution included, nothing pre-filled" \
+  || bad_t "L18c2 the card refusal re-shows the card form" "$(sed -n 's#.*<main>\(.*\)</main>.*#\1#p' "$TMP/c2.html" | head -c 500)"
 code=$(cpost c6 "$CN" "$CE" "$CC" "$CH")
 [[ "$code" == 200 && ! -f "$SECRET_DROP_DIR/$hc" ]] && grep -q 'pay with it' "$TMP/c6.html" \
   && [[ "$(saved_val VISA__NUMBER)" == "$CND" && "$(saved_val VISA__EXP)" == "$CEN" && "$(saved_val VISA__CVC)" == "$CC" && "$(saved_val VISA__HOLDER)" == "$CH" ]] \
