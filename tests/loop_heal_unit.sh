@@ -2,7 +2,8 @@
 # DIVE-9171 isolated unit harness: every loop heals itself by default.
 #   (a) a run that fails once is retried ~15 min later and recovers with no owner message;
 #   (b) 3 failures in a row, the retry included, pause the loop and the owner gets ONE message;
-#   (c) two empty runs (`task done --empty`) on a loop that messages its owner give ONE plain line;
+#   (c) two empty runs (`task done --empty`) on a loop that messages its owner give ONE plain line,
+#       except a proactive check-in, where quiet is the designed result (DIVE-9261);
 #   (d) the weekly improve turn changes at most one line, and never grows the text;
 #   (e) a healthy run makes no model call (counted).
 # Throwaway STATE_DIR — never touches the live tasks.db. Run: bash tests/loop_heal_unit.sh
@@ -122,6 +123,16 @@ t "C6 healing off: no line" "3" "$(sent_n)"
 N=$(mk_tpl "Evening digest" "nobot" "Send the evening digest.")
 empty_run "$N"; empty_run "$N"
 t "C7 no bot: the seat gets one row with the exact line" "1" "$(db "SELECT COUNT(*) FROM tasks WHERE title='Tell your owner $N found nothing 2 times' AND body LIKE '%found nothing twice in a row. It may be broken.%';")"
+# C9 (DIVE-9261) — a proactive check-in's designed result is silence: no streak, no line.
+CHECKIN='If nothing is worth it, send nothing. A quiet day is a good day.'
+P=$(mk_tpl "Check in with you" "$ME" "$CHECKIN"); _loop_pref_set "proactive.tpl.$P" "$ME"
+s0=$(sent_n); n0=$(wc -l < "$NOTES")
+empty_run "$P"; empty_run "$P"; empty_run "$P"
+t "C9 a proactive check-in quiet 3 times: no owner line, no seat note" "$s0|$n0" "$(sent_n)|$(wc -l < "$NOTES")"
+t "C9 the app reads no found nothing for it" "null" "$(loop_json "$P" '.found_nothing')"
+Q=$(mk_tpl "Check in with you" "$ME" "$CHECKIN")
+empty_run "$Q"; empty_run "$Q"
+t "C9 the same text without the proactive mark still gets its line" "$((s0+1))" "$(sent_n)"
 plain=$(db "INSERT INTO tasks (title, created_by, status) VALUES ('one-off', 'owner', 'in_progress'); SELECT ident FROM tasks WHERE id=last_insert_rowid();")
 ( AGENT_NAME="$ME" cmd_task_done "$plain" --empty ) >/dev/null 2>&1; t "C8 --empty on a row that is not a loop run is refused" "1" "$([[ $? -ne 0 ]] && echo 1)"
 r=$(mk_run "$L"); ( AGENT_NAME="$ME" cmd_task_cancel "$r" --empty ) >/dev/null 2>&1; t "C8 --empty on cancel is refused" "1" "$([[ $? -ne 0 ]] && echo 1)"
