@@ -5,6 +5,9 @@
 # explicit empty the plugin does not fill, and a bad value reads as unset.
 # Pure: no root, no network. Run: bash tests/box_named_setting_unit.sh
 set -uo pipefail
+# DIVE-2211: name the tree this harness grades (tests/lib/grading_tree.sh).
+. "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
+  || printf 'grading tree: UNRESOLVED (tests/lib/grading_tree.sh not reachable; no tree named)\n' >&2
 cd "$(dirname "$0")/.."
 TMP="$(mktemp -d /tmp/box-named-setting.XXXXXX)"
 trap 'rc=$?; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
