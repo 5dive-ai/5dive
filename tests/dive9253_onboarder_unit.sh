@@ -52,7 +52,7 @@ t 'L1 ...dashboard is the one channel' "plugin:dashboard@5dive-plugins" "$(sed -
 t 'L1 ...the skip-permissions, autonomy text and Chrome args are gone' 0 "$(grep -c -e skip-permissions -e 'AUTONOMY MODE' -e '^--chrome$' -e telegram <<<"$out")"
 t 'L1 ...no resume of an older session' 'RESUME=' "$(grep '^RESUME=' <<<"$out")"
 t 'L5 the inner shell exports DASHBOARD_ONBOARDER=1' 'OVERRIDE=export DASHBOARD_ONBOARDER=1; ' "$(grep '^OVERRIDE=' <<<"$out")"
-t 'L5 ...and INNER carries it, after STAGE_GUARD' 1 "$(grep -c '^INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${ONBOARDER_OVERRIDE}' bin/5dive-agent-start)"
+t 'L5 ...and INNER carries it, after HERMES_OVERRIDE and before PRELUDE' 1 "$(grep -c '${HERMES_OVERRIDE}${ONBOARDER_OVERRIDE}${PRELUDE}' bin/5dive-agent-start)"
 t 'L5 the block sits after every ARGS+= and before CMD_STR' yes "$(
   b=$(grep -n '^# DIVE-9253: an onboarder seat\. An outsider' bin/5dive-agent-start | cut -d: -f1)
   c=$(grep -n "^CMD_STR=\$(printf '%q ' \"\$BIN\" \"\${ARGS\[@\]}\")" bin/5dive-agent-start | cut -d: -f1)
