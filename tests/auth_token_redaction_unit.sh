@@ -125,6 +125,65 @@ else
   bad_t "case 3c: sweep of all split points — none leaks the token" "leaked at n:$leaks"
 fi
 
+# --- case 5: the oat02 prefix (DIVE-9220) --------------------------------------
+# Claude Code 2.1.332: CLAUDE_CODE_OAUTH_TOKEN "can now end in oat02- as well as
+# oat01-". The token is minted server-side, so the first oat02 token reaches a
+# box whatever Claude Code it runs. A filter keyed on the literal oat01- marker
+# passes it through in the clear and the extractor stores nothing. Every arm
+# above is repeated for oat02, including the full split sweep: the hold-back now
+# matches a byte-class per position, and the digits are where it could slip.
+FAKE2='sk-ant-oat02-ZZZZYYYYXXXXWWWWVVVVUUUU9999888877776666555544443333'
+out=$(printf '  Your OAuth token (valid for 1 year): %s\n  Store this token securely.\n' "$FAKE2" \
+        | _redact_oauth_stream)
+if [[ "$out" != *"${FAKE2:13}"* && "$out" == *"Store this token securely."* ]]; then
+  ok_t "case 5a: an oat02 token is masked, surrounding output preserved"
+else
+  bad_t "case 5a: an oat02 token is masked, surrounding output preserved" "$out"
+fi
+if [[ "$out" == *"sk-ant-oat02-<hidden by 5dive"* ]]; then
+  ok_t "case 5b: the mask names the prefix it matched (oat02), not a hardcoded oat01"
+else
+  bad_t "case 5b: the mask names the prefix it matched (oat02), not a hardcoded oat01" "$out"
+fi
+n=13
+out=$( { printf 'token: %s' "${FAKE2:0:n}"; sleep 0.3; printf '%s\n' "${FAKE2:n}"; } | _redact_oauth_stream )
+if [[ "$out" != *"${FAKE2:13}"* ]]; then
+  ok_t "case 5c: oat02 split exactly on the 13-byte marker boundary is masked"
+else
+  bad_t "case 5c: oat02 split exactly on the 13-byte marker boundary is masked" "$out"
+fi
+# The leak test is the BODY, not the whole token: with a byte-class marker a
+# partial flush could print the prefix and the body separately, and only the
+# body is the secret.
+leaks=""
+for ((n=1; n<${#FAKE2}; n++)); do
+  out=$( { printf 'token: %s' "${FAKE2:0:n}"; sleep 0.05; printf '%s\n' "${FAKE2:n}"; } | _redact_oauth_stream )
+  [[ "$out" == *"${FAKE2:13:8}"* || "$out" == *"$FAKE2"* ]] && leaks="$leaks $n"
+done
+if [[ -z "$leaks" ]]; then
+  ok_t "case 5d: sweep of all $(( ${#FAKE2} - 1 )) oat02 split points — none leaks the token"
+else
+  bad_t "case 5d: sweep of all oat02 split points — none leaks the token" "leaked at n:$leaks"
+fi
+# extract_claude_token reads script's raw log; it must capture oat02 too, or the
+# sign-in "succeeds" upstream and stores nothing.
+printf 'Your OAuth token (valid for 1 year): \033[1m%s\033[0m\r\nStore this token securely.\r\n' "$FAKE2" > "$TMP/oat02.log"
+raw=$(extract_claude_token "$TMP/oat02.log" 2>/dev/null)
+if [[ "$raw" == "$FAKE2" ]]; then
+  ok_t "case 5e: extract_claude_token captures an oat02 token from the login log"
+else
+  bad_t "case 5e: extract_claude_token captures an oat02 token from the login log" "got '$raw'"
+fi
+# Negative controls: a near-miss is NOT a token. The widening is two digits, not
+# "anything after oat".
+printf 'sk-ant-oatXY-%s\nsk-ant-oat2-%s\n' "${FAKE2:13}" "${FAKE2:13}" > "$TMP/near.log"
+raw=$(extract_claude_token "$TMP/near.log" 2>/dev/null)
+if [[ -z "$raw" ]]; then
+  ok_t "case 5f: near-miss prefixes (oatXY-, oat2-) are not captured as a token"
+else
+  bad_t "case 5f: near-miss prefixes (oatXY-, oat2-) are not captured as a token" "got '$raw'"
+fi
+
 # --- case 4: end-to-end through script(1), the exact shape cmd_auth_login uses --
 # The log keeps the raw token (extract_claude_token has to read it); the piped
 # stream — the operator's terminal — must not.

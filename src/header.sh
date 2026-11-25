@@ -835,7 +835,7 @@ skills_install_dirs_all() {
 
 # api-key target per type: the env file (in /etc/5dive/connectors for the
 # default profile) and the env var inside it. Claude-family is special-cased
-# in cmd_auth_set — `sk-ant-oat01-*` tokens write CLAUDE_CODE_OAUTH_TOKEN,
+# in cmd_auth_set — `sk-ant-oatNN-*` tokens (oat01, oat02…) write CLAUDE_CODE_OAUTH_TOKEN,
 # everything else is ANTHROPIC_API_KEY. Non-claude types use a single var
 # that matches what their CLI reads natively.
 declare -A TYPE_API_FILE=(

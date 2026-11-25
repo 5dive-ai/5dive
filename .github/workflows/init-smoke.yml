@@ -24,7 +24,7 @@ name: init-smoke
 # setup-token`) when it is set: the Anthropic test key works headless, which is
 # all OpenClaw and Hermes need, but interactive Claude Code refuses it ("Credit
 # balance is too low", DIVE-7353). init's "Anthropic API key" prompt takes
-# either: a token starting sk-ant-oat01- is stored as CLAUDE_CODE_OAUTH_TOKEN.
+# either: a token starting sk-ant-oat01- or oat02- is stored as CLAUDE_CODE_OAUTH_TOKEN.
 # Unset, the Claude cells fall back to the API key and stay red, on purpose.
 # A cell whose secret is unset still runs install, init and the model pin on a
 # placeholder key, and reports SKIP at step=reply (neutral, not red). Pull
