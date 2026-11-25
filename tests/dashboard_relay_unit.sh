@@ -78,7 +78,7 @@ CALLS="$TMP/calls"; STDINS="$TMP/stdins"; BODY="$TMP/body"
 _gate_uid_to_agent(){ case "$1" in 1042) printf 'tap' ;; 1043) printf 'Bad_Name' ;; *) printf '' ;; esac; }
 _gate_is_root(){ [[ -z "${NOT_ROOT:-}" ]]; }
 # The fake curl, on PATH, so the REAL call line runs (mirrors
-# tests/partner_hire_unit.sh): argv one per line, stdin verbatim, the
+# the hosted plugin's partner harness): argv one per line, stdin verbatim, the
 # --data-binary @file read at call time (the relay deletes it after).
 mkdir -p "$TMP/bin"
 cat >"$TMP/bin/curl" <<'STUB'

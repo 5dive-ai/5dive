@@ -46,7 +46,7 @@ export CONNECTORD_TOKEN="fake-box-token-0000" FIVE_BUG_POST_TIMEOUT=5
 SPOOL="$TMP/state/5dive/bug-spool"
 
 # shellcheck disable=SC1090
-for f in header.sh lib/error_codes.sh lib/output.sh lib/self.sh cmd_selfcheck.sh cmd_partner.sh cmd_bug.sh; do
+for f in header.sh lib/error_codes.sh lib/output.sh lib/self.sh cmd_selfcheck.sh lib/box_token.sh cmd_bug.sh; do
   source "src/$f"
 done
 set +e

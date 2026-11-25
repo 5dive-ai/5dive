@@ -189,10 +189,10 @@ _helper_greeting() {
 # GET /helper/handover with the box token. Prints "<business>\t<slug, slug>" and
 # rc 0 on 200, rc 3 on 404 (never asked), rc 1 on anything else (retry).
 _helper_handover() {
-  lazy_need _partner_box_token _partner_api_base
+  lazy_need _box_token _box_api_base
   local tok url body http
-  tok=$(_partner_box_token 2>/dev/null) || return 1
-  url="$(_partner_api_base)/helper/handover"
+  tok=$(_box_token 2>/dev/null) || return 1
+  url="$(_box_api_base)/helper/handover"
   body=$(mktemp) || return 1
   # The bearer rides stdin (`-H @-`), never argv (DIVE-5168).
   http=$(printf 'Authorization: Bearer %s\n' "$tok" \

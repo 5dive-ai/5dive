@@ -42,7 +42,7 @@ printf 'not a url; rm -rf /\n' >"$FIVE_API_BASE_FILE"
 check 'A4 a junk line is ignored (env, then production)' '[[ "$(FIVE_API_BASE=https://x.example.test five_api_base)" == https://x.example.test ]]'
 rm -f "$FIVE_API_BASE_FILE"
 check 'A5 the root rail reads it' 'grep -q "^_dash_relay_api_base() { five_api_base; }" src/cmd_dashboard_relay.sh'
-check 'A6 the partner rail reads it' 'grep -q "^_partner_api_base() { five_api_base; }" src/cmd_partner.sh'
+check 'A6 the partner rail reads it' 'grep -q "^_box_api_base() { five_api_base; }" src/lib/box_token.sh'
 
 # local-only refusal of e2e pairing; off = unchanged.
 check 'A7 off: chat e2e enable passes the gate' '( local_only_gate chat e2e enable s3cr3t )'

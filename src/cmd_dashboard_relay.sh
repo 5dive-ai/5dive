@@ -70,7 +70,7 @@ _dash_relay_token() {
 
 # _dash_relay_call <method> <url> <json-body|""> <token> — print "<status>\n<body>".
 #
-# THE TOKEN NEVER TOUCHES ARGV (the DIVE-5168 rule, src/cmd_partner.sh). /proc is
+# THE TOKEN NEVER TOUCHES ARGV (the DIVE-5168 rule, now the hosted plugin's bin/partner). /proc is
 # not mounted hidepid on our boxes, so a root curl's command line is readable by
 # the very seat this rail keeps the token from: the bearer goes in on curl's
 # STDIN (`-H @-`), and the body, which carries the owner's messages, from a

@@ -179,7 +179,7 @@ LAZY_FILES=(
   src/cmd_telegram_app.sh
   src/cmd_board.sh
   src/cmd_hire.sh
-  src/cmd_partner.sh
+  src/lib/box_token.sh
   src/cmd_project.sh
   src/cmd_goal.sh
   src/cmd_objective.sh

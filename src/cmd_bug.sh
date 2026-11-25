@@ -112,15 +112,15 @@ _BUG_HTTP=""; _BUG_ID=""; _BUG_KEYLESS=0; _BUG_TOKEN=""
 _bug_post() {
   local payload="$1" tok="" trc=0 out="" url auth
   _BUG_HTTP=""; _BUG_ID=""; _BUG_KEYLESS=0; _BUG_TOKEN=""
-  tok=$(_partner_box_token) || trc=$?
+  tok=$(_box_token) || trc=$?
   if (( trc == 0 )); then
-    url="$(_partner_api_base)/server/bug-reports"
+    url="$(_box_api_base)/server/bug-reports"
     auth=$(printf 'Authorization: Bearer %s' "$tok")
-  elif (( trc == 2 )) && [[ ! -e "$(_partner_connectord_env)" ]]; then
-    url="$(_partner_api_base)/bug-reports"
+  elif (( trc == 2 )) && [[ ! -e "$(_box_connectord_env)" ]]; then
+    url="$(_box_api_base)/bug-reports"
     auth=""; _BUG_KEYLESS=1
   elif (( trc == 1 )); then
-    url="$(_partner_api_base)/bug-reports"
+    url="$(_box_api_base)/bug-reports"
     auth=""; _BUG_KEYLESS=2
   else
     _BUG_HTTP="no-token"; return 1
@@ -261,7 +261,7 @@ _BUG_REPLY_BODY=""
 _bug_replies_get() {
   local out
   out=$(printf 'X-Reply-Token: %s\n' "$2" \
-          | curl -sS --max-time "${FIVE_BUG_POST_TIMEOUT:-20}" "$(_partner_api_base)/bug-reports/$1/replies" -H @- \
+          | curl -sS --max-time "${FIVE_BUG_POST_TIMEOUT:-20}" "$(_box_api_base)/bug-reports/$1/replies" -H @- \
               -w '\n%{http_code}' 2>/dev/null) || true
   _BUG_HTTP="${out##*$'\n'}"
   [[ "$_BUG_HTTP" =~ ^[0-9]{3}$ ]] || _BUG_HTTP="000"
@@ -770,7 +770,7 @@ cmd_bug() {
       ;;
     *)
       local why="could not reach 5dive's API (HTTP ${_BUG_HTTP})" envf
-      envf=$(_partner_connectord_env)
+      envf=$(_box_connectord_env)
       if [[ "$_BUG_HTTP" == "no-token" ]]; then
         why="the box's key file ($envf) holds no 5dive key"
       elif (( _BUG_KEYLESS == 2 )); then

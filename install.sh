@@ -1969,6 +1969,28 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
+# >>> DIVE-9324 hosted plugin (extracted verbatim by tests/hosted_plugin_install_unit.sh)
+# What only works against 5dive's own servers, as the box (today `5dive partner
+# hire`), left the public core for hosted@5dive-plugins. A box 5dive built holds
+# provisioning.env and a box token, so it gets that plugin in the SAME run that
+# removed the built-in: no partner client's hire goes missing for a night. A box
+# whose `partner` already answers skips, so a failed add is retried next run. A
+# self-hosted box (no provisioning.env) is never touched. Best-effort: it never
+# blocks an install or an upgrade.
+_hosted_plugin_ensure() {
+  local prov="${FIVEDIVE_PROVISIONING_ENV:-/etc/5dive/provisioning.env}"
+  local tok="${FIVEDIVE_CONNECTORD_ENV:-/etc/5dive/connectord.env}"
+  offline_update && return 0
+  [[ -f "$prov" ]] || return 0
+  grep -q '^CONNECTORD_TOKEN=.' "$tok" 2>/dev/null || return 0
+  "$BIN_DIR/5dive" partner --help >/dev/null 2>&1 && return 0
+  say "Installing the hosted plugin (this box was built by 5dive)"
+  "$BIN_DIR/5dive" plugin add hosted@5dive-plugins --yes 2>&1 | tail -3 \
+    || echo "warn: hosted plugin not installed — '5dive partner hire' is down until the next upgrade retries" >&2
+  return 0
+}
+# <<< DIVE-9324 hosted plugin
+
 if [[ "${1:-}" == "--upgrade" ]]; then
   shift
   # --no-ui used to gate the (since-removed) local dashboard install; the flag
@@ -2059,6 +2081,7 @@ if [[ "${1:-}" == "--upgrade" ]]; then
       || echo "warn: partner plugin not installed — the sysadmin seat is down until the next upgrade retries" >&2
   fi
   # <<< DIVE-5247 partner plugin migration
+  _hosted_plugin_ensure   # DIVE-9324
 
   echo
   # DIVE-1260: report the version actually swapped in, read from the new bundle.
@@ -2296,6 +2319,10 @@ fi
 # DIVE-5372: same pre-warm as the --upgrade path — the secrets.<domain> route
 # and its certificate exist before the first secret gate needs a link.
 offline_update || 5dive secret _prewarm >/dev/null 2>&1 || true
+
+# DIVE-9324: a box 5dive is building gets the hosted plugin now, not at its
+# first nightly upgrade.
+_hosted_plugin_ensure
 
 echo
 # DIVE-7333: one step, the wizard. It installs the agent's CLI, signs it in and
