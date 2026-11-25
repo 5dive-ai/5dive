@@ -10588,15 +10588,16 @@ _hb_stuck_login_sweep() { # <now> <registry json>
 # so it has no use on a self-hosted one. Core keeps only the gate, so a box that
 # cannot need it pays a stat and no fork: a box with the demo AI account (a paid
 # 5dive server), no handed-over / welcomed record in <state>/helper, and the
-# official plugin claiming the verb. Run in a subshell (the dispatch execs);
-# never fatal to the tick.
+# official plugin claiming the verb. Run in a subshell (the dispatch execs),
+# with no audit row: an unclaimed spare waits here every tick until its first
+# hire, and the heartbeat log already carries what the plugin did. Never fatal.
 _hb_handover_tick() {
   local d="$STATE_DIR/helper" out
   [[ -e "$d/handed-over" || -e "$d/welcomed" ]] && return 0
   [[ -s "$AUTH_PROFILES_DIR/demo-ai/combined.env" ]] || return 0
   lazy_need _plugin_verb_claims _plugin_dispatch_verb
   [[ "$(_plugin_verb_claims handover 2>/dev/null)" == "hosted@5dive-plugins" ]] || return 0
-  out=$( (_plugin_dispatch_verb handover _tick) </dev/null 2>&1 ) || true
+  out=$( (AUDIT_LOG=""; _plugin_dispatch_verb handover _tick) </dev/null 2>&1 ) || true
   [[ -z "$out" ]] || _hb_log "[handover] $(tr '\n' ';' <<<"$out")"
   return 0
 }

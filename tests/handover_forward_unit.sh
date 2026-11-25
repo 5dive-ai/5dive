@@ -35,7 +35,7 @@ bad_t() { fail=$((fail+1)); printf 'FAIL - %s\n   %s\n' "$1" "${2:-}"; }
 GATE=$(sed -n '/^_hb_handover_tick() {/,/^}/p' src/cmd_heartbeat.sh)
 [[ -n "$GATE" ]] || { bad_t "the gate _hb_handover_tick is not in src/cmd_heartbeat.sh" ""; exit 1; }
 
-STATE_DIR="$TMP/state"; AUTH_PROFILES_DIR="$STATE_DIR/auth-profiles"
+STATE_DIR="$TMP/state"; AUTH_PROFILES_DIR="$STATE_DIR/auth-profiles"; AUDIT_LOG="$TMP/audit.log"
 lazy_need() { :; }
 _hb_log() { printf '%s\n' "$*" >>"$TMP/log"; }
 CLAIM="hosted@5dive-plugins"
@@ -43,7 +43,7 @@ _plugin_verb_claims() { [[ "$1" == handover ]] && [[ -n "$CLAIM" ]] && printf '%
 PLUGIN_SAYS="gave the handover to the first hire ada"; PLUGIN_RC=0
 _plugin_dispatch_verb() {
   local stdin; stdin=$(cat)
-  printf '%s|stdin=%s\n' "$*" "${#stdin}" >>"$TMP/calls"
+  printf '%s|stdin=%s|audit=%s\n' "$*" "${#stdin}" "${AUDIT_LOG:-none}" >>"$TMP/calls"
   [[ -n "$PLUGIN_SAYS" ]] && printf '%s\n' "$PLUGIN_SAYS"
   exit "$PLUGIN_RC"       # the real dispatch execs: the gate must hold it in a subshell
 }
@@ -76,10 +76,10 @@ reset; CLAIM="handover@someone-else"; run_gate; b=$(calls)
 
 # ── G5: the forward ──────────────────────────────────────────────────────────
 reset; run_gate
-{ [[ "$(calls)" == 1 && "$(cat "$TMP/calls")" == "handover _tick|stdin=0" ]] \
+{ [[ "$(calls)" == 1 && "$(cat "$TMP/calls")" == "handover _tick|stdin=0|audit=none" ]] \
   && grep -qx '\[handover\] gave the handover to the first hire ada;' "$TMP/log" \
   && grep -qx 'after rc=0' "$TMP/out"; } \
-  && ok_t "G5 a paid box not yet done: 'handover _tick' runs once, stdin closed, its line logged as [handover]" \
+  && ok_t "G5 a paid box not yet done: 'handover _tick' runs once, stdin closed, no audit row, its line logged as [handover]" \
   || bad_t "G5 forward" "calls=$(cat "$TMP/calls" 2>/dev/null) log=$(cat "$TMP/log" 2>/dev/null) out=$(cat "$TMP/out")"
 reset; PLUGIN_SAYS=""; run_gate
 [[ "$(calls)" == 1 && ! -s "$TMP/log" ]] && ok_t "G5b a silent run logs nothing" || bad_t "G5b silent" "log=$(cat "$TMP/log" 2>/dev/null)"
