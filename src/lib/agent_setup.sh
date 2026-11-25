@@ -2030,8 +2030,7 @@ HERMES_BYO_ENV
 codex_plugin_dir() {
   local c
   for c in "${TELEGRAM_CODEX_PLUGIN_DIR:-}" \
-           /usr/local/lib/5dive/telegram-codex \
-           /home/claude/projects/5dive/5dive-plugins/plugins/telegram-codex; do
+           /usr/local/lib/5dive/telegram-codex; do
     [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
   done
   return 1
@@ -2186,8 +2185,7 @@ PY
 grok_plugin_dir() {
   local c
   for c in "${TELEGRAM_GROK_PLUGIN_DIR:-}" \
-           /usr/local/lib/5dive/telegram-grok \
-           /home/claude/projects/5dive/5dive-plugins/plugins/telegram-grok; do
+           /usr/local/lib/5dive/telegram-grok; do
     [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
   done
   return 1
@@ -2198,8 +2196,7 @@ grok_plugin_dir() {
 dashboard_plugin_dir() {
   local c
   for c in "${DASHBOARD_PLUGIN_DIR:-}" \
-           /usr/local/lib/5dive/dashboard \
-           /home/claude/projects/5dive/5dive-plugins/plugins/dashboard; do
+           /usr/local/lib/5dive/dashboard; do
     [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
   done
   return 1
@@ -2388,8 +2385,7 @@ PY
 antigravity_plugin_dir() {
   local c
   for c in "${TELEGRAM_AGY_PLUGIN_DIR:-}" \
-           /usr/local/lib/5dive/telegram-agy \
-           /home/claude/projects/5dive/5dive-plugins/plugins/telegram-agy; do
+           /usr/local/lib/5dive/telegram-agy; do
     [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
   done
   return 1
@@ -2535,8 +2531,7 @@ PY
 opencode_plugin_dir() {
   local c
   for c in "${TELEGRAM_OPENCODE_PLUGIN_DIR:-}" \
-           /usr/local/lib/5dive/telegram-opencode \
-           /home/claude/projects/5dive/5dive-plugins/plugins/telegram-opencode; do
+           /usr/local/lib/5dive/telegram-opencode; do
     [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
   done
   return 1
@@ -2676,8 +2671,7 @@ PY
 pi_plugin_dir() {
   local c
   for c in "${TELEGRAM_PI_PLUGIN_DIR:-}" \
-           /usr/local/lib/5dive/telegram-pi \
-           /home/claude/projects/5dive/5dive-plugins/plugins/telegram-pi; do
+           /usr/local/lib/5dive/telegram-pi; do
     [[ -n "$c" && -f "$c/server.ts" ]] && { printf '%s\n' "$c"; return 0; }
   done
   return 1

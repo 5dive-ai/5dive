@@ -31,7 +31,7 @@ SRC=src
 TMP="$(mktemp -d /tmp/mem-check-unit.XXXXXX)"
 
 # shellcheck disable=SC1090
-for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh; do
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/verify_policy.sh; do
   source "$SRC/$f"
 done
 # shellcheck source=/dev/null
@@ -47,9 +47,9 @@ check(){ if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (want '$3', got '$2')"; 
 STORE="$TMP/home/.claude/projects/proj/memory"
 mkdir -p "$STORE"; : > "$STORE/MEMORY.md"
 export HOME="$TMP/home"
-# _memory_wiki_root checks "$HOME"/projects/5dive/community/wiki FIRST and then
-# falls back to a HARDCODED /home/claude/... — so a fake HOME alone does NOT
-# isolate --store=wiki. Without this dir the wiki arm below writes a fixture
+export FIVE_PROJECTS_ROOT="$HOME/projects/5dive"   # DIVE-9315: the wiki rung
+# _memory_wiki_root checks <projects-root>/community/wiki, and projects-root
+# is $FIVE_PROJECTS_ROOT above — without both, --store=wiki is not isolated. Without this dir the wiki arm below writes a fixture
 # into the real shared wiki (and appends an index line to it). Caught the hard
 # way; do not delete this mkdir.
 mkdir -p "$HOME/projects/5dive/community/wiki"

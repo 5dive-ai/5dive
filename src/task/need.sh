@@ -1939,7 +1939,8 @@ _gate_ask_codehost_rule() {   # <ask> -> 0 when a per-change tap is asked for BE
 # have caught this.
 #
 # NARROW ON PURPOSE, three conjuncts, and each one is load-bearing:
-#   * the ask names a github.com URL under an org we own (5dive-ai, lodar). A
+#   * the ask names a github.com URL under one of the box's own GitHub orgs
+#     (the `own-orgs` setting, DIVE-9315; unset, this arm never fires). A
 #     third-party repo is genuinely someone else's button and is NOT caught.
 #   * the ask asks for a repo WRITE (merge/squash/land/push/revert). "Is the
 #     approach in <our PR> right?" is a judgement and stays fileable.
@@ -1947,11 +1948,14 @@ _gate_ask_codehost_rule() {   # <ask> -> 0 when a per-change tap is asked for BE
 #     the population, and reading the caller keeps it that way.
 # The `--ask-ok` escape is the fourth exit, for the real case where every holder
 # is genuinely out of tokens.
-_GATE_ASK_OURREPO_RX='github\.com/(5dive-ai|lodar)/'
 _GATE_ASK_REPO_WRITE_RX='\b(merge|merges|merged|merging|squash|land|landed|push|pushed|revert)\b'
 _gate_ask_our_repo_write() {   # <ask> -> 0 when it asks for a write on a repo we own
-  local s="${1:-}"
-  LC_ALL=C grep -Eiq "$_GATE_ASK_OURREPO_RX" <<<"$s" || return 1
+  local s="${1:-}" orgs
+  # Validated names ([A-Za-z0-9._-] only), so they are safe inside the regex.
+  orgs=$(box_named_setting own_orgs 2>/dev/null || true)
+  [[ -n "$orgs" ]] || return 1
+  orgs="${orgs//./\\.}"
+  LC_ALL=C grep -Eiq "github\.com/(${orgs// /|})/" <<<"$s" || return 1
   LC_ALL=C grep -Eiq "$_GATE_ASK_REPO_WRITE_RX" <<<"$s" || return 1
   return 0
 }
