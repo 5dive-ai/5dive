@@ -35,7 +35,7 @@ TMP="$(mktemp -d /tmp/escalation-resume.XXXXXX)"
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
          lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-         lib/tasks_db.sh lib/actor.sh cmd_task.sh cmd_org.sh cmd_agent.sh; do
+         lib/tasks_db.sh lib/actor.sh lib/verify_policy.sh cmd_task.sh cmd_org.sh cmd_agent.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -45,6 +45,8 @@ done
 STATE_DIR="$TMP"; TASKS_DIR="$STATE_DIR/tasks"; TASKS_DB="$TASKS_DIR/tasks.db"
 JSON_MODE=0
 mkdir -p "$TASKS_DIR"
+# DIVE-9315: which GitHub orgs are the box's own is the `own-orgs` setting.
+BOX_CONFIG="$TMP/box.json"; printf '{"own_orgs":"5dive-ai lodar"}\n' > "$BOX_CONFIG"
 set +e
 tasks_db_init
 _tasks_db_migrate
@@ -292,6 +294,14 @@ eq_t "F4: the classifier itself needs BOTH halves — a repo with no write verb 
   "$(_gate_ask_our_repo_write "Is https://github.com/5dive-ai/5dive/pull/1 the right shape?" && echo caught || echo clean)" "clean"
 eq_t "F5: ... and a write verb with no repo of ours is clean" \
   "$(_gate_ask_our_repo_write "Please merge the two paragraphs in the launch email." && echo caught || echo clean)" "clean"
+# DIVE-9315: the orgs are the box's `own-orgs` setting, not names in the core.
+eq_t "F5a: a write on a repo of ours IS caught (the positive the controls bound)" \
+  "$(_gate_ask_our_repo_write "Press Merge on https://github.com/5dive-ai/5dive/pull/1" && echo caught || echo clean)" "caught"
+eq_t "F5b: with own-orgs unset the arm never fires" \
+  "$(printf '{}\n' > "$BOX_CONFIG"; _gate_ask_our_repo_write "Press Merge on https://github.com/5dive-ai/5dive/pull/1" && echo caught || echo clean)" "clean"
+eq_t "F5c: a customer's own org is theirs to name" \
+  "$(printf '{"own_orgs":"acme-co"}\n' > "$BOX_CONFIG"; _gate_ask_our_repo_write "Press Merge on https://github.com/acme-co/site/pull/3" && echo caught || echo clean)" "caught"
+printf '{"own_orgs":"5dive-ai lodar"}\n' > "$BOX_CONFIG"
 # THE THIRD CONJUNCT, which had no arm of its own in iteration 1 although the
 # delivery note claimed one. The refusal reads the FILER from the uid-resolved
 # actor, not from --from, and a person filing this for another person is not the

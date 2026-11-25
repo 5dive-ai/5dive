@@ -139,7 +139,7 @@ _HB_GATE_ESCALATE_DAYS="${HEARTBEAT_GATE_ESCALATE_DAYS:-5}"
 # lands. Grep is on the LOCAL origin/main tracking ref (no fetch: cheap +
 # credential-free), so freshness = last time an agent pulled that repo.
 _HB_GATE_SHIPPED_REPOS="${HEARTBEAT_GATE_SHIPPED_REPOS:-5dive-cli}"
-_HB_REPO_BASE="${HEARTBEAT_REPO_BASE:-/home/claude/projects/5dive}"
+_HB_REPO_BASE="${HEARTBEAT_REPO_BASE:-$(box_projects_root 2>/dev/null || printf %s "${DEFAULT_WORKDIR:-/home/claude/projects}")}"   # DIVE-9315: `projects-root`
 _HB_GATE_SHIPPED_REF="${HEARTBEAT_GATE_SHIPPED_REF:-origin/main}"
 # DIVE-1416 fleet-stall self-heal (gaps #2/#3 — gap #1 is _hb_blocked_sweep
 # above). How long a maker->verifier delivery may sit unacknowledged
@@ -263,11 +263,17 @@ _HB_WAKE_DEFAULT_CAP="${HEARTBEAT_WAKE_CAP:-24}"   # default wakes/day per cold 
 _HB_WAKE_COST_EST="${HEARTBEAT_WAKE_COST_EST:-cold-start (est. tokens; billing is Phase 2)}"
 
 # Agents that must NEVER go cold (olivia condition 3: customer-facing/critical
-# stay always-on). main + marketing are pinned; extend via the space-separated
-# HEARTBEAT_WAKE_PROTECTED env. Returns 0 when the agent is protected.
+# stay always-on): the box's `wake-protected` setting (DIVE-9315; 5dive's own
+# boxes get theirs from the devteam plugin), plus the space-separated
+# HEARTBEAT_WAKE_PROTECTED env. Read once per run. Returns 0 when protected.
+_HB_WAKE_PROTECTED_LIST=""; _HB_WAKE_PROTECTED_READ=0
 _hb_wake_protected() {
   local name="$1" p
-  for p in main marketing ${HEARTBEAT_WAKE_PROTECTED:-}; do
+  if (( ! _HB_WAKE_PROTECTED_READ )); then
+    _HB_WAKE_PROTECTED_READ=1
+    _HB_WAKE_PROTECTED_LIST=$(box_named_setting wake_protected 2>/dev/null || true)
+  fi
+  for p in $_HB_WAKE_PROTECTED_LIST ${HEARTBEAT_WAKE_PROTECTED:-}; do
     [[ "$name" == "$p" ]] && return 0
   done
   return 1
@@ -4724,7 +4730,7 @@ _hb_quota_unpark() {  # <name> <everyMin> [<prefetched record>] — rc is ALWAYS
 # than it used to: checkouts are DEDUPED BY SHARED CLONE, and one
 # `worktree list` per clone sees every worktree of it — including the ones that
 # live outside this root, which the old per-directory scan could never reach.
-_HB_PROJECTS_ROOT="${FIVE_PROJECTS_ROOT:-/home/claude/projects/5dive}"
+_HB_PROJECTS_ROOT="$(box_projects_root 2>/dev/null || printf %s "${FIVE_PROJECTS_ROOT:-${DEFAULT_WORKDIR:-/home/claude/projects}}")"   # $FIVE_PROJECTS_ROOT, else `projects-root` (DIVE-9315)
 _HB_WORKSPACE_SCAN_MAX=400
 # DIVE-4213 carryover bounds. The transcript window is a RECORD count (one JSONL
 # record is one physical line) and the message cap is characters: the clause

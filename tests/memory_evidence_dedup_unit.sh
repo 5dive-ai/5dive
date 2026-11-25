@@ -24,7 +24,7 @@ SRC=src
 TMP="$(mktemp -d /tmp/mem-ev-unit.XXXXXX)"
 
 # shellcheck disable=SC1090
-for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh; do
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/verify_policy.sh; do
   source "$SRC/$f"
 done
 # shellcheck source=/dev/null
@@ -48,6 +48,7 @@ NC=(--no-check='DIVE-3106 evidence/dedup fixture — no real-world fact to re-de
 STORE="$TMP/home/.claude/projects/proj/memory"
 mkdir -p "$STORE"; : > "$STORE/MEMORY.md"
 export HOME="$TMP/home"
+export FIVE_PROJECTS_ROOT="$HOME/projects/5dive"   # DIVE-9315: the wiki rung
 
 # add <args...> ; body on stdin. Subshell: `fail` exits, and we want the code.
 add() { ( _memory_add "$@" ) ; }

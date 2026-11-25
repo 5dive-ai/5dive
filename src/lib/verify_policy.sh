@@ -415,6 +415,54 @@ box_verify_small() {
   printf '%s' "$v"
 }
 
+# DIVE-9315 — box settings that used to be 5dive's own names written into the
+# core: which seats never go cold (`wake-protected`), which GitHub orgs count as
+# the box's own (`own-orgs`), which non-agent names may file a task
+# (`principals`), and where the box keeps its checkouts (`projects-root`).
+#
+# The box's value wins; unset, the devteam plugin's (core/box-defaults.json, so
+# 5dive's own boxes keep the values they had); otherwise empty. `none` is an
+# explicit empty that the plugin's value does not fill. Lists are stored
+# space-separated, and anything that fails validation reads as unset.
+_box_name_list_valid() {  # <value>
+  local v="${1:-}" w n=0
+  [[ "$v" == none ]] && return 0
+  [[ -n "$v" && "$v" != *[!A-Za-z0-9._,\ -]* ]] || return 1
+  for w in ${v//,/ }; do
+    [[ "$w" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || return 1
+    n=$((n + 1))
+  done
+  (( n >= 1 && n <= 32 ))
+}
+_box_projects_root_valid() {  # <value>
+  [[ "${1:-}" =~ ^/[A-Za-z0-9._/-]{1,255}$ && "/${1}/" != */../* ]]
+}
+box_named_setting() {  # <json key>
+  local k="$1" v="" f; f=$(_box_config_path)
+  if [[ -r "$f" ]]; then
+    v=$(jq -r --arg k "$k" '.[$k] // empty | strings' "$f" 2>/dev/null || printf '')
+  fi
+  [[ "$v" == none ]] && return 0
+  _box_named_value_ok "$k" "$v" || v=""
+  if [[ -z "$v" ]] && declare -F devteam_box_default >/dev/null 2>&1; then
+    v=$(devteam_box_default "$k")
+    { _box_named_value_ok "$k" "$v" && [[ "$v" != none ]]; } || v=""
+  fi
+  [[ "$k" == projects_root ]] || v="${v//,/ }"
+  printf '%s' "$v"
+}
+_box_named_value_ok() {  # <json key> <value>
+  [[ -n "$2" ]] || return 1
+  if [[ "$1" == projects_root ]]; then _box_projects_root_valid "$2"; else _box_name_list_valid "$2"; fi
+}
+# Where this box keeps its checkouts: $FIVE_PROJECTS_ROOT, else `projects-root`,
+# else the default workdir every box has.
+box_projects_root() {
+  local v="${FIVE_PROJECTS_ROOT:-}"
+  [[ -n "$v" ]] || v=$(box_named_setting projects_root)
+  printf '%s' "${v:-${DEFAULT_WORKDIR:-/home/claude/projects}}"
+}
+
 # DIVE-9262 — `agent-task-cap`: how many low/medium rows ONE AGENT may file in a
 # rolling 24 hours. Off by default. A person filing a row is never capped, and
 # neither is a high or urgent row (src/task/crud.sh).

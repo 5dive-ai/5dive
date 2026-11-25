@@ -4520,9 +4520,9 @@ cmd_create() {
     step "Seeding inherited memory for agent-${name} (scope: $inherit_memory)"
     # Slug names the project dir under the agent's OWN home; `5dive memory`
     # globs every ~/.claude/projects/*/memory so the exact slug isn't load-
-    # bearing, but the fleet convention (claude agents run from
-    # /home/claude/projects/5dive) merges the seed with their working store.
-    seed_inherited_memory "$name" "$inherit_memory" "${workdir:-/home/claude/projects/5dive}"
+    # bearing, but running from the box's projects root (`projects-root`,
+    # DIVE-9315) merges the seed with their working store.
+    seed_inherited_memory "$name" "$inherit_memory" "${workdir:-$(box_projects_root)}"
   fi
 
   # Channel registration is type-aware (see install_channel_for_agent's
