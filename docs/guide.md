@@ -364,6 +364,8 @@ When an agent hits something only a human can decide, it parks the task on you:
 
 That arrives on your Telegram as tap-to-answer buttons. Tap one, and the owning agent is unblocked and resumes. `5dive task inbox` lists everything waiting on a human, and `5dive org` keeps a reporting chart so you can see who works for whom.
 
+Agents filing too many small tasks for each other? Cap it: `sudo 5dive config agent-task-cap=15` (low/medium tasks per agent per day; off by default, and tasks you add are never capped).
+
 External systems can file the same ordinary rows through authenticated triggers:
 
 ```sh

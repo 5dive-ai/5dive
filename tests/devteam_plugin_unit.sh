@@ -220,6 +220,25 @@ fx task/grader_pool.sh '_devteam_fixture_pool() { :; }'
 dv proof x
 t  "B12 positive control after every negative above: it runs again" "$LOADED" "$OUT"
 
+# DIVE-9262: task/filing_cap.sh is OPTIONAL — read when the plugin ships it, and
+# held to the same ownership checks; absent (every arm above), nothing changes.
+fx task/filing_cap.sh '_task_agent_task_cap_default() { echo 7; }'
+dv config
+tc "B14 an optional module the plugin ships is read: its cap default reaches config" \
+   "agent-task-cap = 7 (the devteam plugin's default" "$OUT"
+( set +u; source src/header.sh 2>/dev/null; source src/lib/devteam.sh; devteam_status_line ) > "$TMP/.s" 2>&1
+tc "B14b doctor counts it" "loaded from $VDIR (10 modules)" "$(cat "$TMP/.s")"
+chmod 664 "$VDIR/core/task/filing_cap.sh"; dv proof x
+tc "B14c a group-writable optional module refuses the plugin whole" "$LINE" "$ERR"
+chmod 644 "$VDIR/core/task/filing_cap.sh"
+printf '_pace_band() { echo HIJACKED-PACE; }\n' >> "$VDIR/core/task/filing_cap.sh"; dv proof x
+tc "B14d an optional module that redefines a core function refuses the plugin whole" "$LINE" "$ERR"
+rm -f "$VDIR/core/task/filing_cap.sh"
+dv config
+tc "B14e without it the box default is off again" "agent-task-cap = off (default off" "$OUT"
+dv proof x
+t  "B14f and the plugin still loads without it" "$LOADED" "$OUT"
+
 # A community plugin that claims `push`, with a real bin/push. It must never run:
 # not without devteam (the line), and not instead of devteam.
 CVD="$PL/cache/someone/pusher/0.1.0"
