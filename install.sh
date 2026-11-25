@@ -1260,10 +1260,12 @@ TOOLENV
   # pre-fork agents that no longer exist (0 seats wired it, measured
   # 2026-09-23), and a fix landed in it by mistake (#1005). Shed it.
   rm -f "$LIB_DIR/stop-telegram-reply-check.sh"
+  # DIVE-9327: push-notify.sh is not fetched here any more; it comes from the
+  # hosted plugin (_hosted_plugin_ensure), and a box without it keeps its copy.
   for hook in stop-failure-telegram.sh resume-after-reset.sh run-loop.sh \
               pretool-telegram-question.sh pretool-headless-question.sh \
               posttool-telegram-relay.sh userprompt-mirror-inter-agent.sh \
-              stop-mirror-inter-agent.sh push-notify.sh \
+              stop-mirror-inter-agent.sh \
               sessionstart-resume-context.sh; do
     curl -fsSL "$REPO/hooks/$hook" -o "$LIB_DIR/$hook"
     chmod 755 "$LIB_DIR/$hook"
@@ -1983,10 +1985,40 @@ _hosted_plugin_ensure() {
   offline_update && return 0
   [[ -f "$prov" ]] || return 0
   grep -q '^CONNECTORD_TOKEN=.' "$tok" 2>/dev/null || return 0
-  "$BIN_DIR/5dive" partner --help >/dev/null 2>&1 && return 0
-  say "Installing the hosted plugin (this box was built by 5dive)"
-  "$BIN_DIR/5dive" plugin add hosted@5dive-plugins --yes 2>&1 | tail -3 \
-    || echo "warn: hosted plugin not installed — '5dive partner hire' is down until the next upgrade retries" >&2
+  if ! "$BIN_DIR/5dive" partner --help >/dev/null 2>&1; then
+    say "Installing the hosted plugin (this box was built by 5dive)"
+    "$BIN_DIR/5dive" plugin add hosted@5dive-plugins --yes 2>&1 | tail -3 \
+      || echo "warn: hosted plugin not installed — '5dive partner hire' is down until the next upgrade retries" >&2
+  fi
+  _hosted_push_notify_stage
+  return 0
+}
+
+# DIVE-9327: the phone-push helper agents' failure hooks call left the core for
+# the same plugin (its lib/push-notify.sh). It still has to sit at
+# $LIB_DIR/push-notify.sh: every seat's sudoers grant names that exact path, and
+# rewriting grants on live seats is the risk this avoids. So each run copies the
+# plugin's file there. What lands there runs as root through those grants, so
+# it is copied only when the plugin directory, its lib/ and the file are owned
+# by root (or whoever runs this) and writable by nobody else. A plugin older
+# than 0.2.0 has no lib/push-notify.sh; then the copy already on the box stays,
+# so neither repo has to ship first.
+_hosted_push_notify_stage() {
+  local link="$STATE_DIR/plugins/enabled/hosted@5dive-plugins" dir src p uid mode
+  dir=$(readlink -f -- "$link" 2>/dev/null) || return 0
+  src="$dir/lib/push-notify.sh"
+  [[ -f "$src" ]] || return 0
+  for p in "$dir" "$dir/lib" "$src"; do
+    read -r uid mode < <(stat -L -c '%u %a' -- "$p" 2>/dev/null) || uid=""
+    if [[ "$uid" != 0 && "$uid" != "$EUID" ]] || (( (8#${mode:-777} & 8#022) != 0 )); then
+      echo "warn: not staging push-notify.sh: $p is writable by someone other than root" >&2
+      return 0
+    fi
+  done
+  install -d -m 755 "$LIB_DIR" \
+    && install -m 755 "$src" "$LIB_DIR/.push-notify.sh.new" \
+    && mv -f "$LIB_DIR/.push-notify.sh.new" "$LIB_DIR/push-notify.sh" \
+    || { rm -f "$LIB_DIR/.push-notify.sh.new"; echo "warn: could not stage push-notify.sh; the copy on this box stays" >&2; }
   return 0
 }
 # <<< DIVE-9324 hosted plugin

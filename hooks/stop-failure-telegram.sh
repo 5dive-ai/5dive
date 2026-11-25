@@ -240,7 +240,8 @@ fi
 # DIVE-72: tee a native mobile push alongside the Telegram relay. Only genuine
 # failures (rate-limit pauses auto-resume via the helper above, so they don't
 # push). Fully isolated: backgrounded, output discarded, and a no-op on boxes
-# without a connectord token — can never block or fail this hook.
+# without a connectord token — can never block or fail this hook. The helper
+# comes from the hosted plugin (DIVE-9327), so a self-hosted box may not have it.
 push_helper="/usr/local/lib/5dive/push-notify.sh"
 if ! $is_rate_limit && [[ -x "$push_helper" ]]; then
   "$push_helper" error "$msg" >/dev/null 2>&1 &

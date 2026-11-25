@@ -11,6 +11,12 @@
 #   I4  `partner` already answers                                    -> no add (retried only while missing)
 #   I5  offline update                                               -> nothing
 #   I6  a failed add warns and still returns 0 (never blocks an upgrade)
+#   S1  DIVE-9327: a plugin carrying lib/push-notify.sh -> staged at $LIB_DIR/push-notify.sh, 0755, same bytes
+#   S2  'partner' already answers -> still staged (the add is skipped, the stage is not)
+#   S3  an older plugin (no lib/push-notify.sh) -> the copy already on the box stays
+#   S4  a plugin file writable by group/other -> refused with a warning, the old copy stays
+#   S5  no hosted plugin enabled, and a self-hosted box -> nothing staged
+#   S6  core no longer ships hooks/push-notify.sh, and the hook loop no longer fetches it
 #   W1  the upgrade branch and the fresh install each call it once
 #   W2  `partner` is no longer a core verb: no case arm, not in FIVEDIVE_BUILTIN_VERBS,
 #       and _moved_verb_repo points it at the plugin
@@ -45,12 +51,20 @@ STUB
 chmod +x "$TMP/bin/5dive"
 export STUB_DIR="$TMP"
 
+# The hosted plugin as `plugin add` leaves it: enabled/<key> -> its cache dir.
+STATE="$TMP/state"; LIBD="$TMP/lib5dive"
+mkdir -p "$STATE/plugins/enabled" "$STATE/plugins/cache/hosted/lib"
+chmod 755 "$STATE/plugins/cache/hosted" "$STATE/plugins/cache/hosted/lib"
+ln -s "$STATE/plugins/cache/hosted" "$STATE/plugins/enabled/hosted@5dive-plugins"
+PN="$STATE/plugins/cache/hosted/lib/push-notify.sh"
+printf '#!/bin/sh\n# plugin copy\n' >"$PN"; chmod 755 "$PN"
+
 # case <prov 0|1> <token 0|1> — run the block once; sets CALLS, OUT, ERR, RC.
 case_run() {
   rm -f "$TMP/calls" "$TMP/prov" "$TMP/conn"; : >"$TMP/calls"
   [[ "$1" == 1 ]] && : >"$TMP/prov"
   [[ "$2" == 1 ]] && printf 'CONNECTORD_TOKEN=tok-abc\n' >"$TMP/conn" || printf 'CONNECTORD_TOKEN=\n' >"$TMP/conn"
-  ( BIN_DIR="$TMP/bin"
+  ( BIN_DIR="$TMP/bin" STATE_DIR="$STATE" LIB_DIR="$LIBD"
     offline_update() { [[ "${FIVEDIVE_OFFLINE_UPDATE:-0}" == 1 ]]; }
     say() { echo "→ $*"; }
     FIVEDIVE_PROVISIONING_ENV="$TMP/prov" FIVEDIVE_CONNECTORD_ENV="$TMP/conn"
@@ -75,6 +89,36 @@ FIVEDIVE_OFFLINE_UPDATE=1 case_run 1 1
 STUB_ADD_RC=1 case_run 1 1
 added && [[ $RC -eq 0 && "$ERR" == *"hosted plugin not installed"* ]] \
   && ok_t "I6 a failed add warns and returns 0" || bad_t "I6 failed add" "rc=$RC err=$ERR"
+
+# S1-S6 — DIVE-9327: push-notify.sh comes from the plugin, at the granted path.
+staged_is_plugin() { [[ -x "$LIBD/push-notify.sh" && "$(stat -c %a "$LIBD/push-notify.sh")" == 755 ]] && cmp -s "$PN" "$LIBD/push-notify.sh"; }
+rm -rf "$LIBD"; case_run 1 1
+staged_is_plugin && [[ $RC -eq 0 && ! -e "$LIBD/.push-notify.sh.new" ]] \
+  && ok_t "S1 the plugin's lib/push-notify.sh is staged at \$LIB_DIR/push-notify.sh, 0755, same bytes" \
+  || bad_t "S1 staged" "rc=$RC err=$ERR $(ls -l "$LIBD" 2>&1)"
+rm -rf "$LIBD"; STUB_PARTNER_RC=0 case_run 1 1
+! added && staged_is_plugin && ok_t "S2 'partner' already answers -> no add, still staged" || bad_t "S2 staged without add" "calls=$CALLS $(ls -l "$LIBD" 2>&1)"
+mkdir -p "$LIBD"; printf 'old copy\n' >"$LIBD/push-notify.sh"; mv "$PN" "$TMP/pn.aside"
+case_run 1 1
+[[ "$(cat "$LIBD/push-notify.sh")" == "old copy" && $RC -eq 0 ]] \
+  && ok_t "S3 an older plugin without lib/push-notify.sh leaves the box's copy in place" || bad_t "S3 old plugin" "$(cat "$LIBD/push-notify.sh" 2>&1)"
+mv "$TMP/pn.aside" "$PN"; chmod 775 "$PN"
+case_run 1 1
+[[ "$(cat "$LIBD/push-notify.sh")" == "old copy" && $RC -eq 0 && "$ERR" == *"not staging push-notify.sh"* ]] \
+  && ok_t "S4 a group-writable plugin file is refused with a warning; the old copy stays" || bad_t "S4 unsafe file" "rc=$RC err=$ERR"
+chmod 755 "$PN"; chmod 777 "$STATE/plugins/cache/hosted/lib"
+case_run 1 1
+[[ "$(cat "$LIBD/push-notify.sh")" == "old copy" && "$ERR" == *"not staging"* ]] \
+  && ok_t "S4b a world-writable plugin lib/ is refused too" || bad_t "S4b unsafe dir" "err=$ERR"
+chmod 755 "$STATE/plugins/cache/hosted/lib"
+rm -rf "$LIBD"; rm "$STATE/plugins/enabled/hosted@5dive-plugins"; case_run 1 1
+[[ ! -e "$LIBD/push-notify.sh" && $RC -eq 0 ]] || { bad_t "S5 no plugin enabled -> nothing staged" "$(ls -l "$LIBD" 2>&1)"; }
+ln -s "$STATE/plugins/cache/hosted" "$STATE/plugins/enabled/hosted@5dive-plugins"; case_run 0 1
+[[ ! -e "$LIBD/push-notify.sh" && $RC -eq 0 ]] && ok_t "S5 no hosted plugin, or a self-hosted box -> nothing staged" \
+  || bad_t "S5 self-hosted -> nothing staged" "$(ls -l "$LIBD" 2>&1)"
+loop=$(sed -n '/^  for hook in stop-failure-telegram.sh/,/; do$/p' install.sh)
+[[ ! -e hooks/push-notify.sh && -n "$loop" && "$loop" != *push-notify* ]] \
+  && ok_t "S6 core ships no hooks/push-notify.sh and the hook loop does not fetch it" || bad_t "S6 core copy gone" "loop=$loop"
 
 # W1 — wiring: one call in the --upgrade branch (after the partner migration), one on a fresh install.
 up=$(awk '/^if \[\[ "\$\{1:-\}" == "--upgrade" \]\]; then$/{on=1} on && /^fi$/{exit} on' install.sh | grep -c '^  _hosted_plugin_ensure')

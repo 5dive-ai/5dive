@@ -14,8 +14,9 @@
 #     fourth, DIVE-5894: the dashboard chat adapter's relay, which DIVE-5690 missed) and
 #     still classifies cli-scoped with no extra entries (so the installer's
 #     reconcile keeps re-rendering existing seats)
-#   * push-notify.sh and box_identity_elevate re-run as root only when sudo
-#     grants the exact command, and stay silent otherwise
+#   * box_identity_elevate re-runs as root only when sudo grants the exact
+#     command, and stays silent otherwise (push-notify.sh's arms moved with it
+#     to 5dive-ai/5dive-plugins tests/hosted_push_notify_unit.sh, DIVE-9327)
 #   * 5dive-agent-start's claude block does not wait 45s on a login file the
 #     seat cannot read: it grades the environment systemd injected
 #   * an account login (auth-profiles/<p>/combined.env) moves to claude-keys
@@ -164,7 +165,7 @@ else
   printf 'skip - T6 visudo not installed here\n'
 fi
 
-# --- T7: push-notify.sh and box_identity_elevate ------------------------------
+# --- T7: box_identity_elevate -------------------------------------------------
 # A file only a non-root uid is refused: as root, the arms run as uid 65534.
 AS_SEAT=()
 (( EUID == 0 )) && command -v setpriv >/dev/null && AS_SEAT=(setpriv --reuid=65534 --regid=65534 --clear-groups)
@@ -178,20 +179,10 @@ exit 0
 STUB
 chmod 755 "$TMP/bin" "$TMP/bin/sudo"
 export SUDO_LOG="$TMP/sudo.log"; : > "$SUDO_LOG"; chmod 666 "$SUDO_LOG"
-HOOK="$TMP/push-notify.sh"
-sed "s#/etc/5dive/connectord.env#$TMP/locked.env#" hooks/push-notify.sh > "$HOOK"; chmod 644 "$HOOK"
 sed -n '/^# -------- who may read a key on this box/,$p' src/lib/validation.sh > "$TMP/sp.sh"; chmod 644 "$TMP/sp.sh"
 seat_env() { env PATH="$TMP/bin:$PATH" SUDO_LOG="$SUDO_LOG" "$@"; }
 printf 'CONNECTORD_TOKEN=t\n' > "$TMP/locked.env"
 if can_lock; then
-  chmod 000 "$TMP/locked.env"
-  : > "$SUDO_LOG"; seat_env "${AS_SEAT[@]}" bash "$HOOK" "done" "hi there" seat_b; rc=$?
-  [[ $rc -eq 0 && "$(tail -1 "$SUDO_LOG")" == "-n /usr/local/lib/5dive/push-notify.sh done hi there seat_b" ]] \
-    && ok_t "T7 push-notify: unreadable token -> re-runs as root with the same args" || bad_t "T7 push elevate" "rc=$rc $(cat "$SUDO_LOG")"
-  : > "$SUDO_LOG"; seat_env SUDO_L_RC=1 "${AS_SEAT[@]}" bash "$HOOK" "done" x seat_b; rc=$?
-  [[ $rc -eq 0 && "$(wc -l < "$SUDO_LOG")" == 1 ]] && ok_t "T7 push-notify: no grant -> silent no-op, only sudo -l asked" || bad_t "T7 push no grant" "rc=$rc $(cat "$SUDO_LOG")"
-  rm -f "$TMP/locked.env"; : > "$SUDO_LOG"; seat_env "${AS_SEAT[@]}" bash "$HOOK" "done" x seat_b
-  [[ ! -s "$SUDO_LOG" ]] && ok_t "T7 push-notify: no token file (OSS box) -> sudo never asked" || bad_t "T7 push OSS" "$(cat "$SUDO_LOG")"
   printf 'CONNECTORD_TOKEN=t\n' > "$TMP/locked.env"; chmod 000 "$TMP/locked.env"
   : > "$SUDO_LOG"
   out=$(seat_env FIVEDIVE_CONNECTORD_ENV="$TMP/locked.env" JSON_MODE=1 "${AS_SEAT[@]}" \
