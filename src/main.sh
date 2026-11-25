@@ -52,7 +52,7 @@ Agents:
   5dive market --kind=plugin                         # browse plugins (voice, telegram, dashboard, buzz)
   5dive plugin add|list|remove|upgrade <plugin>      # install a plugin; see '5dive plugin --help'
   5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see '5dive hire --help'
-  5dive helper ensure|status                         # the 5dive "Help & setup" seat (new boxes get none) and the handover
+  5dive handover status                              # 5dive-built boxes: the pre-sale handover to the first hire (hosted@5dive-plugins)
   5dive partner hire <pack> [--as=<name>]            # partner boxes: from the hosted plugin (hosted@5dive-plugins)
   5dive agent list
   5dive agent info <name>                            # type, CLI version, model, channel, state + OUTPUT (DIVE-3274:
@@ -1468,11 +1468,6 @@ main() {
         AUDIT_CMD="hire"; AUDIT_ARGS=("$@")
         with_registry_lock cmd_hire "$@"
       fi ;;
-    helper)
-      # DIVE-8819: the 5dive helper seat. DIVE-8946: `ensure` no longer builds it;
-      # it is still audited, as a root verb.
-      [[ "${1:-}" == ensure ]] && { AUDIT_CMD="helper ensure"; AUDIT_ARGS=(); }
-      cmd_helper "$@" ;;
     agent)
       _agent_verb_dispatch "$@" ;;
     fire)

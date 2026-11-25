@@ -10583,17 +10583,30 @@ _hb_stuck_login_sweep() { # <now> <registry json>
   return 0
 }
 
+# DIVE-9329: the pre-sale handover to the first hire (DIVE-8946) lives in
+# hosted@5dive-plugins (`5dive handover _tick`): it reads 5dive's API as the box,
+# so it has no use on a self-hosted one. Core keeps only the gate, so a box that
+# cannot need it pays a stat and no fork: a box with the demo AI account (a paid
+# 5dive server), no handed-over / welcomed record in <state>/helper, and the
+# official plugin claiming the verb. Run in a subshell (the dispatch execs);
+# never fatal to the tick.
+_hb_handover_tick() {
+  local d="$STATE_DIR/helper" out
+  [[ -e "$d/handed-over" || -e "$d/welcomed" ]] && return 0
+  [[ -s "$AUTH_PROFILES_DIR/demo-ai/combined.env" ]] || return 0
+  lazy_need _plugin_verb_claims _plugin_dispatch_verb
+  [[ "$(_plugin_verb_claims handover 2>/dev/null)" == "hosted@5dive-plugins" ]] || return 0
+  out=$( (_plugin_dispatch_verb handover _tick) </dev/null 2>&1 ) || true
+  [[ -z "$out" ]] || _hb_log "[handover] $(tr '\n' ';' <<<"$out")"
+  return 0
+}
+
 cmd_heartbeat_tick() {
   require_root "heartbeat tick"
   tasks_db_init
   _HB_BALANCE_TICK_MOVED=0   # DIVE-6106: one balance move fleet-wide per tick
   local reg now; reg=$(registry_read); now=$(date +%s)
-  # DIVE-8819/8946: the pre-sale handover to the first hire once (or a seat
-  # built before 8946 welcomes once). One stat once done; never fatal to the tick.
-  if declare -F _helper_tick >/dev/null; then
-    local _hb_helper; _hb_helper=$(lazy_need _helper_tick; _helper_tick "$reg" 2>&1) || true
-    [[ -z "$_hb_helper" ]] || _hb_log "[helper] $(tr '\n' ';' <<<"$_hb_helper")"
-  fi
+  _hb_handover_tick
   local checked=0 woke=0 reaped=0 reclaimed=0 starved=0 sk_notdue=0 sk_busy=0 sk_nowork=0 sk_fail=0 sk_spread=0 sk_active=0 sk_budget=0 sk_held=0 sk_capped=0 sk_parked=0 sk_pace=0
   local today; today=$(date +%F)   # DIVE-1858 wake-budget day key (YYYY-MM-DD)
   # DIVE-4585: republish the account-usage snapshot FIRST, before anything in
