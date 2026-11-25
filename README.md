@@ -168,7 +168,7 @@ sudo -u agent-cmo 5dive browser auth github.com  # you sign in once, by hand
 | Plugin | Function |
 |---|---|
 | [Browser](https://github.com/5dive-ai/5dive-browser) | Real browser with reusable authenticated sessions |
-| [Phone](https://github.com/5dive-ai/5dive-phone) | Apps on a spare Android phone: WhatsApp, Instagram, anything phone-only |
+| [Phone](https://github.com/5dive-ai/5dive-phone) | Apps on a spare Android phone: TikTok, Instagram, your own app's test build |
 | [Voice](https://github.com/5dive-ai/5dive-voice) | Voice messages and spoken replies |
 | [Backup](https://github.com/5dive-ai/5dive-backup) | Nightly encrypted backup of your agents to your own storage; only you hold the key |
 | [Council](https://github.com/5dive-ai/5dive-council) | Multi-agent votes and auditable decisions |
