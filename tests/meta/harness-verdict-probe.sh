@@ -33,11 +33,28 @@ ASSUME_CLEAN=0; ONLY=""; REPORT=""; LABEL=""; SHARD=""; TIMEOUT=${PROBE_TIMEOUT:
 # held a full-sweep shard to the job's 60-minute cap and ended it `cancelled`: main
 # red, the release cut refused. Twice (DIVE-8634, DIVE-9321), both times after the
 # probe had already printed the harness's name and nothing more. -k escalates to
-# SIGKILL on the whole process group KILL_AFTER seconds later; the 124/137 test
-# below already classifies either code as a kill, so no verdict logic moves.
+# SIGKILL KILL_AFTER seconds later; the 124/137 test below already classifies
+# either code as a kill, so no verdict logic moves.
 # PROBE_KILL_AFTER exists for the arm that grades this (corpus_tier_budget_unit.sh),
 # which pays for the grace period in seconds of the tier it enforces.
 KILL_AFTER=${PROBE_KILL_AFTER:-10}
+# WHICH `timeout` KILLS WHAT IS NOT PORTABLE. GNU sends the KILL to timeout's whole
+# process group; uutils (the coreutils of ubuntu-latest, 26.04) KILLs the direct
+# child only, so a TERM-ignoring grandchild (the harness's `sleep`, a subshell)
+# lives on. With stdout and stderr on /dev/null that orphan is harmless, but the
+# mutant run captures stderr through `$(...)`, which waits for EOF on a pipe the
+# orphan still holds: -k alone freed this box and still hung the runner. So the
+# probe reaps the group itself: timeout runs in the background, and once it
+# returns its process group (both implementations setpgid to timeout's own pid)
+# is SIGKILLed before the capture can wait on it. `0<&0` keeps stdin the
+# caller's, which a background job would otherwise trade for /dev/null.
+capped() {
+  timeout -k "$KILL_AFTER" "$TIMEOUT" "$@" 0<&0 &
+  local tpid=$! rc
+  wait "$tpid"; rc=$?
+  kill -KILL -- "-$tpid" 2>/dev/null
+  return "$rc"
+}
 for a in "$@"; do case "$a" in
   --assume-clean) ASSUME_CLEAN=1 ;;
   --only=*) ONLY="${a#--only=}" ;;      # one basename, or a comma-separated list
@@ -179,7 +196,7 @@ for t in "${SELECTED[@]:-}"; do
   PROBED_N=$(( PROBED_N + 1 ))
   printf '  probing %d/%d %s\n' "$PROBED_N" "$CORPUS_N" "$b" >&2
   if (( ! ASSUME_CLEAN )); then
-    timeout -k "$KILL_AFTER" "$TIMEOUT" bash "$t" >/dev/null 2>&1; rc=$?
+    capped bash "$t" >/dev/null 2>&1; rc=$?
     # DIVE-2555: A KILL IS NOT A FAILURE. `timeout` exits 124 when it has to signal
     # the child (137 when the child needed SIGKILL), and folding either into
     # already-red publishes "failed its own clean run" — a statement about the
@@ -253,7 +270,7 @@ if [[ " $ALLOW_UNPROBEABLE " == *" $b "* ]]; then ALLOWED+=("$b"); else UNPROBEA
   # The stderr capture is unchanged and still discards the mutant's stdout: it keeps
   # the mutant's noise off the probe's own progress stream. It is now the SECOND
   # canary channel rather than the only one.
-  out=$(timeout -k "$KILL_AFTER" "$TIMEOUT" bash "$mutant" 2>&1 >/dev/null); rc=$?
+  out=$(capped bash "$mutant" 2>&1 >/dev/null); rc=$?
   rm -f "$mutant"
   # DIVE-2555: THE KILL MUST BE CLASSIFIED BEFORE THE VERDICT IS READ, because a
   # killed mutant produces BOTH of this loop's outcomes for reasons that have

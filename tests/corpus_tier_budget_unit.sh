@@ -648,17 +648,18 @@ fi
 # HAPPENS. `timeout` without -k sends TERM and then waits on its child forever, so a
 # harness whose process ignores TERM held a full-sweep shard to the job's 60-minute
 # cap — `cancelled`, main red, the cut refused — twice (DIVE-8634, DIVE-9321). The
-# probe now escalates to SIGKILL on the process group after PROBE_KILL_AFTER.
+# probe now escalates to SIGKILL after PROBE_KILL_AFTER, then SIGKILLs timeout's
+# process group itself (see the two-`timeout` note below for why -k is not enough).
 #
-# One stub per call site, because they are two `timeout` lines and either can lose
-# its -k alone: TERMCLEAN ignores TERM on its CLEAN run (probe line ~171), TERMMUT
-# only once MUTATED (~245). Both sleep a duration written here, never one measured
+# One stub per call site, because they are two `capped` calls and either can lose
+# its kill alone: TERMCLEAN ignores TERM on its CLEAN run, TERMMUT only once
+# MUTATED (the `$(capped ...)` stderr capture). Both sleep a duration written here, never one measured
 # off a real harness (wiki a-timeout-kill-is-not-a-verdict §4), and only 30s, so the
 # orphans a PRE-fix run leaves behind reap themselves.
 #
 # THE OUTER CAP is what turns the pre-fix hang into a red instead of a hung file:
 # 2s cap + 1s grace returns in ~3s; 15s means TERM was not escalated. Measured on the
-# pre-fix tree: both arms red at the outer cap (rc 124). Cost: two kills, ~6s.
+# pre-fix tree: every kill arm red. Cost: four kills, ~12s.
 if (( SEAM )); then
   TERMCLEAN=ignores_term_clean.sh
   cat > "$FAKE/tests/$TERMCLEAN" <<'STUBEOF'
@@ -687,18 +688,32 @@ STUBEOF
     ok "control: both TERM-ignoring stubs earn 'wired' when nothing hangs"
   else bad "control: both TERM-ignoring stubs earn 'wired' when nothing hangs" "rc=$TCRC $(cat "$TMP/probe-ctl9322.txt" 2>&1)"; fi
 
-  for _stub in "$TERMCLEAN" "$TERMMUT"; do
-    _phase=clean; [[ "$_stub" == "$TERMMUT" ]] && _phase=mutant
-    _t0=$SECONDS
-    _out="$(PROBE_TIMEOUT=2 PROBE_KILL_AFTER=1 timeout -k 2 15 bash "$FAKE_PROBE" --only="$_stub" --label=k9322 --report="$TMP/probe-9322.txt" 2>/dev/null)"; _rc=$?
-    _dt=$(( SECONDS - _t0 ))
-    if (( _rc == 0 && _dt < 10 )); then
-      ok "a $_phase run that ignores SIGTERM is SIGKILLed and the probe returns (${_dt}s, cap 2s + 1s grace)"
-    else bad "a $_phase run that ignores SIGTERM is SIGKILLed and the probe returns (cap 2s + 1s grace)" "rc=$_rc after ${_dt}s — 124/137 is the OUTER 15s cap: timeout waited on a child that ignores TERM"; fi
-    if grep -q "^timed-out	$_stub$" "$TMP/probe-9322.txt" 2>/dev/null && [[ "$_out" == *"1 timed-out (cap 2s)"* ]]; then
-      ok "the SIGKILLed $_phase run is reported timed-out (137 is a kill, not a verdict)"
-    else bad "the SIGKILLed $_phase run is reported timed-out (137 is a kill, not a verdict)" "$_out | $(cat "$TMP/probe-9322.txt" 2>&1)"; fi
-    rm -f "$TMP/probe-9322.txt"
+  # TWO `timeout`s, because they kill different things. GNU KILLs timeout's whole
+  # process group; uutils (ubuntu-latest's coreutils) KILLs the direct child only,
+  # so the stub's TERM-ignoring `sleep` outlives it, and on the mutant site that
+  # orphan holds the `$(...)` stderr pipe open. -k alone was green here and red on
+  # the runner for exactly that reason. The `childonly` shim reproduces uutils on a
+  # GNU box: setsid gives timeout its own group (as uutils' setpgid does) and
+  # --foreground limits the KILL to the child (as uutils does). Measured against
+  # uutils 0.13.0: same pgid layout, same surviving grandchild, same rc 137.
+  _shim="$TMP/childonly-timeout"; mkdir -p "$_shim"
+  printf '#!/usr/bin/env bash\nexec setsid %q --foreground "$@"\n' "$(command -v timeout)" > "$_shim/timeout"
+  chmod +x "$_shim/timeout"
+  for _kind in native childonly; do
+    _path=$PATH; [[ "$_kind" == childonly ]] && _path="$_shim:$PATH"
+    for _stub in "$TERMCLEAN" "$TERMMUT"; do
+      _phase=clean; [[ "$_stub" == "$TERMMUT" ]] && _phase=mutant
+      _t0=$SECONDS
+      _out="$(PROBE_TIMEOUT=2 PROBE_KILL_AFTER=1 timeout -k 2 15 env PATH="$_path" bash "$FAKE_PROBE" --only="$_stub" --label=k9322 --report="$TMP/probe-9322.txt" 2>/dev/null)"; _rc=$?
+      _dt=$(( SECONDS - _t0 ))
+      if (( _rc == 0 && _dt < 10 )); then
+        ok "[$_kind timeout] a $_phase run that ignores SIGTERM is SIGKILLed and the probe returns (${_dt}s, cap 2s + 1s grace)"
+      else bad "[$_kind timeout] a $_phase run that ignores SIGTERM is SIGKILLed and the probe returns (cap 2s + 1s grace)" "rc=$_rc after ${_dt}s — 124/137 is the OUTER 15s cap, >=10s otherwise is an orphan holding the capture pipe"; fi
+      if grep -q "^timed-out	$_stub$" "$TMP/probe-9322.txt" 2>/dev/null && [[ "$_out" == *"1 timed-out (cap 2s)"* ]]; then
+        ok "[$_kind timeout] the SIGKILLed $_phase run is reported timed-out (137 is a kill, not a verdict)"
+      else bad "[$_kind timeout] the SIGKILLed $_phase run is reported timed-out (137 is a kill, not a verdict)" "$_out | $(cat "$TMP/probe-9322.txt" 2>&1)"; fi
+      rm -f "$TMP/probe-9322.txt"
+    done
   done
 else
   bad "probe SIGTERM-ignored arms" "NOT REACHED: could not symlink $PROBE into $FAKE — DIVE-9322 arms graded nothing"
