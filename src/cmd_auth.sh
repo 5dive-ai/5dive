@@ -2173,7 +2173,10 @@ cmd_auth_set() {
   local var="${TYPE_API_VAR[$type]:-}" fname="${TYPE_API_FILE[$type]:-}"
   case "$type" in
     claude)
-      if [[ "$api_key" =~ ^sk-ant-oat01- ]]; then
+      # Any OAuth version digit: Claude Code 2.1.332 added sk-ant-oat02- beside
+      # oat01-, and the token is minted server-side, so the new prefix reaches
+      # boxes whatever Claude Code they run (DIVE-9220).
+      if [[ "$api_key" =~ ^sk-ant-oat[0-9][0-9]- ]]; then
         var="CLAUDE_CODE_OAUTH_TOKEN"
       fi ;;
   esac
@@ -2669,7 +2672,7 @@ PY
 # DIVE-3811 — MASK THE 1-YEAR OAUTH TOKEN IN THE STREAM WE CONTROL.
 #
 # `claude setup-token` prints the long-lived credential in the clear
-# ("Your OAuth token (valid for 1 year): sk-ant-oat01-…"). Upstream's rationale
+# ("Your OAuth token (valid for 1 year): sk-ant-oat01-…", or oat02-). Upstream's rationale
 # for showing it is "you won't be able to see it again" — that rationale is not
 # ours: we capture it below and persist it to anthropic.env / the auth profile,
 # so the echo buys the operator nothing they do not already have. What it does
@@ -2690,9 +2693,19 @@ _redact_oauth_stream() {
   python3 -u -c '
 import re, sys
 
-PREFIX = b"sk-ant-oat01-"
-TOKEN  = re.compile(rb"sk-ant-oat01-[A-Za-z0-9_-]+")
-MASK   = b"sk-ant-oat01-<hidden by 5dive \xe2\x80\x94 already stored for you>"
+# The marker is sk-ant-oat + two version digits + "-": oat01- and, since Claude
+# Code 2.1.332, oat02- (DIVE-9220). MARKER is one byte-class per position, so
+# the hold-back below recognises a tail that could still grow into ANY version.
+DIGITS = frozenset(b"0123456789")
+MARKER = [frozenset([c]) for c in b"sk-ant-oat"] + [DIGITS, DIGITS, frozenset(b"-")]
+TOKEN  = re.compile(rb"(sk-ant-oat[0-9][0-9]-)[A-Za-z0-9_-]+")
+HIDDEN = b"<hidden by 5dive \xe2\x80\x94 already stored for you>"
+
+def mask(m):
+    return m.group(1) + HIDDEN
+
+def could_grow(tail):
+    return all(tail[i] in MARKER[i] for i in range(len(tail)))
 
 inp, out = sys.stdin.buffer, sys.stdout.buffer
 buf = b""
@@ -2704,12 +2717,12 @@ while True:
     # Hold back a tail that is still ambiguous: either a token match that runs
     # to the end of the buffer (more token chars may follow in the next read),
     # or a prefix of the token marker itself. The prefix loop must start at
-    # len(PREFIX), NOT len(PREFIX) - 1: a read boundary landing exactly on the
+    # len(MARKER), NOT len(MARKER) - 1: a read boundary landing exactly on the
     # complete 13-byte marker leaves no token match (the regex needs >=1 body
     # char), so a loop capped at 12 finds nothing, flushes the bare marker, and
     # then flushes the body unredacted on the next read — the whole token in the
-    # clear. Covered by the n=13 arm and the full n=1..len(token) sweep in
-    # tests/auth_token_redaction_unit.sh.
+    # clear. Covered by the n=13 arms and the full n=1..len(token) sweeps (oat01
+    # and oat02) in tests/auth_token_redaction_unit.sh.
     hold = len(buf)
     last = None
     for last in TOKEN.finditer(buf):
@@ -2717,16 +2730,16 @@ while True:
     if last is not None and last.end() == len(buf):
         hold = last.start()
     else:
-        for k in range(min(len(PREFIX), len(buf)), 0, -1):
-            if buf[len(buf) - k:] == PREFIX[:k]:
+        for k in range(min(len(MARKER), len(buf)), 0, -1):
+            if could_grow(buf[len(buf) - k:]):
                 hold = len(buf) - k
                 break
     if hold:
-        out.write(TOKEN.sub(MASK, buf[:hold]))
+        out.write(TOKEN.sub(mask, buf[:hold]))
         out.flush()
         buf = buf[hold:]
 if buf:
-    out.write(TOKEN.sub(MASK, buf))
+    out.write(TOKEN.sub(mask, buf))
 out.flush()
 ' 2>/dev/null
 }
@@ -2738,7 +2751,7 @@ extract_claude_token() {
   local log="$1"
   [[ -s "$log" ]] || return 1
   sed 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\r//g' "$log" \
-    | grep -oE 'sk-ant-oat01-[A-Za-z0-9_-]+' \
+    | grep -oE 'sk-ant-oat[0-9][0-9]-[A-Za-z0-9_-]+' \
     | tail -1 | sed 's/Store$//'
 }
 
