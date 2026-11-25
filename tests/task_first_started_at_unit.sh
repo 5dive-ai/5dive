@@ -203,6 +203,26 @@ _hb_agent_idle() { return 1; }
   && ok_t "rule (b): first_started_at PRESERVED" \
   || bad_t "rule (b): reclaim erased first_started_at" "before=[$fb_before] after=[$(fld "$idb" first_started_at)]"
 
+# --- rule (cut-off): the codex bridge says the turn was cut off (DIVE-9316) --
+# The seventh call site. It fires minutes into the claim, before (b)'s idle
+# grace, so it is graded on its own: a seat that is NOT idle and a budget that
+# cannot overrun, so neither (b) nor (c) can be what reclaimed the row.
+idk=$(addt "rule-cutoff" --assignee=dev2); age_row "$idk" 3
+fk_before=$(fld "$idk" first_started_at)
+_agent_dispatcher_cutoff() { echo "responses stream disconnected"; }
+_hb_reclaim dev2 100000 >/dev/null 2>&1
+unset -f _agent_dispatcher_cutoff
+[[ "$(status_of "$idk")" == "todo" && -e "$STATE_DIR/heartbeat-cutoff/$idk" ]] \
+  && ok_t "rule (cut-off): row reclaimed to todo 3m into the claim" \
+  || bad_t "rule (cut-off): row not reclaimed" "status=[$(status_of "$idk")]"
+[[ "$(fld "$idk" started_at)" == "NULL" ]] && ok_t "rule (cut-off): started_at cleared" \
+  || bad_t "rule (cut-off): started_at survived" "got=[$(fld "$idk" started_at)]"
+[[ "$(fld "$idk" first_started_at)" == "$fk_before" && "$fk_before" != "NULL" ]] \
+  && ok_t "rule (cut-off): first_started_at PRESERVED" \
+  || bad_t "rule (cut-off): reclaim erased first_started_at" "before=[$fk_before] after=[$(fld "$idk" first_started_at)]"
+[[ "$(evn "$idk" task.reclaimed)" == "1" ]] && ok_t "rule (cut-off): reclaim emitted a task.reclaimed ledger event" \
+  || bad_t "rule (cut-off): no task.reclaimed ledger event" "n=[$(evn "$idk" task.reclaimed)]"
+
 # --- the negative control: WITHOUT the fix this suite would still pass on the
 # started_at arms. The discriminating assertion is that a row reclaimed and then
 # RE-CLAIMED gets a fresh started_at while first_started_at does not move. That
@@ -439,18 +459,20 @@ sites=$(grep -c "_hb_reclaim_to_todo \"\$name\"" src/cmd_heartbeat.sh)
 [[ "$inline" == "0" ]] \
   && ok_t "structural: cmd_heartbeat.sh clears started_at in exactly the two graded places" \
   || bad_t "structural: an inlined started_at=NULL bypasses the shared reclaim" "extra=[$inline]"
-# The FIVE, read off the merged tree, in file order:
+# The SEVEN, read off the tree, in file order (re-read for DIVE-9316; the
+# old list had the DIVE-6040 orphaned grade last, it sits third):
 #   1. _hb_reclaim_to_verifier's keep-handoff delegate   (DIVE-4104)
 #   2. rule (a) claiming session gone
-#   3. rule (c) budget overrun, repeat-offender requeue  (DIVE-4111)
-#   4. rule (c) budget overrun, first escalation
-#   5. rule (b) idle stall
-#   6. orphaned grade, no maker on the row                (DIVE-6040)
-# The sixth is the verifier-latency skip's own exit: graded by
-# tests/heartbeat_dispatcher_claim_unit.sh [6040] and
-# tests/heartbeat_claim_outlives_verdict_unit.sh B6.
-[[ "$sites" == "6" ]] \
-  && ok_t "structural: all SIX reclaim call sites route through _hb_reclaim_to_todo" \
+#   3. orphaned grade, no maker on the row                (DIVE-6040)
+#   4. rule (c) budget overrun, repeat-offender requeue  (DIVE-4111)
+#   5. rule (c) budget overrun, first escalation
+#   6. codex turn cut off by a dropped stream, once per row (DIVE-9316)
+#   7. rule (b) idle stall
+# The orphaned grade is graded by tests/heartbeat_dispatcher_claim_unit.sh
+# [6040] and tests/heartbeat_claim_outlives_verdict_unit.sh B6; the cut-off by
+# the rule (cut-off) arm above and tests/dive7626_codex_cap_resume_unit.sh.
+[[ "$sites" == "7" ]] \
+  && ok_t "structural: all SEVEN reclaim call sites route through _hb_reclaim_to_todo" \
   || bad_t "structural: reclaim call sites changed — re-grade the per-rule arms" "sites=[$sites]"
 # The escalation pause is a real, findable site, not a number talked up in a
 # comment: if it stops erasing the clock, `inline` reads 0 here and this guard goes

@@ -1313,6 +1313,61 @@ _agent_dispatcher_turn_classify() {
   return 1
 }
 
+# DIVE-9316 — A TURN CUT OFF BY A DROPPED STREAM IS NOT WORK IN PROGRESS.
+# Box report 1450: a codex turn that ended on "stream disconnected" was final
+# and silent. The bridge (telegram-codex >= 0.5.55) now re-runs such a turn up
+# to twice and records the failure in health.json as `lastTurnError`. When it
+# gives up (`retrying: false`), the row is still in_progress and the seat sits
+# idle: before this the heartbeat read it "busy, skip" and the idle reaper took
+# the row 20+ minutes later with no cause on it.
+#
+# _agent_dispatcher_cutoff_classify <health-json> <inbox-pending> <since-epoch> [now-epoch]
+# Pure. Prints the failed turn's error (one line, bounded) and returns 0 ONLY
+# when all of these hold, else returns 1 with nothing printed:
+#   - the record is a fresh schema-1 reading that says idle (no active turn,
+#     empty queue, empty inbox) — the same verdict _agent_dispatcher_turn_classify gives;
+#   - lastTurnError is a transient drop the bridge gave up on (transient=true,
+#     retrying=false) on a teammate/heartbeat message (source=agent);
+#   - it happened at or after <since-epoch> (the row's claim), so an error
+#     from an earlier run never speaks for this one.
+# An older bridge writes no lastTurnError: no reading, and nothing changes.
+_agent_dispatcher_cutoff_classify() {
+  local raw="${1:-}" pending="${2:-0}" since="${3:-}" now="${4:-}" state="" out=""
+  [[ "$since" =~ ^[0-9]+$ ]] || return 1
+  state="$(_agent_dispatcher_turn_classify "$raw" "$pending" "$now")" || return 1
+  [[ "$state" == idle ]] || return 1
+  out="$(jq -rn --arg raw "$raw" --argjson since "$since" '
+    ($raw | try fromjson catch null) as $h |
+    ($h.lastTurnError // null) as $e |
+    if ($e | type) != "object" then empty
+    elif $e.transient != true or $e.retrying != false or $e.source != "agent" then empty
+    else
+      ((($e.at // "") | tostring | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch null)) as $at |
+      if $at == null or $at < $since then empty
+      else (($e.detail // "") | tostring | gsub("[\\r\\n\\t|]+"; " ") | .[0:200]) as $d |
+        if $d == "" then "stream error" else $d end
+      end
+    end' 2>/dev/null)" || return 1
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# _agent_dispatcher_cutoff <name> <since-epoch> — the live read for the above.
+# Same order and the same fallbacks as _agent_dispatcher_turn_state: inbox
+# first, then health. A seat that is not a dispatcher seat returns 1 at once.
+_agent_dispatcher_cutoff() {
+  local name="$1" since="$2" inbox="" listing="" pending=0 raw=""
+  inbox="$(_agent_delivery_inbox "$name")" || return 1
+  listing="$(find "$inbox" -maxdepth 1 -type f -name '*.json' 2>/dev/null)" \
+    || listing="$(sudo -n -u "agent-${name}" find "$inbox" -maxdepth 1 -type f -name '*.json' 2>/dev/null)" \
+    || return 1
+  pending="$(printf '%s\n' "$listing" | grep -c '/[^./][^/]*\.json$')" || pending=0
+  raw="$(cat "${inbox%/inbox}/health.json" 2>/dev/null)" \
+    || raw="$(sudo -n -u "agent-${name}" cat "${inbox%/inbox}/health.json" 2>/dev/null)" \
+    || return 1
+  _agent_dispatcher_cutoff_classify "$raw" "$pending" "$since"
+}
+
 # Post one message into the dispatcher inbox and CONFIRM it was drained.
 # rc 0 = the dispatcher consumed it (file unlinked). rc 1 = written but still
 # sitting there — same "maybe unsubmitted" meaning the pane path's rc 1 carries.

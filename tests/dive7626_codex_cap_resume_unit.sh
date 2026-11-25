@@ -279,6 +279,69 @@ grep -q "codexQuota.lastTurn.error" <<<"$(declare -f _hb_reclaim)" \
   && ok_t "the reclaim's one-query prefetch carries the codex last-turn error" \
   || bad_t "the prefetch does not carry the codex last-turn error" "the un-park would only ever see the 2-arg path"
 
+# ── 5. DIVE-9316: a turn cut off by a dropped stream is requeued, once ──────
+# Box report 1450: the bridge gave up on a turn ("stream disconnected"), the
+# row stayed in_progress, the seat idled, and the reaper took it 20+ minutes
+# later with no cause. Bridge 0.5.55 records `lastTurnError` in health.json.
+iso_s() { date -u -d "@$1" +%Y-%m-%dT%H:%M:%S.000Z; }
+cut_health() {  # <updatedAt> <active-json> <lastTurnError-json|null>
+  printf '{"schema":1,"bridge":"codex-dispatcher","heartbeatMs":15000,"updatedAt":"%s","queueDepth":0,"active":%s,"lastTurnError":%s}\n' \
+    "$(iso_s "$1")" "$2" "$3"
+}
+lte() {  # <at-epoch> <transient> <retrying> <source>
+  printf '{"at":"%s","detail":"stream disconnected before completion: error sending request","source":"%s","messageId":"5dive-1","transient":%s,"retrying":%s,"attempt":2}' \
+    "$(iso_s "$1")" "$4" "$2" "$3"
+}
+N5=$(date -u +%s); SINCE=$(( N5 - 180 ))
+out=$(_agent_dispatcher_cutoff_classify "$(cut_health "$N5" null "$(lte "$N5" true false agent)")" 0 "$SINCE" "$N5"); rc=$?
+[[ "$rc" == 0 && "$out" == "stream disconnected before completion: error sending request" ]] \
+  && ok_t "cut-off: idle record + a transient drop the bridge gave up on, after the claim -> CUT OFF, with the error" \
+  || bad_t "a cut-off record was not read as cut off" "rc=$rc out=$out"
+cut_neg() {  # <label> <health> [pending]
+  if _agent_dispatcher_cutoff_classify "$2" "${3:-0}" "$SINCE" "$N5" >/dev/null; then bad_t "[control] $1 read as cut off" "$2"
+  else ok_t "[control] $1 is not a cut-off"; fi
+}
+cut_neg "a drop the bridge is still retrying" "$(cut_health "$N5" null "$(lte "$N5" true true agent)")"
+cut_neg "a turn in flight" "$(cut_health "$N5" '{"turnId":"t2","source":"agent"}' "$(lte "$N5" true false agent)")"
+cut_neg "an undrained inbox message" "$(cut_health "$N5" null "$(lte "$N5" true false agent)")" 1
+cut_neg "a non-transient failure (usage limit)" "$(cut_health "$N5" null "$(lte "$N5" false false agent)")"
+cut_neg "a failed CHAT turn (the owner saw it)" "$(cut_health "$N5" null "$(lte "$N5" true false telegram)")"
+cut_neg "an error from before this claim" "$(cut_health "$N5" null "$(lte $(( SINCE - 60 )) true false agent)")"
+cut_neg "an older bridge with no lastTurnError" "$(cut_health "$N5" null null)"
+cut_neg "a STALE record" "$(cut_health $(( N5 - 3600 )) null "$(lte "$N5" true false agent)")"
+
+_agent_delivery_inbox() { printf '%s\n' "$DISP/inbox"; }
+rm -f "$DISP"/inbox/*.json
+reset_all; spies_reset; rm -rf "$STATE_DIR/heartbeat-cutoff"
+T=$(held_row 3)
+cut_health "$(date -u +%s)" null "$(lte "$(date -u +%s)" true false agent)" >"$DISP/health.json"
+_hb_reclaim leo 30 >/dev/null 2>&1
+[[ "$(row "$T")" == todo && -e "$STATE_DIR/heartbeat-cutoff/$T" ]] \
+  && ok_t "cut-off: the row is requeued 3m into the claim, not after the 20m idle grace" \
+  || bad_t "a cut-off row was not requeued" "row=$(row "$T")"
+_hb_claim_task leo "$T" >/dev/null 2>&1
+db "UPDATE tasks SET started_at=datetime('now','-2 minutes') WHERE id=${T};"
+cut_health "$(date -u +%s)" null "$(lte "$(date -u +%s)" true false agent)" >"$DISP/health.json"
+_hb_reclaim leo 30 >/dev/null 2>&1
+[[ "$(row "$T")" == in_progress ]] \
+  && ok_t "cut-off: ONCE per row — a second cut-off is left to the ordinary rules" \
+  || bad_t "a second cut-off requeued the row again" "row=$(row "$T")"
+reset_all; rm -rf "$STATE_DIR/heartbeat-cutoff"
+T=$(held_row 3)
+cut_health "$(date -u +%s)" null null >"$DISP/health.json"
+_hb_reclaim leo 30 >/dev/null 2>&1
+[[ "$(row "$T")" == in_progress ]] \
+  && ok_t "[control] an idle seat with no recorded cut-off keeps its claim inside the grace" \
+  || bad_t "a claim with no cut-off was requeued" "row=$(row "$T")"
+_agent_delivery_inbox() { return 1; }
+
+# The stall grace is the env value again: a hard-coded 20 below the env line overrode it.
+v=$(export HEARTBEAT_STALL_MIN_MINUTES=45; source "$SRC/cmd_heartbeat.sh" >/dev/null 2>&1; printf '%s' "$_HB_STALL_MIN_MINUTES")
+d=$(unset HEARTBEAT_STALL_MIN_MINUTES; source "$SRC/cmd_heartbeat.sh" >/dev/null 2>&1; printf '%s' "$_HB_STALL_MIN_MINUTES")
+[[ "$v" == 45 && "$d" == 20 ]] \
+  && ok_t "HEARTBEAT_STALL_MIN_MINUTES is honoured (45 -> 45; unset -> the 20 the reaper always used)" \
+  || bad_t "the stall grace ignores its env value" "env=45 -> '$v', unset -> '$d'"
+
 echo
 echo "$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

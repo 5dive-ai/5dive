@@ -181,8 +181,11 @@ _HB_OVERLAP_BOUND_DEFAULT="${TASKS_OVERLAP_BOUND_DEFAULT:-3}"
 # must not fire a day of beats on boot.
 _HB_MZ_CATCHUP_MIN="${HEARTBEAT_MATERIALIZER_CATCHUP_MIN:-15}"
 [[ "$_HB_MZ_CATCHUP_MIN" =~ ^[0-9]+$ ]] || _HB_MZ_CATCHUP_MIN=15
-_HB_STALL_MIN_MINUTES="${HEARTBEAT_STALL_MIN_MINUTES:-30}"
-[[ "$_HB_STALL_MIN_MINUTES" =~ ^[0-9]+$ ]] || _HB_STALL_MIN_MINUTES=30
+# DIVE-9316: the default is the 20 the reaper has always used. A hard
+# `_HB_STALL_MIN_MINUTES=20` further down used to override this line, so
+# HEARTBEAT_STALL_MIN_MINUTES was dead; the env value now holds.
+_HB_STALL_MIN_MINUTES="${HEARTBEAT_STALL_MIN_MINUTES:-20}"
+[[ "$_HB_STALL_MIN_MINUTES" =~ ^[0-9]+$ ]] || _HB_STALL_MIN_MINUTES=20
 # Orphan reclaim. An in_progress task whose claiming claude session is GONE — the
 # agent's claude process started AFTER the task did (rotation, service restart,
 # crash, a context reset that exited the process) — is reclaimed to 'todo'
@@ -193,8 +196,7 @@ _HB_PROC_SKEW_SEC=20
 # Backstop for the same-process abandon case (agent claimed a task, then went
 # idle without closing it — its claiming process is unchanged, so the restart
 # rule above can't see it). Reclaim to 'todo' once the task has sat in_progress
-# past this grace AND the agent is idle right now.
-_HB_STALL_MIN_MINUTES=20
+# past this grace (_HB_STALL_MIN_MINUTES, set above) AND the agent is idle right now.
 # DIVE-6040: a verifier-held delivery with NO verdict is exempt from (b) and (c)
 # (DIVE-2560, verifier think-time). Past this many minutes with the seat at rest
 # that think-time is over: the grading session ended without a verdict, and the
@@ -5249,6 +5251,28 @@ ${_q_sql}" 2>/dev/null || true)
       fi
       _hb_reclaim_to_todo "$name" "$id" "overran ${budget}m budget (reap #${reap_n}) — requeued from a clean slate, NOT cancelled"
       reclaimed=$((reclaimed + 1)); continue
+    fi
+    # DIVE-9316 — THE BRIDGE SAYS THIS SEAT'S WORK WAS CUT OFF. A codex
+    # dispatcher seat whose turn on this claim ended on a dropped stream, after
+    # the bridge's own re-runs, is idle with nothing queued: no one is working
+    # the row. Requeue it NOW with that cause, so the picker re-dispatches it,
+    # instead of waiting out the idle grace below and reclaiming it with none
+    # (box report 1450: "reclaimed while the agent had related activity").
+    # ONCE per row: a second cut-off falls through to the ordinary rules, so a
+    # lasting outage cannot spin a wake every tick. Not for a live delivery:
+    # that row's next move is the verifier's.
+    local _cut=""
+    if (( ! delivered_live )) && [[ "$started_epoch" =~ ^[0-9]+$ ]] \
+       && declare -F _agent_dispatcher_cutoff >/dev/null 2>&1 \
+       && _cut=$(_agent_dispatcher_cutoff "$name" "$started_epoch" 2>/dev/null); then
+      local _cutmark="${STATE_DIR:-/var/lib/5dive}/heartbeat-cutoff/${id}"
+      if [[ ! -e "$_cutmark" ]]; then
+        mkdir -p "${_cutmark%/*}" 2>/dev/null || true
+        date -u +%Y-%m-%dT%H:%M:%SZ >"$_cutmark" 2>/dev/null || true
+        _hb_reclaim_to_todo "$name" "$id" "the agent's turn was cut off (${_cut:0:160}) and its bridge gave up after retrying — requeued ${age_min}m into the claim instead of after ${_HB_STALL_MIN_MINUTES}m idle (DIVE-9316)"
+        reclaimed=$((reclaimed + 1)); continue
+      fi
+      _hb_log "[$name] $(_hb_ident "$id") turn cut off again (${_cut:0:160}) — already requeued once for a cut-off, the ordinary rules take it (DIVE-9316)"
     fi
     # (b) idle stall — only if past grace AND a confident idle reading (rc 0).
     if (( age_min >= _HB_STALL_MIN_MINUTES )) && _hb_agent_idle "$name"; then
