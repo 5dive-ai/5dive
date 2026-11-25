@@ -32,13 +32,18 @@ TMP="$(mktemp -d /tmp/hb-wakesleep-unit.XXXXXX)"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/registry.sh cmd_heartbeat.sh; do
+         lib/registry.sh lib/verify_policy.sh cmd_heartbeat.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
 
 JSON_MODE=0
 REGISTRY="$TMP/registry.json"
+# DIVE-9315: who is never slept is the box's `wake-protected` setting, empty by
+# default. Read it from a throwaway box.json, never the live box or plugin.
+export BOX_CONFIG="$TMP/box.json"; echo '{}' > "$BOX_CONFIG"
+unset HEARTBEAT_WAKE_PROTECTED; _DEVTEAM_DIR=""
+protect() { printf '{"wake_protected":"%s"}\n' "$1" > "$BOX_CONFIG"; _HB_WAKE_PROTECTED_READ=0; }
 set +e   # header.sh enabled `set -e`; asserts below deliberately probe states
 
 NOW=1000000                       # fixed "now" epoch — passed into the sweep
@@ -122,10 +127,19 @@ _hb_autosleep_sweep "$NOW" >/dev/null 2>&1
   && ok_t "always_on agent untouched" || bad_t "always_on" "stopped=[$STOPPED] idleSince=$(r_idlesince warm)"
 
 # 8) protected agent flagged cold + idle + past threshold => NEVER slept (condition 3)
+protect main
 sweep_reset; seed "$(cold main ",\"idleSince\":$((NOW-1200))")"; RUNNING[main]=1; IDLE_RC[main]=0; HASWORK[main]=0
 _hb_autosleep_sweep "$NOW" >/dev/null 2>&1
 { ! stopped_has main && (( _HB_SLEPT == 0 )); } \
   && ok_t "protected(main) never slept even if cold-flagged" || bad_t "protected" "stopped=[$STOPPED] slept=$_HB_SLEPT"
+
+# 8b) wake-protected empty (the default; no box value, no plugin) => nobody is
+#     protected, so the same cold idle main IS slept
+protect ""
+sweep_reset; seed "$(cold main ",\"idleSince\":$((NOW-1200))")"; RUNNING[main]=1; IDLE_RC[main]=0; HASWORK[main]=0
+_hb_autosleep_sweep "$NOW" >/dev/null 2>&1
+{ stopped_has main && (( _HB_SLEPT == 1 )); } \
+  && ok_t "empty wake-protected (default) protects nobody: cold idle main is slept" || bad_t "empty protected" "stopped=[$STOPPED] slept=$_HB_SLEPT"
 
 # 9) per-agent sleepAfterMin=5 override => sleeps at now-6m (default 15 would hold)
 sweep_reset; seed "$(cold bot ",\"sleepAfterMin\":5,\"idleSince\":$((NOW-360))")"; RUNNING[bot]=1; IDLE_RC[bot]=0; HASWORK[bot]=0

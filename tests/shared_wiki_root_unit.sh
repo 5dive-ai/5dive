@@ -3,7 +3,7 @@
 #
 # Grades the four arms the row names, all of them PURE (no root, no network):
 #   1. resolver precedence: $FIVEDIVE_WIKI_ROOT > /var/lib/5dive/wiki >
-#      the two fleet community/wiki paths, and "" when none exist.
+#      <projects-root>/community/wiki (DIVE-9315), and "" when none exist.
 #   2. NEGATIVE ARM: with no root at all, `memory add --store=wiki` refuses with
 #      an error that NAMES THE FIX, and `_seed_wiki_memory` reports 0 LOUDLY
 #      (a line on stderr saying why) instead of the silent 0 that let a whole
@@ -24,7 +24,7 @@ TMP="$(mktemp -d /tmp/shared-wiki-unit.XXXXXX)"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/state.sh lib/audit.sh lib/registry.sh; do
+         lib/state.sh lib/audit.sh lib/registry.sh lib/verify_policy.sh; do
   source "$SRC/$f"
 done
 source "$SRC/cmd_pack.sh"
@@ -43,6 +43,9 @@ has() { case "$2" in *"$3"*) ok_t "$1" ;; *) bad_t "$1" "[$2] lacks [$3]" ;; esa
 # same resolver with HOME repointed, and the rung is asserted by ORDER against
 # the override, which is the property that actually matters.
 export HOME="$TMP/home"; mkdir -p "$HOME"
+# DIVE-9315: the projects-root rung is $FIVE_PROJECTS_ROOT, else the box's
+# `projects-root` setting; the harness names it so no box value leaks in.
+export FIVE_PROJECTS_ROOT="$HOME/projects/5dive"
 
 # ── 1. precedence ──────────────────────────────────────────────────────────
 mkdir -p "$TMP/override" "$HOME/projects/5dive/community/wiki"
@@ -52,17 +55,16 @@ mkdir -p "$TMP/override" "$HOME/projects/5dive/community/wiki"
 export FIVEDIVE_WIKI_ROOT="$TMP/override"
 eq "override wins over the fleet path" "$(_memory_wiki_root)" "$TMP/override"
 unset FIVEDIVE_WIKI_ROOT
-eq "fleet community/wiki still resolves when no override is set" \
+eq "the projects root's community/wiki still resolves when no override is set" \
   "$(_memory_wiki_root)" "$HOME/projects/5dive/community/wiki"
 export FIVEDIVE_WIKI_ROOT="$TMP/does-not-exist"
 eq "an override naming a MISSING dir is not reported as a root" \
   "$(_memory_wiki_root)" "$HOME/projects/5dive/community/wiki"
 unset FIVEDIVE_WIKI_ROOT
 rm -rf "$HOME/projects"
-# /home/claude/projects/5dive/community/wiki is a real path on fleet boxes and
-# absent on customer boxes; only assert the empty case when it is truly absent,
-# so this harness grades the same on both.
-if [ ! -d /home/claude/projects/5dive/community/wiki ] && [ ! -d /var/lib/5dive/wiki ]; then
+# /var/lib/5dive/wiki is a real path on some boxes; only assert the empty case
+# when it is truly absent, so this harness grades the same everywhere.
+if [ ! -d /var/lib/5dive/wiki ]; then
   eq "no root anywhere -> empty" "$(_memory_wiki_root)" ""
 else
   ok_t "SKIP empty-case (this box has a real wiki root; precedence graded above)"

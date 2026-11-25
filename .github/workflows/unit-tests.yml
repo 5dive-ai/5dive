@@ -59,7 +59,7 @@ env:
   # (devteam 0.4.5: the heartbeat sweeps moved out of this tree). DIVE-9307: the
   # plugins commit that also carries core/lib/mod_seat.sh and its harness, which
   # left this tree (dive-9307-mod-seat-pii-out, #377 merged in).
-  DEVTEAM_PLUGINS_REF: 4b18786e88c28d1159ee43e896d297e5e79fda2b
+  DEVTEAM_PLUGINS_REF: cd659acef8f361b358f5e05460c30f43798436db
 
 jobs:
   # DIVE-3315: INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s

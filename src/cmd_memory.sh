@@ -337,7 +337,7 @@ _memory_own_roots() {
 _memory_wiki_root() {
   local d
   for d in "${FIVEDIVE_WIKI_ROOT:-}" /var/lib/5dive/wiki \
-           "$HOME"/projects/5dive/community/wiki /home/claude/projects/5dive/community/wiki; do
+           "$(box_projects_root)/community/wiki"; do
     [ -n "$d" ] || continue
     [ -d "$d" ] && { echo "$d"; return 0; }
   done
@@ -573,7 +573,7 @@ function describe(file) {
   return "";
 }
 function slugOf(d) { return (d.m && d.m.name) || path.basename(d.file).replace(/\.md$/, ""); }
-const rel = (f) => f.replace(`${home}/.claude/projects/`, "").replace(/^-home[^/]*\/memory\//, "memory/").replace(`${home}/projects/5dive/`, "").replace("/home/claude/projects/5dive/", "");
+const rel = (f) => f.replace(`${home}/.claude/projects/`, "").replace(/^-home[^/]*\/memory\//, "memory/").replace(`${home}/projects/5dive/`, "").replace(`${process.env.FIVE_PROJECTS_ROOT || "/nonexistent"}/`, "");
 let used = 0, shown = 0;
 if (INDEX) {
   // Stage 1: one row per FILE (best-scoring chunk wins), no bodies. Ranking is
@@ -622,7 +622,7 @@ console.log(`— shown ${shown}/${scored.length} hits, ~${used} tokens —`);
 MEMJS
   local truth=0; _memory_truth_on && truth=1
   local rc=0
-  node "$js" "$query" --limit="$limit" --max-tokens="$maxtok" --roots="$roots" --index="$index" --truth="$truth" || rc=$?
+  FIVE_PROJECTS_ROOT="$(box_projects_root)" node "$js" "$query" --limit="$limit" --max-tokens="$maxtok" --roots="$roots" --index="$index" --truth="$truth" || rc=$?
   # DIVE-8108: exit 3 = the query has no searchable words. Said through fail
   # so the CLI names it, never as a silent empty result.
   [ "$rc" -eq 3 ] && fail "$E_USAGE" "memory search: no searchable words in the query \"$query\" (only punctuation, symbols or very common words) — search with a word the fact itself would use"
@@ -1470,11 +1470,9 @@ _memory_doctor() {
     else roots="${own}${wiki}"; fi
   fi
   [ -n "$roots" ] || fail "$E_NOT_FOUND" "no memory stores found for this user (looked in ~/.claude/projects/*/memory); name whose store to read with --agent=<agent>, or point at one with --roots=<dir>"
-  # Default code-root for stale-ref checks: the 5dive monorepo if it's here.
+  # Default code-root for stale-ref checks: the box's projects root (DIVE-9315).
   if [ -z "$code_root" ]; then
-    for d in /home/claude/projects/5dive "$HOME/projects/5dive"; do
-      [ -d "$d" ] && { code_root="$d"; break; }
-    done
+    d=$(box_projects_root); [ -d "$d" ] && code_root="$d"
   fi
 
   local dirs=() IFS=,
@@ -2274,7 +2272,7 @@ for (const w of wanted) {
   let body = ""; try { body = fs.readFileSync(f, "utf-8"); } catch { missing.push(w); continue; }
   const od = TRUTH ? outdated(body) : "";   // before any truncation can cut the frontmatter
   const home = process.env.HOME || "";
-  const rel = f.replace(`${home}/.claude/projects/`, "").replace(`${home}/projects/5dive/`, "").replace("/home/claude/projects/5dive/", "");
+  const rel = f.replace(`${home}/.claude/projects/`, "").replace(`${home}/projects/5dive/`, "").replace(`${process.env.FIVE_PROJECTS_ROOT || "/nonexistent"}/`, "");
   let cost = estTokens(body);
   let note = "";
   if (used + cost > MAX_TOKENS) {
@@ -2307,7 +2305,7 @@ console.log(`\n— fetched ${found}/${wanted.length} slug(s), ~${used} tokens �
 process.exit(found === 0 ? 4 : 0);
 MEMGETJS
   local truth=0; _memory_truth_on && truth=1
-  node "$js" "${slugs[@]}" --max-tokens="$maxtok" --roots="$roots" --truth="$truth"
+  FIVE_PROJECTS_ROOT="$(box_projects_root)" node "$js" "${slugs[@]}" --max-tokens="$maxtok" --roots="$roots" --truth="$truth"
 }
 
 # memory router — DIVE-3821: rebuild an always-loaded MEMORY.md as a ROUTER.
