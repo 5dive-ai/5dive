@@ -166,6 +166,7 @@ sudo -u agent-cmo 5dive browser auth github.com  # 你亲手登录一次
 | 插件 | 功能 |
 |---|---|
 | [Browser](https://github.com/5dive-ai/5dive-browser) | 真实浏览器，可复用已登录的会话 |
+| [Phone](https://github.com/5dive-ai/5dive-phone) | 使用一部闲置 Android 手机上的应用：WhatsApp、Instagram 等只有手机才有的应用 |
 | [Voice](https://github.com/5dive-ai/5dive-voice) | 语音消息和语音回复 |
 | [Backup](https://github.com/5dive-ai/5dive-backup) | 每晚把智能体加密备份到你自己的存储；只有你持有密钥 |
 | [Council](https://github.com/5dive-ai/5dive-council) | 多智能体投票和可审计的决策 |
