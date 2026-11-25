@@ -643,6 +643,67 @@ else
   bad "probe mutant-kill arms" "NOT REACHED: could not symlink $PROBE into $FAKE — arms 27-30 graded nothing"
 fi
 
+# ------------- DIVE-9322: a harness that IGNORES SIGTERM cannot hold the probe hostage
+# Arms 23-30 grade what the probe SAYS about a kill. This grades that the kill
+# HAPPENS. `timeout` without -k sends TERM and then waits on its child forever, so a
+# harness whose process ignores TERM held a full-sweep shard to the job's 60-minute
+# cap — `cancelled`, main red, the cut refused — twice (DIVE-8634, DIVE-9321). The
+# probe now escalates to SIGKILL on the process group after PROBE_KILL_AFTER.
+#
+# One stub per call site, because they are two `timeout` lines and either can lose
+# its -k alone: TERMCLEAN ignores TERM on its CLEAN run (probe line ~171), TERMMUT
+# only once MUTATED (~245). Both sleep a duration written here, never one measured
+# off a real harness (wiki a-timeout-kill-is-not-a-verdict §4), and only 30s, so the
+# orphans a PRE-fix run leaves behind reap themselves.
+#
+# THE OUTER CAP is what turns the pre-fix hang into a red instead of a hung file:
+# 2s cap + 1s grace returns in ~3s; 15s means TERM was not escalated. Measured on the
+# pre-fix tree: both arms red at the outer cap (rc 124). Cost: two kills, ~6s.
+if (( SEAM )); then
+  TERMCLEAN=ignores_term_clean.sh
+  cat > "$FAKE/tests/$TERMCLEAN" <<'STUBEOF'
+#!/usr/bin/env bash
+# Stub corpus for DIVE-9322: ignores SIGTERM (and so does its sleep, which inherits
+# the ignored disposition) and hangs before its verdict, on the CLEAN run.
+fail=0
+if [[ "${STUB_HANG:-30}" != 0 ]]; then trap '' TERM; sleep "${STUB_HANG:-30}"; fi
+(( fail == 0 ))
+STUBEOF
+  TERMMUT=ignores_term_mutant.sh
+  cat > "$FAKE/tests/$TERMMUT" <<'STUBEOF'
+#!/usr/bin/env bash
+# Stub corpus for DIVE-9322: green and instant clean; once the probe's
+# `fail=$((fail+1))` lands before the verdict, it ignores SIGTERM and hangs.
+fail=0
+(( fail == 0 ))
+rc=$?
+if (( fail != 0 )) && [[ "${STUB_HANG:-30}" != 0 ]]; then trap '' TERM; sleep "${STUB_HANG:-30}"; fi
+exit "$rc"
+STUBEOF
+  # CONTROL: both stubs are probeable and earn `wired` when nothing hangs, so a
+  # `timed-out` below is the clock and the kill, not a stub the probe cannot read.
+  TCOUT="$(STUB_HANG=0 PROBE_TIMEOUT=20 bash "$FAKE_PROBE" --only="$TERMCLEAN,$TERMMUT" --label=ctl9322 --report="$TMP/probe-ctl9322.txt" 2>/dev/null)"; TCRC=$?
+  if (( TCRC == 0 )) && grep -q "^wired	$TERMCLEAN$" "$TMP/probe-ctl9322.txt" && grep -q "^wired	$TERMMUT$" "$TMP/probe-ctl9322.txt"; then
+    ok "control: both TERM-ignoring stubs earn 'wired' when nothing hangs"
+  else bad "control: both TERM-ignoring stubs earn 'wired' when nothing hangs" "rc=$TCRC $(cat "$TMP/probe-ctl9322.txt" 2>&1)"; fi
+
+  for _stub in "$TERMCLEAN" "$TERMMUT"; do
+    _phase=clean; [[ "$_stub" == "$TERMMUT" ]] && _phase=mutant
+    _t0=$SECONDS
+    _out="$(PROBE_TIMEOUT=2 PROBE_KILL_AFTER=1 timeout -k 2 15 bash "$FAKE_PROBE" --only="$_stub" --label=k9322 --report="$TMP/probe-9322.txt" 2>/dev/null)"; _rc=$?
+    _dt=$(( SECONDS - _t0 ))
+    if (( _rc == 0 && _dt < 10 )); then
+      ok "a $_phase run that ignores SIGTERM is SIGKILLed and the probe returns (${_dt}s, cap 2s + 1s grace)"
+    else bad "a $_phase run that ignores SIGTERM is SIGKILLed and the probe returns (cap 2s + 1s grace)" "rc=$_rc after ${_dt}s — 124/137 is the OUTER 15s cap: timeout waited on a child that ignores TERM"; fi
+    if grep -q "^timed-out	$_stub$" "$TMP/probe-9322.txt" 2>/dev/null && [[ "$_out" == *"1 timed-out (cap 2s)"* ]]; then
+      ok "the SIGKILLed $_phase run is reported timed-out (137 is a kill, not a verdict)"
+    else bad "the SIGKILLed $_phase run is reported timed-out (137 is a kill, not a verdict)" "$_out | $(cat "$TMP/probe-9322.txt" 2>&1)"; fi
+    rm -f "$TMP/probe-9322.txt"
+  done
+else
+  bad "probe SIGTERM-ignored arms" "NOT REACHED: could not symlink $PROBE into $FAKE — DIVE-9322 arms graded nothing"
+fi
+
 # ------------------------------------- 31-41 DIVE-2592: A BUDGET RED CONFIRMS ITSELF
 # The measurement that forced this: PR #395 red at 356s and green at 289s on the SAME
 # commit, no rebase — a 67s swing, all of it inside one network-priced harness. A cap

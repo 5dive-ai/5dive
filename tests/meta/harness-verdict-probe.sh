@@ -27,6 +27,17 @@
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.." || exit 2
 ASSUME_CLEAN=0; ONLY=""; REPORT=""; LABEL=""; SHARD=""; TIMEOUT=${PROBE_TIMEOUT:-180}
+# DIVE-9322: SIGTERM IS A REQUEST, NOT A KILL. `timeout` without -k sends TERM and
+# then waits on its child FOREVER, so a harness that ignores TERM (a `trap '' TERM`,
+# a child that inherits it ignored, a process stuck in a wait that TERM cannot end)
+# held a full-sweep shard to the job's 60-minute cap and ended it `cancelled`: main
+# red, the release cut refused. Twice (DIVE-8634, DIVE-9321), both times after the
+# probe had already printed the harness's name and nothing more. -k escalates to
+# SIGKILL on the whole process group KILL_AFTER seconds later; the 124/137 test
+# below already classifies either code as a kill, so no verdict logic moves.
+# PROBE_KILL_AFTER exists for the arm that grades this (corpus_tier_budget_unit.sh),
+# which pays for the grace period in seconds of the tier it enforces.
+KILL_AFTER=${PROBE_KILL_AFTER:-10}
 for a in "$@"; do case "$a" in
   --assume-clean) ASSUME_CLEAN=1 ;;
   --only=*) ONLY="${a#--only=}" ;;      # one basename, or a comma-separated list
@@ -168,7 +179,7 @@ for t in "${SELECTED[@]:-}"; do
   PROBED_N=$(( PROBED_N + 1 ))
   printf '  probing %d/%d %s\n' "$PROBED_N" "$CORPUS_N" "$b" >&2
   if (( ! ASSUME_CLEAN )); then
-    timeout "$TIMEOUT" bash "$t" >/dev/null 2>&1; rc=$?
+    timeout -k "$KILL_AFTER" "$TIMEOUT" bash "$t" >/dev/null 2>&1; rc=$?
     # DIVE-2555: A KILL IS NOT A FAILURE. `timeout` exits 124 when it has to signal
     # the child (137 when the child needed SIGKILL), and folding either into
     # already-red publishes "failed its own clean run" — a statement about the
@@ -242,7 +253,7 @@ if [[ " $ALLOW_UNPROBEABLE " == *" $b "* ]]; then ALLOWED+=("$b"); else UNPROBEA
   # The stderr capture is unchanged and still discards the mutant's stdout: it keeps
   # the mutant's noise off the probe's own progress stream. It is now the SECOND
   # canary channel rather than the only one.
-  out=$(timeout "$TIMEOUT" bash "$mutant" 2>&1 >/dev/null); rc=$?
+  out=$(timeout -k "$KILL_AFTER" "$TIMEOUT" bash "$mutant" 2>&1 >/dev/null); rc=$?
   rm -f "$mutant"
   # DIVE-2555: THE KILL MUST BE CLASSIFIED BEFORE THE VERDICT IS READ, because a
   # killed mutant produces BOTH of this loop's outcomes for reasons that have
