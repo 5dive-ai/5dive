@@ -2907,8 +2907,12 @@ _sup_agent_record() {
   # seat whose composer is holding an undelivered payload is named UNHEALTHY here
   # within one tick. rc 1 (not wedged) leaves the variable empty, so the branch
   # below is disarmed by absence and no new false red is possible.
-  local _sup_wedged=""
-  _sup_wedged=$(_wedge_read "$name" 2>/dev/null) || _sup_wedged=""
+  # DIVE-9304: only a mark written since the unit last came up counts; uptime is
+  # 0 when the unit is down or its start time is unreadable, which disarms the
+  # filter rather than inventing a start.
+  local _sup_wedged="" _sup_up_since=0
+  (( uptime > 0 )) && _sup_up_since=$(( now - uptime ))
+  _sup_wedged=$(_wedge_read "$name" "$_sup_up_since" 2>/dev/null) || _sup_wedged=""
   crow=$(_sup_classify "$desired" "$svc_running" "$active" "$sess" "$tmux_state" "$poller" \
                         "$loop_stuck" "$has_work" "$act_age" "$_SUP_CLI_STALE" "$goal_drift_task" \
                         "$verify_excerpt" "$stranded" \

@@ -49,19 +49,14 @@ root="$stage/root"
 bundle="$root/usr/share/5dive/bundle"
 install -d "$bundle" "$root/DEBIAN" "$root/usr/sbin" "$root/usr/share/doc/5dive"
 
-# The bundle: every path install.sh fetches as $REPO/<path>. Dockerfile's COPY
-# list plus the pii-guard files it leaves to install.sh's fail-soft branch.
+# The bundle: every path install.sh fetches as $REPO/<path> (Dockerfile's COPY
+# list).
 # tests/apt_package_unit.sh checks this list against install.sh's own fetches.
 cp -a "$tree/5dive" "$tree/install.sh" "$bundle/"
 [[ -f "$tree/5dive.sha256" ]] && cp -a "$tree/5dive.sha256" "$bundle/"
 for d in bin prompts hooks systemd; do
   cp -a "$tree/$d" "$bundle/$d"
 done
-install -d "$bundle/scripts/git-hooks-portable" "$bundle/.github"
-cp -a "$tree/scripts/install-pii-push-guard.sh" "$tree/scripts/pii-scan.sh" "$bundle/scripts/"
-cp -a "$tree/scripts/git-hooks-portable/pre-push" "$tree/scripts/git-hooks-portable/prepare-commit-msg" \
-  "$bundle/scripts/git-hooks-portable/"
-cp -a "$tree/.github/pii-denylist.txt" "$bundle/.github/"
 # install.sh fetches the unit as 5dive-agent%40.service; curl's file:// decodes
 # %40 to @, so a symlink makes both names resolve (same as docker/Dockerfile).
 ln -sf 5dive-agent@.service "$bundle/systemd/5dive-agent%40.service"

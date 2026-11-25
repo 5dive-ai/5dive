@@ -4587,7 +4587,9 @@ cmd_create() {
   fi
 
   # DIVE-4936: on a box that turned it on (`5dive config mod-seat=on` — OUR box;
-  # off everywhere else by default), a new claude seat gets the mod and its
+  # off everywhere else by default; the code is the devteam plugin's since
+  # DIVE-9307, so a box without it has no mod_seat_enabled), a new claude seat
+  # gets the mod and its
   # function-hooks flag BEFORE the unit starts below, so the first session loads
   # the tool-call guard. Switch off: nothing here runs. Best-effort: a failed
   # seating leaves the seat exactly as it would have been, and

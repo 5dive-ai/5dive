@@ -479,7 +479,6 @@ tests/memory_two_stage_recall_unit.sh	2115	2423
 tests/merge_queue_triggers_unit.sh	1270	1276
 tests/mirror_chunk_label_unit.sh	283	280
 tests/mirror_mac_app_unit.sh	534	533
-tests/mod_seat_unit.sh	782	782
 tests/model_alias_mapping_account_unit.sh	3265	3293
 tests/model_aliases_unit.sh	510	586
 tests/model_float_unit.sh	891	851
@@ -548,7 +547,6 @@ tests/pi_auth_provider_unit.sh	155	147
 tests/pi_channel_wiring_unit.sh	54	54
 tests/pi_install_node24_unit.sh	29	29
 tests/pi_signin_badge_unit.sh	144	175
-tests/pii_guard_fleet_unit.sh	1423	1348
 tests/pii_scan_range_unit.sh	832	985
 tests/plugin_bare_add_repo_unit.sh	589	571
 tests/plugin_bundled_install_unit.sh	1144	1162

@@ -37,7 +37,7 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/dive7573.XXXXXX")"
 trap 'rc=$?; chmod -R u+w "$T" 2>/dev/null; rm -rf "$T"; echo "HARNESS-RC=$rc"' EXIT
 export FIVE_LOCAL_ONLY_FILE="$T/local-only"
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/models.sh lib/local_only.sh \
-         lib/agent_setup.sh lib/plugin_seats.sh lib/mod_seat.sh cmd_agent_create.sh cmd_local_only.sh; do
+         lib/agent_setup.sh lib/plugin_seats.sh cmd_agent_create.sh cmd_local_only.sh; do
   # shellcheck source=/dev/null
   source "src/$f"
 done
@@ -135,13 +135,15 @@ jq -e --arg m "$M" '.extraKnownMarketplaces == {"5dive-plugins": {source: {sourc
   && ok_ 'G3 the checkout origin names the current org (5dive-ai), not 5dive-com' \
   || bad_ 'G3 origin' "$(git -C "$M" remote get-url origin 2>&1)"
 
-# Q2/Q3: the other two ways 5dive runs Claude Code as a seat.
+# Q2/Q3: the other way 5dive runs Claude Code as a seat (the mod probe, the
+# third, moved to the devteam plugin with lib/mod_seat.sh in DIVE-9307 and is
+# graded there by tests/devteam/mod_seat_unit.sh).
 sudo() { printf 'SUDO %s\n' "$*" >>"$LOG"; cat >/dev/null; return 0; }
-on;  : >"$LOG"; plugin_seat_run_as agent-x PLUGIN=p </dev/null; mod_seat_probe_run x "$T/dbg"
+on;  : >"$LOG"; plugin_seat_run_as agent-x PLUGIN=p </dev/null
 n=$(grep -c 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1' "$LOG")
-[[ $n == 2 ]] && ok_ 'Q2 plugin registration and the mod probe pass the quiet env as the seat' \
-  || bad_ 'Q2 seat runs' "matched $n of 2: $(cat "$LOG")"
-off; : >"$LOG"; plugin_seat_run_as agent-x PLUGIN=p </dev/null; mod_seat_probe_run x "$T/dbg"
+[[ $n == 1 ]] && ok_ 'Q2 plugin registration passes the quiet env as the seat' \
+  || bad_ 'Q2 seat runs' "matched $n of 1: $(cat "$LOG")"
+off; : >"$LOG"; plugin_seat_run_as agent-x PLUGIN=p </dev/null
 ! grep -q 'DISABLE_' "$LOG" && grep -q 'SUDO -u agent-x -H env PLUGIN=p bash -s' "$LOG" \
   && ok_ 'Q3 control: switch off adds nothing (online behaviour byte for byte)' \
   || bad_ 'Q3 off' "$(cat "$LOG")"

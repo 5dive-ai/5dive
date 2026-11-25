@@ -245,6 +245,17 @@ tc "B14e without it the box default is off again" "agent-task-cap = off (default
 dv proof x
 t  "B14f and the plugin still loads without it" "$LOADED" "$OUT"
 
+# DIVE-9307: lib/mod_seat.sh is OPTIONAL the same way. The core's four callers
+# (create, switch, config, doctor) ask `declare -F` first, so the plugin's copy
+# is what turns mod seating on, and a box without it reads off. (doctor needs
+# root, so its no-plugin line is not driven here.)
+fx lib/mod_seat.sh 'mod_seat_enabled() { return 0; }'
+dv config
+tc "B15 the plugin's mod_seat.sh is read: config reports mod-seat on" "mod-seat = on" "$OUT"
+rm -f "$VDIR/core/lib/mod_seat.sh"
+dv config
+tc "B15b without it mod-seat reads off" "mod-seat = off" "$OUT"
+
 # A community plugin that claims `push`, with a real bin/push. It must never run:
 # not without devteam (the line), and not instead of devteam.
 CVD="$PL/cache/someone/pusher/0.1.0"

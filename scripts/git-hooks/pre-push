@@ -75,7 +75,7 @@
 #     and tests/actionlint_scan_unit.sh grades the script both call.
 #   - Installed fleet-wide via core.hooksPath=scripts/git-hooks, set once on the
 #     shared clone config so every linked worktree (and every future one)
-#     inherits it. See scripts/install-pii-push-guard.sh.
+#     inherits it. Our own boxes set it from the private ops repo.
 #   - Threat model for PII is ACCIDENTAL fixture/log PII, not a malicious actor.
 #     Every guard here fails OPEN with a warning if its script is missing (e.g. a
 #     stale branch predating the guard) rather than blocking legitimate work;
