@@ -91,7 +91,7 @@ Agents:
                             # delegated-push capability: a scoped NOPASSWD sudoers
                             # grant for '5dive push' (exact-path _push_do). Off by
                             # default; admin agents already have it, sandboxed
-                            # can't. See docs/delegated-push.md.
+                            # can't. See the devteam plugin's docs/delegated-push.md.
                             # When the box has a shared team bot configured
                             # (team-bot shared persists it), new no-bot agents
                             # auto-attach: own forum topic, send-only on the
@@ -524,8 +524,8 @@ Box disk:
   5dive disk sweep [--dry-run] | alarm | tick                   # SAFE box-disk sweep (rebuildable caches only) + low-disk alarm
 
 Dev-team tools (the devteam plugin — sudo 5dive plugin install devteam; DIVE-6938):
-  5dive proof publish|on|off|status|scorecard        # zero-human proof badge, computed from digest (docs/zero-human.md)
-  5dive push <id|TASK-N> [--open-pr[=<base>]]        # push ONLY the task's branch, ONLY after its gate clears (docs/delegated-push.md)
+  5dive proof publish|on|off|status|scorecard        # zero-human proof badge, computed from digest (devteam plugin: docs/zero-human.md)
+  5dive push <id|TASK-N> [--open-pr[=<base>]]        # push ONLY the task's branch, ONLY after its gate clears (devteam plugin: docs/delegated-push.md)
   5dive push setup                                   # scaffold + check the GitHub App credential (root)
   5dive deploy <id|TASK-N> [--target=<project@ref>]  # deploy ONLY what the task declares, ONLY after its gate clears
   5dive gh <gh args...>                              # actor-routed gh: writes go out as the machine account

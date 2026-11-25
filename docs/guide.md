@@ -522,7 +522,7 @@ How it works, and why it's safe to give an agent:
 - **Author stays yours (optional).** Configure a committer (`GITHUB_APP_COMMIT_AUTHOR`) and a fail-closed scan requires every pushed commit to match it, so provider team-checks (e.g. Vercel) stay green; leave it unset for no restriction. The App is transport auth only, decoupled from commit authorship.
 - **The agent never holds a token.** Gate re-verify, author scan, a repo-scoped short-lived token mint, the push, and token discard all happen atomically in a root-only helper. The token is scoped to just the one target repo, so even a captured token can't reach the rest of your org. Every push is audit-logged.
 
-Full walkthrough (create the App, install it, drop the credential, wire the grant, first push): **[docs/delegated-push.md](delegated-push.md)**.
+Full walkthrough (create the App, install it, drop the credential, wire the grant, first push): **[delegated-push.md](https://github.com/5dive-ai/5dive-plugins/blob/main/plugins/devteam/docs/delegated-push.md)** (in the devteam plugin).
 
 ### Other paths
 

@@ -55,11 +55,11 @@ env:
   # devteam-harnesses job reads it, so moving it never moves the plugins tree the
   # core harnesses grade against (a shared bump turned codex_channel_e2e and
   # plugin_contract red on telegram-codex changes unrelated to devteam).
-  # DIVE-9269: bumped to the plugin commit that carries the grade-derive corpus
-  # (tests/devteam/fixtures/), which left this public tree: 5dive-plugins#376's
-  # head, merged before this pin. DIVE-9307: bumped to the plugin commit that
-  # carries core/lib/mod_seat.sh and its harness, which left this tree.
-  DEVTEAM_PLUGINS_REF: 12d4013147c029bbb03bc74096a435671d3a1d62
+  # DIVE-9281: the plugins commit that carries 5dive-plugins#375, #376 and #377
+  # (devteam 0.4.5: the heartbeat sweeps moved out of this tree). DIVE-9307: the
+  # plugins commit that also carries core/lib/mod_seat.sh and its harness, which
+  # left this tree (dive-9307-mod-seat-pii-out, #377 merged in).
+  DEVTEAM_PLUGINS_REF: 4b18786e88c28d1159ee43e896d297e5e79fda2b
 
 jobs:
   # DIVE-3315: INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s
