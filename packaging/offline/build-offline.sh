@@ -129,10 +129,6 @@ c="$stage/cli"
 cp -a "$tree/5dive" "$tree/install.sh" "$c/"
 [[ -f "$tree/5dive.sha256" ]] && cp -a "$tree/5dive.sha256" "$c/"
 for d in bin prompts hooks systemd; do cp -a "$tree/$d" "$c/$d"; done
-install -d "$c/scripts/git-hooks-portable" "$c/.github"
-cp -a "$tree/scripts/install-pii-push-guard.sh" "$tree/scripts/pii-scan.sh" "$c/scripts/"
-cp -a "$tree/scripts/git-hooks-portable/pre-push" "$tree/scripts/git-hooks-portable/prepare-commit-msg" "$c/scripts/git-hooks-portable/"
-cp -a "$tree/.github/pii-denylist.txt" "$c/.github/"
 ln -sf 5dive-agent@.service "$c/systemd/5dive-agent%40.service"
 tar "${TARD[@]}" -czf "$stage/payload/cli.tar.gz" -C "$c" .
 

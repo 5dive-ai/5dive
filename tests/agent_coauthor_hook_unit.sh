@@ -27,9 +27,6 @@ fi
 cmp -s "$HOOKS/prepare-commit-msg" scripts/git-hooks/prepare-commit-msg \
   && ok_t "in-repo hook is byte-exact with the managed renderer" \
   || [[ "${MUTATE_AUTHOR:-0}${MUTATE_SWITCH:-0}" != 00 ]] || bad_t "in-repo hook drifted from renderer"
-cmp -s scripts/git-hooks/prepare-commit-msg scripts/git-hooks-portable/prepare-commit-msg \
-  && ok_t "portable and in-repo hook copies are byte-exact" \
-  || bad_t "portable hook drifted from in-repo hook"
 
 export GIT_CONFIG_GLOBAL="$TMP/global.gitconfig"
 git config --global user.name "Human Owner"
