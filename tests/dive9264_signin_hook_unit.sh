@@ -125,7 +125,7 @@ as_ boss -X PUT -d '{"email":"leo@example.com"}' "$X/team/members/$LEO/email" >/
 H="$T/hop.h"
 r=$(curl -sk -D "$H" -c "$T/sso1" "$W/signin/fake/as?email=%20MIA@example.com%20")
 check 'G1 a Team-list email is admitted: 200 HTML hop to / (not a 302), no-store' 'grep -qi "^HTTP/[0-9.]* 200" "$H" && grep -qi "^content-type: text/html" "$H" && grep -qi "^cache-control: no-store" "$H" && ! grep -qi "^location:" "$H" && grep -q "http-equiv=\"refresh\" content=\"0;url=/\"" <<<"$r" && grep -q "href=\"/\"" <<<"$r"'
-check 'G1a ...with the session cookie (HttpOnly, Secure, SameSite=Strict)' 'grep -i "^set-cookie: lc_dev=" "$H" | grep -qi "HttpOnly; Secure; SameSite=Strict"'
+check 'G1a ...with the session cookie (HttpOnly, Secure, SameSite=Strict)' 'c=$(grep -i "^set-cookie: lc_dev=" "$H"); grep -qi "HttpOnly; Secure; SameSite=Strict" <<<"$c"'
 check 'G2 the cookie works: it is Mia, still a member with her grants' '[[ "$(as_ sso1 "$X/me" | jq -c "[.id,.role]")" == "[\"$MIA\",\"member\"]" && "$(as_ sso1 "$X/team" | jq -c .agents)" == "[]" ]]'
 check 'G2a ...a NEW device, named after the sign-in' '[[ "$(as_ boss "$X/team" | jq "[.members[] | select(.id == \"$MIA\") | .devices][0]")" == 2 && "$(sql "SELECT name FROM devices WHERE person = ? ORDER BY created DESC, rowid DESC LIMIT 1" "$MIA")" == "Fake sign-in" ]]'
 n0=$(sql "SELECT COUNT(*) FROM people")
