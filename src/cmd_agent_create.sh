@@ -2046,6 +2046,12 @@ write_agent_env() {
   if [[ -z "$chrome" && -r "$env_file" ]]; then
     chrome=$(sed -n 's/^AGENT_CHROME=//p' "$env_file" | head -1)
   fi
+  # DIVE-9253: a chat-only agent (`agent create --chat-only`). Sticky: no
+  # rewrite (channels, model, autonomy) can drop it; only removing the agent does.
+  local chat_only="${_CHAT_ONLY_OVERRIDE:-}"
+  if [[ -z "$chat_only" && -r "$env_file" ]]; then
+    chat_only=$(sed -n 's/^AGENT_CHAT_ONLY=//p' "$env_file" | head -1)
+  fi
   # DIVE-7333: the openclaw/hermes model pin (`agent config set model=`), same
   # discipline. Empty = no line: the seat runs its account's model.
   local model_pin="${_MODEL_OVERRIDE:-}"
@@ -2069,6 +2075,7 @@ write_agent_env() {
     [[ "$can_push" == "1" ]] && printf 'AGENT_CAN_PUSH=1\n'
     [[ "$can_deploy" == "1" ]] && printf 'AGENT_CAN_DEPLOY=1\n'
     [[ "$chrome" == "1" ]] && printf 'AGENT_CHROME=1\n'
+    [[ "$chat_only" == "1" ]] && printf 'AGENT_CHAT_ONLY=1\n'
     [[ -n "$model_pin" ]] && valid_model "$model_pin" && printf 'AGENT_MODEL=%s\n' "$model_pin"
     [[ -n "$oc_port" ]] && openclaw_port_valid "$oc_port" && printf 'AGENT_OPENCLAW_PORT=%s\n' "$oc_port"
     # New telegram agents flow through our 5dive-plugins fork (bundled
@@ -3674,6 +3681,8 @@ cmd_create() {
   local can_deploy=0          # INST-5: delegated-deploy (production ship) capability
   local inherit_memory=""     # DIVE-990 memory-as-onboarding
   local human_id=""           # DIVE-4698: quick-pair to a person this box already knows
+  local chat_only=0           # DIVE-9253: no tools, dashboard reply text only
+  local create_stopped=0      # DIVE-9253: created, not enabled, not started
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --type=*)                    type="${1#--type=}" ;;
@@ -3708,12 +3717,14 @@ cmd_create() {
       --human=*)                   human_id="${1#--human=}" ;;
       --can-push)                  can_push=1 ;;
       --can-deploy)                can_deploy=1 ;;
+      --chat-only)                 chat_only=1 ;;
+      --stopped)                   create_stopped=1 ;;
       -*)                          fail "$E_USAGE" "unknown flag: $1" ;;
       *)                           [[ -z "$name" ]] && name="$1" || fail "$E_USAGE" "extra arg: $1" ;;
     esac
     shift
   done
-  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz|teams|<a plugin channel>[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--fresh|--no-fresh] [--defer-auth] [--own-login] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>]"
+  [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent create <name> --type=<type> [--channels=none|telegram|discord|dashboard|buzz|teams|<a plugin channel>[,ch...]] [--telegram-token=<token|->] [--telegram-cos=<child-username>] [--telegram-cos-avatar=<png>] [--telegram-home-channel=<id>] [--telegram-allowed-users=<csv>] [--telegram-profile=lite|default] [--discord-token=<token|->] [--workdir=<path>] [--auth-profile=<name>] [--provider=<id> --api-key=<key|->] [--base-url=<url>] [--model=<slug>] [--effort=low|medium|high|xhigh|max] [--with-skills=<spec>[,...]] [--no-skills] [--no-team-bot] [--no-heartbeat] [--heartbeat-every=<dur>] [--fresh|--no-fresh] [--defer-auth] [--own-login] [--isolation=admin|standard|sandboxed] [--can-push] [--can-deploy] [--inherit-memory=wiki|all|team|<agent>[,...]] [--human=<id>] [--chat-only] [--stopped]"
   [[ -n "$type" ]] || fail "$E_USAGE" "--type is required"
   valid_name "$name" || fail "$E_VALIDATION" "invalid name (lowercase letters/digits/hyphens, start letter, <=16 chars)"
   is_known_type "$type" || fail "$E_NOT_FOUND" "unknown type: $type (known: ${!TYPE_BIN[*]})"
@@ -3749,6 +3760,12 @@ cmd_create() {
   fi
   if [[ "$type" == "grok" ]]; then
     printf 'note: %s\n' "Grok's tool sends your agent's notes and chat turns to xAI after every turn." >&2 || true
+  fi
+  # DIVE-9253: a chat-only agent is a claude seat on the dashboard channel only;
+  # the launcher refuses anything else, so refuse it here before a seat exists.
+  if [[ "$chat_only" == 1 ]]; then
+    [[ "$type" == claude ]] || fail "$E_VALIDATION" "--chat-only works only with --type=claude (got $type)"
+    [[ "$channels" == dashboard ]] || fail "$E_VALIDATION" "--chat-only needs --channels=dashboard and no other channel (got $channels)"
   fi
   valid_channel "$channels" || fail "$E_VALIDATION" "invalid channels: $channels (none|telegram|discord|dashboard|buzz|teams$(_pc=$(plugin_channel_names); [[ -n "$_pc" ]] && printf '|%s' $_pc), comma-separable)"
   # DIVE-5406: dashboard chat is OPT-IN. DIVE-856 used to fold `dashboard`
@@ -4642,6 +4659,7 @@ cmd_create() {
   # DIVE-499: stamp the autonomy mode into the env file (yolo/son-of-anton add the
   # approved directive at launch; standard = nothing).
   _AUTONOMY_OVERRIDE="$autonomy" _CAN_PUSH_OVERRIDE="$can_push" _CAN_DEPLOY_OVERRIDE="$can_deploy" \
+  _CHAT_ONLY_OVERRIDE="$chat_only" \
     write_agent_env "$name" "$type" "$channels" "$workdir" "$profile" "$isolation"
   link_agent_profile "$name" "$profile"
 
@@ -4842,9 +4860,16 @@ cmd_create() {
   if channel_in_list telegram "$channels" && [[ -n "$telegram_token" && -n "$telegram_allowed_users" ]]; then
     _tg_connect_greet_launch "$name" "$type"
   fi
-  step "Enabling 5dive-agent@${name}.service"
-  systemctl daemon-reload
-  systemctl enable --now "5dive-agent@${name}.service" >&2
+  # DIVE-9253: `--stopped` creates the agent STOPPED and not enabled: whoever
+  # made it starts it when it is needed (`systemctl start`), never at boot.
+  if [[ "$create_stopped" == 1 ]]; then
+    step "Leaving 5dive-agent@${name}.service stopped and not enabled (--stopped)"
+    systemctl daemon-reload
+  else
+    step "Enabling 5dive-agent@${name}.service"
+    systemctl daemon-reload
+    systemctl enable --now "5dive-agent@${name}.service" >&2
+  fi
 
   # Install any preseeded skills. A failed install does NOT roll back the
   # agent — networks flake, the agent itself is fine, and the user can rerun

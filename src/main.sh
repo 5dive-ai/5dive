@@ -69,6 +69,15 @@ Agents:
                             [--with-skills=<spec>[,<spec>...]] [--no-skills]
                             [--no-team-bot] [--defer-auth] [--can-push]
                             [--human=<id>] [--own-login]
+                            [--chat-only] [--stopped]
+                            # --chat-only: a claude agent on --channels=dashboard
+                            # that someone outside the team can type into. It
+                            # starts with no tools, skills or slash commands, and
+                            # its replies are text only (no files, no voice). A
+                            # root-owned file /etc/5dive/chat-only-agents/<name>
+                            # turns the same mode on; nothing turns it off.
+                            # --stopped: create the agent without enabling or
+                            # starting its service; start it when it is needed.
                             # --own-login: a claude/codex/grok hire by an agent uses the
                             # box's existing sign-in for that provider; this keeps
                             # the named --auth-profile as a separate sign-in.
