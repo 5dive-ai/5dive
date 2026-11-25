@@ -126,11 +126,12 @@ rm -f "$TMP/dispatch"; f "" ada --token="$TOK" --job-b64=x
 
 # ── W: wiring ────────────────────────────────────────────────────────────────
 arm=$(awk '/^_agent_verb_dispatch\(\) \{/{f=1} f&&/^\}/{exit} f' src/main.sh)
-{ grep -A2 -E '^        first-job\)' <<<"$arm" | grep -q '_first_job_forward "\$@"' \
-  && grep -A2 -E '^        _first_job_run\)' <<<"$arm" | grep -q '_first_job_forward _run "\$@"'; } \
+fj_arm=$(grep -A2 -E '^        first-job\)' <<<"$arm"); fjr_arm=$(grep -A2 -E '^        _first_job_run\)' <<<"$arm")
+{ grep -q '_first_job_forward "\$@"' <<<"$fj_arm" \
+  && grep -q '_first_job_forward _run "\$@"' <<<"$fjr_arm"; } \
   && ok_t "W1 both agent arms forward (first-job, _first_job_run)" || bad_t "W1 arms" ""
 { [[ ! -e src/cmd_agent_first_job.sh && ! -e tests/agent_first_job_unit.sh ]] \
-  && ! sed -n '/^LAZY_FILES=(/,/^)/p' build.sh | grep -q cmd_agent_first_job \
+  && ! grep -q cmd_agent_first_job <<<"$(sed -n '/^LAZY_FILES=(/,/^)/p' build.sh)" \
   && ! grep -rqE 'cmd_agent_first_job|_first_job_(ask|watch|task|spawn)' src; } \
   && ok_t "W2 the module, its build.sh entry and its harness are gone, and nothing in src calls into it" || bad_t "W2 gone" ""
 grep -q '^  5dive agent first-job <name> --token=' src/main.sh && ok_t "W3 the agent usage keeps the API's spelling" || bad_t "W3 usage" ""
