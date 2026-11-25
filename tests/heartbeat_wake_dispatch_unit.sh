@@ -32,7 +32,7 @@ TMP="$(mktemp -d /tmp/hb-wakedispatch-unit.XXXXXX)"
 
 # shellcheck disable=SC1090
 for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-         lib/registry.sh cmd_heartbeat.sh; do
+         lib/registry.sh lib/verify_policy.sh cmd_heartbeat.sh; do
   # shellcheck source=/dev/null
   source "$SRC/$f"
 done
@@ -61,10 +61,15 @@ seed '{"agents":{"testbot":{},"main":{},"marketing":{}}}'
 [[ "$(_hb_wake_mode testbot)" == "always_on" ]] \
   && ok_t "unset agent => always_on" || bad_t "unset agent => always_on" "got $(_hb_wake_mode testbot)"
 
-# 2) protected-agent gate (olivia condition 3)
+# 2) protected-agent gate (olivia condition 3). DIVE-9315: no seat name is
+# protected by the core itself; the box's `wake-protected` setting names them.
+BOX_CONFIG="$TMP/box.json"; printf '{}\n' > "$BOX_CONFIG"
+_hb_wake_protected main      && bad_t "unset: main is NOT protected by name" || ok_t "unset: main is NOT protected by name"
+printf '{"wake_protected":"main marketing"}\n' > "$BOX_CONFIG"; _HB_WAKE_PROTECTED_READ=0
 _hb_wake_protected main      && ok_t "main is protected"      || bad_t "main is protected"
 _hb_wake_protected marketing && ok_t "marketing is protected" || bad_t "marketing is protected"
 _hb_wake_protected testbot   && bad_t "testbot NOT protected" || ok_t "testbot NOT protected"
+HEARTBEAT_WAKE_PROTECTED=testbot _hb_wake_protected testbot && ok_t "the env still adds a name" || bad_t "the env still adds a name"
 
 # 3) setting cold seeds the default cap and preserves counter
 _hb_wake_mode_write testbot cold ""

@@ -2724,14 +2724,10 @@ cmd_doctor() {
       "${STATE_DIR:-/var/lib/5dive}/memory-consolidate" "${MEMORY_CONSOLIDATE_NOTX_AFTER:-4}"
 
     local mem_roots=() code_root=""
-    for d in /home/claude/projects/5dive /home/claude/projects; do
-      [[ -d "$d" ]] && { code_root="$d"; break; }
-    done
+    d=$(box_projects_root); [[ -d "$d" ]] && code_root="$d"
     # Wiki (shared) + every agent home's memory stores.
-    local wd
-    for wd in /home/claude/projects/5dive/community/wiki; do
-      [[ -d "$wd" ]] && mem_roots+=("$wd")
-    done
+    local wd="$d/community/wiki"
+    [[ -d "$wd" ]] && mem_roots+=("$wd")
     # DIVE-4340: registry-driven, not /home-driven — a reaped seat's leftover
     # home must not contribute a memory store to the hygiene scan.
     local home _seat _seats

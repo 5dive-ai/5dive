@@ -579,7 +579,7 @@ _sc_repo_root() {
     d=$(dirname "$d")
   done
   local c
-  for c in /home/claude/projects/5dive/5dive-cli "$HOME/5dive-cli"; do
+  for c in "$(box_projects_root)/5dive-cli" "$HOME/5dive-cli"; do
     [[ -r "$c/build.sh" && -r "$c/5dive.sha256" ]] && { printf '%s' "$c"; return 0; }
   done
   return 1
@@ -664,7 +664,7 @@ _sc_probe_bundle_integrity() {
 # independent: what is committed must MATCH the live crontabs (ground truth, not the
 # script's own report), and a run that saved nothing must exit non-zero.
 _sc_probe_snapshot_rails() {
-  local snap="${SELFCHECK_SNAPSHOT_SH:-/home/claude/projects/5dive/ops/bin/crontab-snapshot.sh}"
+  local snap="${SELFCHECK_SNAPSHOT_SH:-$(box_projects_root)/ops/bin/crontab-snapshot.sh}"
   [[ -r "$snap" ]] \
     || { _sc_notreached "no-snapshot-script" "crontab-snapshot.sh is not present at $snap (it lives in the ops repo, absent on a pristine runner)"; return; }
   local repo; repo=$(sed -n 's/^REPO="\(.*\)"$/\1/p' "$snap" | head -1)

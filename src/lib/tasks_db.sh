@@ -3567,10 +3567,10 @@ _task_body_size_guard() {
   local n; n=$(printf '%s' "$newbody" | wc -c | tr -d ' ')
   [[ "$n" =~ ^[0-9]+$ ]] || return 0
   if (( n > TASK_BODY_MAX_BYTES )); then
-    fail "$E_VALIDATION" "refusing: that would leave ${ident} with a ${n}-byte body (cap ${TASK_BODY_MAX_BYTES}). A body this size is re-sent into the assignee's context on EVERY dispatch of the row, and it is what broke reading row 4542 at all (DIVE-4419). Keep the pointer on the row and put the long form in a file: write it under /home/claude/projects/5dive/evidence/ and then '${verb} ${ident} --append \"<one-line summary> — full text: <that path>\"'."
+    fail "$E_VALIDATION" "refusing: that would leave ${ident} with a ${n}-byte body (cap ${TASK_BODY_MAX_BYTES}). A body this size is re-sent into the assignee's context on EVERY dispatch of the row, and it is what broke reading row 4542 at all (DIVE-4419). Keep the pointer on the row and put the long form in a file: write it under $(box_projects_root)/evidence/ and then '${verb} ${ident} --append \"<one-line summary> — full text: <that path>\"'."
   fi
   if (( n > TASK_BODY_WARN_BYTES )); then
-    warn "${ident} body is now ${n} bytes (warn at ${TASK_BODY_WARN_BYTES}, refused past ${TASK_BODY_MAX_BYTES}) — every dispatch of this row re-sends all of it. Move the long form to a file under /home/claude/projects/5dive/evidence/ and leave a pointer."
+    warn "${ident} body is now ${n} bytes (warn at ${TASK_BODY_WARN_BYTES}, refused past ${TASK_BODY_MAX_BYTES}) — every dispatch of this row re-sends all of it. Move the long form to a file under $(box_projects_root)/evidence/ and leave a pointer."
   fi
   return 0
 }

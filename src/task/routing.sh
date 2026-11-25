@@ -1757,10 +1757,17 @@ _task_role_skew_note() {
 
 # Non-agent principals that legitimately own a `created_by` and NEVER an
 # assignee — nothing wakes them. Measured on this board 2026-08-12: cli 25,
-# council 97, lodar 4, editor 4, proof 2 (`5dive proof` files with --from=proof).
+# council 97, editor 4, proof 2 (`5dive proof` files with --from=proof).
 # `trigger` marks tasks materialized by signed Event-to-Task ingress; keeping it
 # distinct from `cron` makes each external delivery's provenance queryable.
-_TASK_PRINCIPAL_SENTINELS="cli council telegram dashboard lodar editor proof cron trigger"
+# The box's `principals` setting adds its own names (DIVE-9315: a person who
+# files tasks by name; 5dive's own boxes get theirs from the devteam plugin).
+_TASK_PRINCIPAL_SENTINELS="cli council telegram dashboard editor proof cron trigger"
+if declare -F box_named_setting >/dev/null 2>&1; then
+  _TASK_PRINCIPALS_EXTRA=$(box_named_setting principals 2>/dev/null || true)
+  [[ -z "$_TASK_PRINCIPALS_EXTRA" ]] || _TASK_PRINCIPAL_SENTINELS+=" $_TASK_PRINCIPALS_EXTRA"
+  unset _TASK_PRINCIPALS_EXTRA
+fi
 
 # _task_is_principal_sentinel <name> — 0 when <name> is one of the sentinels
 # above. A FUNCTION, not a read of the global, on purpose: other modules call it,
