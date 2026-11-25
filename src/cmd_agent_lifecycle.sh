@@ -116,6 +116,12 @@ cmd_restart() {
   # never fails on a perms hiccup.
   normalize_restart_profile_perms "$name"
   restart_push_openclaw_state "$name"
+  # DIVE-9304: a restart throws away the composer the wedge mark describes, so
+  # the mark goes with it. Before this the supervisor kept naming a restarted
+  # seat composer-wedged (the remedy its own verdict prints is this verb) until
+  # some later wake verified a submit. Still wedged afterwards = re-marked by
+  # the next injector that measures it.
+  _wedge_clear "$name" 2>/dev/null || true
   if (( defer )); then
     # DIVE-1002: CLI-mediated deferred restart. `sudo 5dive` already runs as
     # root, so the CLI fires systemd-run internally — an (scoped-)admin agent
@@ -175,6 +181,7 @@ cmd_self_restart() {
     || fail "$E_PERMISSION" "refusing: caller '$caller' is not an agent-* user"
   local name="${BASH_REMATCH[1]}"
   require_agent "$name"
+  _wedge_clear "$name" 2>/dev/null || true   # DIVE-9304: see cmd_restart
   # Fixed, name-only command (no caller injection); the ~1s transient unit
   # survives this caller's teardown so its own SIGTERM can't abort the restart.
   systemd-run --on-active=1 --timer-property=AccuracySec=100ms --collect \
@@ -233,6 +240,9 @@ cmd_rm() {
         "${STATE_DIR}/memory-consolidate/${name}.norun" \
         "${STATE_DIR}/memory-consolidate/${name}.nostore" \
         "${STATE_DIR}/memory-consolidate/${name}.stamp"
+  # DIVE-9304: and its wedge mark, so a re-created seat of the same name is not
+  # born composer-wedged.
+  _wedge_clear "$name" 2>/dev/null || true
   remove_channel_secret telegram "$name"
   remove_channel_secret discord  "$name"
   step "Deleting user agent-${name}"

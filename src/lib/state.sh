@@ -108,12 +108,28 @@ _wedge_mark() {
 _wedge_clear() { rm -f "$(_wedge_dir)/${1}" 2>/dev/null || true; return 0; }
 
 # Human-readable detail for <seat>, or rc 1 when the seat is not wedged.
+# args: <seat> [<since-epoch>]
+#
+# DIVE-9304: <since-epoch> is when the seat's unit last came up. A mark written
+# BEFORE that belongs to a session that no longer exists: the restart threw the
+# composer and its unsent text away, so the verdict is about a pane nobody can
+# see any more. Without this the supervisor kept calling a freshly restarted
+# seat `composer-wedged / submit-unverified`, with a growing age, until a later
+# wake happened to verify a submit, and a seat with no row is never woken, so
+# that was forever (box report 1450). The restart verbs also clear the mark
+# (`_wedge_clear` in cmd_restart/cmd_start/cmd_rm); this is the half that
+# covers a restart by any other route (systemd's own Restart=, a box reboot, a
+# raw systemctl). A seat still wedged after the restart is re-marked by the
+# next injector that measures it, with a fresh timestamp, so it is named again.
 _wedge_read() {
-  local seat="$1" line ts chars disp excerpt
+  local seat="$1" since="${2:-}" line ts chars disp excerpt
   line=$(cat "$(_wedge_dir)/${seat}" 2>/dev/null) || return 1
   [[ -n "$line" ]] || return 1
   IFS=$'\x1f' read -r ts chars disp excerpt <<<"$line"
   [[ "$ts" =~ ^[0-9]+$ ]] || return 1
+  if [[ "$since" =~ ^[0-9]+$ ]] && (( since > 0 && ts < since )); then
+    return 1
+  fi
   local age=$(( $(date -u +%s) - ts ))
   (( age < 0 )) && age=0
   if [[ "$disp" == "cleared" ]]; then
