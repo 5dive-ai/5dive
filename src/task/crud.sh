@@ -2110,3 +2110,48 @@ cmd_task_verifier() {
      --arg pac "$cur_accept" --arg ch "$([[ "$new_accept" != "$cur_accept" ]] && echo 1 || echo 0)" \
      --arg m "$mid_handoff" --arg r "$repoint"
 }
+
+# DIVE-9328: `5dive task record-done` — internal, root-only. Files a task that is
+# BORN DONE: assigned, its result already in, never open. The one caller is the
+# first-job verb (hosted@5dive-plugins, moved out of core here): the owner's
+# first job, once the agent has answered it, shows on the Tasks screen like any
+# other task's result (DIVE-5946). It is born done, never added and then closed,
+# because an open row assigned to an agent is one the heartbeat would dispatch,
+# and the agent would do the job a second time.
+#
+# The fields come as ONE JSON object on stdin, never on argv: the result is the
+# agent's whole answer, and argv is readable by every process on the box.
+#   {"title":…, "body":…, "assignee":<agent>, "from":<who>, "result":…,
+#    "startedAt":<ISO-8601, optional: when the work began; default now>}
+# Prints the new row's ident (JSON mode: {ident}). A plugin reaches the board
+# only through this verb: it never writes core's schema itself.
+cmd_task_record_done() {
+  local usage="usage: 5dive task record-done < {\"title\",\"body\",\"assignee\",\"from\",\"result\",\"startedAt\"}  (root only, JSON on stdin)"
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "$usage"
+  _task_board_write_allowed || fail "$E_PERMISSION" \
+    "refusing to write to the production task board from a test run (TASKS_DB resolves to $(_task_real_prod_tasks_db)). Point TASKS_DB/STATE_DIR at a throwaway store."
+  require_root "task record-done"
+  local in title body assignee from result started ident
+  in=$(head -c 262144) || in=""
+  jq -e 'type == "object"' <<<"$in" >/dev/null 2>&1 || fail "$E_USAGE" "$usage"
+  title=$(jq -r '.title // "" | tostring' <<<"$in")
+  body=$(jq -r '.body // "" | tostring' <<<"$in")
+  assignee=$(jq -r '.assignee // "" | tostring' <<<"$in")
+  from=$(jq -r '.from // "" | tostring' <<<"$in")
+  result=$(jq -r '.result // "" | tostring' <<<"$in")
+  started=$(jq -r '.startedAt // "" | tostring' <<<"$in")
+  [[ -n "${title//[[:space:]]/}" ]] || fail "$E_VALIDATION" "record-done: the title is empty"
+  [[ -n "${result//[[:space:]]/}" ]] || fail "$E_VALIDATION" "record-done: the result is empty (a born-done task carries its result)"
+  valid_name "$assignee" || fail "$E_VALIDATION" "record-done: invalid assignee '$assignee'"
+  [[ "$from" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || fail "$E_VALIDATION" "record-done: invalid from '$from'"
+  [[ -z "$started" || "$started" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z$ ]] \
+    || fail "$E_VALIDATION" "record-done: startedAt is not an ISO-8601 UTC time"
+  tasks_db_init
+  ident=$(db "INSERT INTO tasks (title, body, priority, assignee, created_by, status, result, started_at, first_started_at, done_at)
+              VALUES ($(sqlq "$title"), $(sqlq "$body"), 'medium', $(sqlq "$assignee"), $(sqlq "$from"), 'done', $(sqlq "$result"),
+                      COALESCE(datetime($(sqlq "$started")), datetime('now')), COALESCE(datetime($(sqlq "$started")), datetime('now')), datetime('now'));
+            SELECT ident FROM tasks WHERE id = last_insert_rowid();") \
+    || fail "$E_GENERIC" "record-done: the task store refused the row"
+  [[ -n "$ident" ]] || fail "$E_GENERIC" "record-done: the task store returned no ident"
+  ok "$ident" '{ident:$i}' --arg i "$ident"
+}

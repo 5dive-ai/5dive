@@ -499,6 +499,7 @@ cmd_task() {
     followup)        cmd_task_followup "$@" ;;      # DIVE-5507 the Mini App's Follow up box
     need)            cmd_task_need "$@" ;;
     gate-escalate)   cmd_task_gate_escalate "$@" ;;   # DIVE-1927 internal, root-only
+    record-done)     cmd_task_record_done "$@" ;;     # DIVE-9328 internal, root-only: a born-done row (first-job)
     queue)           cmd_task_queue "$@" ;;         # DIVE-3474 gates routed TO ME
     # DIVE-4310: `gates` is the name a human reaches for — measured on lodar's
     # box, where `5dive task gates` returned "unknown task command" and the verb

@@ -727,9 +727,11 @@ _agent_verb_dispatch() {
         # shelld; it records the job and starts a transient unit, so it returns
         # at once. AUDIT_ARGS carries the name only: the token is the Telegram
         # start payload and the job is the customer's own words.
+        # DIVE-9328: the code lives in hosted@5dive-plugins (`5dive first-job`);
+        # this spelling stays because the API execs it and live units call it.
         first-job)
           AUDIT_CMD="agent first-job"; AUDIT_ARGS=("${1:-}")
-          cmd_agent_first_job "$@" ;;
+          _first_job_forward "$@" ;;
         # DIVE-6169: root — this box vouches for one of its agents' did on the
         # a2a feed, so its posts skip the per-IP caps and the spam check.
         a2a-vouch)
@@ -738,7 +740,7 @@ _agent_verb_dispatch() {
         # DIVE-5874: hidden root primitive — the first-job unit's body.
         _first_job_run)
           AUDIT_CMD="agent _first_job_run"; AUDIT_ARGS=("${1:-}")
-          cmd_agent_first_job_run "$@" ;;
+          _first_job_forward _run "$@" ;;
         # DIVE-7478: hidden root primitive — the connect greeting unit's body.
         _tg_connect_greet)
           AUDIT_CMD="agent _tg_connect_greet"; AUDIT_ARGS=("${1:-}")
@@ -1179,6 +1181,22 @@ _moved_verb_repo() {
 # exit stays E_USAGE like every other moved verb.
 _buzz_moved_refusal() {
   fail "$E_USAGE" "Buzz is a plugin now: 5dive plugin install buzz"
+}
+
+# DIVE-9328 — the owner's first job at hire (DIVE-5874) left core for
+# hosted@5dive-plugins: it only works against 5dive's API as the box. Two
+# spellings stay here, forwarded unchanged, because others hold them: the API
+# execs `agent first-job <name> --token= --job-b64=` over shelld, and every
+# first-job unit already running (up to 73h) re-enters `agent _first_job_run`.
+# Official plugin only, as for buzz: both run as root with API-chosen arguments.
+# Without it the call fails with one line and the API retries the tap later;
+# install/upgrade adds or upgrades the plugin on every 5dive-built box in the
+# same run (install.sh _hosted_plugin_ensure).
+_first_job_forward() {
+  if [[ "$(_plugin_verb_claims first-job 2>/dev/null)" == "hosted@5dive-plugins" ]]; then
+    _plugin_dispatch_verb first-job "$@" || true
+  fi
+  fail "$E_NOT_INSTALLED" "first-job is not installed on this box. It comes with a 5dive-built box (plugin hosted@5dive-plugins)."
 }
 
 # DIVE-7950 — crew (the CrewAI runtime, DIVE-787) left core for `crew@5dive-plugins`
