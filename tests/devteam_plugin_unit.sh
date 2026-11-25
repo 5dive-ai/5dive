@@ -119,6 +119,11 @@ tc "D9d a tree that carries the helpers runs the poll, so doctor does not call i
 tc "D9e a partial tree (one helper, no plugin) still logs the loud line" "$NOTRUN (devteam: not installed)" \
    "$( ( set +u; source src/header.sh 2>/dev/null; set +e; source src/lib/devteam.sh; source src/cmd_heartbeat.sh
         _gate_slug_from_url() { :; }; _hb_log() { printf '%s\n' "$1"; }; _hb_forge_merge_sweep ) 2>&1 )"
+tc "D9f a plugin with the helpers but older than the sweep's move (DIVE-9281) says to upgrade" \
+   "older than this 5dive (no _forge_merge_sweep); $NOTRUN — upgrade it" \
+   "$( ( set +u; source src/header.sh 2>/dev/null; set +e; source src/cmd_heartbeat.sh
+        _merge_landed_probe() { :; }; _task_merge_landed_record() { :; }; _gate_slug_from_url() { :; }
+        _hb_log() { printf '%s\n' "$1"; }; _hb_forge_merge_sweep ) 2>&1 )"
 tc "D9b a harness with no plugin loader still gets the loud line" "$NOTRUN —" \
    "$( ( set +u; source src/header.sh 2>/dev/null; set +e; source src/cmd_heartbeat.sh
         _hb_log() { printf '%s\n' "$1"; }; _hb_forge_merge_sweep ) 2>&1 )"
@@ -146,7 +151,8 @@ fx task/delivery.sh 'cmd_task_deliver() { echo "DEVTEAM-DELIVER $*"; }
 cmd_task_merge_do() { echo "DEVTEAM-MERGE-DO"; }
 _merge_landed_probe() { :; }
 _task_merge_landed_record() { :; }
-_gate_slug_from_url() { :; }'
+_gate_slug_from_url() { :; }
+_forge_merge_sweep() { printf "class=ok\\n" > "$STATE_DIR/forge-merge-poll.reading"; }'
 fx task/gate_evidence.sh '_devteam_fixture_gate() { :; }'
 fx task/grader_pool.sh '_devteam_fixture_pool() { :; }'
 fx task/grader_process.sh '_devteam_fixture_process() { :; }'
@@ -178,7 +184,7 @@ done
 tc "B1f doctor's line names where they come from" "loaded from $VDIR (9 modules)" "$(cat "$TMP/.s")"
 rm -f "$STATE_DIR/forge-merge-poll.reading"
 t  "B1g with the plugin loaded a forge-merge pass logs nothing on an empty board" "" "$(fm)"
-tc "B1h because it ran: it recorded its reading" "class=ok" "$(cat "$STATE_DIR/forge-merge-poll.reading" 2>&1)"
+tc "B1h because the tick ran the plugin's pass: it recorded its reading" "class=ok" "$(cat "$STATE_DIR/forge-merge-poll.reading" 2>&1)"
 
 FIVEDIVE_DEVTEAM=0 dv proof x
 tc "B2 FIVEDIVE_DEVTEAM=0 skips the plugin" "$LINE" "$ERR"
