@@ -65,10 +65,20 @@ _devteam_module_file() {
     cmd_push)             _DEVTEAM_REL="cmd_push.sh" ;;
     cmd_deploy)           _DEVTEAM_REL="cmd_deploy.sh" ;;
     cmd_gh)               _DEVTEAM_REL="cmd_gh.sh" ;;
+    task__filing_cap)     _DEVTEAM_REL="task/filing_cap.sh" ;;
     *) _DEVTEAM_REL=""; return 1 ;;
   esac
 }
 readonly DEVTEAM_MODULES="lib__gh_config task__gate_evidence task__grader_pool task__grader_process task__delivery cmd_proof cmd_push cmd_deploy cmd_gh"
+
+# DIVE-9262: modules read when the plugin ships them and skipped when it does
+# not, so neither the core nor the plugin has to be upgraded first. An older
+# plugin without one just leaves its control off (task__filing_cap: the
+# title-word filing cap, which fails open). Present, each passes the same
+# ownership checks as every required module. _DEVTEAM_PRESENT is the list of
+# modules this run reads: the required ones, then the optional ones found.
+readonly DEVTEAM_OPTIONAL_MODULES="task__filing_cap"
+_DEVTEAM_PRESENT=""
 
 # The core's lazy modules whose top-level names the plugin's files read
 # (`_GRADER_FLOOR_*` and the meter's knobs from pace, `_GATE_ASK_MAX_WORDS` from
@@ -106,7 +116,7 @@ _devteam_path_safe() {
 _DEVTEAM_DIR=""
 _DEVTEAM_WHY=""
 _devteam_resolve() {
-  _DEVTEAM_DIR=""; _DEVTEAM_WHY=""
+  _DEVTEAM_DIR=""; _DEVTEAM_WHY=""; _DEVTEAM_PRESENT=""
   local root="${STATE_DIR:-/var/lib/5dive}/plugins"
   local link="$root/enabled/$DEVTEAM_PLUGIN_KEY"
   # The common case on a customer box: one stat, no fork, nothing to say.
@@ -133,11 +143,18 @@ _devteam_resolve() {
     paths+=("$f")
     [[ "$rel" != */* ]] || paths+=("${f%/*}")
   done
+  local present="$DEVTEAM_MODULES"
+  for m in $DEVTEAM_OPTIONAL_MODULES; do
+    _devteam_module_file "$m"; f="$dir/core/$_DEVTEAM_REL"
+    [[ -f "$f" ]] || continue
+    present+=" $m"; paths+=("$f")
+    [[ "$_DEVTEAM_REL" != */* ]] || paths+=("${f%/*}")
+  done
   if ! _devteam_path_safe "${paths[@]}"; then
     _DEVTEAM_WHY="${_DEVTEAM_UNSAFE#"$dir/"} is writable by someone other than root. Reinstall: sudo 5dive plugin upgrade $DEVTEAM_PLUGIN_KEY"
     return 1
   fi
-  _DEVTEAM_DIR="$dir"
+  _DEVTEAM_DIR="$dir"; _DEVTEAM_PRESENT="$present"
 }
 
 _DEVTEAM_LOADED=0
@@ -152,7 +169,7 @@ _devteam_init() {
   _DEVTEAM_LOADED=0; _DEVTEAM_INIT_DONE=1
   _devteam_resolve || return 0
   local -a files=() names=(); local -A seen=(); local m fn
-  for m in $DEVTEAM_MODULES; do _devteam_module_file "$m"; files+=("$_DEVTEAM_DIR/core/$_DEVTEAM_REL"); done
+  for m in $_DEVTEAM_PRESENT; do _devteam_module_file "$m"; files+=("$_DEVTEAM_DIR/core/$_DEVTEAM_REL"); done
   # `{` on the line, or cmd_proof's embedded python (`print()`) reads as a
   # definition and every run would carry a bash `print` stub.
   while IFS= read -r fn; do
@@ -186,7 +203,7 @@ _devteam_load() {
     _load_module $DEVTEAM_CORE_DEPS
   fi
   local __dt_m
-  for __dt_m in $DEVTEAM_MODULES; do
+  for __dt_m in $_DEVTEAM_PRESENT; do
     [[ -z "${FIVE_LAZY_TRACE:-}" ]] \
       || printf '5dive[lazy] devteam load %s\n' "$__dt_m" >&2
     # shellcheck source=/dev/null
@@ -248,7 +265,7 @@ devteam_status_line() {
   (( _DEVTEAM_INIT_DONE )) || _devteam_init
   if [[ -n "$_DEVTEAM_DIR" ]]; then
     printf 'loaded from %s (%s modules)\n' \
-      "$_DEVTEAM_DIR" "$(wc -w <<<"$DEVTEAM_MODULES" | tr -d ' ')"
+      "$_DEVTEAM_DIR" "$(wc -w <<<"$_DEVTEAM_PRESENT" | tr -d ' ')"
   elif [[ "$_DEVTEAM_WHY" == "not installed" ]]; then
     printf 'not installed — this box has no dev-team tools (proof, gh, push, deploy, task deliver/merge)\n'
   else

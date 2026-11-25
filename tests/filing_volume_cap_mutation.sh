@@ -29,7 +29,7 @@ set +e
 
 # ---- baseline: the harness is green against UNMUTATED source ----------------
 base_out=$(DIVE_TEST_SRC="$ROOT/src" bash "$UNIT" 2>&1)
-if [[ "$base_out" == *'RESULT: 15 passed, 0 failed'* ]]; then
+if [[ "$base_out" == *'RESULT: 27 passed, 0 failed'* ]]; then
   ok_t "baseline: unit harness is green before any mutation"
 else
   bad_t "baseline: unit harness is green before any mutation" "$(tail -4 <<<"$base_out")"
@@ -87,7 +87,7 @@ run_mutation() {
 # never-capped arms must notice. Control: an over-budget MEDIUM row is still
 # refused, which proves the cap itself still works and only the exemption moved.
 run_mutation m1-no-priority-exemption \
-  's/&& -z "$_cap_exempt_priority" ]] \\$/]] \\/' \
+  's/ \&\& -z "$_cap_exempt_priority" \&\& "$_vcap"/ \&\& "$_vcap"/' \
   'urgent is never capped' \
   'at the cap, a medium row is REFUSED'
 
@@ -96,7 +96,7 @@ run_mutation m1-no-priority-exemption \
 # reach; the fires-arms must red. Control: high is still uncapped, so the
 # priority rule is untouched and the harness is plainly still running.
 run_mutation m2-threshold-unreachable \
-  's/(( _v24 >= _TASK_FILING_DAILY_CAP ))/(( _v24 >= 99999 ))/' \
+  's/(( _v24 >= _vcap ))/(( _v24 >= 99999 ))/' \
   'at the cap, a medium row is REFUSED' \
   'high is never capped'
 
@@ -115,6 +115,14 @@ run_mutation m4-count-materialized \
   's/AND COALESCE(from_template_id,0)=0//' \
   'template-materialized rows do NOT count' \
   'a filer at 6\/24h'
+
+# ---- M5: a person starts being capped (DIVE-9262) ---------------------------
+# lodar 2026-11-25: a human-filed task is never capped. Drop the roster test and
+# the person arm must red. Control: the over-budget agent is still refused.
+run_mutation m5-person-capped \
+  's/ \&\& _task_roster_has "$_vfiler"; then/; then/' \
+  'a person' \
+  'control: the same call from an over-budget AGENT'
 
 printf -- '-----\nRESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

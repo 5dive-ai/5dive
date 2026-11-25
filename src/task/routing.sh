@@ -776,47 +776,18 @@ _task_lane_oldest() {
       ORDER BY COALESCE(created_at,'') ASC LIMIT ${2:-3};" 2>/dev/null || echo ""
 }
 
-# THE FILING CAP (DIVE-2681). Two controls over one classifier.
+# THE FILING CAPS. Core keeps one: `agent-task-cap`, a plain count of the
+# low/medium rows one agent files in a rolling 24h, off unless the owner turns it
+# on (`5dive config agent-task-cap=<n>`; src/lib/verify_policy.sh).
 #
-# The measured problem: across the 508 rows filed in the 8 days to 2026-08-02,
-# 54% concerned our own machinery and 5.5% touched anything a customer sees —
-# roughly 10:1. The fleet audits itself because auditing is always available,
-# and every internal row costs TWICE, because the DIVE-969 rail then books a
-# grading pass against it. The rule has existed as a directive since 2026-08-02
-# and did not hold: the agent that wrote it filed 55 rows the next day. A rule
-# recalled BY TOPIC cannot fire at a MOMENT, and `task add` is the moment.
+# DIVE-9262: the title-word cap (DIVE-2681) left the core. It judged a row by
+# OUR vocabulary (harness, lint, rails, smoke...), and on a customer's box that
+# refused the customer's own work ("commit the digest CSS"), and
+# "upgrade rails" would match too. The word list, its 1-in-4 ratio refusal and
+# the grader skip now live in the devteam plugin (core/task/filing_cap.sh), which
+# defines _task_internal_subject_reason and _task_filing_ratio_cap. A box without
+# the plugin defines neither, and src/task/crud.sh asks `declare -F` first.
 #
-# So the cap lives here, at the keystroke, and not in anyone's instructions.
-#
-# THE CLASSIFIER IS A CANDIDATE SET, NEVER AN ACTION SET. A title-keyword scan
-# cannot tell a harness row from a product row that happens to say "queue" —
-# "Free OSS web UI: three views (org chart, queue, gates)" is a customer
-# surface and matches on two words. So every consequence below is (a) announced
-# in the output, never silent, and (b) one declared flag away from off:
-#   --customer          this touches a customer surface; classifier was wrong
-#   --already-blocked=  it IS internal, and it is the stated exception
-# A false positive costs one flag. It never costs the row.
-# A MISS IS NOT CHEAP — MEASURED 2026-08-09. The first cut of this scan was
-# deliberately narrow on the reasoning that "a miss here is cheap and a false hit
-# taxes someone's real work". Only the second half of that held. Over the 946
-# hand-filed rows of the preceding 14 days the narrow set flagged **15%** where a
-# read of the same titles says ~67% are our own machinery, so the gating window
-# sat at 3/20 against a 5/20 threshold and the cap **never fired once**. The
-# fleet filed 55 rows a day, two of every three about itself, for five days after
-# the guard shipped and went live in 0.19.6.
-#
-# The narrow set failed for one structural reason: it keyed on MULTI-WORD phrases
-# ("verifier rail", "merge gate", "task add") while the rows that actually get
-# filed say the same things in one word — "gate" (102 occurrences in the missed
-# set), "agent" (97), "task" (80), then verifier, guard, rail, council, probe,
-# board. The vocabulary was right and the arity was wrong.
-#
-# So the set below is single-token where our machinery owns the token outright.
-# Two words stay OUT on purpose because the product IS agent hosting and they
-# cannot discriminate: **agent** and **queue**. Word boundaries do real work
-# here — "dashboard" does not match `board`, "webhook" does not match `hook`,
-# "latest" does not match `test`. Measured detection after widening: 45%, still
-# under the ~67% human read, which is the safe direction for a refusal.
 # Is the ACTIVE task store the production board? The filing cap is a rule about
 # how many rows the fleet puts on the shared board, so a run against a fixture
 # store has nothing for it to govern. Deliberately its own function rather than a
@@ -831,26 +802,6 @@ _task_filing_cap_store_is_prod() {
   ra="$(readlink -f "$active" 2>/dev/null || printf '%s' "$active")"
   rp="$(readlink -f "$prod" 2>/dev/null || printf '%s' "$prod")"
   [[ -n "$ra" && "$ra" == "$rp" ]]
-}
-
-_task_internal_subject_reason() {
-  local t="${1,,}"
-  # Our own machinery: the task engine, gates, verifier rails, CI, the release
-  # cut, harnesses, the board, agent plumbing. Still a candidate set, never an
-  # action set — see the two declared escapes above.
-  [[ "$t" =~ (^|[^a-z])(harness|harnesses|smoke|full[-_ ]sweep|pipefail|shellcheck|actionlint|lint|verifier|verifiers|rail|rails|task[[:space:]](add|done|need|ls)|taskboard|worktree|worktrees|heartbeat|release[-_ ]cut|version[-_ ]bump|changelog|pre[-_ ]push|guard|guards|council|ci|nightly|budget[-_ ]report|backlog|crontab|recurring|maker|regression|flaky|test|tests)([^a-z]|$) ]] \
-    && { printf 'internal machinery'; return 0; }
-  # DIVE-6652: gate, board, digest, unit, cron, hook and probe are OURS only in
-  # a compound. Bare, they are a customer's own work just as often: on teal-fox
-  # all 6 hits in a 20-row window were customer product rows (a feed-publish
-  # gate, a leak-scan gate, a bond-digest page, "customs unit values", a
-  # `critic-board-passed` key), the real machinery count was 0, and the cap
-  # refused a customer's "commit the digest CSS" row. Over our own last 1500
-  # rows the compounds keep 272 of the bare set's 332 hits; most of the 60 it
-  # drops are product rows too (a LinkedIn hook, a checkout probe, a cron line).
-  [[ "$t" =~ (^|[^a-z])((human|merge|push|secret|approval|decision|manual|done|spend|smoke|task|verify|ship)[-_ ]gates?|gates?[-_ ](digest|ping|card|cards|history|rail|rails|tier|routing|answer|evidence|re[-_ ]?nag)|(task|team)[-_ ]board|unit[-_ ]tests?|systemd[-_ ]units?|(git|claude|stop|session[-_ ]?start|pre[-_ ]?commit|pre[-_ ]?tool[-_ ]?use|post[-_ ]?tool[-_ ]?use)[-_ ]hooks?|pretooluse|posttooluse|selfcheck[-_ ]probes?)([^a-z]|$) ]] \
-    && { printf 'internal machinery'; return 0; }
-  return 0
 }
 
 # DIVE-3245 — THE PER-FILER VOLUME CAP: how many low/medium rows this filer has
@@ -879,65 +830,6 @@ _task_filer_low_med_24h() { # <filer> -> count
          AND priority IN ('low','medium')
          AND COALESCE(from_template_id,0)=0
          AND created_at > datetime('now','-24 hours');" 2>/dev/null
-}
-
-# THE NUMBER, AND WHY IT IS THIS NUMBER. Derived from 30 days of the real board
-# (low/medium, template-materialized and cli/system excluded), by asking how many
-# rows each cap WOULD have refused:
-#
-#     cap   main  olivia  dev  dev3  everyone else
-#      10    327     151   78     3              0
-#      12    313     129   47     1              0
-#      15    282      97   18     0              0     <- chosen
-#      20    227      60    7     0              0
-#
-# 15 is the smallest cap at which NO filer outside the top three is ever touched.
-# Below it the cap starts catching dev3, who is not the problem; above it the
-# heavy filers keep more of the headroom that produced 245 cancelled rows out of
-# 1092. The median filer's worst rolling-24h in that window is 4.5 and ten of
-# fourteen filers never exceed 6, so this leaves the ordinary case untouched by
-# more than 2x while binding all three runaway filers — including dev, which is
-# the point: a cap its author is exempt from is a suggestion.
-#
-# NOT `${_TASK_FILING_DAILY_CAP:-15}`. An env-overridable cap IS the bypass flag
-# this row forbids, just spelled differently and invisible in the record — and the
-# population it exists to slow down is the population that would export it. It is
-# a constant, and the harness trips it by seeding real rows rather than by
-# lowering the bar, which also means the tests exercise the REAL threshold.
-_TASK_FILING_DAILY_CAP=15
-
-# How many of the last N standard rows read as internal machinery. Counted by
-# running the SAME classifier over recent titles rather than storing a column —
-# no schema change, and the count can never disagree with the rule that gates
-# the next add. Prints "<internal> <total>".
-#
-# DIVE-6652: a row filed with --customer stays in the window but is never a hit.
-# The filer already told us the scan was wrong about it; re-scanning its title
-# here made every such row raise the count the NEXT filer is refused on. The
-# flag is read back from its task.customer ledger event (task add writes it),
-# keyed on ident so the lookup rides lifecycle_events_ident_idx.
-_task_internal_recent_ratio() {
-  local window="${1:-20}" n=0 hits=0 line
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    n=$((n + 1))
-    [[ "$line" == C* ]] && continue
-    # `if`, not `[[ ]] && ...`: as the LAST command in a loop body a false
-    # `&&` list makes the body — and so the loop — exit 1, which `set -e`
-    # takes as a failure. Same family as the defect this whole ticket exists
-    # to stop generating.
-    if [[ -n "$(_task_internal_subject_reason "${line:2}")" ]]; then
-      hits=$((hits + 1))
-    fi
-  done < <(db "SELECT CASE WHEN EXISTS (SELECT 1 FROM lifecycle_events e
-                                         WHERE e.ident=t.ident AND e.kind='task.customer')
-                           THEN 'C ' ELSE '- ' END || REPLACE(t.title, char(10), ' ')
-               FROM tasks t WHERE t.kind='standard' ORDER BY t.id DESC LIMIT ${window};")
-  # THE TRAILING NEWLINE IS LOAD-BEARING. `read` returns 1 when it hits EOF
-  # without a delimiter, so a bare "%s %s" makes the CALLER's `read` fail, and
-  # under src/header.sh's `set -euo pipefail` that killed `task add` outright
-  # with no error path reached — the exact silent-death class of DIVE-2604.
-  printf '%s %s\n' "$hits" "$n"
 }
 
 # Resolve the lone org root (the single top of the chart — reports_to NULL or a

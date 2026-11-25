@@ -62,6 +62,7 @@ cmd_box_config() {
         "       5dive config telegram-app=on|off|default" \
         "       5dive config seat-isolation=by-role|admin|standard|default" \
         "       5dive config gate-reminders=daily[@HH]|per-gate|default" \
+        "       5dive config agent-task-cap=<rows>|off|default" \
         "       5dive config local-only on|off|status|check   # nothing leaves your network (see: 5dive config local-only --help)" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
@@ -150,11 +151,14 @@ cmd_box_config() {
         "             every 24h on its own clock. daily[@HH] = all of them in ONE message" \
         "             a day at HH:00 UTC (default 09); urgent questions keep their own" \
         "             clock. There is no off: FIVEDIVE_GATE_RENAG=0 in root's cron is the" \
-        "             only full silence. Changing it tells the owner, naming who changed it." ) 2>/dev/null || true
+        "             only full silence. Changing it tells the owner, naming who changed it." \
+        "  agent-task-cap  how many low/medium tasks ONE AGENT may add in a rolling 24h" \
+        "             (DIVE-9262). Off by default. A task a person adds is never capped," \
+        "             and neither is a high or urgent one. Turn it on: agent-task-cap=15." ) 2>/dev/null || true
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll, gate-reminders)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll, gate-reminders, agent-task-cap)" ;;
     esac
     shift
   done
@@ -218,6 +222,12 @@ cmd_box_config() {
       gate_reminders_resolve; grs="$(gate_reminders_text); ${_GATE_REM_SRC}"
     fi
     gr="$_GATE_REM_MODE"; [[ "$gr" == daily ]] && gr="daily@$(printf '%02d' "$_GATE_REM_HOUR")"
+    # DIVE-9262: the per-agent filing cap and whether it came from this box's
+    # setting or the devteam plugin's default.
+    local atc atcs="default off"
+    atc=$(box_agent_task_cap)
+    if [[ -n "$(jq -r '.agent_task_cap // empty' <<<"$(_box_config_read)" 2>/dev/null)" ]]; then atcs="set on this box"
+    elif [[ "$atc" != off ]]; then atcs="the devteam plugin's default"; fi
     ok "verify = ${policy} (${src})
 verify-small = ${small} (${ssrc})
 coauthor = ${coauthor} (box-wide, default on)
@@ -237,12 +247,14 @@ mod-seat = ${ms} (box-wide, default off)
 telegram-app = ${ta} (box-wide, default on)
 seat-isolation = ${si} (box-wide; default by-role = leads and solo agents admin, team members standard)
 account-poll = ${ap} (box-wide, default off)
-gate-reminders = ${gr} (${grs})" \
+gate-reminders = ${gr} (${grs})
+agent-task-cap = ${atc} (${atcs}; a person's tasks and high/urgent are never capped)" \
        '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s,
          reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk, reflex_key_source:$rks,
          reflex_endpoint:$re, reflex_endpoint_source:$res, reflex_api:$ra, reflex_api_source:$ras, reflex_endpoint_key:$rek,
          reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, telegram_app:$ta, seat_isolation:$si, account_poll:$ap,
-         gate_reminders:$gr, gate_reminders_hour_utc:(if $grh == "" then null else ($grh|tonumber) end), gate_reminders_source:$grsrc, path:$p}' \
+         gate_reminders:$gr, gate_reminders_hour_utc:(if $grh == "" then null else ($grh|tonumber) end), gate_reminders_source:$grsrc, agent_task_cap:$atc, agent_task_cap_source:$atcs, path:$p}' \
+       --arg atc "$atc" --arg atcs "$atcs" \
        --arg gr "$_GATE_REM_MODE" --arg grh "$_GATE_REM_HOUR" --arg grsrc "$_GATE_REM_SRC" \
        --arg ms "$ms" --arg ok "$ok_k" --arg ta "$ta" --arg si "$si" --arg ap "$ap" --argjson oks "$okeys" \
        --arg v "$policy" --arg s "$src" --arg sm "$small" --arg c "$coauthor" \
@@ -370,13 +382,17 @@ gate-reminders = ${gr} (${grs})" \
       # No `off`: a value any sudo-5dive seat can write must never mute the owner.
       gate-reminders|gate_reminders) gate_reminders_valid "$v" \
                 || fail "$E_VALIDATION" "gate-reminders takes daily, daily@<hour 0-23 UTC>, per-gate, or default — got '${v:0:40}'. There is no off: reminders can be bundled, not silenced" ;;
+      # DIVE-9262. Stored as .agent_task_cap; `default` clears it (= off, or the
+      # devteam plugin's default on a box that has it).
+      agent-task-cap|agent_task_cap) [[ "$v" == default ]] || _agent_task_cap_valid "$v" \
+                || fail "$E_VALIDATION" "agent-task-cap takes a number of tasks per agent per 24h (1-9999), off, or default — got '${v:0:40}'" ;;
       # DIVE-4890. Validated in full before anything is written, like every key
       # above: one bad value in a multi-key call writes none of them.
       pace-week|pace_week) _pace_week_valid "$v" \
                 || fail "$E_VALIDATION" "pace-week takes <soft>/<hard> (integers, soft <= hard <= 100, e.g. 85/95), off, or default — got '$v'" ;;
       pace-5h|pace_5h) _pace_5h_valid "$v" \
                 || fail "$E_VALIDATION" "pace-5h takes a percentage (an integer 0-100, e.g. 85), off, or default — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll, gate-reminders)" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll, gate-reminders, agent-task-cap)" ;;
     esac
   done
   require_root
@@ -410,7 +426,8 @@ gate-reminders = ${gr} (${grs})" \
           || "$k" == mod-seat || "$k" == mod_seat || "$k" == telegram-app || "$k" == telegram_app \
           || "$k" == seat-isolation || "$k" == seat_isolation \
           || "$k" == account-poll || "$k" == account_poll \
-          || "$k" == gate-reminders || "$k" == gate_reminders ) ]]; then
+          || "$k" == gate-reminders || "$k" == gate_reminders \
+          || "$k" == agent-task-cap || "$k" == agent_task_cap ) ]]; then
       json=$(jq --arg k "${k//-/_}" 'del(.[$k])' <<<"$json")
     else
       if [[ "$k" == gate-reminders || "$k" == gate_reminders ]]; then

@@ -415,6 +415,30 @@ box_verify_small() {
   printf '%s' "$v"
 }
 
+# DIVE-9262 — `agent-task-cap`: how many low/medium rows ONE AGENT may file in a
+# rolling 24 hours. Off by default. A person filing a row is never capped, and
+# neither is a high or urgent row (src/task/crud.sh).
+#
+# Unset reads `off`, unless the devteam plugin supplies a default
+# (_task_agent_task_cap_default): that is how 5dive's own boxes keep the cap of
+# 15 they had before this was a setting. An explicit value, `off` included,
+# always wins. Anything unparseable reads `off`: a quota that cannot be read must
+# never stop a filing.
+_agent_task_cap_valid() {  # <value>
+  [[ "${1:-}" == off || "${1:-}" =~ ^[1-9][0-9]{0,3}$ ]]
+}
+box_agent_task_cap() {
+  local v="" f; f=$(_box_config_path)
+  if [[ -r "$f" ]]; then
+    v=$(jq -r '.agent_task_cap // empty' "$f" 2>/dev/null || printf '')
+  fi
+  if [[ -z "$v" ]] && declare -F _task_agent_task_cap_default >/dev/null 2>&1; then
+    v=$(_task_agent_task_cap_default 2>/dev/null) || v=""
+  fi
+  _agent_task_cap_valid "$v" || v="off"
+  printf '%s' "$v"
+}
+
 # `_task_grade_table_from_body <id>` — the LAST computed table written onto the
 # row, or nothing.
 #

@@ -13,10 +13,15 @@
 #   spares   the same board does NOT refuse urgent/high, and does not refuse a
 #            filer at a normal day's volume
 #
+# DIVE-9262: IT IS THE OWNER'S SETTING NOW, OFF BY DEFAULT. `5dive config
+# agent-task-cap=<n>` turns it on; a person filing a row (a name that is not a
+# seat on this box) is never capped. The devteam plugin may supply a default
+# (_task_agent_task_cap_default) so 5dive's own boxes keep their 15; an explicit
+# setting, off included, beats it.
+#
 # NO BYPASS. There is deliberately no flag and no env override — an env-tunable
 # cap is the bypass spelled differently, and invisible in the record. So this
-# harness trips the REAL threshold by seeding real rows, which is also why it
-# cannot be fooled by a cap that was quietly loosened.
+# harness trips the REAL threshold by seeding real rows.
 set -uo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \
@@ -57,19 +62,17 @@ AUDIT_CALLS="$TMP/audit.calls"; : >"$AUDIT_CALLS"
 audit_log() { printf '%s\n' "$*" >>"$AUDIT_CALLS"; }
 tasks_db_init; _tasks_db_migrate >/dev/null 2>&1
 
-CAP="$_TASK_FILING_DAILY_CAP"
-# BEHAVIOURAL, not a grep of the source. A source grep would still pass if the
-# assignment were `${_TASK_FILING_DAILY_CAP:-15}` — which is exactly the bypass
-# this row forbids, spelled so it reads like a default. Export a hostile value
-# and re-source: the constant must survive it.
-_cap_under_env=$( SRC="$SRC" _TASK_FILING_DAILY_CAP=999 bash -c '
-  set +e
-  for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh \
-           lib/agent_setup.sh lib/state.sh lib/audit.sh lib/registry.sh \
-           lib/tasks_db.sh lib/actor.sh cmd_task.sh; do . "$SRC/$f" 2>/dev/null; done
-  printf "%s" "$_TASK_FILING_DAILY_CAP"' 2>/dev/null )
-chk "the cap is a CONSTANT: a hostile env value does NOT raise it" "15" "$_cap_under_env"
+CAP=15
+setcap() { # <value>|unset — the owner's box setting
+  if [[ "$1" == unset ]]; then printf '{}\n' > "$STATE_DIR/box.json"
+  else printf '{"agent_task_cap":"%s"}\n' "$1" > "$STATE_DIR/box.json"; fi
+}
+# Every filer below is an AGENT (a seat on the org chart) unless named a person.
+db "INSERT INTO agents_org (name, reports_to) VALUES ('quiet',NULL),('heavy',NULL),('stale',NULL),('tmpl',NULL),('fresh',NULL);" >/dev/null 2>&1
 
+# ---- OFF BY DEFAULT ----------------------------------------------------------
+# A box that never set it caps nobody: an agent far over 15 files freely.
+setcap unset
 seed() { # <filer> <n> <priority> [age-hours]
   local who="$1" n="$2" pri="$3" age="${4:-1}" i
   for (( i=0; i<n; i++ )); do
@@ -88,6 +91,11 @@ rc_of() { ( JSON_MODE=0; cmd_task_add "$3" --priority="$2" --from="$1" ) >/dev/n
 # fourteen filers never exceed 6. This arm is the one that proves the cap is not
 # simply always-on — without it, every "refused" arm below is satisfied by a
 # rule that refuses everything.
+seed fresh 20 medium 2
+chk "unset (the default), an agent at 20/24h files fine" "0" "$(rc_of fresh medium 'still under no cap')"
+chk "the default reads as off" "off" "$(box_agent_task_cap)"
+setcap "$CAP"
+
 seed quiet 6 medium 2
 chk "a filer at 6/24h (above the real median) files fine" "0" "$(rc_of quiet medium 'ordinary finding')"
 
@@ -103,7 +111,8 @@ chk "low is capped too, not just medium" "1" \
 # A refusal that only names the limit buys silence, not judgement.
 chk "it names the ALTERNATIVE, not just the limit (the row body)" "1" \
     "$(grep -c 'BODY of the row you found it on' <<<"$out")"
-chk "it points at the wiki for durable knowledge" "1" "$(grep -c 'community/wiki' <<<"$out")"
+chk "it points at notes/wiki for durable knowledge" "1" "$(grep -c 'notes or wiki' <<<"$out")"
+chk "it names the owner's setting" "1" "$(grep -c 'config agent-task-cap' <<<"$out")"
 chk "it states there is NO bypass flag" "1" "$(grep -c 'no bypass flag' <<<"$out")"
 chk "it records the refused title rather than losing it" "1" \
     "$(grep -c 'REFUSED TITLE' <<<"$out")"
@@ -138,6 +147,29 @@ chk "template-materialized rows do NOT count toward their creator's cap" "0" \
 # files freely, which proves those refusals came from the rule, not the fence.
 chk "off the shared board the cap declines to enforce" "0" \
     "$( FIVEDIVE_PROD_TASKS_DB="$TMP/not-the-board.db" rc_of heavy medium 'off-board filing' )"
+
+# ---- a PERSON is never capped (lodar 2026-11-25) ------------------------------
+seed owner-person "$CAP" medium 2
+chk "a person (not a seat on this box) over the cap files fine" "0" \
+    "$( ( JSON_MODE=0; cmd_task_add 'the owner asks for a thing' --priority=medium --assignee=quiet --from=owner-person ) >/dev/null 2>&1; printf '%s' "$?")"
+chk "control: the same call from an over-budget AGENT is refused" "$E_VALIDATION" \
+    "$( ( JSON_MODE=0; cmd_task_add 'an agent asks for a thing' --priority=medium --assignee=quiet --from=heavy ) >/dev/null 2>&1; printf '%s' "$?")"
+
+# ---- the owner's setting decides -------------------------------------------
+setcap off
+chk "agent-task-cap=off: the over-budget agent files" "0" "$(rc_of heavy medium 'cap turned off')"
+_task_agent_task_cap_default() { printf '15'; }
+chk "off beats the devteam plugin's default" "0" "$(rc_of heavy medium 'off still wins')"
+setcap unset
+chk "unset + the plugin's default: the cap fires" "$E_VALIDATION" "$(rc_of heavy medium 'plugin default binds')"
+unset -f _task_agent_task_cap_default
+chk "unset, no plugin: off again" "0" "$(rc_of heavy medium 'no plugin no cap')"
+setcap 500
+chk "a higher owner number lifts it" "0" "$(rc_of heavy medium 'owner raised it')"
+setcap banana
+chk "an unreadable value reads off (fails open)" "off" "$(box_agent_task_cap)"
+chk "the setting rejects junk" "1" "$(_agent_task_cap_valid banana; printf '%s' "$?")"
+chk "the setting takes a count" "0" "$(_agent_task_cap_valid 15; printf '%s' "$?")"
 
 printf -- '-----\nRESULT: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]

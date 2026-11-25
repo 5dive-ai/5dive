@@ -556,97 +556,55 @@ cmd_task_add() {
   if [[ -n "$verifier" && -n "$assignee" && "$verifier" == "$assignee" ]]; then
     fail "$E_VALIDATION" "'$verifier' is this task's own assignee ('$assignee') — a maker can't grade itself (pick a different --verifier, or drop --assignee and let it default so the two can't collide)"
   fi
-  # DIVE-2681: the filing cap, enforced at the keystroke. Classify FIRST, because
-  # the classification feeds two separate controls below (the refusal here, and
-  # the verifier-rail skip further down). --customer declares the classifier
+  # DIVE-2681 / DIVE-9262: the title-word classifier and its 1-in-4 refusal are
+  # the devteam plugin's (core/task/filing_cap.sh), not the core's: they judge a
+  # row by 5dive's own vocabulary, which refused customers' own rows. Without the
+  # plugin neither function exists, nothing is classified and nothing is refused.
+  # Classify FIRST, because the classification feeds two controls (the refusal
+  # here, and the grader skip further down). --customer declares the classifier
   # wrong and turns both off; --already-blocked declares the stated exception and
   # turns off only the refusal, recording its reason in the body.
   local internal_reason=""
-  if [[ "$kind" == "standard" && -z "$customer_facing" ]]; then
+  if [[ "$kind" == "standard" && -z "$customer_facing" ]] \
+     && declare -F _task_internal_subject_reason >/dev/null 2>&1; then
     internal_reason=$(_task_internal_subject_reason "$title")
   fi
-  # THE CAP GOVERNS THE SHARED BOARD, SO IT ONLY APPLIES TO THE SHARED BOARD.
-  # Found 2026-08-09 by widening the classifier above: 24 harnesses seed rows with
-  # titles like "w review gate" and "smoke previous work", and once enough of them
-  # land in one fixture store the cap starts refusing a TEST's setup — which is
-  # not a filing decision at all, it is a rig building a fixture. The narrow scan
-  # hid this by never matching those titles; it was always the wrong scope.
-  # Store identity is the same primitive _task_human_send_allowed (DIVE-1506) uses
-  # one control over, for the same "a fixture must not act on prod" reason.
   # HIGH AND URGENT ARE NEVER CAPPED (lodar, 2026-08-09: "maybe refuse only low
-  # and med priority tasks"). The cap exists to stop the fleet filing routine
-  # observations about itself, and a quota that can block a SERIOUS finding is a
-  # quota that will eventually eat one — the cost of the two failure directions
-  # is not symmetric. An agent that has judged something high or urgent has said
-  # more about it than any title scan can, so that judgement wins. This also
-  # narrows what the escapes are for: --already-blocked is now about the stated
-  # exception at medium, not a way to force a serious row through.
+  # and med priority tasks"): a quota that can block a SERIOUS finding will
+  # eventually eat one. Both caps below honour it.
   local _cap_exempt_priority=""
   [[ "$priority" == "high" || "$priority" == "urgent" ]] && _cap_exempt_priority=1
-  if _task_filing_cap_store_is_prod && [[ -z "$_cap_exempt_priority" && -n "$internal_reason" && -z "$already_blocked" && "${FIVE_FILING_CAP:-1}" != "0" ]]; then
-    # `|| true` on the read as well as the newline at the producer: two
-    # independent guards, because a filing rule must never be able to take
-    # `task add` down. If the read ever comes back empty the cap declines to
-    # enforce rather than dying — a control that fails OPEN is the right
-    # posture for a quota, and the wrong one for a security check.
-    local _hits=0 _win=0; read -r _hits _win < <(_task_internal_recent_ratio 20) || true
-    [[ "$_hits" =~ ^[0-9]+$ ]] || _hits=0
-    [[ "$_win"  =~ ^[0-9]+$ ]] || _win=0
-    # Only enforce once the window is big enough to mean anything — on a fresh
-    # board a 1-in-4 rule computed over three rows is noise, not a signal.
-    if (( _win >= 8 )) && (( (_hits + 1) * 4 > (_win + 1) )); then
-      # A REFUSAL MUST LEAVE THE FINDING SOMEWHERE (lodar, 2026-08-09: "if task
-      # is refused where will it be logged if something serious found?"). Until
-      # now: nowhere. `fail` printed to the caller's terminal and returned, so a
-      # refused row left no record of its own title — the cap could eat a real
-      # finding and neither the filer's next session nor anyone auditing the cap
-      # could recover what was lost. policy_refuse writes the TITLE into
-      # policy_refusals.detail and emits a policy.refused lifecycle event, so
-      # `5dive task refusals` and the ledger both hold it. It fails with the same
-      # code afterwards, so the refusal itself is unchanged.
-      #
-      # The ident slot takes the would-be title rather than an ident, because at
-      # this point in `task add` the row does not exist and never will — the
-      # whole event is "this title was not allowed to become a row". Recording a
-      # synthetic ident would be worse than none: it would look like a lookup key.
-      policy_refuse "$E_VALIDATION" filing-cap-internal-machinery DIVE-2681 "(unfiled) ${title}" \
-        "filing cap: ${_hits} of the last ${_win} rows are already internal machinery — this one would make it $((_hits + 1))/$((_win + 1)), over the 1-in-4 cap.
-REFUSED TITLE (recorded in policy_refusals, not lost): ${title}
-An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked shipped work. Otherwise it belongs in the body of the row it was found on, or in the team wiki.
-  · it is serious                  →  --priority=high (high and urgent are never capped)
-  · it already blocked something   →  --already-blocked='<what it blocked>'
-  · the scan is wrong, this is a customer surface  →  --customer
-  · fleet-wide override (emergencies)  →  FIVE_FILING_CAP=0"
-    fi
+  if [[ -n "$internal_reason" && -z "$_cap_exempt_priority" && -z "$already_blocked" ]] \
+     && declare -F _task_filing_ratio_cap >/dev/null 2>&1 && _task_filing_cap_store_is_prod; then
+    _task_filing_ratio_cap "$title"
   fi
-  # DIVE-3245 — THE PER-FILER VOLUME CAP, beside the ratio cap above rather than
-  # replacing it, because they bind different things and both are needed.
-  # DIVE-2681 caps the PROPORTION of internal-machinery titles fleet-wide; this
-  # caps the VOLUME one filer can add per rolling 24h whatever the titles say.
-  # Measured: main filed 404 low/medium rows in 30 days and almost none of them
-  # classify as machinery, so the ratio cap never saw them.
+  # DIVE-3245 / DIVE-9262 — `agent-task-cap`: how many low/medium rows ONE AGENT
+  # may file in a rolling 24h, whatever the titles say. Off unless the owner sets
+  # it (`5dive config agent-task-cap=<n>`; box_agent_task_cap). A person filing a
+  # row is never capped: the filer must be a seat on this box's roster, so the
+  # owner, `telegram`, `cli` and any other uid-less principal file freely.
   #
   # THERE IS NO BYPASS FLAG, deliberately (DIVE-3245): "the population this exists
   # to slow down is exactly the population that would reach for one." The escape is
-  # --priority=high|urgent, which is BETTER than a flag precisely because it is not
-  # a bypass — it is a claim about severity, recorded on the row, visible to
-  # everyone, and falsifiable later. An env kill-switch would be invisible in the
-  # record, which is the property that makes it worth refusing.
+  # --priority=high|urgent, a claim about severity recorded on the row. The cap is
+  # the owner's setting, written by root, not an environment variable an agent
+  # can export.
   #
-  # IT STILL FAILS OPEN, which is not a bypass and is the same posture the ratio
-  # cap takes: if the count cannot be read the cap declines to enforce rather than
-  # taking `task add` down. A quota that can break filing is worse than a quota
-  # that occasionally misses.
-  if [[ "$kind" == "standard" && -z "$materialized" && -z "$_cap_exempt_priority" ]] \
+  # IT FAILS OPEN: if the count cannot be read the cap declines to enforce rather
+  # than taking `task add` down. A quota that can break filing is worse than a
+  # quota that occasionally misses.
+  local _vcap; _vcap=$(box_agent_task_cap 2>/dev/null) || _vcap="off"
+  if [[ "$kind" == "standard" && -z "$materialized" && -z "$_cap_exempt_priority" && "$_vcap" =~ ^[0-9]+$ ]] \
      && _task_filing_cap_store_is_prod; then
     local _vfiler; _vfiler=$(task_actor "$from") || _vfiler=""
-    # `cli` is the unmeasurable-actor sentinel, not a person with a filing habit.
-    if [[ -n "$_vfiler" && "$_vfiler" != "cli" ]]; then
+    # Agents only: `cli` is the unmeasurable-actor sentinel, and a name that is
+    # not a seat on this box is a person (or a uid-less principal acting for one).
+    if [[ -n "$_vfiler" && "$_vfiler" != "cli" ]] && _task_roster_has "$_vfiler"; then
       local _v24; _v24=$(_task_filer_low_med_24h "$_vfiler") || _v24=""
-      if [[ "$_v24" =~ ^[0-9]+$ ]] && (( _v24 >= _TASK_FILING_DAILY_CAP )); then
+      if [[ "$_v24" =~ ^[0-9]+$ ]] && (( _v24 >= _vcap )); then
         # Counted for the same reason the WIP cap counts its trips: whether this
-        # binds constantly is a fact about INFLOW, and it decides whether 15 was
-        # the right number — measured later, rather than re-argued.
+        # binds constantly is a fact about INFLOW, and it decides whether the
+        # owner's number is right — measured later, rather than re-argued.
         db "INSERT INTO task_prefs (key,value) VALUES ('filing_volume_cap_trips','1')
             ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INT)+1 AS TEXT), updated_at=datetime('now');" 2>/dev/null || true
         # DISTINCT SLUG from the ratio cap's, so `task refusals` and the ledger can
@@ -657,12 +615,12 @@ An internal-machinery finding gets its own ident ONLY if it has ALREADY blocked 
         # at the row the finding came from — which is where DIVE-3245 phase 2 will
         # put findings, so the instruction does not change under people later.
         policy_refuse "$E_VALIDATION" filing-cap-daily-volume DIVE-3245 "(unfiled) ${title}" \
-          "filing cap: ${_vfiler} has filed ${_v24} low/medium rows in the last 24h (cap ${_TASK_FILING_DAILY_CAP}, rolling).
+          "filing cap: ${_vfiler} has filed ${_v24} low/medium rows in the last 24h (cap ${_vcap}, rolling; the owner sets it with 5dive config agent-task-cap).
 REFUSED TITLE (recorded in policy_refusals, not lost): ${title}
 This is a budget on NEW ROWS, not on noticing things. Put it where it already has context:
   · a finding on work you are doing  →  append it to the BODY of the row you found it on
-  · durable, reusable knowledge      →  community/wiki/ (see the compile-knowledge skill; a
-    plain fact from this session needs no row and no page — 'memory consolidate' already lifts it)
+  · durable, reusable knowledge      →  your team's notes or wiki, not the board; a plain
+    fact from this session needs no row, 5dive memory consolidate already keeps it
   · someone must ACT and it is serious →  --priority=high (high and urgent are never capped)
 There is no bypass flag. If it is serious enough to need one, it is serious enough to be high."
       fi
@@ -956,7 +914,7 @@ REFUSED TITLE (recorded in policy_refusals, not lost): ${title}"
     parent="$(db "SELECT COALESCE(p.ident,'') FROM tasks t LEFT JOIN tasks p ON p.id=t.parent_id WHERE t.id=${id};" 2>/dev/null)" \
     actor="$creator" claimed_by="$derived_actor" in="$title" \
     detail="${priority} → ${assignee:-unassigned}${verifier:+ (verifier ${verifier})}"
-  # DIVE-6652: --customer is stored, so the filing cap's recent-rows window
+  # DIVE-6652: --customer is stored, so the devteam plugin's filing cap
   # (_task_internal_recent_ratio) stops counting this row as internal machinery.
   # A ledger event rather than a column: no schema epoch bump for one bit.
   [[ -n "$customer_facing" ]] && ledger_emit task.customer ident="$ident" task_id="$id" actor="$creator"
