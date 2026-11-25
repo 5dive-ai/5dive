@@ -35,6 +35,7 @@ cmd_start() {
   local name="${1:-}"
   [[ -n "$name" ]] || fail "$E_USAGE" "usage: 5dive agent start <name>"
   require_agent "$name"
+  _wedge_clear "$name" 2>/dev/null || true   # DIVE-9304: a fresh session has a fresh composer (see cmd_restart)
   systemctl start "5dive-agent@${name}.service" >&2
   # DIVE-857 prereq (b): record the operator's intent so the supervisor can
   # tell a crashed unit from a deliberate stop without inference.
