@@ -174,8 +174,7 @@ case "$TYPE" in
     if codex_dispatcher_enabled "$CHANNELS"; then
       CODEX_PLUGIN_DIR=""
       for _c in "${TELEGRAM_CODEX_PLUGIN_DIR:-}" \
-                /usr/local/lib/5dive/telegram-codex \
-                /home/claude/projects/5dive/5dive-plugins/plugins/telegram-codex; do
+                /usr/local/lib/5dive/telegram-codex; do
         [[ -n "$_c" && -f "$_c/dispatcher.ts" ]] && { CODEX_PLUGIN_DIR="$_c"; break; }
       done
       [[ -n "$CODEX_PLUGIN_DIR" ]] \
@@ -204,8 +203,7 @@ case "$TYPE" in
     if [[ ",${CHANNELS}," == *,telegram,* ]]; then
       OPENCODE_PLUGIN_DIR=""
       for _c in "${TELEGRAM_OPENCODE_PLUGIN_DIR:-}" \
-                /usr/local/lib/5dive/telegram-opencode \
-                /home/claude/projects/5dive/5dive-plugins/plugins/telegram-opencode; do
+                /usr/local/lib/5dive/telegram-opencode; do
         [[ -n "$_c" && -f "$_c/server.ts" ]] && { OPENCODE_PLUGIN_DIR="$_c"; break; }
       done
       [[ -n "$OPENCODE_PLUGIN_DIR" ]] \
@@ -230,8 +228,7 @@ case "$TYPE" in
     if [[ ",${CHANNELS}," == *,telegram,* ]]; then
       PI_PLUGIN_DIR=""
       for _c in "${TELEGRAM_PI_PLUGIN_DIR:-}" \
-                /usr/local/lib/5dive/telegram-pi \
-                /home/claude/projects/5dive/5dive-plugins/plugins/telegram-pi; do
+                /usr/local/lib/5dive/telegram-pi; do
         [[ -n "$_c" && -f "$_c/server.ts" ]] && { PI_PLUGIN_DIR="$_c"; break; }
       done
       [[ -n "$PI_PLUGIN_DIR" ]] \
@@ -751,8 +748,7 @@ TOML
      && ! grep -q '^\[mcp_servers\.telegram\]' "$AGENT_CODEX_HOME/config.toml" 2>/dev/null; then
     CODEX_PLUGIN_DIR=""
     for _c in "${TELEGRAM_CODEX_PLUGIN_DIR:-}" \
-              /usr/local/lib/5dive/telegram-codex \
-              /home/claude/projects/5dive/5dive-plugins/plugins/telegram-codex; do
+              /usr/local/lib/5dive/telegram-codex; do
       [[ -n "$_c" && -f "$_c/server.ts" ]] && { CODEX_PLUGIN_DIR="$_c"; break; }
     done
     if [[ -n "$CODEX_PLUGIN_DIR" ]]; then
@@ -1057,8 +1053,7 @@ if [[ "$TYPE" == "grok" ]] && [[ ",${CHANNELS}," == *,telegram,* ]]; then
   install -d -m 700 "$AGENT_GROK_HOME"
   GROK_PLUGIN_DIR=""
   for _c in "${TELEGRAM_GROK_PLUGIN_DIR:-}" \
-            /usr/local/lib/5dive/telegram-grok \
-            /home/claude/projects/5dive/5dive-plugins/plugins/telegram-grok; do
+            /usr/local/lib/5dive/telegram-grok; do
     [[ -n "$_c" && -f "$_c/server.ts" ]] && { GROK_PLUGIN_DIR="$_c"; break; }
   done
   if [[ -n "$GROK_PLUGIN_DIR" ]]; then
@@ -1133,8 +1128,7 @@ if [[ "$TYPE" == "grok" ]]; then
   if [[ ",${CHANNELS}," == *,dashboard,* ]]; then
     DASH_PLUGIN_DIR=""
     for _c in "${DASHBOARD_PLUGIN_DIR:-}" \
-              /usr/local/lib/5dive/dashboard \
-              /home/claude/projects/5dive/5dive-plugins/plugins/dashboard; do
+              /usr/local/lib/5dive/dashboard; do
       [[ -n "$_c" && -f "$_c/server.ts" ]] && { DASH_PLUGIN_DIR="$_c"; break; }
     done
     if [[ -n "$DASH_PLUGIN_DIR" ]]; then
@@ -1887,8 +1881,7 @@ if [[ "$TYPE" == "antigravity" ]] && [[ ",${CHANNELS}," == *,telegram,* ]]; then
   install -d -m 700 "$HOME/.gemini" "$AGY_CONFIG_DIR"
   AGY_PLUGIN_DIR=""
   for _c in "${TELEGRAM_AGY_PLUGIN_DIR:-}" \
-            /usr/local/lib/5dive/telegram-agy \
-            /home/claude/projects/5dive/5dive-plugins/plugins/telegram-agy; do
+            /usr/local/lib/5dive/telegram-agy; do
     [[ -n "$_c" && -f "$_c/server.ts" ]] && { AGY_PLUGIN_DIR="$_c"; break; }
   done
   if [[ -n "$AGY_PLUGIN_DIR" ]]; then
@@ -1997,8 +1990,7 @@ if [[ "$TYPE" == "antigravity" ]]; then
   AGY_DASH_SERVER=""
   if [[ ",${CHANNELS}," == *,dashboard,* ]]; then
     for _c in "${DASHBOARD_PLUGIN_DIR:-}" \
-              /usr/local/lib/5dive/dashboard \
-              /home/claude/projects/5dive/5dive-plugins/plugins/dashboard; do
+              /usr/local/lib/5dive/dashboard; do
       [[ -n "$_c" && -f "$_c/server.ts" ]] && { AGY_DASH_SERVER="$_c/server.ts"; break; }
     done
     [[ -n "$AGY_DASH_SERVER" ]] \
@@ -3289,8 +3281,7 @@ if [[ "$TYPE" == "hermes" || "$TYPE" == "openclaw" || "$TYPE" == "pi" || "$TYPE"
    && [[ ",${CHANNELS}," == *,dashboard,* ]]; then
   DASH_PLUGIN_DIR=""
   for _c in "${DASHBOARD_PLUGIN_DIR:-}" \
-            /usr/local/lib/5dive/dashboard \
-            /home/claude/projects/5dive/5dive-plugins/plugins/dashboard; do
+            /usr/local/lib/5dive/dashboard; do
     [[ -n "$_c" && -f "$_c/server.ts" ]] && { DASH_PLUGIN_DIR="$_c"; break; }
   done
   DASH_BUN="$(resolve_bun)" || DASH_BUN=""

@@ -63,6 +63,10 @@ cmd_box_config() {
         "       5dive config seat-isolation=by-role|admin|standard|default" \
         "       5dive config gate-reminders=daily[@HH]|per-gate|default" \
         "       5dive config agent-task-cap=<rows>|off|default" \
+        "       5dive config wake-protected=<names>|none|default" \
+        "       5dive config own-orgs=<github orgs>|none|default" \
+        "       5dive config principals=<names>|none|default" \
+        "       5dive config projects-root=<dir>|none|default" \
         "       5dive config local-only on|off|status|check   # nothing leaves your network (see: 5dive config local-only --help)" \
         "" \
         "  verify   whether a task on this box gets a grader session." \
@@ -154,11 +158,18 @@ cmd_box_config() {
         "             only full silence. Changing it tells the owner, naming who changed it." \
         "  agent-task-cap  how many low/medium tasks ONE AGENT may add in a rolling 24h" \
         "             (DIVE-9262). Off by default. A task a person adds is never capped," \
-        "             and neither is a high or urgent one. Turn it on: agent-task-cap=15." ) 2>/dev/null || true
+        "             and neither is a high or urgent one. Turn it on: agent-task-cap=15." \
+        "  wake-protected  agents that never go cold, comma-separated (DIVE-9315). Unset by default." \
+        "  own-orgs   GitHub orgs that are this box's own (DIVE-9315). An agent may not ask a" \
+        "             person to merge or push on one of them when a seat could. Unset by default." \
+        "  principals  names that may file tasks without being an agent, e.g. the owner (DIVE-9315)." \
+        "  projects-root  where this box keeps its checkouts and community/wiki (DIVE-9315)." \
+        "             Default: ${DEFAULT_WORKDIR:-/home/claude/projects}. \$FIVE_PROJECTS_ROOT wins over it." \
+        "             For these four, none = empty, and an unset one takes the devteam plugin's value." ) 2>/dev/null || true
         return 0 ;;
       -*) fail "$E_USAGE" "unknown flag: $1" ;;
       *=*) sets+=("$1") ;;
-      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll, gate-reminders, agent-task-cap)" ;;
+      *)  fail "$E_USAGE" "usage: 5dive config [<key>=<value>]  (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll, gate-reminders, agent-task-cap, wake-protected, own-orgs, principals, projects-root)" ;;
     esac
     shift
   done
@@ -229,6 +240,10 @@ cmd_box_config() {
     atc=$(box_agent_task_cap)
     if [[ -n "$(jq -r '.agent_task_cap // empty' <<<"$(_box_config_read)" 2>/dev/null)" ]]; then atcs="set on this box"
     elif [[ "$atc" != off ]]; then atcs="the devteam plugin's default"; fi
+    # DIVE-9315: the names and the path that used to be written into the core.
+    local wp oo pr prt
+    wp=$(box_named_setting wake_protected); oo=$(box_named_setting own_orgs)
+    pr=$(box_named_setting principals); prt=$(box_projects_root)
     ok "verify = ${policy} (${src})
 verify-small = ${small} (${ssrc})
 coauthor = ${coauthor} (box-wide, default on)
@@ -249,12 +264,19 @@ telegram-app = ${ta} (box-wide, default on)
 seat-isolation = ${si} (box-wide; default by-role = leads and solo agents admin, team members standard)
 account-poll = ${ap} (box-wide, default off)
 gate-reminders = ${gr} (${grs})
-agent-task-cap = ${atc} (${atcs}; a person's tasks and high/urgent are never capped)" \
+agent-task-cap = ${atc} (${atcs}; a person's tasks and high/urgent are never capped)
+wake-protected = ${wp:-none}
+own-orgs = ${oo:-none}
+principals = ${pr:-none}
+projects-root = ${prt}" \
        '{verify:$v, source:$s, verify_small:$sm, coauthor:$c, pace_week:$pw, pace_week_source:$pws, pace_5h:$p5, pace_5h_source:$p5s,
          reflex_receipts:$rr, reflex_receipts_source:$rrs, reflex_model:$rm, reflex_model_source:$rms, reflex_key:$rk, reflex_key_source:$rks,
          reflex_endpoint:$re, reflex_endpoint_source:$res, reflex_api:$ra, reflex_api_source:$ras, reflex_endpoint_key:$rek,
          reflex_configured:(if $rc == "true" then true elif $rc == "false" then false else null end), openrouter_key:$ok, openrouter_keys:$oks, mod_seat:$ms, telegram_app:$ta, seat_isolation:$si, account_poll:$ap,
-         gate_reminders:$gr, gate_reminders_hour_utc:(if $grh == "" then null else ($grh|tonumber) end), gate_reminders_source:$grsrc, agent_task_cap:$atc, agent_task_cap_source:$atcs, path:$p}' \
+         gate_reminders:$gr, gate_reminders_hour_utc:(if $grh == "" then null else ($grh|tonumber) end), gate_reminders_source:$grsrc, agent_task_cap:$atc, agent_task_cap_source:$atcs,
+         wake_protected:($wp|split(" ")|map(select(. != ""))), own_orgs:($oo|split(" ")|map(select(. != ""))),
+         principals:($pr|split(" ")|map(select(. != ""))), projects_root:$prt, path:$p}' \
+       --arg wp "$wp" --arg oo "$oo" --arg pr "$pr" --arg prt "$prt" \
        --arg atc "$atc" --arg atcs "$atcs" \
        --arg gr "$_GATE_REM_MODE" --arg grh "$_GATE_REM_HOUR" --arg grsrc "$_GATE_REM_SRC" \
        --arg ms "$ms" --arg ok "$ok_k" --arg ta "$ta" --arg si "$si" --arg ap "$ap" --argjson oks "$okeys" \
@@ -387,13 +409,19 @@ agent-task-cap = ${atc} (${atcs}; a person's tasks and high/urgent are never cap
       # devteam plugin's default on a box that has it).
       agent-task-cap|agent_task_cap) [[ "$v" == default ]] || _agent_task_cap_valid "$v" \
                 || fail "$E_VALIDATION" "agent-task-cap takes a number of tasks per agent per 24h (1-9999), off, or default — got '${v:0:40}'" ;;
+      # DIVE-9315. Stored space-separated under the underscore name; `default`
+      # clears it (= the devteam plugin's value, or empty), `none` = empty.
+      wake-protected|wake_protected|own-orgs|own_orgs|principals) _box_name_list_valid "$v" || [[ "$v" == default ]] \
+                || fail "$E_VALIDATION" "$k takes names separated by commas (letters, digits, . _ -), none, or default — got '${v:0:40}'" ;;
+      projects-root|projects_root) _box_projects_root_valid "$v" || [[ "$v" == default || "$v" == none ]] \
+                || fail "$E_VALIDATION" "projects-root takes an absolute directory (letters, digits, . _ - /), none, or default — got '${v:0:40}'" ;;
       # DIVE-4890. Validated in full before anything is written, like every key
       # above: one bad value in a multi-key call writes none of them.
       pace-week|pace_week) _pace_week_valid "$v" \
                 || fail "$E_VALIDATION" "pace-week takes <soft>/<hard> (integers, soft <= hard <= 100, e.g. 85/95), off, or default — got '$v'" ;;
       pace-5h|pace_5h) _pace_5h_valid "$v" \
                 || fail "$E_VALIDATION" "pace-5h takes a percentage (an integer 0-100, e.g. 85), off, or default — got '$v'" ;;
-      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll, gate-reminders, agent-task-cap)" ;;
+      *) fail "$E_VALIDATION" "unknown box setting: $k (keys: verify, verify-small, coauthor, pace-week, pace-5h, reflex-receipts, reflex-model, reflex-key, reflex-endpoint, reflex-api, reflex-endpoint-key, openrouter-key, openrouter-key.<plugin>, mod-seat, telegram-app, seat-isolation, account-poll, gate-reminders, agent-task-cap, wake-protected, own-orgs, principals, projects-root)" ;;
     esac
   done
   require_root
@@ -428,12 +456,15 @@ agent-task-cap = ${atc} (${atcs}; a person's tasks and high/urgent are never cap
           || "$k" == seat-isolation || "$k" == seat_isolation \
           || "$k" == account-poll || "$k" == account_poll \
           || "$k" == gate-reminders || "$k" == gate_reminders \
-          || "$k" == agent-task-cap || "$k" == agent_task_cap ) ]]; then
+          || "$k" == agent-task-cap || "$k" == agent_task_cap \
+          || "$k" == wake-protected || "$k" == wake_protected || "$k" == own-orgs || "$k" == own_orgs \
+          || "$k" == principals || "$k" == projects-root || "$k" == projects_root ) ]]; then
       json=$(jq --arg k "${k//-/_}" 'del(.[$k])' <<<"$json")
     else
       if [[ "$k" == gate-reminders || "$k" == gate_reminders ]]; then
         case "$v" in daily) v="daily@09" ;; daily@*) v="daily@$(printf '%02d' "$((10#${v#daily@}))")" ;; esac
       fi
+      case "$k" in wake-protected|wake_protected|own-orgs|own_orgs|principals) v="${v//,/ }"; v=$(xargs <<<"$v") ;; esac
       json=$(jq --arg k "${k//-/_}" --arg v "$v" '.[$k] = $v' <<<"$json")
     fi
     applied+=("$k")

@@ -225,6 +225,18 @@ devteam_require() {
   return 0
 }
 
+# DIVE-9315: the plugin's value for a box setting the box leaves unset, or
+# nothing. DATA, not code: core/box-defaults.json is read with one jq call and
+# never sourced, so a heartbeat tick that asks pays no plugin load. It passes
+# the same ownership check as every module. This is how 5dive's own boxes keep
+# the seat names, GitHub orgs and paths the core no longer carries.
+devteam_box_default() {  # <json key>
+  [[ -n "$_DEVTEAM_DIR" ]] || return 0
+  local f="$_DEVTEAM_DIR/core/box-defaults.json"
+  [[ -f "$f" ]] && _devteam_path_safe "$f" || return 0
+  jq -r --arg k "$1" '.[$k] // empty | strings' "$f" 2>/dev/null || true
+}
+
 _devteam_is_verb() { [[ " $DEVTEAM_VERBS " == *" ${1:-} "* ]]; }
 
 # main()'s fallthrough, before any plugin verb is looked up: run a devteam verb

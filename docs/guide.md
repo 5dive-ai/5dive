@@ -366,6 +366,8 @@ That arrives on your Telegram as tap-to-answer buttons. Tap one, and the owning 
 
 Agents filing too many small tasks for each other? Cap it: `sudo 5dive config agent-task-cap=15` (low/medium tasks per agent per day; off by default, and tasks you add are never capped).
 
+A few more box settings, all empty by default: `wake-protected=lead,support` (agents that never go cold), `own-orgs=acme` (your GitHub orgs: an agent may not ask you to merge or push there when a teammate could), `principals=dana` (a person who files tasks by name) and `projects-root=/srv/work` (where your checkouts and `community/wiki` live).
+
 External systems can file the same ordinary rows through authenticated triggers:
 
 ```sh

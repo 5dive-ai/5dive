@@ -423,7 +423,7 @@ _proactive_in_home() { # <home> <dir>
 }
 _proactive_workdir() {
   local w; w=$(registry_read 2>/dev/null | jq -r --arg n "$1" '.agents[$n].workdir // empty' 2>/dev/null) || w=""
-  printf '%s' "${w:-${DEFAULT_WORKDIR:-/home/claude/projects/5dive}}"
+  printf '%s' "${w:-${DEFAULT_WORKDIR:-/home/claude/projects}}"
 }
 # The agent's memory store: the one with an index, else any, else the one its
 # workdir's sessions load (made now).
