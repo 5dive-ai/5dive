@@ -43,7 +43,8 @@ TEAM_BUNDLE_FORMAT=1
 # The team key is trusted ONLY through 5dive's root, certified for this one kind
 # (5dive-team-key): the update key, the office app key and an expired or revoked
 # key are refused (_ou_chain, src/lib/offline_update.sh). A box without the root
-# refuses every premium file. packaging/premium-team/build.sh makes one.
+# refuses every premium file. 5dive's API makes them (DIVE-9114); the shell
+# reference producer is in hosted@5dive-plugins (tools/premium-team-build.sh).
 # Deliberately no DRM: the file can be passed on; the signature says it came
 # from 5dive, the stamp says whose copy it was.
 TEAM_PREMIUM_KIND="5dive-premium-team"
@@ -159,57 +160,21 @@ _team_premium_update_from() {
   printf '%s' "$old"
 }
 
-# 5dive team update <team> [--allow-downgrade] — ask 5dive for the newest version
-# of a premium team this server's account is entitled to, and apply it in place.
-# GET <api>/server/premium-teams/<team>/latest?have=<version> with the box token:
-# 200 = the buyer's signed file (then `team import` checks and applies it, exactly
-# as a file brought by hand), 204 = nothing newer, 402/403 = the subscription
-# ended, 404 = no such premium team for this account. An offline box imports the
-# file by hand.
-_team_premium_update_online() {
-  local team="" allow=0 a f have tok trc=0 url out http rc=0
-  for a in "$@"; do
-    case "$a" in
-      --allow-downgrade) allow=1 ;;
-      --json) ;;
-      -h|--help)
-        printf '%s\n' "usage: 5dive team update <team> [--allow-downgrade]" \
-          "  Bring a premium team bought from 5dive up to its newest version: personas," \
-          "  skills, roles and loops move; every agent keeps its memory, channels and bot." \
-          "  Needs this server online. Offline: 5dive team import <newer file>" >&2
-        return 0 ;;
-      -*) fail "$E_USAGE" "unknown flag: $a (usage: 5dive team update <team> [--allow-downgrade])" ;;
-      *)  [[ -z "$team" ]] && team="$a" || fail "$E_USAGE" "usage: 5dive team update <team> [--allow-downgrade]" ;;
-    esac
-  done
-  [[ "$team" =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]] || fail "$E_USAGE" "usage: 5dive team update <team> [--allow-downgrade]"
-  require_root "team update"
-  f="${STATE_DIR:-/var/lib/5dive}/premium-teams/$team.json"
-  [[ -f "$f" ]] || fail "$E_NOT_FOUND" "'$team' is not a premium team on this server (only a team bought from 5dive updates this way)"
-  have=$(jq -r '.version // empty' "$f" 2>/dev/null)
-  if declare -F local_only_on >/dev/null && local_only_on; then
-    fail "$E_VALIDATION" "this server works offline, so it cannot ask 5dive for a newer $team. Bring the newer file and run: 5dive team import <file>"
+# DIVE-9330 (step 6e of DIVE-9262) — `team update <team>` asks 5dive's API, as
+# the box, for the newest version of a premium team (DIVE-9116), so it left core
+# for hosted@5dive-plugins as the verb `premium-team update`. What it downloads
+# it hands back to core's `team import`, which checks and applies it here: an
+# offline box imports the same file by hand, so the verify side never moves.
+# The spelling `team update` stays because the buyer's docs name it and the
+# API's partner route probes `team update --json` (this answer must never read
+# "unknown team subcommand"). Official plugin only: it runs as root and fetches
+# what it applies. install.sh adds the plugin on every box with a box token and
+# a premium team (_hosted_plugin_ensure).
+_team_update_forward() {
+  if [[ "$(_plugin_verb_claims premium-team 2>/dev/null)" == "hosted@5dive-plugins" ]]; then
+    _plugin_dispatch_verb premium-team update "$@" || true
   fi
-  lazy_need _box_token
-  tok=$(_box_token) || trc=$?
-  (( trc == 0 )) && [[ -n "$tok" ]] || fail "$E_PERMISSION" "this server has no 5dive sign-in to ask with. Import the newer file by hand: 5dive team import <file>"
-  url="$(five_api_base)/server/premium-teams/$team/latest?have=${have}"
-  out=$(mktemp --suffix=.gz) || fail "$E_GENERIC" "could not stage the download"
-  # The bearer goes in on STDIN (-H @-), never argv (DIVE-5168).
-  http=$(printf 'Authorization: Bearer %s\n' "$tok" \
-           | curl -sS --max-time "${FIVE_TEAM_UPDATE_TIMEOUT:-120}" -H @- -o "$out" -w '%{http_code}' "$url" 2>/dev/null) || true
-  case "${http:-000}" in
-    200) ;;
-    204) rm -f "$out"; ok "premium team $team is up to date (${have:-unknown version})" '{team:$t, version:$v, updated:false}' --arg t "$team" --arg v "$have"; return 0 ;;
-    402|403) rm -f "$out"; fail "$E_PERMISSION" "the subscription to premium team $team has ended for this account — renew it to get updates. The team on this server keeps working." ;;
-    404) rm -f "$out"; fail "$E_NOT_FOUND" "5dive has no premium team $team for this server's account" ;;
-    *)   rm -f "$out"; fail "$E_GENERIC" "could not reach 5dive for premium team $team (HTTP ${http:-000}) — try again later, or import the newer file by hand" ;;
-  esac
-  local -a iargs=(import "$out")
-  (( allow )) && iargs+=(--allow-downgrade)
-  ( cmd_team "${iargs[@]}" ) || rc=$?
-  rm -f "$out"
-  return "$rc"
+  fail "$E_NOT_INSTALLED" "team update is not installed on this box: it comes with plugin hosted@5dive-plugins (sudo 5dive plugin add hosted@5dive-plugins). Offline: 5dive team import <newer file>"
 }
 
 # <file> <dir> -> unpack a team bundle into <dir>, print its team slug.

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # DIVE-9116 — a premium team bought from 5dive UPDATES IN PLACE from a newer
-# signed file: `team import <newer file>` over the installed team, and
-# `team update <team>` (asks 5dive for the newest, then the same import).
+# signed file: `team import <newer file>` over the installed team. (`team
+# update <team>`, which asks 5dive for that file and hands it to this import,
+# moved to hosted@5dive-plugins with DIVE-9330; its O arms went with it, and
+# tests/team_update_forward_unit.sh pins core's forward.)
 #
-# ROUND TRIP, through the real producer (packaging/premium-team/build.sh), the
+# ROUND TRIP, with files from a test producer (tests/lib/premium_team_file.sh), the
 # real verify + `team import` → `up` path, and the REAL `agent update
 # --from-pack=<file>` (src/cmd_pack.sh) on a fixture home. `agent import` is
 # emulated (it needs unix users): it lays the pack down the way import does —
@@ -20,12 +22,8 @@
 #   D2  an older version is refused (names --allow-downgrade) ...
 #   D3  ... and goes back with --allow-downgrade (role text back to 1.0.0's);
 #   B1  a newer file for ANOTHER buyer is refused, label unchanged;
-#   O1  `team update`: 204 says up to date; 403 says the subscription ended;
-#       200 applies the file it got; a team that is not premium is refused;
-#       the bearer never reaches curl's argv.
 #
-# COVERAGE LIMIT: unix users are not created (emulated import); the API route
-# that serves the newest file is DIVE-9114's and is stubbed here.
+# COVERAGE LIMIT: unix users are not created (emulated import).
 #
 # Run: bash tests/premium_team_update_unit.sh   (no root, no network)
 set -uo pipefail
@@ -56,7 +54,7 @@ tasks_db_init
 export TMPDIR="$TMP/tmpd" TEAM_AUTH_PROFILE=fixture
 export AGENT_HOME_ROOT="$TMP/home" REGISTRY="$TMP/agents.json" PENDING_RESTART_DIR="$TMP/pending"
 printf '{"agents":{}}\n' >"$REGISTRY"
-BUILD=packaging/premium-team/build.sh
+BUILD=tests/lib/premium_team_file.sh   # DIVE-9330: the real producer left core
 
 PASS=0; FAIL=0
 ok_t()  { printf 'ok   - %s\n' "$1"; PASS=$((PASS+1)); }
@@ -248,37 +246,6 @@ else bad_t 'D3 downgrade failed' "rc=$rc label=$(label_ver) $(tail -3 "$TMP/d3.o
 if (( rc != 0 )) && grep -q 'same buyer' "$TMP/b1.out" && [[ "$(label_ver)" == 1.0.0 && -z "$(grep '^agent ' "$REC")" ]]; then
   ok_t 'B1 a newer file for another buyer is refused, label unchanged'
 else bad_t 'B1 other buyer not refused' "rc=$rc $(tail -3 "$TMP/b1.out")"; fi
-
-# ============ O. team update (online) ========================================
-_box_token() { printf 'tok-SECRET'; }
-five_api_base() { printf 'https://api.example.test'; }
-CURL_CODE=204
-curl() { # records argv; serves the 1.1.0 file on 200
-  printf '%s\n' "$*" >>"$TMP/curl.argv"; cat >>"$TMP/curl.stdin"
-  local o="" prev=""; for a in "$@"; do [[ "$prev" == -o ]] && o="$a"; prev="$a"; done
-  [[ "$CURL_CODE" == 200 && -n "$o" ]] && cp "$TMP/v2.gz" "$o"
-  printf '%s' "$CURL_CODE"
-}
-: >"$TMP/curl.argv"; : >"$TMP/curl.stdin"
-( _team_premium_update_online research ) >"$TMP/o1.out" 2>&1; rc=$?
-if (( rc == 0 )) && grep -q 'up to date (1.0.0)' "$TMP/o1.out" && grep -q 'premium-teams/research/latest?have=1.0.0' "$TMP/curl.argv"; then
-  ok_t 'O1a 204: says up to date, and asked with the installed version'
-else bad_t 'O1a 204 not handled' "rc=$rc $(cat "$TMP/o1.out") $(cat "$TMP/curl.argv")"; fi
-CURL_CODE=403
-( _team_premium_update_online research ) >"$TMP/o2.out" 2>&1; rc=$?
-if (( rc != 0 )) && grep -q 'subscription to premium team research has ended' "$TMP/o2.out"; then ok_t 'O1b 403: the subscription ended, the team keeps working'
-else bad_t 'O1b 403 not handled' "rc=$rc $(cat "$TMP/o2.out")"; fi
-CURL_CODE=200; : >"$REC"
-( _team_premium_update_online research ) >"$TMP/o3.out" 2>&1; rc=$?
-if (( rc == 0 )) && [[ "$(label_ver)" == 1.1.0 ]] && grep -q 'Check every number against two sources.' "$MD_ANA" && [[ -z "$(grep '^agent import' "$REC")" ]]; then
-  ok_t 'O1c 200: the file it got is checked and applied in place'
-else bad_t 'O1c 200 not applied' "rc=$rc label=$(label_ver) $(tail -4 "$TMP/o3.out")"; fi
-( _team_premium_update_online nosuch ) >"$TMP/o4.out" 2>&1; rc=$?
-if (( rc != 0 )) && grep -q 'not a premium team on this server' "$TMP/o4.out"; then ok_t 'O1d a team that is not premium is refused'
-else bad_t 'O1d non-premium not refused' "rc=$rc $(cat "$TMP/o4.out")"; fi
-if ! grep -q 'tok-SECRET' "$TMP/curl.argv" && grep -q 'Authorization: Bearer tok-SECRET' "$TMP/curl.stdin"; then ok_t 'O1e the bearer goes on stdin, never argv'
-else bad_t 'O1e bearer on argv' "$(cat "$TMP/curl.argv")"; fi
-eq_t 'O1f no download is left behind' '' "$(find "$TMP/tmpd" -maxdepth 1 -name '*.gz' 2>/dev/null | head -3)"
 
 SUMMARY_PRINTED=1
 printf '\n%s\n' "premium_team_update_unit: pass=$PASS fail=$FAIL"

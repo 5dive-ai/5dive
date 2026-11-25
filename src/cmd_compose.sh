@@ -3630,7 +3630,7 @@ cmd_team() {
   case "$sub" in
     import) : ;;
     export)  cmd_team_export "$@"; return $? ;;   # DIVE-9107
-    update)  _team_premium_update_online "$@"; return $? ;;   # DIVE-9116
+    update)  _team_update_forward "$@" ;;   # DIVE-9116; the code is hosted@5dive-plugins' (DIVE-9330)
     plan)    _team_plan "$@"; return $? ;;
     freedom) cmd_team_freedom "$@"; return $? ;;   # DIVE-8853
     start)   _team_release start "$@"; return $? ;;
