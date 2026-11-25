@@ -2785,6 +2785,35 @@ elif [[ "$TYPE" == "claude" ]]; then
   echo "[5dive] agent=${NAME} no ANTHROPIC_API_KEY in the launcher env — custom-API-key seed not needed (skipped)" >&2
 fi
 
+# DIVE-9253: an onboarder seat. An outsider (a prospect firm's visitor) types
+# into it through the web chat while it runs on the box's Claude sign-in, so it
+# gets NO tools: no built-ins (--tools "", and every built-in denied by name as a
+# backstop), no skills or slash commands, and a permission mode that refuses any
+# tool not allowlisted, so the dashboard reply tool is the one thing it can call
+# (a plugin MCP that loads anyway is refused, not prompted). Every argument the
+# blocks above added (autonomy text, Chrome, other channels) is dropped: the
+# argv is rebuilt here, last. The dashboard plugin drops reply files and voice
+# on its own (DASHBOARD_ONBOARDER, and the same marker). Either the env stamp or
+# the root-owned marker turns it on; neither can turn it off.
+ONBOARDER_MARKER_DIR="${ONBOARDER_MARKER_DIR:-/etc/5dive/onboarders}"
+ONBOARDER_OVERRIDE=""
+ONBOARDER_DENY_TOOLS="Agent,Task,Bash,BashOutput,KillShell,KillBash,Read,Write,Edit,MultiEdit,NotebookEdit,NotebookRead,Glob,Grep,LS,LSP,WebFetch,WebSearch,TodoWrite,TodoRead,Skill,SlashCommand,ToolSearch,AskUserQuestion,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,CronCreate,CronDelete,CronList,DesignSync,ListAgents,McpTaskCheck,Monitor,PushNotification,ReportFindings,ScheduleWakeup,SendMessage,TaskCreate,TaskGet,TaskList,TaskOutput,TaskStop,TaskUpdate,Workflow,ListMcpResourcesTool,ReadMcpResourceTool,PowerShell,Artifact,ArtifactComments,ArtifactData"
+if [[ "${AGENT_ONBOARDER:-}" == 1 || -e "${ONBOARDER_MARKER_DIR}/${NAME}" ]]; then
+  [[ "$TYPE" == claude ]] \
+    || { echo "[5dive] agent=${NAME} is an onboarder seat, which runs only as type claude (got $TYPE); not starting" >&2; exit 2; }
+  [[ "$CHANNELS" == dashboard ]] \
+    || { echo "[5dive] agent=${NAME} is an onboarder seat, whose only channel is dashboard (got '$CHANNELS'); not starting" >&2; exit 2; }
+  ARGS=(--permission-mode dontAsk
+        --allowedTools "mcp__plugin_dashboard_dashboard__reply"
+        --tools ""
+        --disallowedTools "$ONBOARDER_DENY_TOOLS"
+        --disable-slash-commands
+        --channels "plugin:dashboard@5dive-plugins")
+  RESUME_ID=""
+  ONBOARDER_OVERRIDE="export DASHBOARD_ONBOARDER=1; "
+  echo "[5dive] agent=${NAME} onboarder seat: no tools, dashboard reply only (text, no files)" >&2
+fi
+
 CMD_STR=$(printf '%q ' "$BIN" "${ARGS[@]}")
 
 # Headless first-boot for openclaw with no channel. The old prelude ran the
@@ -2844,7 +2873,7 @@ else
   LOOP="while true; do ${CMD_STR}; sleep 2; done"
 fi
 
-INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${OPENCLAW_PATH_OVERRIDE}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PI_OVERRIDE}${HERMES_OVERRIDE}${PRELUDE}${LOOP}"
+INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${ONBOARDER_OVERRIDE}${STAGE_GUARD}${OPENCLAW_PATH_OVERRIDE}${CODEX_OVERRIDE}${OPENCODE_OVERRIDE}${PI_OVERRIDE}${HERMES_OVERRIDE}${PRELUDE}${LOOP}"
 [[ -n "$PROFILE" ]] && echo "[5dive] agent=${NAME} using auth-profile=${PROFILE}" >&2
 
 # DIVE-4036: DECLARE how dispatched work reaches this agent, then launch.

@@ -2046,6 +2046,12 @@ write_agent_env() {
   if [[ -z "$chrome" && -r "$env_file" ]]; then
     chrome=$(sed -n 's/^AGENT_CHROME=//p' "$env_file" | head -1)
   fi
+  # DIVE-9253: an onboarder seat (`5dive onboarder create`). Sticky: no rewrite
+  # (channels, model, autonomy) can drop it; only `onboarder rm` removes the seat.
+  local onboarder="${_ONBOARDER_OVERRIDE:-}"
+  if [[ -z "$onboarder" && -r "$env_file" ]]; then
+    onboarder=$(sed -n 's/^AGENT_ONBOARDER=//p' "$env_file" | head -1)
+  fi
   # DIVE-7333: the openclaw/hermes model pin (`agent config set model=`), same
   # discipline. Empty = no line: the seat runs its account's model.
   local model_pin="${_MODEL_OVERRIDE:-}"
@@ -2069,6 +2075,7 @@ write_agent_env() {
     [[ "$can_push" == "1" ]] && printf 'AGENT_CAN_PUSH=1\n'
     [[ "$can_deploy" == "1" ]] && printf 'AGENT_CAN_DEPLOY=1\n'
     [[ "$chrome" == "1" ]] && printf 'AGENT_CHROME=1\n'
+    [[ "$onboarder" == "1" ]] && printf 'AGENT_ONBOARDER=1\n'
     [[ -n "$model_pin" ]] && valid_model "$model_pin" && printf 'AGENT_MODEL=%s\n' "$model_pin"
     [[ -n "$oc_port" ]] && openclaw_port_valid "$oc_port" && printf 'AGENT_OPENCLAW_PORT=%s\n' "$oc_port"
     # New telegram agents flow through our 5dive-plugins fork (bundled
@@ -4842,9 +4849,16 @@ cmd_create() {
   if channel_in_list telegram "$channels" && [[ -n "$telegram_token" && -n "$telegram_allowed_users" ]]; then
     _tg_connect_greet_launch "$name" "$type"
   fi
-  step "Enabling 5dive-agent@${name}.service"
-  systemctl daemon-reload
-  systemctl enable --now "5dive-agent@${name}.service" >&2
+  # DIVE-9253: an onboarder seat is created STOPPED and not enabled: it starts
+  # on its firm's first message (`5dive onboarder wake`) and never at boot.
+  if [[ "${_CREATE_STOPPED:-}" == 1 ]]; then
+    step "Leaving 5dive-agent@${name}.service stopped (starts on its first message)"
+    systemctl daemon-reload
+  else
+    step "Enabling 5dive-agent@${name}.service"
+    systemctl daemon-reload
+    systemctl enable --now "5dive-agent@${name}.service" >&2
+  fi
 
   # Install any preseeded skills. A failed install does NOT roll back the
   # agent — networks flake, the agent itself is fine, and the user can rerun

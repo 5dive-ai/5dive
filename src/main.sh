@@ -1448,6 +1448,13 @@ main() {
         hire) AUDIT_CMD="partner hire"; AUDIT_ARGS=("${@:2}") ;;
       esac
       cmd_partner "$@" ;;
+    onboarder)
+      # DIVE-9253: one locked-down agent per prospect firm (src/cmd_onboarder.sh).
+      # create/rm/wake/tick are root verbs and audited; ls is a read.
+      case "${1:-}" in
+        create|rm|remove|wake) AUDIT_CMD="onboarder ${1}"; AUDIT_ARGS=("${@:2}") ;;
+      esac
+      cmd_onboarder "$@" ;;
     helper)
       # DIVE-8819: the 5dive helper seat. DIVE-8946: `ensure` no longer builds it;
       # it is still audited, as a root verb.
