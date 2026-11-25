@@ -7647,200 +7647,18 @@ _hb_rebalance_sweep() {  # <now> <usage-json>
   return 0
 }
 
+# DIVE-9281: the sweep is the devteam plugin's (core/task/gate_evidence.sh); the
+# heartbeat only calls it, and a box without the plugin skips it.
 _hb_gate_shipped_sweep() {
-  local grow gid gident gtype gowner repo hit _c_epoch _asked
-  # Normalize the repo allow-list: commas or spaces both separate.
-  local repos; repos="${_HB_GATE_SHIPPED_REPOS//,/ }"
-  [[ -n "${repos// }" ]] || return 0
-  # DIVE-6938: the PR reader is the devteam plugin's.
-  devteam_loaded || return 0
-  # DIVE-2414: resolve the read-only gh credential ONCE for the whole sweep, not
-  # per gate — _gate_gh_token can shell out to sudo and the sweep runs every tick.
-  # Empty is a first-class answer: the subject reader returns UNKNOWN, never a
-  # silent accept.
-  local _gs_tok=""
-  command -v gh >/dev/null 2>&1 && _gs_tok=$(_gate_gh_token)
-  while IFS= read -r grow; do
-    [[ -n "$grow" ]] || continue
-    IFS=$'\x1f' read -r gid gident gtype gowner <<<"$grow"
-    [[ -n "$gid" && -n "$gident" ]] || continue
-    # DIVE-2068: type=secret is satisfied ONLY by a human handing over a
-    # credential — that event cannot appear in a commit or a merged PR, ever.
-    # So for this type a commit/PR hit carries ZERO information and "likely
-    # shipped, verify and close" would be a false positive 100% of the time.
-    # Skip both evidence paths below (subject-PR and row-commit) up front;
-    # decision/approval/manual are unaffected — a commit genuinely can be
-    # evidence for those.
-    if [[ "$gtype" == "secret" ]]; then
-      _hb_log "[gate-shipped] ${gident} — type=secret: a commit/PR can never be evidence a credential was handed over (DIVE-2068); NOT flagging, gate stays eligible"
-      _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=type-secret" || true
-      continue
-    fi
-    # DIVE-2414: READ WHAT THE GATE IS ABOUT BEFORE READING THE ROW.
-    # The commit-stream lookup below is row-level evidence: it answers "did
-    # something naming this ROW land", which on a multi-item row is routinely a
-    # different item than the one the ask is about (DIVE-2382 — flagged "likely
-    # shipped, verify+close" while its live approval asked about something else).
-    # So when the ASK names a pull request, that PR's MEASURED state is
-    # authoritative and the row's commits are not consulted at all:
-    #   OPEN     -> withhold the flag even if the row has commits. The ask is live.
-    #   UNKNOWN  -> withhold. A state that could not be read is not a negative
-    #               (DIVE-2318). No stamp, so a later tick retries.
-    #   MERGED   -> flag, with the SUBJECT as the named evidence.
-    # A gate that names NO subject falls through to the row-level path, which
-    # keeps its DIVE-1140 behaviour and now SAYS which evidence class it used.
-    # Fetched per row rather than in the sweep query on purpose: an ask is
-    # multi-line and would break the x'1f' line-per-row read above.
-    local _ask _sbody _sslug _sv _svd
-    _ask=$(db "SELECT COALESCE(ask,'') FROM tasks WHERE id=${gid};")
-    _sbody=$(db "SELECT COALESCE(body,'') FROM tasks WHERE id=${gid};")
-    _sslug=$(_gate_task_repo_slug "" "$_sbody")
-    _sv=$(_gate_subject_verdict "$_ask" "$_gs_tok" "$gident" "$_sslug")
-    _svd="${_sv#*|}"
-    case "${_sv%%|*}" in
-      OPEN)
-        _hb_log "[gate-shipped] ${gident} — the PR its ASK names is still OPEN (${_svd}); NOT flagging, and the row's own commits are NOT evidence about this gate (DIVE-2414). Gate stays eligible."
-        _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=subject-open" "subject=$_svd" || true
-        continue ;;
-      UNKNOWN)
-        _hb_log "[gate-shipped] ${gident} — its ASK names a PR whose state could NOT be read (${_svd}); NOT flagging (a non-verdict is not a negative), no stamp, will retry (DIVE-2414)."
-        _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=subject-unreadable" "subject=$_svd" || true
-        continue ;;
-      MERGED)
-        db "UPDATE tasks SET shipped_flag_at=datetime('now') WHERE id=${gid};"
-        _task_store_audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "evidence=subject-pr" "subject=$_svd" || true
-        _hb_log "[gate-shipped] ${gident} — the PR its ASK names is MERGED (${_svd}) -> flagged on SUBJECT state, not on the row's commits (DIVE-2414)"
-        if [[ -n "$gowner" ]] && _task_agent_channel "$gowner"; then
-          ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$gowner" --message="🚢 ${gident} — the pull request this open ${gtype} gate ASKS ABOUT is now merged (${_svd}). Likely settled: verify and close with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off (DIVE-555), so it stays open until you clear it." ) >/dev/null 2>&1 || true
-        fi
-        continue ;;
-    esac
-    # NO-SUBJECT from here down: the ask names no pull request, so nothing can
-    # retire it automatically and the row-level nudge has to say what it is.
-    hit=""
-    for repo in $repos; do
-      hit=$(_hb_repo_grep_ident "$repo" "$gident") && [[ -n "$hit" ]] && break
-      hit=""
-    done
-    [[ -n "$hit" ]] || continue
-    # DIVE-2001: a merge that PREDATES the open ask cannot be evidence the ask is
-    # satisfied. The flag fired on DIVE-1968 citing a commit merged ~2h before the
-    # gate existed, telling the owner "likely shipped, verify and close" about work
-    # the open ask had nothing to do with. On a ticket that lands in pieces that
-    # nudge points the right way for the wrong reason, arrives with the authority
-    # of an automatic check, and agrees with what the assignee already wants to do.
-    # Deliberately does NOT stamp shipped_flag_at: the gate stays eligible, so a
-    # genuinely later merge still flags on a subsequent tick.
-    _c_epoch=$(awk '{print $3}' <<<"$hit")
-    _asked=$(db "SELECT COALESCE(strftime('%s', need_asked_at),'') FROM tasks WHERE id=${gid};")
-    # DIVE-2003: the epoch is field 3 of _hb_repo_grep_ident's output — git's
-    # '%h %ct %s' with the repo stem PREPENDED. That field index is a contract
-    # between two functions and the unit test STUBS the producer, so a drift in
-    # the real --format string is invisible to the suite. Measured by olivia:
-    # reverting the stub to a no-epoch format and DELETING this guard outright
-    # give the IDENTICAL 8/2 signature, and the fall-through wrote nothing to
-    # _hb_log or audit_log — so the guard could vanish leaving no trace anywhere.
-    # Fail-open remains correct (withholding a legitimate flag is itself a
-    # silence), but it must never again be silent.
-    if [[ ! "$_c_epoch" =~ ^[0-9]+$ ]]; then
-      _hb_log "[gate-shipped] ${gident} — commit epoch UNPARSEABLE from lookup (\"${hit}\"); flagging anyway, but the predates-ask guard could NOT run (lookup format drift?)"
-      # DIVE-2054: task-store gate-sweep telemetry — fenced.
-      _task_store_audit_log "gate shipped-flag" "degraded" 0 -- "task=$gident" "reason=epoch-unparseable" "commit=$hit" || true
-    elif [[ ! "$_asked" =~ ^[0-9]+$ ]]; then
-      # Deliberately a DIFFERENT message from the drift case above: legacy gates
-      # predate need_asked_at, so this is expected and routine. Folding the two
-      # together would bury the drift signal in noise that operators learn to skip.
-      # And deliberately a different DURABILITY: the drift branch writes an audit
-      # row, this one does not. A routine event does not belong in the audit table
-      # — filling it with the expected case is how the exceptional case stops being
-      # findable in it.
-      _hb_log "[gate-shipped] ${gident} — no need_asked_at stamp; predates-ask guard not applicable (legacy gate)"
-    elif (( _c_epoch < _asked )); then
-      _hb_log "[gate-shipped] ${gident} — newest matching commit PREDATES the open ask ($(date -u -d @"$_c_epoch" +%FT%TZ) < $(date -u -d @"$_asked" +%FT%TZ)); NOT flagging, gate stays eligible"
-      # DIVE-2054: same reasoning as the "degraded" case above — fenced.
-      _task_store_audit_log "gate shipped-flag" "skip" 0 -- "task=$gident" "reason=commit-predates-ask" "commit=$hit" || true
-      continue
-    fi
-    db "UPDATE tasks SET shipped_flag_at=datetime('now') WHERE id=${gid};"
-    # DIVE-2054: same reasoning as the two branches above — fenced.
-    _task_store_audit_log "gate shipped-flag" "ok" 0 -- "task=$gident" "type=$gtype" "evidence=row-commit" "commit=$hit" || true
-    _hb_log "[gate-shipped] ${gident} — its ask names NO PR subject; falling back to ROW-level evidence: commit on ${_HB_GATE_SHIPPED_REF} references the row: ${hit} -> flagged"
-    if [[ -n "$gowner" ]] && _task_agent_channel "$gowner"; then
-      # DIVE-2414: name the EVIDENCE CLASS in the nudge. This flag says a commit
-      # named the ROW, and the ask names no PR to check instead — so on a row
-      # carrying several items it may well be about a different one (DIVE-2382).
-      # The old wording asserted "likely shipped" with no way to tell the two apart.
-      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$gowner" --message="🚢 ${gident} — a commit referencing this open ${gtype} gate's ROW landed on ${_HB_GATE_SHIPPED_REF} (${hit}). This ask names no pull request, so the evidence is ROW-level: if the row carries several items, the commit may be about a different one — check before you clear. Verify with \`5dive task show ${gident}\`. Auto-flag only — a merge is not a sign-off, so it stays open until you clear it." ) >/dev/null 2>&1 || true
-    fi
-  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||need_type||x'1f'||COALESCE(assignee,'')
-               FROM tasks
-               WHERE need_type IS NOT NULL AND need_answered_at IS NULL
-                 AND shipped_flag_at IS NULL
-                 AND status NOT IN ('done','cancelled');")
-  return 0
+  declare -F _gate_shipped_sweep >/dev/null 2>&1 || return 0
+  _gate_shipped_sweep
 }
 
-# ── DIVE-4701 — POLL THE BOUND PULL REQUEST OF A GRADED ROW ───────────────────
-#
-# AXIS: the autonomy number. A row whose pull request the MAINTAINER merged on
-# the forge waits today for a seat to be woken and to run a verb. On a box with
-# no machine credential — every outside-contributor box; teal-fox is one — that
-# wait is a HUMAN noticing, which is the loop this sweep removes. luca's ask 3
-# (2026-09-18, `2026-09-18-task-flow-simplification.md`): *"A merged PR closes
-# its row. Poll the PR on rows with delivery_ref; when it is merged, stamp the
-# merge sha and close — a read needs no bot token."*
-#
-# IT DOES NOT CLOSE, AND THE NARROWING IS THE POINT. *"A merged pull request is
-# not automatically a finished row"* — DIVE-4520 measured two of seven rows one
-# morning carrying an owed clause inside their own PASS verdict, which survives
-# the merge. So this sweep RECORDS the landing the forge already reports (the
-# DIVE-4654 columns), retires the hold, takes the row out of the MERGING stage
-# and hands it to the seat whose close is ungated. The close stays a judgement a
-# seat makes. What changes is that the row now SAYS it is owed a close, to the
-# seat that can give it one, without anybody having had to look.
-#
-# WHY THE HEARTBEAT AND NOT THE VERB. `task merge-landed` (DIVE-4654) already
-# does all of the above, correctly, and is reachable by the three seats the row
-# names. Every one of them has to be DISPATCHED first, and the dispatch is the
-# expensive part — `cmd_heartbeat.sh:4085` wakes the merge owner to read a pull
-# request by hand, and DIVE-4632 measured four such dispatches of which the last
-# three were no-ops costing a session each. The observation needs no session.
-#
-# SCOPED TO `graded->merge`, deliberately, and not to every row with a binding.
-# That is the one stage whose EXIT is the landing; a `delivered` or `reviewing`
-# row whose pull request merged early is a different question (the grade has not
-# happened) and recording a landing on it would retire a hold nobody placed. If
-# this arm proves quiet, widening is a second row, not a wider predicate here.
-#
-# COST: one read per merging row per tick, and the row leaves the population the
-# moment it is recorded — `_TASKS_MERGE_LANDED_SQL` is subtracted below, so a
-# landing is read ONCE and never again. An OPEN pull request is re-read each
-# tick, which is the whole job. A rail that cannot answer changes NOTHING and is
-# reported once on `doctor`, never per tick (the DIVE-4619 shape: the sweep
-# records what it measured, the health check reads the recording).
-#
+# DIVE-4701 forge merge poll: the sweep is the devteam plugin's _forge_merge_sweep
+# (DIVE-9281); the tick keeps the off switch and the no-plugin answer.
 # OFF SWITCH: FIVEDIVE_FORGE_MERGE_POLL=off. Default on.
 _HB_FORGE_MERGE_POLL="${FIVEDIVE_FORGE_MERGE_POLL:-on}"
 
-# _hb_forge_merge_reading_path — where the sweep leaves what it measured, for
-# `doctor` to read. A FILE and not a task_prefs row on purpose: `doctor` runs
-# health checks that must not open or migrate the task store to answer.
-_hb_forge_merge_reading_path() {
-  printf '%s/forge-merge-poll.reading' "${STATE_DIR:-/var/lib/5dive}"
-}
-
-# _hb_forge_merge_record_reading <class> <rows> <landed> <unreadable> <reason>
-# Best-effort: a reading that cannot be written costs a doctor line, never a tick.
-_hb_forge_merge_record_reading() {
-  local f; f="$(_hb_forge_merge_reading_path)"
-  local d; d="$(dirname "$f")"
-  [[ -d "$d" ]] || return 0
-  printf 'class=%s\nasof=%s\nasof_epoch=%s\nrows=%s\nlanded=%s\nunreadable=%s\nreason=%s\n' \
-    "$1" "$(date -u +%FT%TZ 2>/dev/null || printf 'unknown')" \
-    "$(date +%s 2>/dev/null || printf '0')" "$2" "$3" "$4" "$5" \
-    >"$f" 2>/dev/null || return 0
-  return 0
-}
 
 # DIVE-4833 — the approval offer's clock. One pass per tick over gates whose
 # `need_expires_at` has passed, resolving each through the SAME `_gate_expire_due`
@@ -7898,102 +7716,13 @@ _hb_forge_merge_sweep() {
     _hb_log "[forge-merge] the merge-landing helpers are not loaded in this context; sweep did NOT run — no row was read and nothing was written (this is not 'nothing had merged')"
     return 0
   fi
-  local row id ident dref asgn vfier owner probe verdict rest sha at moved
-  local n_rows=0 n_landed=0 n_open=0 n_unread=0 n_wfail=0
-  local first_reason=""
-  while IFS= read -r row; do
-    [[ -n "$row" ]] || continue
-    IFS=$'\x1f' read -r id ident dref asgn vfier owner <<<"$row"
-    # A row with no binding is NEVER read. The predicate below already excludes
-    # it (`_TASKS_TFV_SQL` requires a non-blank delivery_ref); this is the second
-    # half of that assertion, here because a read is the only thing in this sweep
-    # that leaves the box.
-    [[ -n "$id" && -n "$dref" ]] || continue
-    n_rows=$((n_rows+1))
-    probe=$(_merge_landed_probe "$dref" "$(_gate_slug_from_url "$dref" 2>/dev/null || printf '')" 2>/dev/null) || probe="UNKNOWN"
-    verdict="${probe%%$'\x1f'*}"
-    rest="${probe#*$'\x1f'}"
-    case "$verdict" in
-      OPEN)
-        # THE NEGATIVE CONTROL, and it is the common case: the forge answered and
-        # it has not landed. Nothing is written, nothing is stamped, no throttle
-        # is consumed — the next tick asks again, which is the entire job.
-        n_open=$((n_open+1))
-        continue ;;
-      MERGED) : ;;
-      *)
-        # A non-verdict is not a negative (DIVE-2318/DIVE-2414). Nothing is
-        # written and no stamp is taken, so a later tick retries. Counted, and
-        # said once through the reading `doctor` reads — never per tick.
-        n_unread=$((n_unread+1))
-        [[ -n "$first_reason" ]] || first_reason="${dref}"
-        continue ;;
-    esac
-    sha="${rest%%$'\x1f'*}"
-    at="${rest#*$'\x1f'}"
-    # DIVE-4899: THE PRIMARY IS NOT THE ROW. A companion bound beside it that
-    # has not landed keeps the row in the merging stage — counted OPEN, nothing
-    # written — so the merge owner goes on being dispatched to merge the rest.
-    # Recording here is what let DIVE-4895 read done with its frontend half open.
-    if declare -F _task_companions_unlanded >/dev/null 2>&1; then
-      local _comp_open; _comp_open=$(_task_companions_unlanded "$id" 2>/dev/null || printf '')
-      if [[ -n "$_comp_open" ]]; then
-        n_open=$((n_open+1))
-        continue
-      fi
-    fi
-    # `forge-poll` and not this box's seat name: the ACTOR on this record is the
-    # poller, and a record that named a seat would credit a landing to somebody
-    # who was not there — the same false-credit class `_merge_disp_read` refuses
-    # one outcome further out.
-    if ! _task_merge_landed_record "$id" "$sha" "$at" "forge-poll" "$dref"; then
-      n_wfail=$((n_wfail+1))
-      _hb_log "[forge-merge] ${ident} — ${dref} is MERGED (${sha:0:12} at ${at}) but the task store REFUSED the record; the row is unchanged and still holds at MERGING"
-      continue
-    fi
-    n_landed=$((n_landed+1))
-    moved=""
-    declare -F _task_merge_landed_handoff >/dev/null 2>&1 \
-      && moved=$(_task_merge_landed_handoff "$id" "$ident" "$asgn" "$vfier" 2>/dev/null || printf '')
-    _task_store_audit_log "task.merge-landed" ok 0 -- \
-      "id=${id}" "task=${ident}" "ref=${dref}" "sha=${sha}" "merged_at=${at}" \
-      "actor=forge-poll" "owed=${owner}" 2>/dev/null || true
-    _hb_log "[forge-merge] ${ident} — ${dref} is ON THE TARGET BRANCH (merged ${at} as ${sha:0:12}); landing RECORDED, merge hold on '${owner:-nobody}' retired, row has LEFT the merging stage. NOT closed — a merged pull request is not automatically a finished row (DIVE-4520).${moved}"
-    # WAKE THE SEAT THAT OWES THE CLOSE, which after the handoff is the row's
-    # assignee. The dispatcher will reach it on its own next tick now that the
-    # row has left the stage that was excluding it; this is the same one-shot
-    # courtesy ping `_hb_gate_shipped_sweep` sends, and it is one-shot for the
-    # same reason — the landing is recorded, so this row is never seen again.
-    local closer; closer=$(db "SELECT COALESCE(assignee,'') FROM tasks WHERE id=${id};" 2>/dev/null || printf '')
-    if [[ -n "$closer" ]] && _task_agent_channel "$closer"; then
-      ( _5DIVE_SYSTEM_NOTICE=1 cmd_send "$closer" --message="🚢 ${ident} — the pull request bound to this row (${dref}) is MERGED ON THE FORGE (${sha:0:12}, ${at}). The heartbeat recorded the landing, retired the merge hold and took the row out of the merging stage, so what it is owed now is a CLOSE and nobody owes it a merge. Read the PASS verdict FIRST: a merged pull request is not automatically a finished row (DIVE-4520), so if the verdict left something owed, discharge that before you close. \`5dive task show ${ident}\`" ) >/dev/null 2>&1 || true
-    fi
-  # THE POPULATION IS THE STAGE PREDICATE AND NOTHING ELSE, and that is where the
-  # cost bound comes from rather than from a throttle written here.
-  # `_TASKS_TFV_SQL` already subtracts a recorded landing (`_TASKS_MERGE_LANDED_SQL`)
-  # and every terminal row, so a row is polled exactly while it is IN the merging
-  # stage: once this sweep records the landing, the row leaves the stage and is
-  # never read again. Re-stating either clause here would be a second copy of a
-  # constant this repo deliberately has one of (DIVE-4327), and a second copy is
-  # how the poller and the board come to disagree about which rows are merging.
-  done < <(db "SELECT id||x'1f'||COALESCE(ident,'DIVE-'||id)||x'1f'||COALESCE(delivery_ref,'')||x'1f'||
-                      COALESCE(assignee,'')||x'1f'||COALESCE(verifier,'')||x'1f'||$(_tasks_merge_owner_sql)
-                 FROM tasks
-                WHERE (${_TASKS_TFV_SQL});" 2>/dev/null)
-  # THE READING, not a log line. Written on every pass including a clean one: an
-  # absent measurement and a measured pass must not read the same (DIVE-4619).
-  if (( n_unread > 0 )); then
-    _hb_forge_merge_record_reading "unreadable" "$n_rows" "$n_landed" "$n_unread" \
-      "the credential-free rail could not be asked about ${n_unread} of ${n_rows} merging row(s); first was ${first_reason}"
-  else
-    _hb_forge_merge_record_reading "ok" "$n_rows" "$n_landed" "0" ""
+  # DIVE-9281: the sweep itself is the devteam plugin's (core/task/delivery.sh).
+  # A plugin older than this 5dive has the helpers above and not the sweep.
+  if ! declare -F _forge_merge_sweep >/dev/null 2>&1; then
+    _hb_log "[forge-merge] the devteam plugin is older than this 5dive (no _forge_merge_sweep); sweep did NOT run — upgrade it: sudo 5dive plugin upgrade devteam@5dive-plugins"
+    return 0
   fi
-  # Log only when something HAPPENED. A tick that read three open pull requests
-  # and wrote nothing is the steady state, and a line per tick for it is how the
-  # tick log stops being read at all.
-  (( n_landed > 0 || n_wfail > 0 )) \
-    && _hb_log "[forge-merge] pass done — ${n_rows} merging row(s) polled, ${n_landed} landing(s) recorded, ${n_open} still open, ${n_unread} unreadable, ${n_wfail} write-refused"
-  return 0
+  _forge_merge_sweep
 }
 
 # CNCL-12: the recurring rot-triage scan. A tier-2 gate left unanswered 48h+ gets a council

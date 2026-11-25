@@ -14,7 +14,7 @@
 <p align="center"><a href="README.md">English</a> ｜ <b>简体中文</b></p>
 
 <p align="center">
-  <a href="docs/zero-human.md"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F5dive-ai%2F5dive%2Fstatus%2Fbadge.json" alt="自主完成的任务占比"></a>
+  <a href="https://github.com/5dive-ai/5dive-plugins/blob/main/plugins/devteam/docs/zero-human.md"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F5dive-ai%2F5dive%2Fstatus%2Fbadge.json" alt="自主完成的任务占比"></a>
   <a href="https://github.com/5dive-ai/5dive/releases"><img src="https://img.shields.io/github/v/release/5dive-ai/5dive" alt="最新版本"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="许可证：MIT"></a>
   <a href="https://play.google.com/store/apps/details?id=ai.fivedive.app&amp;referrer=utm_source%3Dgithub%26utm_medium%3Downed%26utm_campaign%3D5dive-readme"><img src="https://img.shields.io/badge/Android-3DDC84?logo=android&amp;logoColor=white" alt="Google Play 上的 Android 应用"></a>
@@ -225,7 +225,7 @@ Linux 用户隔离智能体；`systemd` 负责进程守护；SQLite 存储任务
 
 智能体使用 `sandboxed`、`standard` 或 `admin` 权限。`init` 创建的第一个智能体默认是 `admin`。人工审批可以配置。5dive 不收集遥测数据；API key 直接发给各自的模型提供商。以 root 运行 [`install.sh`](install.sh) 之前，请先审阅它。卸载 5dive：`sudo 5dive uninstall`。
 
-使用 `5dive push` 时，智能体通过你自己的 GitHub App 推送代码，从不持有它的 token。[委托 git push →](docs/delegated-push.md) · [权限与隔离 →](https://5dive.ai/docs/5dive-cli#isolation)
+使用 `5dive push` 时，智能体通过你自己的 GitHub App 推送代码，从不持有它的 token。[委托 git push →](https://github.com/5dive-ai/5dive-plugins/blob/main/plugins/devteam/docs/delegated-push.md) · [权限与隔离 →](https://5dive.ai/docs/5dive-cli#isolation)
 
 ## 资源
 
