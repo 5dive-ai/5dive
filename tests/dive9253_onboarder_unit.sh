@@ -52,7 +52,7 @@ t 'L1 ...dashboard is the one channel' "plugin:dashboard@5dive-plugins" "$(sed -
 t 'L1 ...the skip-permissions, autonomy text and Chrome args are gone' 0 "$(grep -c -e skip-permissions -e 'AUTONOMY MODE' -e '^--chrome$' -e telegram <<<"$out")"
 t 'L1 ...no resume of an older session' 'RESUME=' "$(grep '^RESUME=' <<<"$out")"
 t 'L5 the inner shell exports DASHBOARD_ONBOARDER=1' 'OVERRIDE=export DASHBOARD_ONBOARDER=1; ' "$(grep '^OVERRIDE=' <<<"$out")"
-t 'L5 ...and INNER carries it' 1 "$(grep -c '^INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${ONBOARDER_OVERRIDE}' bin/5dive-agent-start)"
+t 'L5 ...and INNER carries it, after STAGE_GUARD' 1 "$(grep -c '^INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${ONBOARDER_OVERRIDE}' bin/5dive-agent-start)"
 t 'L5 the block sits after every ARGS+= and before CMD_STR' yes "$(
   b=$(grep -n '^# DIVE-9253: an onboarder seat\. An outsider' bin/5dive-agent-start | cut -d: -f1)
   c=$(grep -n "^CMD_STR=\$(printf '%q ' \"\$BIN\" \"\${ARGS\[@\]}\")" bin/5dive-agent-start | cut -d: -f1)
@@ -80,9 +80,9 @@ _ONBOARDER_OVERRIDE='' write_agent_env onb-acme claude dashboard "" "" sandboxed
 t 'W1 ...an unrelated rewrite keeps it' 1 "$(grep -cx 'AGENT_ONBOARDER=1' "$ENV_DIR/onb-acme.env")"
 write_agent_env theo claude telegram
 t 'W1 ...an ordinary seat never gets it' 0 "$(grep -c ONBOARDER "$ENV_DIR/theo.env")"
+_stopped_blk=$(awk '/DIVE-9253: an onboarder seat is created STOPPED/,/^  fi$/' src/cmd_agent_create.sh)
 t 'W1 create leaves a _CREATE_STOPPED seat stopped and not enabled' yes "$(
-  awk '/DIVE-9253: an onboarder seat is created STOPPED/,/^  fi$/' src/cmd_agent_create.sh \
-    | grep -q 'if \[\[ "${_CREATE_STOPPED:-}" == 1 \]\]; then' && echo yes || echo no)"
+  grep -q 'if \[\[ "${_CREATE_STOPPED:-}" == 1 \]\]; then' <<<"$_stopped_blk" && echo yes || echo no)"
 
 # --- the verb, sourced with stubs ----------------------------------------------------
 LOG="$TMP/calls.log"; : > "$LOG"
@@ -139,6 +139,11 @@ t 'C4 ...the minute tick is installed' 1 "$(grep -c '^\* \* \* \* \* root /usr/l
 t 'C5 a second create of the same slug is refused' 5 "$( (cmd_onboarder_create acme <<<"$GOOD") >/dev/null 2>&1; echo $?)"
 t 'C5 a brief with an email is refused before any agent is made' 3 "$( (cmd_onboarder_create other <<<'{"firm":"O","domains":["o.com"],"facts":["user@example.com"]}') >/dev/null 2>&1; echo $?)"
 t 'C5 ...and leaves no marker behind' no "$([[ -e "$TMP/markers/onb-other" ]] && echo yes || echo no)"
+# The firm name and the fact sheet are data: shell in them is written, never run.
+inj_sheet="$TMP/inj-sheet.md"; printf 'Price: $(touch %s/pwned-sheet) `id`\n' "$TMP" > "$inj_sheet"
+inj_md=$(_onboarder_claude_md '{"firm":"Evil $(touch '"$TMP"'/pwned-firm) `id` ${HOME}","domains":["e.com"],"band":"%s Team"}' "$inj_sheet")
+t 'C6 shell in the firm name or fact sheet never runs' no "$([[ -e "$TMP/pwned-firm" || -e "$TMP/pwned-sheet" ]] && echo yes || echo no)"
+t 'C6 ...and lands in CLAUDE.md verbatim' 3 "$(grep -cF -e '# You are 5dive'"'"'s AI assistant for Evil $(touch' -e 'Price: $(touch' -e 'the %s Team plan is already picked' <<<"$inj_md")"
 
 t 'S1 ls --json: stopped' '[{"slug":"acme","firm":"Acme Law","domains":["acme-law.com"],"band":"Team","setup":"cloud","running":false}]' "$(JSON_MODE=0 cmd_onboarder_ls --json)"
 
@@ -164,6 +169,18 @@ t 'T4 a stopped seat with nothing queued stays stopped' 0 "$(grep -c 'systemctl 
 echo '{}' > "$inbox/1.json"
 : > "$LOG"; cmd_onboarder_tick 2>/dev/null
 t 'T4 ...and starts when a message is queued' 1 "$(grep -c 'systemctl start 5dive-agent@onb-acme.service' "$LOG")"
+
+# --- a seat the operator stopped stays down (refresh_plugins_parked_agent_unit A1) ---
+REG='{"agents":{"onb-acme":{"type":"claude","desiredState":"stopped"}}}'
+: > "$LOG"; cmd_onboarder_tick 2>/dev/null
+t 'P1 tick does not start a parked seat with a queued message' 0 "$(grep -c 'systemctl start' "$LOG")"
+: > "$LOG"
+t 'P2 wake on a parked seat fails as a conflict' 5 "$( (cmd_onboarder_wake acme) >/dev/null 2>&1; echo $?)"
+t 'P2 ...and starts nothing' 0 "$(grep -c 'systemctl start' "$LOG")"
+REG='{"agents":{"onb-acme":{"type":"claude","desiredState":"running"}}}'
+: > "$LOG"; cmd_onboarder_tick 2>/dev/null
+t 'P3 once started again by the operator, a message wakes it' 1 "$(grep -c 'systemctl start 5dive-agent@onb-acme.service' "$LOG")"
+REG='{"agents":{}}'
 
 # --- rm -------------------------------------------------------------------------------
 REG='{"agents":{"onb-acme":{"type":"claude"}}}'; : > "$LOG"
