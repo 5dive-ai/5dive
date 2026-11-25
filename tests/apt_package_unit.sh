@@ -29,11 +29,8 @@ if sh -n $pk/postinst; then ok "parses: $pk/postinst (sh)"; else bad "does not p
 # A release-shaped tree from this checkout: a tag carries the built bundle,
 # main does not, so a stand-in bundle carries the version.
 tree="$tmp/tree"
-mkdir -p "$tree/scripts/git-hooks-portable" "$tree/.github"
+mkdir -p "$tree"
 cp -a install.sh LICENSE bin prompts hooks systemd "$tree/"
-cp -a scripts/install-pii-push-guard.sh scripts/pii-scan.sh "$tree/scripts/"
-cp -a scripts/git-hooks-portable/pre-push scripts/git-hooks-portable/prepare-commit-msg "$tree/scripts/git-hooks-portable/"
-cp -a .github/pii-denylist.txt "$tree/.github/"
 printf '#!/usr/bin/env bash\nreadonly FIVE_VERSION="1.2.3"\n' > "$tree/5dive"
 
 # 1. Builds, named and versioned from the bundle.

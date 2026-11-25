@@ -32,13 +32,10 @@ WORK="$(mktemp -d)"; chmod 755 "$WORK"
 # ---------------------------------------------------------------- fixtures
 mk_release() { # <dir> <version>
   local t="$1" v="$2"
-  mkdir -p "$t"/{bin,prompts,hooks,systemd,scripts/git-hooks-portable,.github}
+  mkdir -p "$t"/{bin,prompts,hooks,systemd}
   printf '#!/usr/bin/env bash\nreadonly FIVE_VERSION="%s"\n' "$v" > "$t/5dive"; chmod 755 "$t/5dive"
   echo 5dive-agent-start > "$t/bin/host-scripts.manifest"
   : > "$t/prompts/team-CLAUDE.md"; : > "$t/hooks/h.sh"; : > "$t/systemd/5dive-agent@.service"
-  : > "$t/scripts/install-pii-push-guard.sh"; : > "$t/scripts/pii-scan.sh"
-  : > "$t/scripts/git-hooks-portable/pre-push"; : > "$t/scripts/git-hooks-portable/prepare-commit-msg"
-  : > "$t/.github/pii-denylist.txt"
   # The stand-in installer: install.sh's own reads, recorded.
   cat > "$t/install.sh" <<'INST'
 #!/usr/bin/env bash

@@ -132,7 +132,7 @@ cmd_box_config() {
         "             'config' reports which key each consumer uses (openrouter-keys)." \
         "  mod-seat     whether a NEW claude seat gets the mod tool-call guard at create" \
         "             time, and whether 'doctor --category=mod' probes seats (DIVE-4936)." \
-        "             Default off: the plugin's hooks are an early-access Claude Code API." \
+        "             Default off. Needs the devteam plugin; without it this does nothing." \
         "  telegram-app whether this box's agent bots answer /app with a button that opens" \
         "             5dive inside Telegram, signed into the box owner's account (DIVE-5185)." \
         "             Default on; off hides nothing else and changes no other command." \
@@ -199,7 +199,8 @@ cmd_box_config() {
       re="$_REFLEX_ENDPOINT"; res="$_REFLEX_ENDPOINT_SRC"; ra="$_REFLEX_API"; ras="$_REFLEX_API_SRC"
       rek=$(reflex_endpoint_key_status)
     fi
-    # DIVE-4936: whether new claude seats get the mod guard.
+    # DIVE-4936: whether new claude seats get the mod guard. The seating code is
+    # the devteam plugin's (core/lib/mod_seat.sh, DIVE-9307): without it, off.
     # DIVE-5026: the connector-store OpenRouter key, set/unset only. The
     # dashboard reads this field's PRESENCE to know the box can take the key
     # from a form instead of a terminal.

@@ -1928,7 +1928,8 @@ cmd_doctor() {
   # claude once per claude seat (~3s each, measured on 2.1.281), and the
   # dashboard polls `doctor --json`. The nightly Claude Code upgrade asks for
   # it by name, which is the moment a module can stop loading. With the
-  # box switch off (every box but ours) it probes nothing — see lib/mod_seat.sh.
+  # box switch off (every box but ours) it probes nothing. The probe is the
+  # devteam plugin's (core/lib/mod_seat.sh, DIVE-9307); without it, one line.
   local run_mod=0
   [[ "$filter" == "mod" ]] && run_mod=1
 
@@ -2844,7 +2845,11 @@ cmd_doctor() {
   fi
 
   if (( run_mod )); then
-    doctor_check_mod_seats
+    if declare -F doctor_check_mod_seats >/dev/null 2>&1; then
+      doctor_check_mod_seats
+    else
+      doctor_add mod seating ok "mod seating is in the devteam plugin, which this box does not have — nothing probed"
+    fi
   fi
 
   # --- summary + output ---

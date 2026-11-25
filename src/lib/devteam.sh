@@ -66,6 +66,7 @@ _devteam_module_file() {
     cmd_deploy)           _DEVTEAM_REL="cmd_deploy.sh" ;;
     cmd_gh)               _DEVTEAM_REL="cmd_gh.sh" ;;
     task__filing_cap)     _DEVTEAM_REL="task/filing_cap.sh" ;;
+    lib__mod_seat)        _DEVTEAM_REL="lib/mod_seat.sh" ;;
     *) _DEVTEAM_REL=""; return 1 ;;
   esac
 }
@@ -74,10 +75,12 @@ readonly DEVTEAM_MODULES="lib__gh_config task__gate_evidence task__grader_pool t
 # DIVE-9262: modules read when the plugin ships them and skipped when it does
 # not, so neither the core nor the plugin has to be upgraded first. An older
 # plugin without one just leaves its control off (task__filing_cap: the
-# title-word filing cap, which fails open). Present, each passes the same
+# title-word filing cap, which fails open; lib__mod_seat, DIVE-9307: seating the
+# mod guard on new claude seats, which core asks `declare -F` for and skips
+# without). Present, each passes the same
 # ownership checks as every required module. _DEVTEAM_PRESENT is the list of
 # modules this run reads: the required ones, then the optional ones found.
-readonly DEVTEAM_OPTIONAL_MODULES="task__filing_cap"
+readonly DEVTEAM_OPTIONAL_MODULES="task__filing_cap lib__mod_seat"
 _DEVTEAM_PRESENT=""
 
 # The core's lazy modules whose top-level names the plugin's files read
