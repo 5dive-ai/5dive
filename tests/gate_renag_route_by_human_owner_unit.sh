@@ -60,7 +60,7 @@ CONNECTORS_DIR="$TMP/connectors"; mkdir -p "$CONNECTORS_DIR"
 # Reserved fakes only (CLAUDE.md): documented 1234567890-shaped ids.
 CHAT_K=1234500011
 CHAT_A=1234500022
-BOTS="kseat kdead alena luca aseat"
+BOTS="kseat kdead cleo luca aseat"
 ACCESS="$TMP/access.json"
 printf '{"allowFrom":["%s","%s"]}\n' "$CHAT_K" "$CHAT_A" >"$ACCESS"
 for b in $BOTS; do printf 'TELEGRAM_BOT_TOKEN=tok-%s\n' "$b" >"$CONNECTORS_DIR/telegram-${b}.env"; done
@@ -102,7 +102,7 @@ bots() { cut -d'>' -f1 <"$SEND_LOG" | awk '!s[$0]++' | paste -sd, -; }
 col() { db "SELECT COALESCE($2,'NULL') FROM tasks WHERE id=$1;"; }
 
 db "INSERT INTO agents_org (name,reports_to,role) VALUES ('marcus',NULL,'coordinator'),
-      ('kseat','marcus',NULL),('kdead','marcus',NULL),('alena','marcus',NULL),
+      ('kseat','marcus',NULL),('kdead','marcus',NULL),('cleo','marcus',NULL),
       ('luca','marcus',NULL),('aseat','marcus',NULL);"
 
 reset() {
@@ -125,21 +125,21 @@ receipt() { # <via> <chat> <age>  — a confirmed card from an earlier send
 
 # ─── A1 anchor: registry EMPTY — the pre-DIVE-4911 path, byte for byte ────────
 reset
-a1=$(mk_gate DIVE-A1 alena '')
+a1=$(mk_gate DIVE-A1 cleo '')
 _hb_gate_renag_sweep
-[[ "$(sends)" == "alena>"* && "$(col "$a1" gate_renag_failed_at)" == "NULL" ]] \
+[[ "$(sends)" == "cleo>"* && "$(col "$a1" gate_renag_failed_at)" == "NULL" ]] \
   && ok_t "A1 anchor: with no human accounts the re-nag still rides the filer's bot, no backoff stamp" \
   || bad_t "A1 registry-empty behaviour changed" "sends=$(sends) failed=$(col "$a1" gate_renag_failed_at)"
 
 # ─── R1 THE BUG: owned by K, filed by a seat whose bot K never started ────────
 r1_arm() {
   reset; humans_on
-  db "INSERT INTO human_agents (human_id,agent) VALUES ('k','kseat'),('a','aseat'),('a','alena');"
-  DEAD_BOTS="alena"          # K never started alena's bot
-  R1=$(mk_gate DIVE-441 alena k)
+  db "INSERT INTO human_agents (human_id,agent) VALUES ('k','kseat'),('a','aseat'),('a','cleo');"
+  DEAD_BOTS="cleo"          # K never started cleo's bot
+  R1=$(mk_gate DIVE-441 cleo k)
   _hb_gate_renag_sweep
   grep -qx "kseat>${CHAT_K}" "$SEND_LOG" && [[ "$(col "$R1" gate_pinged_at)" != "NULL" ]] \
-    && ! grep -q "^alena>" "$SEND_LOG"
+    && ! grep -q "^cleo>" "$SEND_LOG"
 }
 if r1_arm; then
   ok_t "R1 a gate owned by K and filed by another seat is delivered through K's linked seat"
@@ -160,12 +160,12 @@ grep -qx "kseat>${CHAT_K}" "$SEND_LOG" && [[ "$(col "$r2" gate_pinged_at)" != "N
 reset; humans_on
 db "INSERT INTO human_agents (human_id,agent) VALUES ('k','kdead');"
 receipt luca "$CHAT_K" '-3 hours'          # luca has reached K before
-DEAD_BOTS="kdead alena"
-r3=$(mk_gate DIVE-R3 alena k)
+DEAD_BOTS="kdead cleo"
+r3=$(mk_gate DIVE-R3 cleo k)
 _hb_gate_renag_sweep
 order=$(sends)
 [[ "$order" == "kdead>${CHAT_K} "*"luca>${CHAT_K} " && "$(col "$r3" gate_pinged_at)" != "NULL" \
-   && "$order" != *"alena>"* ]] \
+   && "$order" != *"cleo>"* ]] \
   && ok_t "R3 'chat not found' on K's linked bot falls through to the bot with a confirmed receipt" \
   || bad_t "R3 did not try the next bot" "sends=$order pinged=$(col "$r3" gate_pinged_at)"
 [[ "$(col "$r3" gate_renag_failed_at)" == "NULL" ]] \
@@ -176,12 +176,12 @@ order=$(sends)
 reset; humans_on
 db "INSERT INTO human_agents (human_id,agent) VALUES ('k','kdead');"
 receipt luca "$CHAT_K" '-3 hours'
-DEAD_BOTS="kdead luca alena"
-r4=$(mk_gate DIVE-R4 alena k)
+DEAD_BOTS="kdead luca cleo"
+r4=$(mk_gate DIVE-R4 cleo k)
 _hb_gate_renag_sweep
 via=$(col "$r4" gate_renag_failed_via)
 [[ "$(col "$r4" gate_renag_failed_at)" != "NULL" && "$(col "$r4" gate_pinged_at)" == "NULL" \
-   && "$via" == "kdead,luca,alena" && "$(bots)" == "kdead,luca,alena" ]] \
+   && "$via" == "kdead,luca,cleo" && "$(bots)" == "kdead,luca,cleo" ]] \
   && ok_t "R4 every bot failing stamps gate_renag_failed_at + the bots tried, and NOT gate_pinged_at" \
   || bad_t "R4 failure not recorded as a negative receipt" "sends=$(sends) via=$via pinged=$(col "$r4" gate_pinged_at)"
 grep -q "UNDELIVERED to k rows=${r4}" "$HB_LOG" \
@@ -198,7 +198,7 @@ _hb_gate_renag_sweep
 # the backoff and not a wedged row.
 db "UPDATE tasks SET gate_renag_failed_at=datetime('now','-25 hours') WHERE id=${r4};"
 _hb_gate_renag_sweep
-[[ "$(bots)" == "kdead,luca,alena" ]] \
+[[ "$(bots)" == "kdead,luca,cleo" ]] \
   && ok_t "R4 after 24h the reminder is tried again" \
   || bad_t "R4 backoff never expired" "sends=$(sends)"
 
@@ -215,7 +215,7 @@ DOCTOR_CHECKS='[]'; step() { :; }
 doctor_check_gate_owner_delivery
 sev=$(jq -r '.[] | select(.name=="gate-owner-delivery") | .severity' <<<"$DOCTOR_CHECKS")
 msg=$(jq -r '.[] | select(.name=="gate-owner-delivery") | .message' <<<"$DOCTOR_CHECKS")
-[[ "$sev" == "error" && "$msg" == *"DIVE-R4 (owner k; failed via kdead,luca,alena)"* ]] \
+[[ "$sev" == "error" && "$msg" == *"DIVE-R4 (owner k; failed via kdead,luca,cleo)"* ]] \
   && ok_t "D1 doctor lists the undelivered gate, its owner and the bots that failed" \
   || bad_t "D1 doctor silent on the undelivered gate" "sev=$sev msg=$msg"
 
@@ -230,14 +230,14 @@ out=$(cmd_human_recipient DIVE-R4 2>&1)
 [[ "$out" == *"kdead: chat not found"* && "$out" == *"sender: luca"* && "$out" == *"NOT delivered"* ]] \
   && ok_t "H1 human recipient shows each bot's reach, the sender, and the failed reminder" \
   || bad_t "H1 human recipient hides the sender" "$out"
-DEAD_BOTS="kdead luca alena"
+DEAD_BOTS="kdead luca cleo"
 out=$(cmd_human_recipient DIVE-R4 2>&1)
 [[ "$out" == *"sender: NONE"* ]] \
   && ok_t "H1 with no bot able to reach the person it says so instead of OK" \
   || bad_t "H1 printed a sender nobody can use" "$out"
 
 # ─── R5 a confirmed send clears the stamp; D2 doctor then reads ok ────────────
-DEAD_BOTS="kdead alena"                       # luca reaches K again
+DEAD_BOTS="kdead cleo"                       # luca reaches K again
 db "UPDATE tasks SET gate_renag_failed_at=datetime('now','-25 hours') WHERE id=${r4};"
 _hb_gate_renag_sweep
 [[ "$(col "$r4" gate_renag_failed_at)" == "NULL" && "$(col "$r4" gate_renag_failed_via)" == "NULL" \

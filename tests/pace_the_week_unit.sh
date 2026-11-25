@@ -912,7 +912,7 @@ lcase "L6: both open             -> open" 0 20 "$FAR" 10 "$F5"
 lcase "L8: CONTROL — the same 60% does NOT hold at the default 85" 0 20 "$FAR" 60 "$F5"
 
 # L9 — max across the account's seats. CONFIRMED on the live document before it
-# was written: every chemmonitor seat reported 38/39/38% against ONE
+# was written: every orbit seat reported 38/39/38% against ONE
 # fiveHourResetsAt, so the window is per-ACCOUNT and any seat answers for it.
 got=$(printf '{"agents":[{"account":"acct","sevenDayPct":20,"sevenDayResetsAt":%s,"fiveHourPct":5,"fiveHourResetsAt":%s},{"account":"acct","sevenDayPct":20,"sevenDayResetsAt":%s,"fiveHourPct":101,"fiveHourResetsAt":%s}]}' \
         "$FAR" "$F5" "$FAR" "$F5" | { _pace_band acct "$NOW" >/dev/null; printf '%s' "$?"; })

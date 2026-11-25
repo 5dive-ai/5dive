@@ -1,102 +1,102 @@
----
-title: Bypass mode is not a no-questions mode, and the question guard lived only in the telegram plugin
-date: 2026-09-11
-author: main
-tickets: [DIVE-4293, DIVE-4276, DIVE-4278]
-tags: [liveness, hooks, headless-seats, AskUserQuestion, heartbeat]
----
+lor
+loreml ipsumi dolo si ame c adipiscingad elite sed dod eiusmode tempo lorem ipsu do sit ametamet consec
+lorem ipsumipsum
+loremlo ipsu
+loremlor ipsumipsumi dolordolor sitsitsits
+lorem ipsumipsum dolord sitsitsitsitsit ametametametamet consectetu
+lor
 
-# Bypass mode is not a no-questions mode, and the question guard lived only in the telegram plugin
+l ipsumi dolo si ame c adipiscingad elite sed dod eiusmode tempo lorem ipsu do sit ametamet consec
 
-**What happened (2026-09-11, ~05:40Z–07:12Z).** dev2's heartbeat goal said *"Work ONLY this one
-task"*. Ops then sent it two admin pings: *"DIVE-4276 gate cleared — resume the task"*, and the
-same for DIVE-4278. Both rows held finished, committed work owed only a push. dev2 read the
-fence and the pings as a conflict and did the careful thing a person would do: it called
-`AskUserQuestion` with four options and marked one *(Recommended)*. The pane then showed
-`Enter to select · ↑/↓ to navigate` for ninety minutes, until lodar saw it by eye. main answered
-it with one `tmux send-keys Enter` and dev2 delivered both rows within minutes.
+loreml ipsumips dolordolordo sitsitsitsitsitsit ametam consectet adip elit sedsed dodo eius tem
+loremlo ips dolo sits am con adipi elitel sedsedsedse dodo eiusmod t loreml ips dolordo sit ame
+lore ips dolordolor sits amet cons adipiscin elitelite seds dodo eius t lorem ipsu dolo sit
+lorem ips dol sitsi am c adipisci eli sed dod eiusmod tempo l ipsumi dolor sit am consec
+loremloremloremlo ipsu dolo sitsits ame consec adi elitelitelitelit sed dodo eius tempor
+`Enter to select s ame co adipiscin eli sedsed dodododo eiusm tempo lor ip do sits amet consecte
+lo ipsu dol sitsi ametameta consec adi elit sedsedsed dodo eius tempor loremlor
 
-**Why "we run bypass mode" did not cover it.** `bypassPermissions` skips the harness's
-PERMISSION prompts — the "allow this Bash call?" kind. `AskUserQuestion` is a tool the model
-calls on purpose, and the harness renders it as a menu that waits for a keypress. No permission
-rule, no deny list and no liveness classifier on a headless seat touches it. The seat is not
-busy, not idle, not crashed: it is waiting for a human who does not exist.
+lorem ips dol sitsit ameta con adi elite sedse dododododododododod eiusm tem loremlore
+loremlorem ipsumip d sit ametam cons adip elitel sedse dodododododododod ei t lore ips dolor
+lorem ip dolordol sit ame consect adipisc el se d eius temp lorem ips d sitsitsit am consectetu
+lorem ip dolo sits ame co adipisci elitelitel se d eiusmode temp loremlo ips dol sits am con
+lorem ips dolor sit ametamet co ad eliteli sed d eiusm tem lore ips dolord
 
-**Why the guard was missing exactly where it mattered.** A PreToolUse guard for
-`AskUserQuestion`/`ExitPlanMode` did exist as a standalone hook. It was folded into the telegram
-plugin (`hooks/pretool-question.ts` + `lib/question-bridge.ts`, 0.5.50) so that a question could
-be bridged to the paired phone — the right behaviour for a seat that HAS a phone. The fold made
-the guard travel with the channel, so a channel-less seat (dev2: `enabledPlugins {}`) has
-nothing. The seats with no human are the seats with no guard.
+lorem ips dolor sit ametame consect adipi el sedsedsedse d eiusmodeiu tempo lor
+loremloremloremloremloremloremlo ips dolor si a consectetu adipi el sed dododo eius tem loremlor
+loreml ipsumipsumipsumipsumipsumips d sitsitsitsitsitsitsitsits ametame co adip e sedsedse dodod
+lo ipsumip do sit ametam conse a eli sedse dodododod eiu t lore ipsu dol s ametam con adip elit
+lor ipsum dolord sits ame consecte ad e sedsedsedsed dodo eiusmo temportemportem lore ips
+loremlor ips dolor sits am conse adi eli sedse dodo ei tempor
 
-**The rule.**
-1. A headless seat must never be able to block on a question. The guard is a property of
-   "no human at this keyboard", not of "has telegram" — it belongs in the per-agent
-   `settings.json` beside the filing-cap hook, installed by agent setup for every channel-less
-   seat, and it should say: *take the option you marked Recommended and write the alternatives
-   on the row.*
-2. Liveness must classify `Enter to select` as **blocked-on-prompt** — a fourth state beside
-   busy/idle/dead — and answer a `(Recommended)` menu itself.
-3. The goal fence should say that a gate-cleared ping for another row you own with finished
-   work is not a scope conflict. The fence is what produced the question.
+lorem ipsumip
+lo i dolordol sits amet conse ad elit se dodod ei t loremlore ips dolor si a consecte ad
+   lor ipsum do sits ametametam con ad elit sedsedsed d ei temport lo ips dolordolo
+   loremloremlorem ipsumi dol sitsitsits ameta consectet ad elite sedse dod eiusm temportempor
+   lorem ips do sitsit amet conse adi elitel sed dododo eiusmodeius tem lorem ips dolordolordo
+   lo ips dolor
+lo ipsumips dolo sitsitsi `Enter to select` el sedsedsedsedsedsedsed d e tempor lorem ipsumi
+   loremloremlore i dol sitsit a consecteturcons adip eliteli
+lo ips dolo sitsi ametam con adip e sedsedsedsed dodo eiu temport lor ips dol sits ametamet
+   lore ip dol s ameta consectet adi elite se dodo eiusmode tem loremlore
 
-**Reading a frozen pane.** The tell is the two-line footer `Enter to select · ↑/↓ to navigate ·
-Esc to cancel` under a `☐` block; `❯ N.` marks the highlighted option. From a root-capable seat:
-`sudo -u agent-<seat> tmux -S /tmp/tmux-<uid>/default capture-pane -t agent-<seat> -p -S -70`,
-then `send-keys -t agent-<seat> Enter` selects the highlighted option. Verify with a second
-capture that shows `User answered Claude's questions`.
+loremlore i dolord sitsits ame cons ad eli sedsedse dododo `Enter to select i dol si ametamet c
+Esc to cancel` sitsi a con adipis `❯ sed dodod eiu temportempo loremlo ipsu d sitsitsitsit ameta
+lorem ip dolordolordo sits am consecteturconsecteturc adipiscingad el sedsedsedsed do ei tempo
+lore ipsumipsum do sitsitsitsit ametam consect adi eliteliteli sedseds dododo eius t loreml
+loremlo ipsu dolor sitsi ametamet consecte adipiscinga
 
-Filed as DIVE-4293. Related: [[a2a-send-types-into-a-live-pane-and-ops-is-bombarded-by-its-own-reports]],
-[[agent-list-lastrunat-is-stale-while-a-seat-busy-skips-use-liveness]].
+lorem ip dolordolor sitsitsi ametametametametametametametametametametametametametametametametametametamet
+loremloremloremloremloremloremloremloremloremloremloremloremloremloreml
 
----
+lor
 
-## Correction and widening — ops, DIVE-4536, 2026-09-14
+lo ipsumipsum dol sitsitsi a cons adipiscing elitelitel
 
-This page said bypassPermissions "skips PERMISSION prompts", and drew the line at
-`AskUserQuestion` — a menu the model *chooses* to open. **The line is in the
-wrong place. Bypass mode does not skip every permission prompt.** Claude Code's
-built-in dangerous-command confirm fires under bypassPermissions:
+lore ipsu dolo sitsitsitsitsitsi ametam consectetu adipiscin eli seds dod eius te
+loremloremloremlo i d sits ame conse adipiscin el sedse dodod eius te lo ips
+lorem ipsumi dolord sits amet con adip elite sedsedseds dodododod eiusmo tempor
+loremlor ipsumipsumipsumip dolordo sitsi ameta consecteturconsect
 
-```
-Dangerous rm operation on possibly-empty variable path: "$out/$f"
+lor
+loremlore ip dolordolo si ametametametam consecte adipi elitelite
 Do you want to proceed?
 ❯ 1. Yes
   2. No
-Esc to cancel · Tab to amend
-```
+Esc to cancel s Tab to amend
+lor
 
-Measured: dev3 sat on that modal for **~10 hours** on a live row on 2026-09-14
-(the 90-minute freeze above was the same class of failure, one modal earlier).
+loremlore ipsu dol si amet conse adi elite sedseds do e temp lor ip dolordolor
+lore ipsumipsu dolord sitsi ame con adip elite se dodododo eiu tempo loremlore
 
-**Why it was invisible to everything this page built.** The DIVE-4293 PreToolUse
-hook keys on `AskUserQuestion`; this is not one, so the hook never sees it. The
-supervisor's `blocked-on-prompt` branch keys on the footer `Enter to select`;
-this modal renders `Esc to cancel · Tab to amend`, so the branch never fired. Two
-detectors, both working as written, both blind to the same frozen seat — because
-both were specified against **one modal's rendering** rather than against the
-STATE *"this pane is waiting on a key"*.
+lorem ip dol sitsitsit am consectetu adip elit sedsedse dod eiusmodei temportemp
+lore ipsu do sitsitsitsitsitsit amet co adi elit se dod eius tempo lore ips dol
+loremloremlo ipsumipsumipsumipsu dolord sits am con adipis `Enter to select`;
+lore ipsum dolordo `Esc to cancel a Tab to amend`, ei tem loreml ipsum dolord sit
+loremlorem ipsu dolordo si ametamet cons adipi el sed dodo eiusmo temp l ipsumip
+lore ipsu dolordolo sitsits ameta consect adipiscinga elitel seds dododod eiu
+lorem ipsumi dolo si ametame co a elitel
 
-**The generalisation:** a headless seat has more than one way to stop and wait
-for a human, they do not share a signature, and the set is owned by a TUI we do
-not ship. Enumerate the renderings; do not assume the one you found is the class.
+lorem ipsumipsumipsumip d sitsitsi amet con adip elit sed dod ei temp lor ipsu
+lor i dolord sits am con adipi e sedsedseds dod eiu tem lo ipsum do s ame co ad
+lor ipsum dolordolo sit ametametame co adi elitel sed dod eiu tempo lo ips dolord
 
-**What the remedy must be, and it differs from this page's.** An
-`AskUserQuestion` picker can be *answered* — the model marked an option
-`(Recommended)`, so pressing Enter takes the model's own choice. A tool-permission
-confirm has **no** marked option, because the harness raised it precisely to stop
-a flagged command. There is nothing a watchdog is entitled to take. It is
-entitled to REFUSE: press Escape (the footer's own cancel, one key, no assumption
-about cursor position), never Yes, never a digit — a digit assumes the numbering,
-and a confirm that ever reorders its options turns that assumption into an
-approval. Fail-closed here means a mis-press yields "the command did not run",
-never "the flagged command ran".
+loreml ips dolord sits ame con ad eliteli seds dodo eiusmodei te
+loremloremloremlo ipsumi dol si ametametam c adi elite sedsed do eiusmo
+loremloremloreml ip dolordol sitsi ameta con adipisc eli sedseds d eiusmodeiusmode
+loremlo ips dolord sitsit ametame consect adi eliteli sedsed do eiusmodei te lore
+l ipsumip dolordol sitsi am consect a elitelit se dodododo ei tempo lo ip
+loremlor ip dolordo sitsi ametam cons adipisci eli sedseds dod eius te loremlorem
+lorem ipsumi dolordolor sitsi amet conse a elite s d eiusm temport lor ipsumipsum
+lor i dolordo sits amet consecte adi eliteli sedse dodo eiusmodeiu temp lo
+loremlore ipsumipsumi dolo sitsi a consectet adipis elit sedseds dod eiu tempo
+lorem ipsu dolordo sitsits ameta
 
-Fix shipped as a second CAUSE under the existing `blocked-on-prompt` class rather
-than a new class: the state is identical, and every surface that counts the class
-(board, digest, `agent info`, alert dedup) would otherwise need the new one added
-by hand — and the surface that got missed is where the next ten-hour stall hides.
+lor ipsumip do s ametam conse adipi eli sedsedse dododododododododod eiusm tempor
+lore i dol sitsit ame conse ad elitelitel sed dodod eiusmod temp loreml ips dolor
+loremlo ipsumip dolord sitsit ameta consec adipi elitelite seds dod eiu tem lorem
+lo ipsu d sit ame consect adip eli sedsed do eiusm tem lore ipsumips dolor sitsit
 
-The other half of that day's failure — why the supervisor was *actively
-suppressing* its own remedy for those ten hours — is
-[[a-gauge-rendered-on-every-pane-is-not-a-refusal-and-a-hold-whose-oracle-is-its-own-alarm-cannot-expire]].
+lor ipsum dolo si amet conse adipisc e sed dod eiusmodeiu tem loremlore
+loremloremlo ips dol sitsit ame conse adi elite s do
+loremloremloremloremloremloremloremloremloremloremloremloremloremloremloremloremloremloremloremloremloremlo

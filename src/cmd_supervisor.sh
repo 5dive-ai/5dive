@@ -1794,7 +1794,7 @@ sup_info_for_agent() {  # <name>
 # Every alert below used to name `main` literally, on BOTH legs, in all three
 # rails. `main` is a seat that exists on exactly one box in the world — ours.
 # Reported from a customer box (teal-fox, 5dive 0.40.0, 2026-09-15) whose org
-# roots are claude-aleks / claude-alena / claude-jane: `agent send main` failed
+# roots are claude-ava / claude-cleo / claude-nell: `agent send main` failed
 # with "no agent named 'main'" and `_task_agent_channel main` was false, so both
 # legs dropped and the ONLY trace of a seat sitting on an open row with nothing
 # closed in 32 days was a warn line in a cron log nobody reads. That is the
@@ -1810,7 +1810,7 @@ sup_info_for_agent() {  # <name>
 # regression dressed as a fix. `_task_resolve_gate_notifier` is the resolver
 # whose JOB is "which seat pages a person about fleet state", and it FALLS BACK
 # to `_task_resolve_coordinator`, so on an untagged customer chart with one root
-# it resolves exactly what the row asked for (claude-aleks) and on this box it
+# it resolves exactly what the row asked for (claude-ava) and on this box it
 # resolves `main` — byte-identical here, fixed there. It also gives the customer
 # the narrow override the row wanted without inventing a config key: tagging
 # a seat `gate notifier` moves the alerts alone, where tagging one `coordinator`

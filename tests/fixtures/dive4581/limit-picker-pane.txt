@@ -1,7 +1,7 @@
 
  ▐▛███▛█   Claude Code v2.1.273
 ▝▜██████▀  Sonnet 5 · Claude API
-  ▝▝ ▝▝    /var/lib/5dive-warm/mark
+  ▝▝ ▝▝    /var/lib/5dive-warm/acct-a
 
 
 ❯ [cc-inject-probe] no-op: this line only proves your composer still submits

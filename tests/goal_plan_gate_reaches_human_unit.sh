@@ -6,7 +6,7 @@
 # THE INCIDENT (even-branch, CLI 0.135.0, 2026-11-18 10:01Z). `goal add` planned 8
 # tasks, over the default checkpoint of 6, and filed the anchor's plan gate as a
 # tier-1 `decision`. DIVE-4415 routes a tier<2 decision to the org lead BY KIND, so
-# the gate read "routed to kostya" and needs_human was 0. But `goal add --from-gate`
+# the gate read "routed to tess" and needs_human was 0. But `goal add --from-gate`
 # builds only on a HUMAN approve (DIVE-916). The one answer that could build the
 # plan was never asked for, and the answer that was asked for could not build it:
 # the app's goal card sat at "planning" with no Start, and the partner's Start
@@ -70,10 +70,10 @@ audit_log() { :; }
 export -f 5dive 2>/dev/null || true
 _gate_proof_enforced() { return 1; }   # the evidence floor is another row's subject
 
-# A chart with a reachable lead under the root: kostya leads, swan builds.
+# A chart with a reachable lead under the root: tess leads, swan builds.
 db "INSERT INTO agents_org(name,reports_to,role) VALUES('lodar-root',NULL,'coordinator');"
-db "INSERT INTO agents_org(name,reports_to,role) VALUES('kostya','lodar-root','lead');"
-db "INSERT INTO agents_org(name,reports_to,role) VALUES('swan','kostya','builder');"
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('tess','lodar-root','lead');"
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('swan','tess','builder');"
 
 col() { db "SELECT COALESCE($2,'') FROM tasks WHERE ident=$(sqlq "$1");"; }
 human_verdict() {   # the CLI's own "waiting on a human" verdict (needs_human in ls --json)
@@ -85,8 +85,8 @@ db "INSERT INTO tasks(ident,title,status,created_by) VALUES('DIVE-901','control 
 : >"$PING_FILE"
 ( actor_seam_as swan; cmd_task_need DIVE-901 --type=decision --options="approve|revise" --recommend="approve" \
     --ask="Which of the two shapes should we build for this scope fork?" --from=swan ) >/dev/null 2>&1
-if [[ "$(col DIVE-901 routed_reviewer)" == "kostya" && "$(human_verdict DIVE-901)" == "0" ]] && ! human_pinged; then
-  ok_t "P  control: a plain tier-1 decision from swan routes to the lead kostya (so a human route below is the fix, not a leadless chart)"
+if [[ "$(col DIVE-901 routed_reviewer)" == "tess" && "$(human_verdict DIVE-901)" == "0" ]] && ! human_pinged; then
+  ok_t "P  control: a plain tier-1 decision from swan routes to the lead tess (so a human route below is the fix, not a leadless chart)"
 else
   bad_t "P  control: plain decision must reach the lead" "routed='$(col DIVE-901 routed_reviewer)' verdict=$(human_verdict DIVE-901)"
 fi
@@ -116,7 +116,7 @@ gate_arm() {
   local rr; rr=$(col "$anchor" routed_reviewer)
   [[ -z "$rr" ]] \
     && ok_t "G${label} the plan gate is NOT routed to the org lead" \
-    || bad_t "G${label} the plan gate must not go to the lead" "routed_reviewer='$rr' (the even-branch shape: routed to kostya)"
+    || bad_t "G${label} the plan gate must not go to the lead" "routed_reviewer='$rr' (the even-branch shape: routed to tess)"
   [[ "$(human_verdict "$anchor")" == "1" ]] \
     && ok_t "G${label} the CLI's needs_human verdict is 1 — the app's 'check' stage and the partner's humanGateOpen see it" \
     || bad_t "G${label} needs_human verdict" "got $(human_verdict "$anchor") tier=$(col "$anchor" tier) cap=$(col "$anchor" needs_capability)"
@@ -163,14 +163,14 @@ fi
 
 # B3: the lead cannot clear it by answering as an agent — it was never theirs.
 if [[ -n "$ANCHOR_B" ]]; then
-  ( actor_seam_as kostya; cmd_task_answer "$ANCHOR_B" --value=approve ) >/dev/null 2>&1
+  ( actor_seam_as tess; cmd_task_answer "$ANCHOR_B" --value=approve ) >/dev/null 2>&1
   out=$( cmd_goal_add --from-gate="$ANCHOR_B" 2>/dev/null ); rc=$?
   nstd=$(db "SELECT COUNT(*) FROM tasks WHERE project_key='launch-b' AND kind='standard' AND title NOT LIKE 'Goal:%';")
   [[ $rc -ne 0 && "$nstd" == "0" ]] \
     && ok_t "B3 the lead answering as an agent builds nothing (the gate is the owner's)" \
     || bad_t "B3 lead answer must not build" "rc=$rc nstd=$nstd answered_by='$(col "$ANCHOR_B" need_answered_by)'"
   # B4: nor by passing --human without the evidence (the flag alone is a claim).
-  ( actor_seam_as kostya; _gate_human_principal() { return 1; }
+  ( actor_seam_as tess; _gate_human_principal() { return 1; }
     cmd_task_answer "$ANCHOR_B" --value=approve --human ) >/dev/null 2>&1
   [[ "$(col "$ANCHOR_B" need_answered_by)" != human:* && -z "$(col "$ANCHOR_B" need_answered_at)" ]] \
     && ok_t "B4 an agent's unproven --human on the plan gate is refused (the tier-2 proof floor holds)" \

@@ -743,7 +743,7 @@ _hb_log() { printf '%s [heartbeat] %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 # Every escalation in this file used to be `( cmd_send "main" … ) >/dev/null 2>&1
 # || true`, or the same shape addressed to "ops". Both names exist on exactly one
 # box in the world: ours. DIVE-4551 was filed from a customer box (teal-fox)
-# whose org roots are claude-aleks / claude-alena / claude-jane — there the send
+# whose org roots are claude-ava / claude-cleo / claude-nell — there the send
 # fails and the redirection eats the failure, so there is no warn in the cron
 # log, no `supervisor_events` row and nothing for `doctor` to read. The
 # supervisor rails DIVE-4551 fixed at least printed a warn, which is how the
