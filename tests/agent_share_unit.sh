@@ -193,11 +193,11 @@ eq_t 'leak exits E_VALIDATION' "$E_VALIDATION" "$rc"
 has_t 'refusal names the line and kind' "$out" "CLAUDE.md:3: host-path: /home/someone"
 has_t 'refusal says nothing was published' "$out" "Nothing was published"
 _share_dir_of_agent beta >/dev/null && bad_t 'leaky agent has no share' || ok_t 'leaky agent has no share'
-fixture delta "" "SSH to 62.238.117.176 as root, notes in /home/someone/notes, ping @zed"
+fixture delta "" "SSH to 93.184.216.34 as root, notes in /home/someone/notes, ping @zed"
 out=$( (cmd_agent_share delta) 2>&1 ); rc=$?
 eq_t 'leaky skill body exits E_VALIDATION' "$E_VALIDATION" "$rc"
 has_t 'skill refusal names the skill file and line' "$out" "skills/research/SKILL.md:5: host-path: /home/someone"
-has_t 'skill refusal names the address too' "$out" "skills/research/SKILL.md:5: hostname: 62.238.117.176"
+has_t 'skill refusal names the address too' "$out" "skills/research/SKILL.md:5: hostname: 93.184.216.34"
 has_t 'skill refusal says nothing was published' "$out" "Nothing was published"
 _share_dir_of_agent delta >/dev/null && bad_t 'leaky skill body: nothing published' "$(ls -R "$SHARE_DIR")" || ok_t 'leaky skill body: nothing published'
 fixture epsilon ""

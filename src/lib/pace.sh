@@ -40,7 +40,7 @@ _GRADER_USAGE_CMD="${_GRADER_USAGE_CMD:-5dive usage --json}"
 #
 # Empty is a real, common state, not an edge case: measured 2026-09-09, SIX OF
 # FOURTEEN live seats reported fiveHourPct=null (marketing, warm-mark, creative,
-# olivia, dev2, don), and chemmonitor reported null for both. Whatever the cause
+# olivia, dev2, don), and orbit reported null for both. Whatever the cause
 # — idle seat, statusline cache not yet written — the floor has nothing to
 # compare against, and the caller must treat that as a refusal.
 #
@@ -341,7 +341,7 @@ _grader_account_of() {  # <agent>  [<usage-json-on-stdin>]
 # (2026-09-13, `5dive usage --json`):
 #
 #     mark        12 seats   sevenDayPct max 15   (4 of 12 seats null)
-#     chemmonitor  1 seat    sevenDayPct BLIND
+#     orbit  1 seat    sevenDayPct BLIND
 #     codex        1 seat    sevenDayPct BLIND
 #
 # A grader refusal defers ONE spawn and the delivery waits; the next tick
@@ -371,7 +371,7 @@ _grader_account_of() {  # <agent>  [<usage-json-on-stdin>]
 #                          medium work and every recurring beat wait.
 #   FIVE_PACE_BLIND=refuse — the filing's literal reading: no meter, no
 #                          dispatch. Correct on a fleet whose meters are
-#                          reliable; it freezes chemmonitor and codex on this
+#                          reliable; it freezes orbit and codex on this
 #                          one. Left available, not made the default.
 #
 # The alternative not taken is written on DIVE-4430's body, not only here.
@@ -1318,7 +1318,7 @@ _pace_field_5h() {  # <account> <now>  [<usage-json-on-stdin>]
 # the fail-closed lower bound on a shared pool and the same reasoning DIVE-4586
 # uses for the weekly — but the max is taken over live READINGS, not over the
 # pct field on its own. CONFIRMED before it was written, on the live document
-# 2026-09-19/20: every seat of `chemmonitor` reported 38/39/38% against ONE
+# 2026-09-19/20: every seat of `orbit` reported 38/39/38% against ONE
 # `fiveHourResetsAt` (1789891800), and every seat of `mark` reported 0% against
 # one reset of its own — one window per ACCOUNT, sampled at slightly different
 # moments per seat, not one window per seat. If that ever stops being true the

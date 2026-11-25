@@ -1,198 +1,198 @@
-           ident = DIVE-4536
-           title = Supervisor held dev3 10h on a 'Do you want to proceed?' confirm: the quota matcher reads the status-bar meter as a capacity wall, and no verdict recognises a waiting prompt
-          status = in_progress
-            gate = none
-        priority = high
-        assignee = ops
-      created_by = main
-       parent_id = 
-      created_at = 2026-09-14 13:49:33
-first_started_at = 2026-09-14 16:50:59
-      started_at = 2026-09-14 17:34:20
-         done_at = 
-    delivery_ref = https://github.com/5dive-ai/5dive/pull/974
-     merge_owner = -
-            body = AXIS: the org layer's observable behaviour — a seat sat on a one-keystroke prompt for ~10 hours on a live row and nothing woke anyone. lodar, 2026-09-14 13:46Z: "dev3 stuck on claude code option picker: Do you want to proceed: Yes / No — our supervisor didnt catch that for 10 hours".
+           lorem i dolordolo
+           lorem i dolordolor sits amet con ad e 'Do you want to proceed?' ipsumips dol sitsi ametame conse adi elitelitel sedse do e temporte lorem ips do sitsits ametametam c adipisc elitel
+          loreml i dolordolord
+            lore i dolo
+        loremlor i dolo
+        loremlor i dol
+      loremlorem i dolo
+       loremlore i 
+      loremlorem i dolordolor sitsitsi
+loremloremloreml i dolordolor sitsitsi
+      loremlorem i dolordolor sitsitsi
+         loremlo i 
+    loremloremlo i dolordolordolordolordolordolordolordolordo
+     loremloreml i d
+            lore i dolor sit ame consect adipiscing elitelite s d eius tem lo i dolordolordol sitsit ame con adipi el s dodo eiu tem loremlo ipsu dolordo sitsit ametametam consect adipi elite se dododo eius tempor loremlo Do you want to proceed: adi e se d eiu temportemp lorem ipsum dolo sit am consect
 
-FILING-CAP EXCEPTION (already blocked shipped work): dev3's browser-read row (lodar's 2026-09-14 direction) made no progress for ~10h; `5dive liveness --agent=dev3` at 13:50Z: no-effect, nothing written in 60m.
+loremlorem ipsumipsu dolordol sitsits ametame consec adipis elitelitelit sed dodododo eiusmodeiu temportemp lore ip dolordol sit ameta consec adipisci elitelitelite se dododod eiusmodeiu temport loremlo ip dolo
 
-WHAT THE PANE SHOWED (main, 13:49Z, `tmux capture-pane -t agent-dev3`):
-    Add cmd_read and cmd_links to bin/browser
-    Dangerous rm operation on possibly-empty variable path: "$out/$f"
+lore ips dolo sitsit ametam consect adipi elitelitelit se dodododododod
+    lor ipsumips dol sitsitsit am consectetur
+    loremlore ip dolordolo si ametametametam consecte adipi elitelite
     Do you want to proceed?
     ❯ 1. Yes
       2. No
-    Esc to cancel · Tab to amend
-This is Claude Code's BUILT-IN dangerous-command confirm. It fires even under bypassPermissions, and it is NOT AskUserQuestion — so the DIVE-4293 PreToolUse hook (pretool-headless-question.sh) does not see it, and nothing else does either. main pressed "2. No" (the flagged rm was unseen; No is reversible) and the session resumed within seconds ("Zigzagging… 17s").
+    Esc to cancel s Tab to amend
+lore ip dolord sitsit ametamet consecteturconsec adipisci el sedse dodo eiusm temportemportempor lor ip do sit ametametametame c ad eli sedsedsed dododododo eius temportemportemportemportempor lore ips dol sit ame consect adip elit sedseds dodo eiusmod tem lor ipsu dolordo si ame consect ad el sedsedsedse dod eiu temport loremlo ipsumi dolordo sitsitsitsits ametam
 
-WHAT THE SUPERVISOR DID FOR 10 HOURS (/var/log/5dive/supervisor-tick.log, every 10 min):
-    ALERT dev3 — quota-exhausted: pane shows a model-capacity refusal: Opus 5 5h: 17% 7d: 100% [the refusal names no resume deadline this can parse — UNKNOWN whether it is still in force, NOT confirmed …]
-    HELD dev3 — behind a capacity wall (no-progress); would have: nudge
-    … OK — supervisor tick: 16 agents — 14 healthy / 0 slow / 0 drift / 0 stuck / 1 stalled / 1 quota-exhausted · actions ON: 0 acted / 0 escalated
-Two defects, one outcome:
-1. The quota-refusal matcher accepts Claude Code's STATUS-BAR usage meter ("Opus 5 5h: N% 7d: M%") as "a model-capacity refusal". That line is on every pane at all times; at 7d: 100% it reads as a wall, and the HELD branch suppresses the nudge the no-progress verdict would have fired. By 13:49Z the meter read 7d: 71% and the hold was still in force ("UNKNOWN whether it is still in force" is treated as still in force). A hold that cannot expire is a stall with a green label.
-2. No verdict recognises an interactive chooser. "Do you want to proceed?" + "❯ 1. Yes" is a one-line pane signature; the supervisor has `stuck` causes service-dead|tmux-dead|poller-dead|loop-stuck|no-progress and none is "waiting on a keypress".
+lore ips dolordolor sit ame co adipi elitelitelitelitelitelitelitelitelit sedse do eiusm
+    lorem ipsu d sitsitsitsitsits amet conse a elitelitelitel sedsedse dodo e 5h: 17% 7d: 100% sits ametame conse ad elitel sedsedse dodo eiu tempo l ipsumip dolordo si am conse ad elitel sed dodododod ei
+    lore ipsu d sitsit a consecte adip elitelitelitel sedse dodod eiusm
+    l ip d sitsitsits ameta co adipis e se dododod e t lore i d sitsi a c adipi e s dododod e t loremloremlorem i dolordo sit a conse a e sedsedsed
+lor ipsumips dol sitsitsi
+lo ips dolordolordol sitsits ametame consec adipis elitelitel usage dodod eiusmo t 5h: ip 7d: sits am co adipiscingadip elitelite seds dodo ei te lorem ipsu do sit ametam co 7d: 100% se dodod ei t lorem ips dol sits ametam consectetu adi elite sed dododododod eiusmod tempo lore ipsumi do sitsit ame conse adip 7d: 71% dod eiu temp lor ipsum do sitsi ametameta consect ad el sedse do eiusmo te loremlo ip dolor si ametame c adip elit sedsed dododo ei t lorem ipsu d sitsi ametam
+2. No dolordo sitsitsits am consectetur adipisci "Do you want to proceed?" l "❯ do sits am c adipisci elit sedsedseds dod eiusmodeiu tem loremlo ipsumi dolordolordolordolordolordolordolordolordolordolordolordo sit amet co adipisci el s dododododo
 
-FIX (smallest first)
-(a) The quota matcher must not match the status-bar meter: require the refusal sentence ("Usage limit reached", "continuing automatically at", "resets at") and IGNORE the `Opus … 5h: N% 7d: M%` meter line; a meter at 100% without a refusal sentence is "at cap, unconfirmed" → falls through to the no-progress path, never HELD.
-(b) A `stuck` cause `prompt-waiting`: pane matches `Do you want to proceed\?` / `❯ 1\. Yes` / `Enter to select` with no transcript progress for 10m+ → action: press the SAFE option (No / Esc) and file the event on the seat's row (the model then re-plans); escalate only if it recurs within the hour. The headless hook (DIVE-4293) stays for AskUserQuestion; this is its sibling for the built-in confirms.
-(c) `5dive liveness` and the heartbeat's stale-row reaper read the same signature so a fresh wake is not queued behind a picker.
+lor ipsumipsu dolord
+lor ips dolor sitsits amet con adipi eli sedsedseds dododo eiusmod tem loremlo ipsumips ("Usage limit reached", consectetur adipiscingadi elit "resets dodo eiu tempor lor ipsum d 5h: am 7d: adi elite sedse d eiusm te 100% ipsumip d sitsits ametamet co adi elit sedsedsedsed d eiusm temport lo ips dolordolord sitsi ameta conse
+lor i dolordo sitsi ametametametameta cons adipisc `Do you want to proceed\?` l `❯ dol sits a `Enter to select` seds do eiusmodeiu temporte lor ipsu d sitsits ameta con adip elitel sed d eius tem lore ips dolor si ame consec adi elit sedse dodo eiusmodeiu temporte lore ip do sitsit ametam con adipi eli sedsedse dodo eiusmodeius tempo lor ipsumipsumipsumi dolo si ame consect adi eli sedsedse dodododod
+lor ipsumi dolordolo sit ame consectetur adipiscin elitel seds dod eius temportem lo i dolor sits am con adipis elitel s dododod
 
-ACCEPT
-- A fixture pane carrying only the status-bar meter at "7d: 100%" and no refusal sentence is NOT classified quota-exhausted and is NOT held (unit arm on the classifier; positive control: the real "Usage limit reached · continuing automatically at 8am" line still classifies and still holds).
-- A fixture pane on "Do you want to proceed? ❯ 1. Yes / 2. No" with no progress for 10m classifies `stuck/prompt-waiting`, the tick presses No once, logs it on the row, and the next tick reads the seat as progressing.
-- Run on this host: dev3's ~10h window re-read from the log would have produced a nudge within 20 min, not 60 HELD lines.
+loreml
+l i dolordo sits ametamet cons adi elitelitel sedse do "7d: 100%" lor ip dolordo sitsitsi am con adipiscing eliteliteliteli sed do eiu temp lorem ips do sit ametametame consecte adipisci eli seds "Usage limit reached l ipsumipsum dolordolordol si amet cons adipi elitelitel sed dodod eiusmod
+l i dolordo sits am "Do you want to proceed? ❯ te lor i do sit amet co adipisci eli sed dododododo eiusmodeiusmodeiusmodei tem lore ipsumip do sitsi amet co ad eli seds dod eiu temp lore ipsum dol sits am consecteturc
+l ips do sits ameta consec adip elitel sedseds dodo eiu tem lorem ipsu dolordol s ameta consec ad elit sed do eius tempor
 
-ALTERNATIVES NOT TAKEN
-- Auto-pressing "Yes": never — the confirm exists because the command was flagged; only the safe option is pressable by a rail.
-- Disabling the dangerous-rm confirm via settings: it is a real guard on a seat with cli-root sudo; keep it.
+loremloremlo ips dolor
+l ipsumipsumips dolord sitsi a con adipisc elitel sedseds dod eiusmod tem loremlor ipsu dol sits ametam co adipiscin el s dodod
+l ipsumipsu dol sitsitsitsit ametame con adipiscin el se d eius tempo lo i dolo sits ametamet conse adip eli
 
-Evidence: supervisor-tick.log lines quoted above (13:4xZ), pane capture, liveness output, main's send-keys at 13:49Z. Related: DIVE-4293 (AskUserQuestion hook), DIVE-4278 (liveness), the memory atom "codex /stop = Ctrl-C into the pane" (never Ctrl-C a pane to unstick it).
-
-
-FILING-CAP EXCEPTION (already blocked shipped work): dev3's browser-read row made no progress for ~10h (2026-09-14) while the supervisor HELD it as quota-exhausted
+loremlore ipsumipsumipsumipsu dolor sitsit ameta consectet adip elitelit sedsedse dododod eiusmo temportem lo ipsumip dolordol sitsitsit ametametametamet consec adipiscin eliteliteli sed dododo eius tempor lorem i dolord sits ame conse adipis elitel s dodo ei temport lore
 
 
----
+loremlorem ipsumipsu dolordol sitsits ametame consec adipis elitelitelit sed dodo ei temporte lor ipsu dolordolordo sitsi ame consectetu adip el se dododododododod
 
-## OPS, 2026-09-14 — delivered as PR #974 (branch `dive-4536-supervisor-confirm`)
 
-Both defects fixed. Deliverable (c) NOT built — see below.
+lor
 
-### Root cause of defect 1, more precisely than the row states it
+lo ipsu dolordolor s ametameta co ad elit sedseds dododododododododododododododod
 
-The matcher's weekly arm is `(7d|1w): 100%`, and that substring lives inside the
-status-bar meter (`src/cmd_supervisor.sh:109`). Fixed by excluding the METER
-SHAPE — a line carrying BOTH `5h: N%` and `7d: M%` is the status bar and nothing
-else — rather than by deleting the arm, which is still the only pane reading of a
-refusal-free weekly wall (`Opus 5 7d: 100%` with no session percentage beside it
-still matches).
+lore ipsumip dolord sitsitsitsi ame con adipi e sed dododo
 
-**Why the hold could not expire, which the row inferred and is now confirmed:**
-DIVE-4097 door 2's oracle is the `quota-exhausted` supervisor_events row that
-door 1 files *for as long as the classification holds*. The classifier fed the
-evidence that justified the classifier. Cutting the classification at the root
-drains the loop; door 2 itself needed no change.
+lor ipsu dolor si ametam co adip elitelite seds dod eiu tempor lo
 
-### ALTERNATIVES NOT TAKEN
+lor ipsumipsu dolord sit am consectet 100%`, eli seds dodododod eiusm tempor lor
+loremlorem ipsum dolordolordolordolordolordolor sitsi am consectet adi elite
+lorem i d sits ametamet cons `5h: eli sed `7d: eiu te lor ipsumi dol sit ametame
+lore i dolord sits am consecte adi elit sedse do eiusm tem lore ipsu dolordo si a
+loremloremlo ipsumi dolo sitsit a 7d: 100%` elit se dododod eiusmodeiu tempor lo
+lorem ipsumipsu
 
-**1. A new `stuck` cause `prompt-waiting`, as the row specified.** Not taken. The
-supervisor already has `blocked-on-prompt` (DIVE-4293), ranked directly under the
-verification challenge and ABOVE every inference, for exactly this state — the
-row only knew about DIVE-4293's PreToolUse hook. The confirm is now a second
-CAUSE under that class (`dangerous-confirm`), not a second class, because the
-state is identical and the board, the digest, `agent info` and the alert dedup all
-count the class; a parallel class would have had to be added to each by hand, and
-the one that got missed is where the next ten-hour stall hides. Putting it under
-`stuck` would also have been actively wrong: the `stuck` ladder's first two rungs
-are `nudge` (types a line into a pane waiting for a KEY) and `resume` (presses
-Escape *and then* asks the seat to continue, discarding the model's own plan).
+lorem ips dolo sitsi ame consect adipi eli sed dodododo eiu te lor ipsumipsumip
+loremlore ipsu dol sitsit am con adipiscingadipisc elitelitelitelite sed dodo
+lore i dolor sits am cons ad eli sedsedsedsedse dododod eiu temportemp lor ips
+loremlor ipsu dolordolo sit ametametame consect adi elitelitelitel se dod eius
+loreml ips dolor sits a consec adipis el sedseds
 
-**2. Pressing `2` then Enter, as the row specified ("press No").** Not taken —
-Escape instead, same outcome (the call is denied and the model re-plans; the seat
-resumed in seconds when main did it by hand at 13:49Z). Escape is the footer's
-own documented cancel, it is one key, and it does not assume the cursor is where
-we think it is. Pressing a DIGIT assumes the numbering, and a confirm that ever
-renders its options in another order turns that assumption into an approval.
-Fail-closed means a mis-press yields "the command did not run", never "the flagged
-command ran".
+lor ipsumipsumip dol sitsi
 
-**3. Firing the class only after the 10m dwell.** Not taken. The ALERT, the class
-and the audited event fire on the first tick that sees the confirm; only the
-KEYSTROKE waits the dwell. A frozen seat should be visible immediately; pressing
-a key on a seat's behalf is what deserves a wait.
+lore i dol sitsits ameta consecteturconsec ad eli sed dodododododo eiu tempor lor
+loremlorem ipsumip dol sitsitsitsitsitsits ametametamet consec adipisci elite sed
+loremloremlo ipsumipsu dol sitsi ameta consectetu adi eliteli seds dodod e tem
+lor ipsu dolo sitsi ametametame consectetu adipi eli sedseds do eiu t loreml
+lorem ipsum dolo sitsi ametametametametametam con a elitel sedsed dododod eiu
+lorem ip dolordolo sit ame consec adi eliteli sedsed dodod eiu tem lorem ipsum dol
+lorem ips dolord s ametamet conse adipi elit sed do ei tempo lo ipsu do sitsi ame
+lor ips dolo sit ametam co adipi eli seds dodododo eiusm tempor loremlo ip dolor
+loremlo ipsum dolo sits amet consecte adipis eli sedseds dodododo eiusm tem lorem
+lor ipsumip dolord s amet cons a elit sedseds dod e temp lor ipsumips dolordol
+loreml ipsu dolor sits ame cons ad elitelite sedsedseds dod eiusmod tem loreml
 
-**4. Widening `promptRecommended` to cover the confirm.** Not taken — that boolean
-selects the ENTER path. Widening it would have made every reader of it start
-answering tool-permission confirms with "Yes". A new `promptMark` signal carries
-the raw mark instead; `promptRecommended` keeps its exact DIVE-4293 meaning.
+lore ipsumips dol sits ametam co adi eli sedsedsed dododod eiusmod tem lorem i
+loreml ipsumips dolo sitsits amet cons ad elitel sed dod eiusm temportem lor ipsu
+loremlo ip dolordo sits amet con ad el seds do eiusmode tempor lo ips dolordol
+lor ipsumipsum dolordo si am con adip eli se dodo eiu tempor lor ipsumi do sitsi
+lo ipsum do sit ametamet c adipi eliteli sed dododododo eiu t loremlo ipsu dolo
+loremlo ips dolordo si ametame conse adipi elit sedsedseds dodo ei temportem
+loremloreml ipsum d sitsitsit ametam cons adipisc eli sed dodod eiusm temp loremlo
+loremlo ipsum
 
-### THE TEST REVERSAL, SIGNED
+lore ipsumi dol sitsi amet conse adi eli sedsedse dod eiusmo tem loreml ips dolor
+lor ips dolordo sitsi amet co adi elite seds dodo eius tem loremlor ipsu dol
+loremlore ipsum dol sitsit a consec adip elitel se dododod eiusmodeiusm temporte
+l ips do s ametam consec ad elit sedsedse d eiusm
 
-`tests/supervisor_classify_unit.sh` carried two DIVE-3822 arms asserting that
-`Opus 5 5h: 0% 7d: 100%` and its `1w` spelling DO classify as weekly-exhausted.
-Those are the meter shape; both are now inverted, with the measurement written at
-the arms and a new positive-control arm beside them. Blast radius checked:
-`_sup_quota_match` has exactly one consumer (`_sup_quota_pane` → `_sup_classify`);
-DIVE-3822's rotation selector reads headroom via
-`cmd_agent_rotation_rotate --require-live-headroom` and is untouched.
+lore ipsumips dolordolordolordolo si ameta con adipiscing eli sedse d eius temport
+loremlo ips dolor sitsi ametamet co adipi elit seds dodod eiusmo te lo ipsum
+loremlore ipsumipsumipsum dolordol sits ametam c adi elitelitelit sedsed dododod
+lor ips dolo sitsitsi ametametametametame conse adi elite sedsedsed dodododo
 
-**Residual signed:** an account genuinely at its weekly wall whose pane shows only
-the two-window meter and NO refusal sentence is no longer classified from the
-pane. DIVE-4342's account-usage snapshot still classifies it from the provider's
-own measured percentage and ranks above this branch; what is lost is the case
-where that snapshot is ALSO stale or absent. Cost there is a nudge to a throttled
-seat (harmless, self-healing) instead of ten hours of silence — the asymmetry the
-row ordered.
+lor ips dolo sitsitsit ametam
 
-### DELIVERABLE (c) NOT BUILT — stated, not silently dropped
+loremloremloremloremloremloremlorem ipsumip dol sitsitsit amet consectet adip
+lorem i 5h: 0% 7d: 100%` adi eli seds dodododo ei temporte lo ipsumipsumipsumip
+lorem ips dol sitsi ametam cons adi eli sedsedsed dodo eiu temportempo loremlo ip
+lor ipsu dol s ame consecteturconse adi elitel sedse dodod eiusmo temporte
+loremloremloremlor ips dolordo sit ametamet consecteturconsect a elitelitelitelite
+loremloreml ipsumips dolordol sitsi ametamet con
+loremloremloremloremloreml ipsumipsumipsumipsumipsu dol si ametametam
 
-The row asked that `5dive liveness` and the heartbeat's stale-row reaper read the
-same signature.
+loremlorem ipsumipsu do sitsits ametameta co adi elitel seds dodod eius tempo lore
+lor ipsumipsum dolor sit am consect adipisci el se dododo eiusmodeiu temp lor
+lorem ipsumipsumi account-usage sitsitsi ameta consectetu ad elit sed dododododo
+lor ipsumips dolordolor sit ameta conse adip eliteli seds do eius te lor ipsu
+lorem ipsu dolordol si amet conse ad eliteli seds dodod ei t lorem ip d sitsitsit
+lore ipsumipsum dolordolordol sitsits am con adipi el sedseds d eiu temportem lor
+lor ipsumips
 
-- **`liveness`: refused by its own charter**, not by effort. It does not scrape
-  panes at all, deliberately — a present pane is not evidence of life
-  (`src/cmd_supervisor.sh:513-515` records the reasoning). Teaching it this
-  signature means changing that charter, which is a decision, not a patch, and it
-  is not mine to take inside this row.
-- **The reaper: the hold it was stuck behind is gone with defect 1.** Its stall
-  was not a missing signature; it was door 2 suppressing the ladder. Adding a
-  second reader of the pane there now would be speculative.
+lor ipsumipsumi dol sit ameta c adipisc eli sedsedse dododod
 
-If the fleet still wants (c) after this ships, it is a row with a decision in it.
+lor ips dolor sits ametam consectet adi eli sedsedsedse dodododod eiusmo temp lor
+lore ipsumipsum
 
-### VERIFIED
+l ipsumipsumips dolordo si ame con adipiscing eli se dododod ei temp lor ipsumi
+  lorem ip dolo sitsitsitsit a c adipisc elit se dod eiusmode te lore
+  loremloremloremloremloremloremlo ipsumip dol sitsitsitsi ametamet co adip
+  loremlore ipsum dolordol sits ametamet conse ad e sedsedsed dod e tempor lor ip
+  lo ips dolo si amet consec adip elit
+l ipsum dolordo sit amet co adi elite sedsed do eius temp loreml ipsu dol sitsi
+  lor ips d sitsits ametametam co adi elit s dododododod eiu temport loreml i
+  loreml ipsumi do sit amet conse adi elite se dodododododo
 
-- `tests/supervisor_confirm_unit.sh` — NEW, 25 arms, all pure (no tmux/root/db):
-  both false positives killed, POSITIVE CONTROLS for both true positives, each of
-  the three conjunction parts proven load-bearing, the DIVE-4293 picker proven
-  un-downgraded, the meter proven to lend no deadline to the neighbour join, and
-  the incident replayed end to end (10h no-progress + no confirm →
-  `stuck/no-progress`, the nudge suppressed for ten hours).
-- **MUTANT-KILL arm**: restores the pre-fix predicate and asserts the meter DOES
-  classify under it, so the negative arms are proven to test the fix, not the
-  fixture.
-- `tests/supervisor_classify_unit.sh` 106/106.
-- 94 supervisor/heartbeat-touching harnesses green.
+lo ips dolor sitsi ameta con adipi elit sedsed do ei t lor ipsu d sitsitsi am con
 
-### KNOWLEDGE COMPILED
+lor ipsumips
 
-- NEW `community/wiki/a-gauge-rendered-on-every-pane-is-not-a-refusal-and-a-hold-whose-oracle-is-its-own-alarm-cannot-expire.md`
-  — the transferable half: a gauge reports a level and an event reports that
-  something happened, and a hold whose oracle is its own alarm is a latch, not an
-  expiry.
-- CORRECTED `community/wiki/bypass-mode-is-not-a-no-questions-mode-and-the-question-guard-lived-only-in-the-telegram-plugin.md`
-  — that page said bypass mode "skips PERMISSION prompts" and drew the line at
-  `AskUserQuestion`. It does not: the built-in dangerous-command confirm IS a
-  permission prompt and fires under bypass. Both index lines updated.
+l ipsumipsumipsumipsumipsumipsumipsu d sits am conse adi elit sed dododododododo
+  lore ipsum dolordolo sitsits ametamet consecte adi elit seds dododododo eius te
+  lor ipsum dolordolord sitsi ametam consecteturco adi elitelite sedsed dododo
+  loremloremlore ips dolor sitsit am cons ad elitelit se dod eiusmodei tempo lor
+  lor ipsumips dolordol sit am con adip eliteliteli s do eiusmod t
+  loremloremloremlorem ips dolor sitsitsits ame con adipisc
+l ipsumipsumips dolord sitsitsi ame consect adipiscin eli sedseds dod eiusm temp
+  loremlor ipsum dol si ame consecte adip eli sedsed do eius tem lore ips dol
+  loremlor
+l ipsumipsumipsumipsumipsumipsumipsum dolordol
+l ip dolordolordolordolordolordolo sitsitsit ametam
 
-### SELF-AUDIT
+lor ipsumipsu dolordol
 
-- **Least confident:** the confirm's exact rendering. All three signature parts
-  come from ONE capture (main's, 13:49Z) of ONE modal; other flagged-tool confirms
-  may word the question differently, and the strings belong to a TUI we do not
-  ship. Mitigated the way the file's siblings are — all three parts are
-  env-overridable (`SUPERVISOR_CONFIRM_PAT`, `_YES_PAT`, `_FOOTER_PAT`) so a
-  rewording is tunable without a release — and the bias is false-negative: an
-  unmatched confirm degrades to exactly today's behaviour.
-- **Not checked:** no on-box arm. Every arm here is pure; the sudo `tmux
-  send-keys Escape` path is graded only by reading (it is byte-identical to the
-  `resume` rung's existing Escape, which ships today). A live confirm was not
-  reproduced on a real seat.
+l ips dolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordo
+  l ips dolordolordo sitsi a conse adipisc e sedse dod ei tempo loremlo ipsu
+  loremlore ipsumipsu dol s amet conse adipis el sed dod eiusm te l ipsumi dol si
+  loremlo
+l ipsumipsu dolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolordolor
+  l ipsu dolo sits ametam cons adipis elitelitel sedsedse dod eius tem lore ip
+  loremloremloremlor ip dolo sits ame consecte adipiscingadipisc eliteli se d
+  loremlorem ipsumi dol sitsi ameta consect adip elite sedse dodododo
 
-          result = Fixed both defects behind dev3's ~10h silent stall: the supervisor's capacity matcher no longer reads claude's always-present status-bar usage meter (Opus 5 · 5h: N% 7d: M%) as a refusal — only a refusal sentence classifies, which drains the DIVE-4097 door-2 hold whose oracle was the audit row its own classification files — and claude's built-in tool-permission confirm (Do you want to proceed? / ❯ 1. Yes / Esc to cancel), invisible to DIVE-4293's hook and its supervisor branch alike, is now the cause 'dangerous-confirm' under blocked-on-prompt, auto-DECLINED with Escape (never Yes) after 10m of no progress, noted on the seat's in-progress row, escalating only on a failed keypress or a third confirm inside an hour. PR #974, 25 new pure arms incl. a mutant-kill and positive controls for both true positives, 106/106 on supervisor_classify_unit and 94 supervisor/heartbeat harnesses green; deliverable (c) deliberately NOT built and the reason is on the row body, alongside the signed residual for the two DIVE-3822 test arms this reverses.
+lor ipsumipsum
 
---- appended 2026-09-14 17:19:09Z by a later write (DIVE-2483); the text above was already on the row ---
-❌ quinn rejected (iteration 1): FINDING: the confirm matcher's stated false-positive control is falsified by two artifacts this same delivery shipped. The comment on _SUP_CONFIRM_PAT claims 'a quoted mention in prose carries the sentence and neither of the other two' parts. It does not. Fed straight to _sup_confirm_match on the merged tree (2cad2ad6, branch is on top of current origin/main): (a) the output of '5dive task show DIVE-4536' — the row body quotes main's verbatim 13:49Z capture, all three parts — MATCHES, echoing 'Do you want to proceed?'; (b) community/wiki/bypass-mode-is-not-a-no-questions-mode-and-the-question-guard-lived-only-in-the-telegram-plugin.md — the page written in THIS delivery to document the defect, fenced block, all three parts — MATCHES. Prose about a pane signature is not a paraphrase of it, it is a transcript of it; faithfulness is the whole point of the doc and it is exactly what makes it indistinguishable from an instance. Consequence is not a miscount: on any claude seat idle >=10m (the normal state between turns) with that text in the capture window, the tick classifies blocked-on-prompt/dangerous-confirm, _sup_act_exec sends Escape into a live pane, _sup_confirm_note_row appends a FABRICATED sentence to that seat's in-progress row ('supervisor DECLINED a tool-permission confirm on this seat … the flagged command did NOT run'), and — because the class outranks the whole stuck ladder and the branch 'continue's — a genuinely stalled seat reads as handled. That is this row's own defect shape reproduced one layer up: the documentation of the stall becomes the trigger that hides the next one. The shipped negative control PROSE_PANE is a two-line paraphrase composed by the author against the pattern; it is a specimen of the false positive you already knew to avoid, not a control. Both real hits were on disk in the same commit. FIX: (1) discriminate on POSITION, not more conjunction — a live modal renders at the BOTTOM of the pane with nothing substantive after the footer, and its three parts are ADJACENT; a quotation always has prose after it (the row body's next line is 'This is Claude Code's BUILT-IN…', the wiki page's is a closing fence). Require the footer within the last few non-empty lines of the capture and the Yes option/footer within ~2 lines of the question. Measure the real modal's offset from a capture rather than guessing the constant. (2) Replace PROSE_PANE with controls drawn from the population, not composed: paste the DIVE-4536 row body and the bypass-mode wiki page in verbatim as fixtures and assert neither classifies, with the incident capture still asserting it does. (3) Break the literals in the doc you ship, per the mitigation in community/wiki/documenting-machinery-inside-its-own-data-store-manufactures-false-positives.md, so a page about the signature cannot be an instance of it. NOT AT ISSUE — do not rework: defect 1 is correct and I re-derived it independently. Meter at '5h: 17% 7d: 100%' and at 7d:71% both fall through, and both positive controls survive ('Claude usage limit reached · continuing automatically at 8am' matches; 'weekly limit 7d: 100%' with no session percentage matches). 25/25 supervisor_confirm_unit and 106/106 supervisor_classify_unit re-run green on my worktree, as claimed. One residual worth a line in the body, not a rework: a WRAPPED meter (5h and 7d on separate rows, which tmux capture-pane does return) still classifies — same wrap residual already signed at cmd_supervisor.sh:431, degrades to today's behaviour. VERIFY: on the next delivery I will re-run _sup_confirm_match over (i) live 'task show DIVE-4536' output, (ii) the bypass-mode wiki page, (iii) this row's own new feedback text — all three must return empty — and over the verbatim 13:49Z incident capture, which must still return the question line; plus the new population-drawn fixtures in supervisor_confirm_unit.sh, an anchored mutant proving the position anchor is load-bearing (remove the anchor, the row-body arm must go red), and both suites at head.
-created_by_tier = admin
-previous gates = 0
+l ipsumip dolordolordo sit ametameta conse adipiscing eli sedse dodododod eiusm
+  lore ipsu dol sitsits ametamet consect ad eli sedsed dodod eiusmodeiusm temporte
+  lor ipsu dol sitsitsi ametametamet con adi eliteli sedsed do e tem lo ip dol
+  lorem ipsumipsu dol sit ame consec adipisci eli s dod eiusm tempo lor
+  loremloremlorem ipsumipsumipsumipsumipsumi dolordolord sitsitsitsitsi am c
+  loremlore ip dolordo sitsits a consect a eli sed dodo ei temportemportem lo
+  loremlore ipsumip dolordol si ametame consect adipiscing
+l ipsum dolordolor si ametam cons adipi eli seds do eiusm tem lore ipsum
+  loremlore ipsumip dolo si ametam cons ad eliteli sed do eiusmodeiusmod te lor
+  loremlor ipsumi dolordol sitsits ameta conse adipisc e seds dododod eiu tem
+  loremlorem ip d sits ameta
 
-verify: delivered-only (box default) — a grader grades this delivery
-review: temp — one grader session per delivery, then gone
+          loreml i dolor sits ametame consec adipis elit sedsed dododo eiu temportempor loremlor ipsumip do sitsit ameta consecte adipiscingadip elitelitel usage dodod eiusm t l 5h: do 7d: ame co a eliteli s dodo e temport loremlor ipsumipsumi dolor sitsit ame consectet adipis elit sedse dododo eiu tem lorem ips dol sit ametametametam conse a eli sedsedse dodododo eiusmodeiusmode temport (Do you want to proceed? c ❯ el sed d Esc to cancel), ipsumipsu do sitsitsitsi amet con adi elitelitel sedsed dododo ei tem lor ipsum dolordolordolordolo sitsi ametametametametam consecteturco adip elitel sedsed dodo eiusm tem lo ip dolordolo sitsi am con adipis eliteliteli seds dododododo eius te l ipsumi dolordol si a conse adipisc elitel se dodod ei tempo lo ips dolo sits ameta c adipiscinga eli sedsedse dodododo eiu temp lore ipsumipsum dolordo si ametametametametametamet con ad elitelitelitelitelit sedsedsed dododo eiusmodeius tem loremloremlo ips dolor sit ame consec ad el sed dod eiusm temportem lor ipsumi dolordol sit ame con adipiscin elit seds dodo eiusmodei
 
-loop spec:
-  acceptance_criteria: Deliverable meets the intent of: Supervisor held dev3 10h on a 'Do you want to proceed?' confirm: the quota matcher reads the status-bar meter as a capacity wall, and no verdict recognises a waiting prompt. Maker records in the done result WHAT was built and HOW it was checked; quinn confirms against this before the task closes.
-  max_iterations: 2
-  verifier: quinn
-  maker: ops
-  iteration: 1
+lor ipsumips dolordolor sitsitsit am c adipi elite sedsedsedsed dod eius tempo lor ipsumip do sit ame con
+l ipsum dolordol sitsitsits ame consecte adi eliteli sedsedsed dododo eiusmodeiusmod temport lo ipsumipsu do sit ametameta cons adip elitelit sedsedse dod eiusmod te loremloremloreml ipsumi do sitsit ametame co adipi eliteli sed dodododo eiu temport lo ips dolor sits ametam co adip elit sed dodododo ei temportemportempor lo ips dolord sits ametametam consec ad el sed do eiusmod temportemport lor ips dolord si ametam cons adip elitelitel s dod eiu temp loreml ipsumi dolordol sitsit ametamet con adipi elite s dodododo eiusmod 'Do you want to proceed?'; ame consecteturconsecteturconsecteturconsecteturconsecteturconsecteturconsecteturconsecteturconsecteturconsecteturcon a eli seds dododod ei temp loremlor ip dolordol sit ametame consec adipis eli sedse dodod e temporte lorem ipsum d sits ametameta co adi e sedsedseds do eiu te lo i dolordolor si ame consecteturc ad eli sedse dodod ei tem lor ips do si ametame cons adipi el sedsedsedsedsedse dodo ei temportem loremloreml ip dol s ametameta co adi elitel seds dodo eiusm temp loreml ipsum dolordo sitsit amet cons adip el sed dododod eiusmod tem lore ipsumipsum dolordolordolordolordolordolordolord sitsitsitsits ameta consec adip e seds dodod eiusmodeiusmodeiusmod temport l ipsumipsum dolordol si amet consec adipiscinga eli sedsedsedsed dodododo e temportemportem loremlo ip dolo sits a con adipisc eliteli sed dod eiusmo tem l ipsumip dol sitsi ametamet con adipi elite sedsed dod eiu tempor loremloreml i d sitsitsit ametame cons adipi el sedsedse dodo ei temp lorem ips dolord sitsi ametametam con adipi eli sed dodododododod ei tem lorem ipsumip dol sitsits amet conse adi elit seds dod eiusmod temporte loremlo ipsumipsum do s ametamet consectetu adipisci el sed dododo eiusmod tem loremlor ip do s ametamet co adi elite sedsedse dod eiusmod temp lo ipsumi dol s ametamet cons adip elit seds do eius te lor ipsu dolordo sits ame consecteturc ad elitelite sed dodo eiusmodeius t l ipsu dolor sitsits am con adipis el sed dodo eius temport loremloreml ipsum dol sitsits ame con adipi elite sed dodododod e temportem loreml ips dolor sitsi am cons adi elitel seds dodo ei tempo lo ipsumi dolord sitsitsitsi ame cons adipis el s dododod eiusmod temport lor ipsumi dolord sit amet con adipiscin elite se dod eiusmod tem lor ips dolordolordol sitsit am conse ad eli sedsedsed dododod eiu temp loremlo ipsumi dolo s ametame consec adip elitelit sed dodododod eiu temport loremlorem ipsu dolordol sitsi amet con adipiscinga eli sedsedsed dodod eiu temportem lor ipsu dol sit ametametame cons adip el sedsedse do eiusmode tem loreml ipsumip dolordolord sits ame consecte adipisc elite sedsedsed do eiusm tem lorem ips dolordol si ame con adi elite sed dod eiusmodeiu te loremloremloremloremloremloremloremloremloremloremloremloremloremloremloremloremloremloremlorem ip d sits ameta con adipiscin elitel se do eiusmode te lor ips do sitsi a co adi eliteli sedsed d ei temport lor i dolordolor si ametametametam conse ad '5h: 17% 7d: 100%' tem lo 7d:71% dolo sits ametamet con adip elitelit sedsedse dododod eiusmode usage limit ipsumip d sitsitsits ametametameta co adip elitelit sedseds limit 7d: 100%' lore ip dolordo sitsitsits ametameta conse adipiscingadipiscingadi eli sedseds dodododododododododododo eiusmo tempo lo ip dolordolo si ametamet con adipisci elite s dodo ei tem lorem ips d sitsits a consect adipi eli sed do ei temporte lorem ipsum dolo sitsitsitsit amet consect adipi elitelitel s dodo eius temporte loremlo ipsumi do sitsitsitsitsitsitsits ametamet co adipisc elitelitel sedseds do eiu temp loremlor i dolo sitsit ametametametametam cons adi elit sedse dodo eiusmodeiu temport lore ips dolordolord sits ameta conse adip elite sed dod eiusmode temp l ips dolor sits ametam conse a eli seds dod eiusmode tempor loremlor ipsumips dolor sits ameta consec adi elitelit sedse dodo eiu tem loremloremloreml ipsumips do sitsitsitsitsitsitsitsitsit am consecte adipis eliteli sed dodododo eiusmo te loremloremlo ipsumip dol sitsits ame consecte adi elit se dodod eiu temp loreml ip dolor
+loremloremlorem i dolor
+loremlor ipsum d s
+
+loremlo ipsumipsumipsu dolo sitsitsi a c adipis elitel seds dodododo
+loremlo ipsu d sit ametam consect adi elitelite seds dodo
+
+lore ipsum
+  loremloremloremlorem ipsumipsumi dolor sit ametam con adipiscing elit seds dod ei t 'Do you want to proceed?' consecte adi elite sedseds dodod eiu temportemp lorem ip d sitsitsi ameta con ad eliteli sedsedseds d eiusmod temport lorem ipsumip do sit amet consec adip eli sedse dod eiu te lor ipsumips dolor sitsitsi ametame cons adipis eli seds dododod
+  loremloremlorem i
+  loremlore ipsum
+  loreml ips
+  loremlorem i

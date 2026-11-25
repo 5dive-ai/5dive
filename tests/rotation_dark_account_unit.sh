@@ -233,7 +233,7 @@ t "5 a codex seat: nothing armed" "" "$(_sup_arm_wall_resume chat)"
 # Replay of 2026-10-14 04:43-04:53Z: mark (A) walled, its seats measured at 100%
 # 5h; mp-team (B) had seats on it whose freshest cache (ads, 04:42:27Z) carried
 # seven_day 69% and no five_hour block, the rest null or 40 minutes old;
-# chemmonitor (C) dark, remembered at 100% 7d. The heartbeat's call is
+# orbit (C) dark, remembered at 100% 7d. The heartbeat's call is
 # --if-current-near-wall --require-live-headroom. Pre-fix: "no eligible
 # account", and lodar moved the seats by hand. NEGATIVE CONTROL: PROBE_MUTANT=1
 # drops the probe branch and the move arms go red.

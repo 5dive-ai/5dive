@@ -53,7 +53,7 @@ ALERT_AT=1789887633
 RESET=1789891800
 TICK=600
 # The verbatim audited rows, newest first, as _sup_wall_state reads them.
-EVENTS=$(cat "$FIX/olivia-2026-09-20-events.txt")
+EVENTS=$(cat "$FIX/seat-2026-09-20-events.txt")
 INCIDENT_DETAIL=$(grep -m1 'resets 1789891800' <<<"$EVENTS" | sed 's/^.* | //')
 NO_OUTPUT_DETAIL=$(grep -m1 'nothing closed in 3d' <<<"$EVENTS" | sed 's/^.* | //')
 

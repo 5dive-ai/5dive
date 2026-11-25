@@ -2,7 +2,7 @@
 # DIVE-7028 — on a self-hosted box with ONE Claude login, every new seat came up
 # signed out: `agent import --auth-profile=mp` was deferred anyway ("auth was
 # deferred (agent is UNAUTHED)"), `hire --from-market` minted an empty profile
-# named after the hire, and `team import --auth-profile=konst` left every seat
+# named after the hire, and `team import --auth-profile=rio` left every seat
 # unauthed. Graded on box fixtures through the REAL credential check
 # (cmd_auth.sh auth_creds_present):
 #   1. the rule (_create_sole_account): which box has "one login";
@@ -63,7 +63,7 @@ done
 cmd_install() { printf 'INSTALL-ATTEMPTED %s\n' "$*"; return 1; }
 export FIVEDIVE_CHAT_ONLY_MARK="$TMP/chat-only"
 MP='mp:CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-mp'
-KONST='konst:CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-konst'
+RIO='rio:CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-rio'
 DEMO='demo-ai:ANTHROPIC_AUTH_TOKEN=sk-or-v1-fixturedemo'
 
 # box <profile:line>... — each arg is one account and one line of its
@@ -91,7 +91,7 @@ box "$MP" 'trends:ANTHROPIC_AUTH_TOKEN=sk-or-v1-fixturedemo' "$DEMO"
 eq_t 'nor the demo key saved under another name' mp "$(rule claude)"
 box "$DEMO"
 eq_t 'a demo-only box has no login of its own' none "$(rule claude)"
-box "$MP" "$KONST"
+box "$MP" "$RIO"
 eq_t 'two logins: nothing is picked' none "$(rule claude)"
 box "$MP"
 printf 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-shared\n' > "$CONNECTORS_DIR/anthropic.env"
@@ -130,9 +130,9 @@ eq_t 'a team template (defer_auth, no account) on a one-login box: signed in on 
 eq_t "the dashboard's set-up-later (an EMPTY named profile) still defers" \
   'profile=marcus defer=1 channels=none' "$(made marcus --type=claude --auth-profile=marcus --defer-auth)"
 
-box "$MP" "$KONST"
-eq_t 'two logins, account named (cqa5, --auth-profile=konst): honoured, not deferred' \
-  'profile=konst defer=0 channels=none' "$(made dev --type=claude --auth-profile=konst --defer-auth)"
+box "$MP" "$RIO"
+eq_t 'two logins, account named (cqa5, --auth-profile=rio): honoured, not deferred' \
+  'profile=rio defer=0 channels=none' "$(made dev --type=claude --auth-profile=rio --defer-auth)"
 eq_t 'two logins, no account, deferred: still asks (stays deferred, no account picked)' \
   'profile= defer=1 channels=none' "$(made dev --type=claude --defer-auth)"
 eq_t 'two logins, no account, not deferred: still refused' \
@@ -168,10 +168,10 @@ box "$MP"
 eq_t "Olivia's \"hire marcus\" (import --as=marcus, no account): binds mp, not a new empty profile" \
   '--auth-profile=mp (no channels)' "$(imported olivia --as=marcus)"
 eq_t 'an explicit account is never overridden' \
-  '--auth-profile=konst (no channels)' "$(imported explicit --as=marcus --auth-profile=konst)"
+  '--auth-profile=rio (no channels)' "$(imported explicit --as=marcus --auth-profile=rio)"
 eq_t 'a BYO key keeps the per-agent profile' \
   '--auth-profile=marcus (no channels)' "$(imported byo --as=marcus --provider=openrouter --api-key=sk-or-v1-x)"
-box "$MP" "$KONST"
+box "$MP" "$RIO"
 eq_t 'two logins: the per-agent profile (sign in later) stays' \
   '--auth-profile=marcus (no channels)' "$(imported two --as=marcus)"
 grep -q -- '--defer-auth' "$TMP/two.argv" \

@@ -3,7 +3,7 @@
 #
 # THE INCIDENT (customer box teal-fox, 5dive 0.35.1, 2026-09-13). An agent
 # (claude-swan) whose org row names a `reports_to` lead (claude-victor, under
-# claude-alena) filed `task need --type=decision --tier=1 --options=… --recommend=…`
+# claude-cleo) filed `task need --type=decision --tier=1 --options=… --recommend=…`
 # on a real in-org scope fork. It went straight to the paired human. `gate_history`
 # shows two epochs and `route_provenance` EMPTY on BOTH; the delivery log has no
 # "lead-route gate QUEUED" line for it, only phone pings. The principal answered
@@ -78,10 +78,10 @@ ROUTE_FILE="$TMP/route.log"
 5dive() { if [[ "${1:-}" == "agent" && "${2:-}" == "send" ]]; then printf '%s\n' "${3:-}" >>"$ROUTE_FILE"; fi; return 0; }
 export -f 5dive 2>/dev/null || true
 
-# The customer's chart, verbatim in shape: alena is the lone root (so also the
-# coordinator fallback), victor reports to alena, swan reports to victor.
-db "INSERT INTO agents_org(name,reports_to,role) VALUES('alena',NULL,'coordinator');"
-db "INSERT INTO agents_org(name,reports_to,role) VALUES('victor','alena','head of research');"
+# The customer's chart, verbatim in shape: cleo is the lone root (so also the
+# coordinator fallback), victor reports to cleo, swan reports to victor.
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('cleo',NULL,'coordinator');"
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('victor','cleo','head of research');"
 db "INSERT INTO agents_org(name,reports_to,role) VALUES('swan','victor','builder');"
 
 # A neutral in-org ask: it must miss the eng-ship classifier and the tier-2

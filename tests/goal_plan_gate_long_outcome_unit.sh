@@ -60,8 +60,8 @@ _gate_proof_enforced() { return 1; }
 _org_resolve_assignee() { printf '%s' "swan"; }
 
 db "INSERT INTO agents_org(name,reports_to,role) VALUES('lodar-root',NULL,'coordinator');"
-db "INSERT INTO agents_org(name,reports_to,role) VALUES('kostya','lodar-root','lead');"
-db "INSERT INTO agents_org(name,reports_to,role) VALUES('swan','kostya','builder');"
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('tess','lodar-root','lead');"
+db "INSERT INTO agents_org(name,reports_to,role) VALUES('swan','tess','builder');"
 
 col() { db "SELECT COALESCE($2,'') FROM tasks WHERE ident=$(sqlq "$1");"; }
 human_verdict() {

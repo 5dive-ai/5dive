@@ -1175,7 +1175,7 @@ rotation_balance_rank_names() {
 # was actually rendered UNDER this account. account_best_ratelimits takes any
 # bound seat's statusline cache, and a seat that just moved still holds the
 # cache it rendered on its previous account until its next turn — 2026-10-03,
-# mark's 98%/7d with identical resetsAt landed on a 0% chemmonitor and held the
+# mark's 98%/7d with identical resetsAt landed on a 0% orbit and held the
 # pacer. So a cache older than the seat's newest binding event is skipped. A
 # reading from the live-header probe (account_live_ratelimits, source=probe in
 # the account's usage.json) competes on asOf like any seat's.
@@ -1287,12 +1287,12 @@ account_ratelimits_from_headers() {
 #
 # `account usage` takes the freshest statusline a bound seat rendered, and a
 # seat renders only when it takes a turn, so an account with no busy seat had
-# no current number (2026-10-22 02:10Z: konst and mp read `- (remembered)`).
+# no current number (2026-10-22 02:10Z: rio and mp read `- (remembered)`).
 #
 # The usage panel's own endpoint (GET /api/oauth/usage) reads zero tokens, but
 # it needs the `user:profile` scope and every account here is signed in with a
 # long-lived `CLAUDE_CODE_OAUTH_TOKEN`, which carries `user:inference` only:
-# 403 oauth_scope_insufficient, measured on konst. So the poll is the header
+# 403 oauth_scope_insufficient, measured on rio. So the poll is the header
 # probe above: no seat, no session file, no output token, ~22 input tokens.
 # On an account nobody has used for 5h that call opens the 5h window, the same
 # thing a seat's first turn would do; it moves the percentage by nothing the

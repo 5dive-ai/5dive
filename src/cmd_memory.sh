@@ -1769,7 +1769,7 @@ PYEOF
 #     the transcript's tool calls naming the atom's file or slug. DIVE-712: the
 #     live session saves a fact by hand, consolidate later distils the same
 #     session, and without this the hand atom is not on the list — 9 of 9
-#     duplicate pairs on claude-konst's 2026-10-12 lint were a hand atom plus
+#     duplicate pairs on claude-rio's 2026-10-12 lint were a hand atom plus
 #     the same fact under a new slug, usually in another language.
 # A tool call that only READS an atom also names it; listing that one is a cost
 # of a few prompt lines, not a wrong answer, since a fact the session took from

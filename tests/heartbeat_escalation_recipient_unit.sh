@@ -81,14 +81,14 @@ this_box() {   # the chart as `5dive org ls` prints it on 2026-09-15
 }
 lone_root() { # the customer box DIVE-4551 was filed from: no main, no ops
   chart
-  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-aleks','founder',NULL);"
-  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ivan','engineer','claude-aleks');"
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ava','founder',NULL);"
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ivan','engineer','claude-ava');"
 }
 three_roots() {  # teal-fox as reported: nothing resolves, and that is the state
   chart
-  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-aleks','founder',NULL);"
-  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-alena','ops',NULL);"
-  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-jane','eng',NULL);"
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ava','founder',NULL);"
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-cleo','ops',NULL);"
+  db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-nell','eng',NULL);"
 }
 undeliv_count() { db "SELECT COUNT(*) FROM supervisor_events WHERE event='alert-undeliverable';"; }
 undeliv_reasons() { db "SELECT DISTINCT cause FROM supervisor_events WHERE event='alert-undeliverable' ORDER BY cause;" | paste -sd, -; }
@@ -105,9 +105,9 @@ t "A3 this box: the housekeeping rails still resolve to ops, not to the notifier
 
 lone_root
 t "A4 lone-root customer chart: the escalation recipient is the root" \
-  "claude-aleks" "$(_hb_escalation_recipient)"
+  "claude-ava" "$(_hb_escalation_recipient)"
 t "A5 lone-root customer chart: with no ops seat, housekeeping falls back to the root — not to nobody" \
-  "claude-aleks" "$(_hb_ops_recipient)"
+  "claude-ava" "$(_hb_ops_recipient)"
 db "UPDATE agents_org SET role='engineer — gate notifier' WHERE name='claude-ivan';"
 t "A6 ...and an explicit tag moves the alerts alone" \
   "claude-ivan" "$(_hb_escalation_recipient)"
@@ -161,7 +161,7 @@ drive() {
   : >"$SENT_LOG"
   local name=claude-ivan acct=pooled-1 defer_n=7 task_ident=DIVE-9001 heal_gap=91
   local -a rec=(1 2); local idlist="DIVE-9001 DIVE-9002 " orphan="DIVE-9003 "
-  local eident=DIVE-9005 etmpl=DIVE-8001 easg=claude-ivan etarget=claude-jane ehours=51
+  local eident=DIVE-9005 etmpl=DIVE-8001 easg=claude-ivan etarget=claude-nell ehours=51
   local emsg="Recurring-stall ESCALATED:"
   local _hdr="FLEET IDLE" total_stranded=4 stranded_todo=3 open_gates=1 since_secs=5400 parked_gates=0 parked_todo=0
   local _act_detail="0 active" _tail="(detail)" eligible=6 last_ping="never"
@@ -190,8 +190,8 @@ t "B5 this box: and nothing was lost" "0" "$(undeliv_count)"
 lone_root; clear_events
 drive; rc=$?
 t "B6 lone-root customer chart: every site runs" "0" "$rc"
-t "B7 lone-root customer chart: ALL TEN reach claude-aleks — including the three billing/stranded rails that used to reach nobody" \
-  "10" "$(sent_to claude-aleks)"
+t "B7 lone-root customer chart: ALL TEN reach claude-ava — including the three billing/stranded rails that used to reach nobody" \
+  "10" "$(sent_to claude-ava)"
 t "B8 lone-root customer chart: no seat named main was addressed" \
   "0" "$(sent_to main)"
 t "B9 lone-root customer chart: nothing lost" "0" "$(undeliv_count)"
@@ -256,7 +256,7 @@ t "E3b MUTANT: all ten sites still extract (one of them now a no-op)" "10" "${#C
 drive; rc=$?
 t "E3c MUTANT: drive still returns 0" "0" "$rc"
 t "E4 MUTANT: on the customer chart one escalation no longer reaches the root (9, not 10)" \
-  "9" "$(sent_to claude-aleks)"
+  "9" "$(sent_to claude-ava)"
 t "E5 MUTANT: and it leaves no audit row behind — the silent loss this row exists to end" \
   "0" "$(undeliv_count)"
 

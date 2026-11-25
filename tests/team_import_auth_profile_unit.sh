@@ -81,9 +81,9 @@ BASE=$(_compose_parse "$TMP/shop.5dive.yaml" 2>/dev/null)
 [[ -n "$BASE" ]] && ok_t 'T0 the template parses' || bad_t 'T0 the template did not parse — every arm below is vacuous' ''
 declare -F _compose_apply_auth_profile >/dev/null \
   && ok_t 'T0b the transform exists' || bad_t 'T0b _compose_apply_auth_profile is missing' ''
-OVR=$(_compose_apply_auth_profile "$BASE" konst 2>/dev/null)
-eq_t 'T1 every seat that names no account goes on konst' \
-  '{"axe":"konst","books":"work","byo":"","clicker":"konst","clip":"konst","desk":"konst","dude":"konst","pixel":"konst"}' \
+OVR=$(_compose_apply_auth_profile "$BASE" rio 2>/dev/null)
+eq_t 'T1 every seat that names no account goes on rio' \
+  '{"axe":"rio","books":"work","byo":"","clicker":"rio","clip":"rio","desk":"rio","dude":"rio","pixel":"rio"}' \
   "$(jq -cS '.agents | map_values(.auth_profile // "")' <<<"$OVR")"
 eq_t 'T1b NEGATIVE CONTROL: the parsed template itself names no account but books' \
   '{"axe":"","books":"work","byo":"","clicker":"","clip":"","desk":"","dude":"","pixel":"","x":""}' \
@@ -126,15 +126,15 @@ seat() {
 }
 roster() { local n; for n in clip dude pixel axe desk clicker books byo; do printf '%s=%s ' "$n" "$(seat "$n")"; done; }
 
-up --auth-profile=konst; up_rc=$?
-eq_t 'T2 up --auth-profile=konst runs' 0 "$up_rc"
+up --auth-profile=rio; up_rc=$?
+eq_t 'T2 up --auth-profile=rio runs' 0 "$up_rc"
 [[ $up_rc -eq 0 ]] || printf '%s\n' "$(tail -15 "$TMP/up.log")" >&2
-eq_t 'T2a all six pack seats are imported on konst; books keeps work; byo keeps its key' \
-  'clip=--auth-profile=konst dude=--auth-profile=konst pixel=--auth-profile=konst axe=--auth-profile=konst desk=--auth-profile=konst clicker=--auth-profile=konst books=--auth-profile=work byo=(none) ' \
+eq_t 'T2a all six pack seats are imported on rio; books keeps work; byo keeps its key' \
+  'clip=--auth-profile=rio dude=--auth-profile=rio pixel=--auth-profile=rio axe=--auth-profile=rio desk=--auth-profile=rio clicker=--auth-profile=rio books=--auth-profile=work byo=(none) ' \
   "$(roster)"
 grep -q -- '--api-key=sk-or-v1-fixture' "$RECORD/create.byo" 2>/dev/null \
   && ok_t 'T2b the BYO seat still gets its own key' || bad_t 'T2b the BYO seat lost its key' "$(cat "$RECORD/create.byo" 2>/dev/null)"
-grep -qF "every seat that names none signs in on 'konst'" "$TMP/up.log" \
+grep -qF "every seat that names none signs in on 'rio'" "$TMP/up.log" \
   && ok_t 'T2c up says which account the roster is on' || bad_t 'T2c up did not name the account' "$(cat "$TMP/up.log")"
 
 up
@@ -151,9 +151,9 @@ echo '== 3. team import hands it to up =='
 UPARGS="$TMP/upargs"
 ( cmd_compose_up() { printf '%s\n' "$@" > "$UPARGS"; return 0; }
   _team_manifest_write() { :; }
-  cmd_team import "$TMP/shop.5dive.yaml" --auth-profile=konst ) > "$TMP/import.log" 2>&1
-grep -qx -- '--auth-profile=konst' "$UPARGS" 2>/dev/null \
-  && ok_t 'T5 team import --auth-profile=konst runs up with --auth-profile=konst' \
+  cmd_team import "$TMP/shop.5dive.yaml" --auth-profile=rio ) > "$TMP/import.log" 2>&1
+grep -qx -- '--auth-profile=rio' "$UPARGS" 2>/dev/null \
+  && ok_t 'T5 team import --auth-profile=rio runs up with --auth-profile=rio' \
   || bad_t 'T5 the flag did not reach up' "up argv: $(tr '\n' ' ' < "$UPARGS" 2>/dev/null) · $(tail -5 "$TMP/import.log")"
 grep -q 'has no effect' "$TMP/import.log" \
   && bad_t 'T5b team import still says the flag has no effect' "$(grep 'has no effect' "$TMP/import.log")" \
@@ -162,12 +162,12 @@ grep -q 'has no effect' "$TMP/import.log" \
 echo '== 4. two Claude logins: the seat is signed in on the named one =='
 AUTH_PROFILES_DIR="$TMP/auth-profiles"; CONNECTORS_DIR="$TMP/connectors"
 TYPE_AUTH[claude]="$CONNECTORS_DIR/anthropic.env:CLAUDE_CODE_OAUTH_TOKEN"
-mkdir -p "$TMP/bin" "$CONNECTORS_DIR" "$AUTH_PROFILES_DIR"/{mp,konst}
+mkdir -p "$TMP/bin" "$CONNECTORS_DIR" "$AUTH_PROFILES_DIR"/{mp,rio}
 for _t in claude codex; do printf '#!/bin/sh\nexit 0\n' > "$TMP/bin/$_t"; chmod +x "$TMP/bin/$_t"; TYPE_BIN[$_t]="$TMP/bin/$_t"; done
 cmd_install() { return 1; }
 export FIVEDIVE_CHAT_ONLY_MARK="$TMP/chat-only"
 printf 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-mp\n'    > "$AUTH_PROFILES_DIR/mp/combined.env"
-printf 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-konst\n' > "$AUTH_PROFILES_DIR/konst/combined.env"
+printf 'CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-rio\n' > "$AUTH_PROFILES_DIR/rio/combined.env"
 actor_routing_agent() { return 1; }
 create_agent_user() { printf 'REACHED profile=%s defer=%s\n' "$profile" "$defer_auth"; exit 0; }
 printf '%s\n' '{"packFormat":1,"agentName":"clip","config":{"type":"claude"},"includes":{"memory":false}}' > "$TMP/manifest.json"
@@ -195,9 +195,9 @@ made() {
   grep -m1 '^REACHED ' <<<"$out" | sed 's/^REACHED //' || true
   grep -q '^REACHED ' <<<"$out" || echo "(refused: $(tail -2 <<<"$out" | tr '\n' ' '))"
 }
-up --auth-profile=konst
-eq_t 'T6 clip, imported with the argv up built under --auth-profile=konst: signed in on konst, not deferred' \
-  'profile=konst defer=0' "$(made "$RECORD/import.clip")"
+up --auth-profile=rio
+eq_t 'T6 clip, imported with the argv up built under --auth-profile=rio: signed in on rio, not deferred' \
+  'profile=rio defer=0' "$(made "$RECORD/import.clip")"
 up
 eq_t 'T6n NEGATIVE CONTROL: without the flag, two logins: clip is left to sign in later on its own profile' \
   'profile=clip defer=1' "$(made "$RECORD/import.clip")"

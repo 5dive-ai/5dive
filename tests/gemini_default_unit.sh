@@ -164,15 +164,15 @@ eq_t 'agent create --type=claude with no account: not the Gemini login' \
 SPEC='{"agents":{"lead":{"type":"claude","model":"opus"}}}'
 eq_t 'team import: a plain Claude seat is left on its own rule (it never moves onto Gemini)' \
   "$(jq -c . <<<"$SPEC")" "$(_compose_apply_newest_login "$SPEC" | jq -c .)"
-claude_login konst; age client-gemini antigravity 100
+claude_login rio; age client-gemini antigravity 100
 JSON_MODE=1; ( cmd_account_default --clear ) >/dev/null 2>&1; JSON_MODE=0
 gemini_login gem2
 eq_t 'Gemini added after a second Claude: it is the newest login' gem2:antigravity "$(pick)"
 eq_t '...team import still moves its plain seat to the Claude added before it, as before DIVE-8481' \
-  '{"type":"claude","model":"opus","auth_profile":"konst"}' "$(_compose_apply_newest_login "$SPEC" | jq -c .agents.lead)"
+  '{"type":"claude","model":"opus","auth_profile":"rio"}' "$(_compose_apply_newest_login "$SPEC" | jq -c .agents.lead)"
 LANDS="claude codex"
 eq_t '...and a pack that cannot land on Gemini goes to that Claude too' \
-  '--type=claude --auth-profile=konst model=opus effort=high' "$(imported nogem2 --as=marcus)"
+  '--type=claude --auth-profile=rio model=opus effort=high' "$(imported nogem2 --as=marcus)"
 LANDS="antigravity claude codex"
 
 echo '== 4. an upgrade changes no hire =='
