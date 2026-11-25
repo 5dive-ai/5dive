@@ -108,7 +108,9 @@ CREATE TABLE IF NOT EXISTS people (
 );
 CREATE TABLE IF NOT EXISTS grants (person TEXT NOT NULL, agent TEXT NOT NULL, PRIMARY KEY (person, agent));
 `);
-for (const [t, col, def] of [["devices", "person", "''"], ["pair_codes", "person", "''"], ["pair_codes", "agents", "'*'"]]) {
+// DIVE-9264: a person's work email (lower-case, '' = none); an invite may carry it.
+for (const [t, col, def] of [["devices", "person", "''"], ["pair_codes", "person", "''"], ["pair_codes", "agents", "'*'"],
+  ["people", "email", "''"], ["pair_codes", "email", "''"]]) {
   const cols = db.query(`PRAGMA table_info(${t})`).all() as { name: string }[];
   if (!cols.some((c) => c.name === col)) db.exec(`ALTER TABLE ${t} ADD COLUMN ${col} TEXT NOT NULL DEFAULT ${def}`);
 }
@@ -123,6 +125,9 @@ db.transaction(() => {
     db.query("UPDATE devices SET person = ? WHERE id = ?").run(pid, d.id);
   }
 })();
+// Two live people never share an email; a removed row keeps its email (a leaver stays known).
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS people_email ON people (email) WHERE email != '' AND removed = 0");
+db.exec("CREATE TABLE IF NOT EXISTS signin_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
 
 const now = () => Math.floor(Date.now() / 1000);
 const sha256 = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
@@ -399,7 +404,7 @@ function fileAllowed(dev: Device, path: string): boolean {
 
 // Spend a one-time code (typed, or from a join link) and let this device in.
 // The code joins the person it names, else makes a new person from it.
-type CodeRow = { hash: string; role: string; name: string; person: string; agents: string };
+type CodeRow = { hash: string; role: string; name: string; person: string; agents: string; email: string };
 function admitDevice(row: CodeRow, typedName: string): { cookie: string; device: string; person: string; role: "owner" | "member" } | null {
   return db.transaction(() => {
     if (db.query("UPDATE pair_codes SET used = 1 WHERE hash = ? AND used = 0").run(row.hash).changes !== 1) return null;
@@ -411,24 +416,31 @@ function admitDevice(row: CodeRow, typedName: string): { cookie: string; device:
       role = p.role; name = p.name;
     } else {
       person = randomBytes(6).toString("hex");
-      db.query("INSERT INTO people (id, name, role, created) VALUES (?, ?, ?, ?)").run(person, name, role, now());
+      const email = row.email && !emailTaken(row.email) ? row.email : "";
+      db.query("INSERT INTO people (id, name, role, created, email) VALUES (?, ?, ?, ?, ?)").run(person, name, role, now(), email);
       let list: string[] = [];
       if (row.agents === "*") list = ["*"];
       else { try { const a = JSON.parse(row.agents); if (Array.isArray(a)) list = a.filter((x) => typeof x === "string" && AGENT_RE.test(x)); } catch {} }
       for (const a of list) db.query("INSERT OR IGNORE INTO grants (person, agent) VALUES (?, ?)").run(person, a);
     }
-    const cookie = randomBytes(32).toString("base64url");
-    const device = randomBytes(6).toString("hex");
-    db.query("INSERT INTO devices (id, name, cookie_hash, created, last_seen, role, person) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(device, name, sha256(cookie), now(), now(), role === "owner" ? "owner" : "chat", person);
-    return { cookie, device, person, role };
+    return { ...newDevice(person, name, role), person, role };
   })();
 }
+function newDevice(person: string, name: string, role: "owner" | "member"): { cookie: string; device: string } {
+  const cookie = randomBytes(32).toString("base64url");
+  const device = randomBytes(6).toString("hex");
+  db.query("INSERT INTO devices (id, name, cookie_hash, created, last_seen, role, person) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(device, name, sha256(cookie), now(), now(), role === "owner" ? "owner" : "chat", person);
+  return { cookie, device };
+}
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const emailTaken = (email: string, but = "") =>
+  !!db.query("SELECT 1 FROM people WHERE email = ? AND removed = 0 AND id != ?").get(email, but);
 const sessionCookie = (cookie: string) => `lc_dev=${cookie}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=31536000`;
 const normCode = (v: unknown) => (typeof v === "string" ? v.replace(/[\s-]/g, "").toUpperCase() : "");
 function codeRow(code: string): CodeRow | null {
   if (!code) return null;
-  return db.query("SELECT hash, role, name, person, agents FROM pair_codes WHERE hash = ? AND used = 0 AND expires >= ?").get(sha256(code), now()) as CodeRow | null;
+  return db.query("SELECT hash, role, name, person, agents, email FROM pair_codes WHERE hash = ? AND used = 0 AND expires >= ?").get(sha256(code), now()) as CodeRow | null;
 }
 // Ten code tries a minute across every sign-in door (typed code, join link).
 const pairTries: number[] = [];
@@ -475,6 +487,8 @@ function appFile(app: OfficeApp, rel: string): string | null {
   if (rel.includes("\0") || rel.split("/").includes("..")) return null;
   const p = normalize(join(app.root, rel));
   if (p !== app.root && !p.startsWith(app.root + "/")) return null;
+  // DIVE-9264: <app>/_server/ is code the server runs, never a file it serves.
+  if (p === join(app.root, "_server") || p.startsWith(join(app.root, "_server") + "/")) return null;
   try {
     const st = statSync(p);
     const f = st.isDirectory() ? join(p, "index.html") : p;
@@ -523,6 +537,12 @@ async function browserSide(req: Request, url: URL): Promise<Response> {
     const app = officeApp();
     if (app && p === "/" && deviceOf(req)) return new Response(null, { status: 302, headers: { location: app.index + url.search, "cache-control": "no-store" } });
     return new Response(app && p !== "/lite" ? PAGE.replace('<html lang="en">', '<html lang="en" data-app="1">') : PAGE, { headers: PAGE_HEADERS });
+  }
+  // DIVE-9264: the office app's sign-in module (see signinModule below).
+  if (read && p === "/api/signin/providers") return json({ providers: await signinProviders(url) }, 200, { "cache-control": "no-store" });
+  if (read && p.startsWith("/signin/")) {
+    const mod = await signinModule();
+    return typeof mod?.handle === "function" ? mod.handle(req, url, signinCtx(url)) : json({ error: "not found" }, 404);
   }
   if (read && !p.startsWith("/api/")) {
     const app = officeApp();
@@ -809,7 +829,8 @@ form.send textarea{flex:1;resize:none;height:44px;max-height:140px;padding:11px 
 .ghost{display:grid;place-items:center;background:transparent;color:var(--accent);border:1px solid var(--line);padding:0 12px}
 .pair{padding:48px 24px;text-align:center}.pair h2{margin:0 0 8px;font-size:24px}.pair p{color:var(--mute);margin:0 0 24px}
 .pair input{display:block;width:100%;max-width:320px;margin:0 auto 12px;padding:14px;font-size:24px;letter-spacing:4px;text-align:center;text-transform:uppercase;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink)}
-.pair input#dn{font-size:16px;letter-spacing:0;text-transform:none}.pair .btn{width:100%;max-width:320px}.err{color:#dc2626;min-height:22px;margin-top:12px}
+.pair input#dn{font-size:16px;letter-spacing:0;text-transform:none}.pair .btn{width:100%;max-width:320px}
+.pair a.btn{display:block;margin:0 auto 12px;line-height:44px;text-decoration:none}.err{color:#dc2626;min-height:22px;margin-top:12px}
 .empty{padding:40px 24px;text-align:center;color:var(--mute)}
 </style></head><body>
 <header><button id="back" hidden>&larr; Back</button><h1 id="title">Office chat</h1><a id="manage" href="/panel" hidden style="color:var(--accent);text-decoration:none;font-size:15px">⚙️ Manage</a></header>
@@ -843,7 +864,7 @@ function guessName() {
 function deviceName() { const v = ($("#dn") && $("#dn").value.trim()) || ""; return (v || guessName()).slice(0, 40); }
 function showPair() {
   view = "pair"; reset("Office chat", false);
-  app.innerHTML = '<div class="pair"><h2>Connect this device</h2><p>Type the code your office server shows.</p>' +
+  app.innerHTML = '<div class="pair"><h2>Connect this device</h2><p id="hint">Type the code your office server shows.</p>' +
     '<input id="code" autocomplete="one-time-code" inputmode="text" maxlength="12" placeholder="ABCD-1234" aria-label="Pairing code">' +
     '<input id="dn" maxlength="40" placeholder="' + esc(guessName()) + '" aria-label="Name this device (optional)">' +
     '<button class="btn" id="go">Connect</button><div class="err" id="err"></div></div>';
@@ -858,6 +879,14 @@ function showPair() {
     } catch (e) { $("#err").textContent = e.message; }
   };
   $("#go").onclick = go; $("#code").onkeydown = (e) => { if (e.key === "Enter") go(); };
+  // DIVE-9264: a sign-in button per provider the office app offers, above the code box.
+  fetch("/api/signin/providers").then((r) => r.json()).then((j) => {
+    const b = (j.providers || []).filter((x) => String(x.href).indexOf("/signin/") === 0)
+      .map((x) => '<a class="btn" href="' + esc(x.href) + '">' + esc(x.label) + "</a>").join("");
+    if (!b || view !== "pair" || !$("#hint")) return;
+    $("#hint").insertAdjacentHTML("beforebegin", b);
+    $("#hint").textContent = "Or type the code your office server shows.";
+  }).catch(() => {});
 }
 
 async function showList() {
@@ -1295,7 +1324,7 @@ const TEAM_MAX = 20;
 // app takes from the link's #). Spent exactly as given, never case-folded.
 const linkToken = () => randomBytes(32).toString("base64url");
 const INVITE_TTL = 24 * 3600;
-type Person = { id: string; name: string; role: "owner" | "member"; created: number };
+type Person = { id: string; name: string; role: "owner" | "member"; created: number; email?: string };
 type Ctx = { dev: Device; me: Person };
 type Handler = (req: Request, url: URL, c: Ctx, m: RegExpMatchArray) => Promise<Response> | Response;
 const ownerOnly = () => json({ error: "owner_only", reason: "Only the team's owner can do this." }, 403);
@@ -1318,25 +1347,25 @@ function setGrants(person: string, list: string[] | null) {
 function personView(p: Person) {
   const devices = (db.query("SELECT COUNT(*) AS n FROM devices WHERE person = ? AND revoked = 0").get(p.id) as { n: number }).n;
   return {
-    id: p.id, name: p.name, email: p.name, invitedEmail: p.name, role: p.role, state: "joined",
+    id: p.id, name: p.name, email: p.email || p.name, invitedEmail: p.email || p.name, workEmail: p.email ?? "", role: p.role, state: "joined",
     invitedAt: iso(p.created), joinedAt: iso(p.created), agents: agentsOf(p.id, p.role), perms: [], devices,
   };
 }
 // An invite not yet used shows on the owner's list as "invited"; its id is
 // "i" + the first 12 hex of the code's hash, so the owner can cancel it.
 function inviteViews() {
-  const rows = db.query("SELECT hash, role, name, agents, expires FROM pair_codes WHERE used = 0 AND expires >= ? AND person = '' AND name != '' ORDER BY expires")
-    .all(now()) as { hash: string; role: string; name: string; agents: string; expires: number }[];
+  const rows = db.query("SELECT hash, role, name, agents, expires, email FROM pair_codes WHERE used = 0 AND expires >= ? AND person = '' AND name != '' ORDER BY expires")
+    .all(now()) as { hash: string; role: string; name: string; agents: string; expires: number; email: string }[];
   return rows.map((r) => {
     let agents: string[] | null = null;
     if (r.agents !== "*") { try { agents = JSON.parse(r.agents); } catch { agents = []; } }
     return {
-      id: "i" + r.hash.slice(0, 12), name: r.name, email: r.name, invitedEmail: r.name, role: r.role === "owner" ? "owner" : "member",
+      id: "i" + r.hash.slice(0, 12), name: r.name, email: r.email || r.name, invitedEmail: r.email || r.name, role: r.role === "owner" ? "owner" : "member",
       state: "invited", invitedAt: iso(r.expires - INVITE_TTL), joinedAt: null, expiresAt: iso(r.expires), agents, perms: [], devices: 0,
     };
   });
 }
-const livePeople = () => db.query("SELECT id, name, role, created FROM people WHERE removed = 0 ORDER BY created").all() as Person[];
+const livePeople = () => db.query("SELECT id, name, role, created, email FROM people WHERE removed = 0 ORDER BY created").all() as Person[];
 function removePerson(id: string): boolean {
   return db.transaction(() => {
     if (db.query("UPDATE people SET removed = ? WHERE id = ? AND removed = 0").run(now(), id).changes !== 1) return false;
@@ -1382,8 +1411,11 @@ const teamRoutes: [string, RegExp, Handler][] = [
       return json({ ok: true, id: p.id, link: `${url.origin}/join#${code}`, emailed: false, expiresAt: iso(expires) });
     }
     if (c.me.role !== "owner") return ownerOnly();
-    // The app's invite form sends an email; the office has no mail, so it is the person's name.
-    const name = cleanName(b.name ?? b.email);
+    // The app's invite form sends an email; the office has no mail, so it names the
+    // person. DIVE-9264: a real email is kept too (work-account sign-in matches it).
+    const email = typeof b.email === "string" && EMAIL_RE.test(b.email.trim()) ? b.email.trim().toLowerCase() : "";
+    if (email && emailTaken(email)) return json({ error: "email_taken", reason: "Someone on the team already has that email." }, 409);
+    const name = cleanName(b.name ?? (email ? b.email.trim().split("@")[0] : b.email));
     if (!name || !/^[A-Za-z0-9]/.test(name)) return json({ error: "invalid_email", reason: "Type their name (letters, digits, spaces)." }, 400);
     const role = b.role === "owner" ? "owner" : "member";
     // The app's "All agents" leaves `agents` out (every agent, as online); a
@@ -1394,8 +1426,8 @@ const teamRoutes: [string, RegExp, Handler][] = [
     const code = linkToken();
     const hash = sha256(code), expires = now() + INVITE_TTL;
     db.query("DELETE FROM pair_codes WHERE expires < ? OR used = 1").run(now());
-    db.query("INSERT INTO pair_codes (hash, expires, role, name, person, agents) VALUES (?, ?, ?, ?, '', ?)")
-      .run(hash, expires, role === "owner" ? "owner" : "chat", name, agents === null || role === "owner" ? "*" : JSON.stringify(agents));
+    db.query("INSERT INTO pair_codes (hash, expires, role, name, person, agents, email) VALUES (?, ?, ?, ?, '', ?, ?)")
+      .run(hash, expires, role === "owner" ? "owner" : "chat", name, agents === null || role === "owner" ? "*" : JSON.stringify(agents), email);
     return json({ ok: true, id: "i" + hash.slice(0, 12), link: `${url.origin}/join#${code}`, emailed: false, expiresAt: iso(expires) });
   }],
   ["PUT", /^\/team\/members\/([a-f0-9]{8,32})\/agents$/, async (req, _u, c, m) => {
@@ -1407,6 +1439,17 @@ const teamRoutes: [string, RegExp, Handler][] = [
     if (!p) return json({ error: "not_found" }, 404);
     setGrants(p.id, list);
     return json({ ok: true, agents: agentsOf(p.id, p.role) });
+  }],
+  // DIVE-9264: set or clear ("") a person's work email.
+  ["PUT", /^\/team\/members\/([a-f0-9]{8,32})\/email$/, async (req, _u, c, m) => {
+    if (c.me.role !== "owner") return ownerOnly();
+    const b = await body(req);
+    const email = typeof b?.email === "string" ? b.email.trim().toLowerCase() : null;
+    if (email === null || (email && !EMAIL_RE.test(email))) return json({ error: "invalid_email" }, 400);
+    if (!livePeople().some((x) => x.id === m[1])) return json({ error: "not_found" }, 404);
+    if (email && emailTaken(email, m[1])) return json({ error: "email_taken", reason: "Someone on the team already has that email." }, 409);
+    db.query("UPDATE people SET email = ? WHERE id = ?").run(email, m[1]);
+    return json({ ok: true, email });
   }],
   ["DELETE", /^\/team\/members\/(i?[a-f0-9]{8,32})$/, (_r, _u, c, m) => {
     if (c.me.role !== "owner") return ownerOnly();
@@ -1682,6 +1725,85 @@ const settingsRoutes: [string, RegExp, Handler][] = [
   }],
 ];
 
+// ── DIVE-9264: the sign-in hook ───────────────────────────────────────────────
+// A signed office app may carry <app>/_server/signin.mjs: a module that lets a
+// trusted outside sign-in service vouch for a person's email. Core knows no
+// service. It imports the module lazily, once per app version (keyed by the
+// app's realpath, like officeApp()), never serves it (appFile), and hands it
+// one small ctx: the office origin, a private key/value store, the Team list's
+// emails, signIn() and json(). Routes: GET /api/signin/providers (buttons for
+// the signed-out page), GET /signin/* → handle (signed out), /api/proxy/signin/*
+// → admin (owner only, checked here). No app, no module, or a module that fails
+// to load: the feature is absent ([] and 404), the server keeps running.
+//
+// signIn answers 200 HTML that navigates to /, not a 302: the provider's callback
+// is a cross-site navigation, and a SameSite=Strict cookie set inside a cross-site
+// redirect chain is not sent on the follow-up /; a fresh same-origin navigation
+// from a page is. A removed person's email never signs in (the owner re-invites).
+let signinSeen: { root: string; mod: Promise<any> } | null = null;
+function signinModule(): Promise<any> {
+  const app = officeApp();
+  if (!app) return Promise.resolve(null);
+  if (signinSeen?.root !== app.root) {
+    const f = join(app.root, "_server", "signin.mjs");
+    signinSeen = { root: app.root, mod: !existsSync(f) ? Promise.resolve(null) : import(f)
+      .then((m) => (typeof m?.providers === "function" ? m : null))
+      .catch((e) => { console.error(`local chat: sign-in module not loaded: ${String(e?.message ?? e).slice(0, 200)}`); return null; }) };
+  }
+  return signinSeen.mod;
+}
+async function signinProviders(url: URL): Promise<{ id: string; label: string; href: string }[]> {
+  const mod = await signinModule();
+  let list: unknown = [];
+  try { list = mod ? await mod.providers(signinCtx(url)) : []; } catch (e) { console.error("local chat: sign-in providers failed", e); }
+  return (Array.isArray(list) ? list : []).filter((x: any) => /^[a-z0-9-]{1,32}$/.test(x?.id) && typeof x.label === "string"
+    && x.label.length <= 40 && typeof x.href === "string" && x.href.startsWith("/signin/")).map((x: any) => ({ id: x.id, label: x.label, href: x.href }));
+}
+function signinCtx(url: URL) {
+  return {
+    origin: url.origin,
+    kv: {
+      get: (k: string) => (db.query("SELECT value FROM signin_kv WHERE key = ?").get(String(k)) as { value: string } | null)?.value ?? null,
+      set: (k: string, v: string | null) => {
+        if (typeof k !== "string" || !k || k.length > 64 || (v !== null && (typeof v !== "string" || v.length > 16384))) throw new Error("signin kv: bad key or value");
+        if (v === null) db.query("DELETE FROM signin_kv WHERE key = ?").run(k);
+        else db.query("INSERT OR REPLACE INTO signin_kv (key, value) VALUES (?, ?)").run(k, v);
+      },
+    },
+    people: () => (db.query("SELECT email, removed FROM people WHERE email != ''").all() as { email: string; removed: number }[])
+      .map((r) => ({ email: r.email, removed: r.removed !== 0 })),
+    signIn,
+    json: (b: unknown, status = 200) => json(b, status),
+  };
+}
+// "A trusted sign-in service says this person is <email>." Admits a new device
+// for that live person; else spends an open invite that names this email
+// (the invite's role and agents, exactly as its join link would, and the link
+// is then used); else (allowNew, room left) a new member with NO agents.
+// An invite still lives INVITE_TTL: past it the owner invites again.
+function signIn(email: string, opts: { allowNew?: boolean; via?: string } = {}): Response | null {
+  if (pairThrottled()) return json({ error: "too many tries, wait a minute" }, 429);
+  const em = String(email ?? "").trim().toLowerCase();
+  if (!EMAIL_RE.test(em)) return null;
+  const got = db.transaction(() => {
+    const rows = db.query("SELECT id, role, removed FROM people WHERE email = ?").all(em) as { id: string; role: "owner" | "member"; removed: number }[];
+    const live = rows.find((r) => r.removed === 0);
+    let person = live?.id ?? "", role: "owner" | "member" = live?.role ?? "member";
+    if (!live) {
+      const invite = db.query("SELECT hash, role, name, person, agents, email FROM pair_codes WHERE email = ? AND person = '' AND used = 0 AND expires >= ? ORDER BY expires DESC LIMIT 1")
+        .get(em, now()) as CodeRow | null;
+      if (invite) return admitDevice(invite, "");
+      if (rows.length || opts?.allowNew !== true || livePeople().length + inviteViews().length >= TEAM_MAX) return null;
+      person = randomBytes(6).toString("hex");
+      db.query("INSERT INTO people (id, name, role, created, email) VALUES (?, ?, 'member', ?, ?)").run(person, cleanName(String(email).trim().split("@")[0]) || "member", now(), em);
+    }
+    return newDevice(person, cleanName(opts?.via) || "sign-in", role);
+  })();
+  if (!got) return null;
+  return new Response(`<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/"><title>Signed in</title><a href="/">Continue</a>`,
+    { headers: { ...PAGE_HEADERS, "set-cookie": sessionCookie(got.cookie), "cache-control": "no-store" } });
+}
+
 const OFFICE_ROUTES: [string, RegExp, Handler][] = [...teamRoutes, ...chatRoutes, ...serverRoutes, ...settingsRoutes];
 // The one door: /api/proxy/<path>. Writes must come from this origin (the app
 // is served here; the cookie is SameSite=Strict too). Signed out, only the
@@ -1697,6 +1819,13 @@ async function officeProxy(req: Request, url: URL): Promise<Response> {
       if (!Number.isFinite(len)) return json({ error: "length required" }, 411);
       if (len > FILE_MAX + 1024) return json({ error: "That is too big to send here." }, 413);
     }
+  }
+  if (path === "/signin" || path.startsWith("/signin/")) {
+    const dev = deviceOf(req);
+    if (!dev) return json({ error: "unauthorized", reason: "signed_out" }, 401);
+    if (dev.personRole !== "owner") return ownerOnly();
+    const mod = await signinModule();
+    return typeof mod?.admin === "function" ? mod.admin(req, url, signinCtx(url)) : json({ error: "not found" }, 404);
   }
   if (m === "POST" && path === "/team/accept") {
     if (pairThrottled()) return json({ error: "too many tries, wait a minute" }, 429);
