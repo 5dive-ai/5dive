@@ -57,8 +57,9 @@ env:
   # plugin_contract red on telegram-codex changes unrelated to devteam).
   # DIVE-9269: bumped to the plugin commit that carries the grade-derive corpus
   # (tests/devteam/fixtures/), which left this public tree: 5dive-plugins#376's
-  # head, merged before this pin.
-  DEVTEAM_PLUGINS_REF: 662b52ade962127eb5c48d799d7f0df2c18259a2
+  # head, merged before this pin. DIVE-9307: bumped to the plugin commit that
+  # carries core/lib/mod_seat.sh and its harness, which left this tree.
+  DEVTEAM_PLUGINS_REF: 12d4013147c029bbb03bc74096a435671d3a1d62
 
 jobs:
   # DIVE-3315: INDEPENDENTLY-CAPPED SHARDS, not a bigger number. lodar's 300s
