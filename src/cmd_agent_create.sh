@@ -2046,7 +2046,7 @@ write_agent_env() {
   if [[ -z "$chrome" && -r "$env_file" ]]; then
     chrome=$(sed -n 's/^AGENT_CHROME=//p' "$env_file" | head -1)
   fi
-  # DIVE-9253: an onboarder seat (`5dive onboarder create`). Sticky: no rewrite
+  # DIVE-9253: an onboarder seat (`5dive onboarder box`). Sticky: no rewrite
   # (channels, model, autonomy) can drop it; only `onboarder rm` removes the seat.
   local onboarder="${_ONBOARDER_OVERRIDE:-}"
   if [[ -z "$onboarder" && -r "$env_file" ]]; then
@@ -4850,7 +4850,7 @@ cmd_create() {
     _tg_connect_greet_launch "$name" "$type"
   fi
   # DIVE-9253: an onboarder seat is created STOPPED and not enabled: it starts
-  # on its firm's first message (`5dive onboarder wake`) and never at boot.
+  # on its firm's first message (`5dive onboarder box wake`) and never at boot.
   if [[ "${_CREATE_STOPPED:-}" == 1 ]]; then
     step "Leaving 5dive-agent@${name}.service stopped (starts on its first message)"
     systemctl daemon-reload

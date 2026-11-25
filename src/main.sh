@@ -1449,10 +1449,14 @@ main() {
       esac
       cmd_partner "$@" ;;
     onboarder)
-      # DIVE-9253: one locked-down agent per prospect firm (src/cmd_onboarder.sh).
-      # create/rm/wake/tick are root verbs and audited; ls is a read.
+      # DIVE-9253/9254: one locked-down agent per prospect firm (src/cmd_onboarder.sh).
+      # Client add/rm/mark change the firm table and 5dive; box create/rm/wake are
+      # root verbs on the onboarding server. All audited; ls and box tick are not.
       case "${1:-}" in
-        create|rm|remove|wake) AUDIT_CMD="onboarder ${1}"; AUDIT_ARGS=("${@:2}") ;;
+        add|rm|remove|mark) AUDIT_CMD="onboarder ${1}"; AUDIT_ARGS=("${@:2}") ;;
+        box) case "${2:-}" in
+               create|rm|remove|wake) AUDIT_CMD="onboarder box ${2}"; AUDIT_ARGS=("${@:3}") ;;
+             esac ;;
       esac
       cmd_onboarder "$@" ;;
     helper)

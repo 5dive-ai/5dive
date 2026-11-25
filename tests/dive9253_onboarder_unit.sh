@@ -10,9 +10,8 @@
 #   L5 the inner shell exports DASHBOARD_ONBOARDER=1 for the plugin (lock 2)
 #   W1 write_agent_env stamps AGENT_ONBOARDER=1 and keeps it across a rewrite
 #   B* the brief: public facts only (fields, email, phone, contact)
-#   C* create: sandboxed claude seat on dashboard, stopped, marker before the
-#      agent exists, root-owned CLAUDE.md with rules + fact sheet + brief, record
-#   R/S/T rm, ls --json, wake and the 2 h idle tick
+# The verbs (box create/rm/ls/wake/tick and the client add/rm/ls/mark) moved
+# to tests/dive9254_onboarder_door_unit.sh with DIVE-9254.
 #
 # Run: bash tests/dive9253_onboarder_unit.sh (no root, no network).
 set -uo pipefail
@@ -89,21 +88,11 @@ LOG="$TMP/calls.log"; : > "$LOG"
 fail() { echo "FAIL[$1] ${*:2}" >&2; exit "$1"; }
 step() { :; }; warn() { :; }
 require_root() { :; }
-E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_CONFLICT=5 E_GENERIC=1
+E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_GENERIC=1
 JSON_MODE=0
 REG='{"agents":{}}'
 registry_read() { printf '%s' "$REG"; }
 with_registry_lock() { "$@"; }
-cmd_create() { echo "create _ONBOARDER_OVERRIDE=${_ONBOARDER_OVERRIDE:-} _CREATE_STOPPED=${_CREATE_STOPPED:-} marker=$([[ -e "$ONBOARDER_MARKER_DIR/$1" ]] && echo yes || echo no) $*" >> "$LOG"; }
-cmd_rm() { echo "rm $*" >> "$LOG"; }
-RUNNING=" "
-systemctl() {
-  echo "systemctl $*" >> "$LOG"
-  case "$1" in
-    is-active) u=${3#5dive-agent@onb-}; [[ "$RUNNING" == *" ${u%.service}"* ]] ;;
-    *) return 0 ;;
-  esac
-}
 export ONBOARDER_STATE_DIR="$TMP/state" ONBOARDER_MARKER_DIR="$TMP/markers" ONBOARDER_FACT_SHEET="$TMP/sheet.md" \
        ONBOARDER_CRON_FILE="$TMP/cron" ONBOARDER_HOME_ROOT="$TMP/home"
 printf '5dive runs a team of AI agents on your own server.\n' > "$ONBOARDER_FACT_SHEET"
@@ -122,56 +111,6 @@ t 'B6 a bad domain is refused' yes "$([[ "$(prob '{"firm":"A","domains":["not a 
 t 'B7 not JSON is refused' 'the brief is not valid JSON' "$(prob 'nope')"
 t 'B8 a slug that would overflow a Linux user name is refused' no "$(yn _onboarder_valid_slug abcdefghijklm)"
 
-out=$( (cmd_onboarder_create acme <<<"$GOOD") 2>&1 )
-t 'C1 create succeeds' yes "$([[ "$out" == *"agent onb-acme created, stopped"* ]] && echo yes || echo no)"
-c=$(grep '^create ' "$LOG")
-t 'C1 ...a sandboxed claude seat on dashboard only, no skills/team bot/heartbeat' yes "$([[ "$c" == *"onb-acme --type=claude --channels=dashboard --isolation=sandboxed --no-skills --no-team-bot --no-heartbeat"* ]] && echo yes || echo no)"
-t 'C2 ...stamped onboarder and created stopped' yes "$([[ "$c" == *"_ONBOARDER_OVERRIDE=1 _CREATE_STOPPED=1"* ]] && echo yes || echo no)"
-t 'C2 ...the marker existed before the agent did' yes "$([[ "$c" == *"marker=yes"* ]] && echo yes || echo no)"
-t 'C2 ...and it is never left enabled' 1 "$(grep -c 'systemctl disable --now 5dive-agent@onb-acme.service' "$LOG")"
-md="$TMP/home/agent-onb-acme/.claude/CLAUDE.md"
-t 'C3 CLAUDE.md says it is 5dive'"'"'s AI assistant' 1 "$(grep -c "^# You are 5dive's AI assistant for Acme Law$" "$md")"
-t 'C3 ...never offers a call, points to Buy with the band' 2 "$(grep -c -e 'Never offer, suggest or book a call' -e 'Buy button on this page; the Team plan is already picked' "$md")"
-t 'C3 ...carries the fact sheet and the brief' 3 "$(grep -c -e '5dive runs a team of AI agents' -e '^- Domains: acme-law.com$' -e '^- Contact: Jo Bloggs, Managing partner$' "$md")"
-t 'C3 ...is not writable by the seat (640)' 640 "$(stat -c %a "$md")"
-t 'C4 the record holds slug, firm, domains, band' '["acme","Acme Law","acme-law.com","Team"]' "$(jq -c '[.slug,.firm,.domains[0],.band]' "$TMP/state/acme.json")"
-t 'C4 ...the minute tick is installed' 1 "$(grep -c '^\* \* \* \* \* root /usr/local/bin/5dive onboarder tick' "$TMP/cron")"
-t 'C5 a second create of the same slug is refused' 5 "$( (cmd_onboarder_create acme <<<"$GOOD") >/dev/null 2>&1; echo $?)"
-t 'C5 a brief with an email is refused before any agent is made' 3 "$( (cmd_onboarder_create other <<<'{"firm":"O","domains":["o.com"],"facts":["user@example.com"]}') >/dev/null 2>&1; echo $?)"
-t 'C5 ...and leaves no marker behind' no "$([[ -e "$TMP/markers/onb-other" ]] && echo yes || echo no)"
-
-t 'S1 ls --json: stopped' '[{"slug":"acme","firm":"Acme Law","domains":["acme-law.com"],"band":"Team","setup":"cloud","running":false}]' "$(JSON_MODE=0 cmd_onboarder_ls --json)"
-
-# --- wake and tick --------------------------------------------------------------------
-: > "$LOG"
-cmd_onboarder_wake acme >/dev/null
-t 'T1 wake starts a stopped seat' 1 "$(grep -c 'systemctl start 5dive-agent@onb-acme.service' "$LOG")"
-RUNNING=" acme"; : > "$LOG"
-cmd_onboarder_wake acme >/dev/null
-t 'T1 ...and does nothing to a running one' 0 "$(grep -c 'systemctl start' "$LOG")"
-t 'S1 ls --json: running' true "$(cmd_onboarder_ls --json | jq '.[0].running')"
-: > "$LOG"; cmd_onboarder_tick
-t 'T2 tick leaves a seat seen just now running' 0 "$(grep -c 'systemctl stop' "$LOG")"
-touch -d '-121 minutes' "$TMP/state/acme.active"
-: > "$LOG"; cmd_onboarder_tick 2>/dev/null
-t 'T3 tick stops a seat idle 2 h' 1 "$(grep -c 'systemctl stop 5dive-agent@onb-acme.service' "$LOG")"
-inbox="$TMP/home/agent-onb-acme/.claude/channels/dashboard/agent-inbox"; mkdir -p "$inbox"
-touch -d '-121 minutes' "$TMP/state/acme.active" "$inbox"
-: > "$LOG"; cmd_onboarder_tick 2>/dev/null
-t 'T3 ...an empty old inbox does not keep it up' 1 "$(grep -c 'systemctl stop' "$LOG")"
-RUNNING=" "; : > "$LOG"; cmd_onboarder_tick 2>/dev/null
-t 'T4 a stopped seat with nothing queued stays stopped' 0 "$(grep -c 'systemctl start' "$LOG")"
-echo '{}' > "$inbox/1.json"
-: > "$LOG"; cmd_onboarder_tick 2>/dev/null
-t 'T4 ...and starts when a message is queued' 1 "$(grep -c 'systemctl start 5dive-agent@onb-acme.service' "$LOG")"
-
-# --- rm -------------------------------------------------------------------------------
-REG='{"agents":{"onb-acme":{"type":"claude"}}}'; : > "$LOG"
-cmd_onboarder_rm acme >/dev/null
-t 'R1 rm removes the agent with its home' 1 "$(grep -cx 'rm onb-acme --purge-home' "$LOG")"
-t 'R1 ...the record and the marker' no "$([[ -e "$TMP/state/acme.json" || -e "$TMP/markers/onb-acme" ]] && echo yes || echo no)"
-t 'R1 ...and ls is empty' '[]' "$(cmd_onboarder_ls --json)"
-t 'R2 rm of an unknown slug is not found' 4 "$( (cmd_onboarder_rm nope) >/dev/null 2>&1; echo $?)"
 
 echo "---"; echo "pass=$PASS fail=$FAIL"
 (( FAIL == 0 ))
