@@ -112,17 +112,17 @@ eq_ "setting standard, no manifest tier: empty (create decides)" "$(_import_reso
 
 echo "COMPOSE"
 # The per-seat JSON both arg builders receive (defaults already merged in).
-LEAD='{"type":"claude","pack":"kostya"}'
-MEMBER='{"type":"claude","pack":"artyom","reports_to":["kostya"]}'
-MEMBER_STR='{"type":"claude","reports_to":"kostya"}'
-OWN='{"type":"claude","pack":"lena","reports_to":["kostya"],"isolation":"admin"}'
-NONPUSH='{"type":"claude","pack":"q","reports_to":["kostya"],"can_push":false}'
+LEAD='{"type":"claude","pack":"tess"}'
+MEMBER='{"type":"claude","pack":"artyom","reports_to":["tess"]}'
+MEMBER_STR='{"type":"claude","reports_to":"tess"}'
+OWN='{"type":"claude","pack":"lena","reports_to":["tess"],"isolation":"admin"}'
+NONPUSH='{"type":"claude","pack":"q","reports_to":["tess"],"can_push":false}'
 iso_of(){ grep -E '^--isolation=' | tr '\n' ' ' | sed 's/ $//'; }
 rm -f "$BOX_CONFIG"
-eq_ "by-role, pack path: the lead is pinned admin" "$(_compose_import_args "$LEAD" kostya kostya . | iso_of)" "--isolation=admin"
+eq_ "by-role, pack path: the lead is pinned admin" "$(_compose_import_args "$LEAD" tess tess . | iso_of)" "--isolation=admin"
 eq_ "by-role, pack path: a member is pinned standard (its manifest never decides)" "$(_compose_import_args "$MEMBER" artyom artyom . | iso_of)" "--isolation=standard"
 eq_ "by-role, create path: a member (reports_to as a string) is pinned standard" "$(_compose_create_args "$MEMBER_STR" ruslan . | iso_of)" "--isolation=standard"
-eq_ "by-role, create path: the lead is pinned admin" "$(_compose_create_args '{"type":"claude"}' kostya . | iso_of)" "--isolation=admin"
+eq_ "by-role, create path: the lead is pinned admin" "$(_compose_create_args '{"type":"claude"}' tess . | iso_of)" "--isolation=admin"
 eq_ "a spec's own tier is forwarded on the pack path, once, and wins" "$(_compose_import_args "$OWN" lena lena . | iso_of)" "--isolation=admin"
 eq_ "DIVE-6543: a non-pusher is pinned standard once, by the push pin" "$(_compose_import_args "$NONPUSH" q q . | iso_of)" "--isolation=standard"
 # DIVE-7236: a template's `defaults: isolation: standard` reaches every seat

@@ -1,42 +1,42 @@
-           ident = DIVE-4581
-           title = Fleet-health pages a human for Claude Code's own usage-limit picker: classify it quota-exhausted, answer 'wait here, continue automatically' itself, never blocked-on-prompt (3 false pages 09-15/16)
-          status = in_progress
-            gate = none
-        priority = high
-        assignee = dev
-      created_by = main
-       parent_id = 
-      created_at = 2026-09-16 01:14:00
-first_started_at = 2026-09-16 05:53:21
-      started_at = 2026-09-16 05:53:21
-         done_at = 
-    delivery_ref = absent
-     merge_owner = -
-            body = ## Why (lodar, Telegram 2026-09-16 01:13Z)
+           lorem i dolordolo
+           lorem i dolordolordo sitsi a conse adi elitel sedsed dod usage-limit temport loremlor ip dolordolordolord sitsit ameta conse continue automatically' sedseds dodod eiusmodeiusmodeiu te lorem ipsum dolordolo
+          loreml i dolordolord
+            lore i dolo
+        loremlor i dolo
+        loremlor i dol
+      loremlorem i dolo
+       loremlore i 
+      loremlorem i dolordolor sitsitsi
+loremloremloreml i dolordolor sitsitsi
+      loremlorem i dolordolor sitsitsi
+         loremlo i 
+    loremloremlo i dolord
+     loremloreml i d
+            lore i do sit ametame consecte adipiscing eliteli
 
-> false notification - the agent was sitting on 'You've hit your org's monthly spend limit · ask your admin to raise it … your weekly limit resets Sep 19, 12pm (UTC)' - so the blocked-on-prompt is wrong and shouldnt be alarmed
+l ipsum dolordolordo s ame conse adi eliteli se dododod eiu temp lorem ipsumip dolor limit a con adip elite se dodod ei t lore ipsumi limit resets ame con adip elitel s do eiu temportemportempo lo ipsum dol sitsitsi am consect
 
-Three FLEET-HEALTH blocked-on-prompt pages in one evening (quinn ~16:05Z, ops ~16:20Z, community ~01:00Z, all on the exhausted chemmonitor account) reached lodar's phone for the same non-event. Axis: the org layer's observable behaviour — a human paged for a hold that has its own resume time.
+lorem ipsumipsumip dolordolordolordo sitsi am con adipisc elitel sedsedse dod eiusmode temportem loremlor ips do sit ametameta consectetur adipisci eliteli sedseds dodod eiu tem lore ipsumipsum dolor sit ame consect adipiscing elitelite s d eiusm tempo lor i dolo sits ame con adi elitel sedse
 
-## Mechanism
+lo ipsumipsu
 
-When Claude Code hits a plan/org limit mid-turn it prints the refusal and renders ITS OWN three-option picker ("What do you want to do? 1. Stop and wait for limit to reset / 2. Wait here, then continue automatically at <time> / 3. Upgrade your plan", "Enter to confirm · Esc to cancel"). The watchdog's picker matcher keys on the confirm/cancel vocabulary, finds no "(Recommended)" mark, and escalates as "a person must choose" — the AskUserQuestion shape. It is not: it is a QUOTA hold with a resume time printed in the pane, and the safe answer is always option 2 (the seat parks and resumes at the reset). main answered quinn and ops by hand with `tmux send-keys Down Enter` (2026-09-15 16:xxZ); by the time community was read the picker had already dismissed itself and the pane showed the refusal + idle composer + `1w: 100%`.
+lore ipsumi dolo sits a consecte limit elitelit se dododo eiu temport lor ipsumip dol sit ametametamet consec ("What do you want to do? lo Stop and wait for limit to reset s do Wait here, lore continue automatically si ametam c ad Upgrade your plan", "Enter to confirm i Esc to cancel"). con adipiscing elitel sedseds dodo ei tem loremloremlore ipsumipsumi dolor si ametametametame conse adi elitelite se do eiusmo temp loremlo i dol sitsitsitsitsit ametam co ad elit se do e tempo lore ipsu d sitsit amet consect ad eli sedse dod eiu temp loreml ip dolord sitsit a cons adip elite sed dododod ei tem loremlo ipsu dolordol sitsi ame con ad elit seds dodod eiusmodei temp loreml ipsumipsumi dolordol si ame cons adipiscin eli seds dod eiusmo tem loremlo ipsumipsu dolord sit ame cons adipis eli sedseds d eius temporte l `1w: 100%`.
 
-## Fix (dev, cmd_supervisor.sh / fleet-health picker path)
+lo ips dolor sitsitsitsitsitsi a consecteturc adipis elite
 
-1. Before the blocked-on-prompt arm, match the usage-limit picker (any of: "hit your org's monthly spend limit", "Usage limit reached", "Stop and wait for limit to reset", "continue automatically at") and classify the seat **quota-exhausted** with the resume time parsed from the pane — the class the supervisor already has (`quota-exhausted` in the tick summary) — not blocked-on-prompt.
-2. Answer it: press Down, Enter (option 2, "Wait here, then continue automatically") as the seat's own user; that is the documented self-heal ("continuing automatically at HH:MM" then appears on the status line). Never Escape (leaves the seat stopped).
-3. No human page for this class. One digest line per seat per window at most; the tick summary already counts them.
-4. Test arms: a pane fixture with the limit picker → classified quota-exhausted, keypress sent, no escalate; a real AskUserQuestion picker fixture → still escalates; the DIVE-4536 lesson stands — match the LIMIT vocabulary, and keep this row's own text out of any pane a seat renders (quoting the picker in a diff or reply pages the seat that quotes it).
+lo ipsumi dol sitsitsitsitsitsi amet conse adi usage-limit sedsed dodo eiu temp lore ipsum dolordo sitsi limit", "Usage limit reached", "Stop and wait for limit to reset", "continue automatically cons adi elitelit sed dodo eiusmodeiusmodeiusm temp lor ipsumi dolo sitsit amet con adip e sed dodod eiu temportemp loremlo ips dolordolordolordol si ame cons adipisci e sed dododododododododo
+lo ipsumi dol sitsi ameta conse adipisc el "Wait here, eius continue automatically") ip dol sitsit ame conse adip el sed dododododo eiusmodei temportempor loremloremlor ip dolord sits ametame co adi elitel sedsed dodod eiusmo temport lor ipsu dolordolo
+lo ip dolor sits ame cons adipis eli sedsed dodo eiu temp lor ipsumi do sitsi ame cons adipisc eliteli sedsed dodod
+lo ipsu dolor s amet consect adip eli limit dododo e temportemp loremloremloreml ipsumips dolor si ametameta c adip eliteliteliteli sedsed dododod e tempo loremlorem ips dolordolo sitsit ametam c adipi eli sedse dododododod eiu temp lore ipsum dol sits ame co adi elit s dodo eiusmod temporte lor ipsumi do s amet co adipi elite sed dodo eius tempor lore
 
-Related: DIVE-4536 (picker matcher fires on quoted vocabulary), the quota-hold-is-keyed-on-pane-text note (main memory), 2026-09-15 supervisor rung-4 page on a reaped pool seat (same watcher family; not filed).
+loremlor ipsumipsu dolordo sitsits ameta co adipis elitelitelit sed dodododododododododododododododo eius tempo loremlor ipsumipsum dolordolor sitsit amet co a elitel seds dodo eiusm temport loremlo ips dolordo
 
-          result = 
-created_by_tier = admin
-previous gates = 0
+          loreml i 
+loremloremlorem i dolor
+loremlor ipsum d s
 
-verify: delivered-only (box default) — no grader yet — one is attached when a delivery is bound (task deliver --pr=…)
-review: temp — one grader session per delivery, then gone
+loremlo ipsumipsumipsu dolo sitsitsi a co adipis eli s dod ei temporte lore i dolordol si ameta conse adipisc eliteli
+loremlo ipsu d sit ametam consect adi elitelite seds dodo
 
-loop spec:
-  max_iterations: 2
+lore ipsum
+  loremloremlorem i

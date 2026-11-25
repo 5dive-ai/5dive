@@ -82,22 +82,22 @@ eq_t '...and its login is written down as one it already had' seen "$(line mp cl
 chatgpt_login gpt; age mp claude 100
 eq_t 'the owner adds ChatGPT: new hires go to it' gpt:codex "$(pick)"
 eq_t '...a claude hire still finds no newer claude login' none "$(pick claude)"
-claude_login konst; age gpt codex 50
-eq_t 'a second Claude added for headroom: the same rule, it is the default' konst:claude "$(pick)"
+claude_login rio; age gpt codex 50
+eq_t 'a second Claude added for headroom: the same rule, it is the default' rio:claude "$(pick)"
 eq_t '...and a codex hire still goes to ChatGPT' gpt:codex "$(pick codex)"
 claude_login demo-ai
-eq_t 'the demo AI turning up later never becomes the default' konst:claude "$(pick)"
+eq_t 'the demo AI turning up later never becomes the default' rio:claude "$(pick)"
 eq_t '...and is not even written down' '' "$(line demo-ai claude)"
-mv "$AUTH_PROFILES_DIR/konst/combined.env" "$TMP/konst.env"; mkdir -p "$AUTH_PROFILES_DIR/konst"
-printf '# signed out\n' > "$AUTH_PROFILES_DIR/konst/combined.env"
+mv "$AUTH_PROFILES_DIR/rio/combined.env" "$TMP/rio.env"; mkdir -p "$AUTH_PROFILES_DIR/rio"
+printf '# signed out\n' > "$AUTH_PROFILES_DIR/rio/combined.env"
 eq_t 'the newest login signs out: the next newest that works, never the empty one' gpt:codex "$(pick)"
-_konst_ts=$(line konst claude)
-mv "$TMP/konst.env" "$AUTH_PROFILES_DIR/konst/combined.env"
-eq_t 'its file back (a token refresh, a re-sign-in): the default again' konst:claude "$(pick)"
-eq_t '...on its OLD stamp, so a refresh never re-adds a login' "$_konst_ts" "$(line konst claude)"
-rm -rf "$AUTH_PROFILES_DIR/konst"
+_rio_ts=$(line rio claude)
+mv "$TMP/rio.env" "$AUTH_PROFILES_DIR/rio/combined.env"
+eq_t 'its file back (a token refresh, a re-sign-in): the default again' rio:claude "$(pick)"
+eq_t '...on its OLD stamp, so a refresh never re-adds a login' "$_rio_ts" "$(line rio claude)"
+rm -rf "$AUTH_PROFILES_DIR/rio"
 eq_t 'the newest account removed: back to ChatGPT' gpt:codex "$(pick)"
-eq_t '...and its line is gone, so the same name added again counts as new' '' "$(line konst claude)"
+eq_t '...and its line is gone, so the same name added again counts as new' '' "$(line rio claude)"
 rm -rf "$AUTH_PROFILES_DIR/gpt"
 eq_t 'ChatGPT removed too: no default, hires land on Claude by their own rules' none "$(pick)"
 chatgpt_login gpt
@@ -159,13 +159,13 @@ made() {
   grep -m1 '^REACHED ' <<<"$out" | sed 's/^REACHED //' || true
   grep -q '^REACHED ' <<<"$out" || grep -m1 -oE 'not authenticated|not configured|is empty' <<<"$out" || echo '(refused)'
 }
-fresh_box; claude_login mp; pick >/dev/null; claude_login konst; chatgpt_login gpt; age konst claude 100
+fresh_box; claude_login mp; pick >/dev/null; claude_login rio; chatgpt_login gpt; age rio claude 100
 eq_t 'agent create --type=codex, no account: the ChatGPT login' 'type=codex profile=gpt defer=0' "$(made pixel --type=codex)"
 grep -qF "the codex login added last" "$TMP/last.log" && ok_t 'create says which login it used' || bad_t 'create did not say' "$(cat "$TMP/last.log")"
 eq_t 'agent create --type=claude on two Claude logins: the one added last (refused before)' \
-  'type=claude profile=konst defer=0' "$(made dev --type=claude)"
+  'type=claude profile=rio defer=0' "$(made dev --type=claude)"
 eq_t 'an explicit --auth-profile still wins' 'type=claude profile=mp defer=0' "$(made dev --type=claude --auth-profile=mp)"
-eq_t 'a deferred hire with no account (a team template) gets it too' 'type=claude profile=konst defer=0' "$(made dev --type=claude --defer-auth)"
+eq_t 'a deferred hire with no account (a team template) gets it too' 'type=claude profile=rio defer=0' "$(made dev --type=claude --defer-auth)"
 
 echo '== 4. real cmd_import seam (hire, marketplace, one-tap, partner) =='
 printf '%s\n' '{"packFormat":1,"agentName":"marcus","config":{"type":"claude","model":"opus","effort":"high"},"includes":{"memory":false}}' > "$TMP/manifest.json"
@@ -229,7 +229,7 @@ grep -q '_compose_apply_newest_login "\$spec"' src/cmd_compose.sh \
 echo '== 6. DIVE-7415: the owner pins a default, and it beats newer logins =='
 PIN="$AUTH_PROFILES_DIR/.default"
 registry_read() { printf '%s\n' '{"agents":{}}'; }
-fresh_box; claude_login mp; pick >/dev/null; claude_login konst; age konst claude 100
+fresh_box; claude_login mp; pick >/dev/null; claude_login rio; age rio claude 100
 JSON_MODE=1
 _d=$( ( cmd_account_default mp ) 2>/dev/null)
 eq_t 'account default <account> pins its login and answers it, pinned' 'mp claude true' "$(jq -r '.data | "\(.account) \(.type) \(.pinned)"' <<<"$_d")"
@@ -250,23 +250,23 @@ eq_t 'account default <account>:<type> pins that harness' 'gpt codex true' "$(jq
 _d=$( ( cmd_account_default --clear ) 2>/dev/null)
 eq_t '--clear: back to the newest login (DIVE-7152 unchanged)' 'gpt codex false' "$(jq -r '.data | "\(.account) \(.type) \(.pinned)"' <<<"$_d")"
 [[ ! -e "$PIN" ]] && ok_t '--clear removes the pin file' || bad_t '--clear left the pin file' "$(cat "$PIN")"
-( cmd_account_default konst ) >/dev/null 2>&1
-mv "$AUTH_PROFILES_DIR/konst/combined.env" "$TMP/konst.env"
+( cmd_account_default rio ) >/dev/null 2>&1
+mv "$AUTH_PROFILES_DIR/rio/combined.env" "$TMP/rio.env"
 eq_t 'a pinned login signed out right now is skipped (newest wins meanwhile)' gpt:codex "$(pick)"
 [[ -e "$PIN" ]] && ok_t '...and the pin is kept, so a refresh mid-write never loses it' || bad_t 'a signed-out pin was dropped' ''
-mv "$TMP/konst.env" "$AUTH_PROFILES_DIR/konst/combined.env"
-eq_t '...signed back in, the pin is the default again' konst:claude "$(pick)"
-( cmd_account_rename konst konst2 ) >/dev/null 2>&1
-eq_t 'account rename keeps the pin on the renamed account' konst2:claude "$(pick)"
-( cmd_account_remove konst2 ) >/dev/null 2>&1
+mv "$TMP/rio.env" "$AUTH_PROFILES_DIR/rio/combined.env"
+eq_t '...signed back in, the pin is the default again' rio:claude "$(pick)"
+( cmd_account_rename rio rio2 ) >/dev/null 2>&1
+eq_t 'account rename keeps the pin on the renamed account' rio2:claude "$(pick)"
+( cmd_account_remove rio2 ) >/dev/null 2>&1
 [[ ! -e "$PIN" ]] && ok_t 'account remove of the pinned account clears the pin' || bad_t 'remove left the pin' "$(cat "$PIN")"
 eq_t '...and new hires go back to the newest login' gpt:codex "$(pick)"
-age gpt codex 100; claude_login konst2
+age gpt codex 100; claude_login rio2
 pinned() { account_default_v >/dev/null; printf '%s:%s pinned=%s' "$ACCOUNT_DEFAULT_ACCOUNT" "$ACCOUNT_DEFAULT_TYPE" "$ACCOUNT_DEFAULT_PINNED"; }
 eq_t 'a new account of the same name does not inherit the old pin (it is just the newest login)' \
-  'konst2:claude pinned=0' "$(pinned)"
+  'rio2:claude pinned=0' "$(pinned)"
 printf '1\tghost\tclaude\n' > "$PIN"
-eq_t 'a pin naming an account that is gone is ignored' 'konst2:claude pinned=0' "$(pinned)"
+eq_t 'a pin naming an account that is gone is ignored' 'rio2:claude pinned=0' "$(pinned)"
 [[ ! -e "$PIN" ]] && ok_t '...and dropped' || bad_t 'a gone pin was kept' ''
 _d=$( ( cmd_account_default nobody ) 2>&1)
 grep -q "no account named 'nobody'" <<<"$_d" && ok_t 'pinning an account the box does not have is refused' || bad_t 'pin of a missing account' "$_d"

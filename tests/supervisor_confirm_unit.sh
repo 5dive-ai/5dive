@@ -66,7 +66,10 @@ CONFIRM_PANE=$'Add cmd_read and cmd_links to bin/browser\nDangerous rm operation
 #     live page no longer carries them either, which is the other half of the
 #     fix, not a substitute for this arm.
 #
-# Do not "tidy" these files. Their value is that nobody wrote them for this test.
+# Since DIVE-9269 their prose is word-scrubbed (every word outside a pane
+# signature replaced by same-length filler, so no internal record ships in the
+# public repo). Line count, indentation, blank lines and each signature's
+# position are unchanged, which is all the matcher reads. Do not "tidy" them.
 FIX_ROW_BODY=tests/fixtures/dive4536/row-body-task-show.txt
 FIX_WIKI_PAGE=tests/fixtures/dive4536/wiki-bypass-mode.md
 

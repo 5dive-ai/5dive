@@ -514,13 +514,13 @@ _task_send_owner() { HUMAN_FIRED=1; return 0; }
 # arms grade is that the alert honours whatever it resolves, and the resolution
 # ORDER itself is graded against a real org chart in
 # tests/supervisor_alert_recipient_unit.sh.
-_task_resolve_gate_notifier() { printf 'claude-aleks'; }
+_task_resolve_gate_notifier() { printf 'claude-ava'; }
 
 MACHINE_FIRED=0; HUMAN_FIRED=0; _sup_capacity_alert ops quota-exhausted "d" true true
 t "capacity_alert: both legs fire when both are asked for" "1:1" "$HUMAN_FIRED:$MACHINE_FIRED"
 
 t "capacity_alert: ...addressed to the RESOLVED seat, not the literal 'main'" \
-  "claude-aleks:claude-aleks" "$SENT_TO:$CHAN_FOR"
+  "claude-ava:claude-ava" "$SENT_TO:$CHAN_FOR"
 
 MACHINE_FIRED=0; HUMAN_FIRED=0; _sup_capacity_alert ops quota-exhausted "d" false false
 t "capacity_alert: the human leg is silent when muted"   "0" "$HUMAN_FIRED"
@@ -567,7 +567,7 @@ t "4551 no recipient: a muted leg is not counted as lost" \
 
 # A recipient that resolves but whose a2a rail refuses — the `no agent named`
 # half of the customer report, now audited instead of warned away.
-_task_resolve_gate_notifier() { printf 'claude-aleks'; }
+_task_resolve_gate_notifier() { printf 'claude-ava'; }
 5dive() { return 1; }
 _task_agent_channel() { return 0; }
 MACHINE_FIRED=0; HUMAN_FIRED=0; _SUP_ALERTS_UNDELIVERABLE=0

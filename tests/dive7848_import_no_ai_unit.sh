@@ -87,7 +87,7 @@ chmod +x "$TMP/bin/5dive"
 PATH="$TMP/bin:$PATH"
 
 MP='mp:CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-mp'
-KONST='konst:CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-konst'
+RIO='rio:CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-fixture-rio'
 box() {
   rm -rf "$AUTH_PROFILES_DIR" "$CONNECTORS_DIR" "$FIVEDIVE_CHAT_ONLY_MARK" "$STATE_DIR"/account-logins* 2>/dev/null
   mkdir -p "$AUTH_PROFILES_DIR" "$CONNECTORS_DIR"
@@ -192,7 +192,7 @@ box; TTY=1; JSON_MODE=1
 eq_t '--json at a terminal: never prompts, the seat waits' \
   '--auth-profile=marcus defer mark=true' "$(imported json '1\n2\nsk-ant-api03-x\n' --as=marcus)"
 JSON_MODE=0
-box "$MP" "$KONST"; TTY=1
+box "$MP" "$RIO"; TTY=1
 eq_t 'two logins on the box (it has AI, the owner picks): not asked, not marked (NEGATIVE CONTROL)' \
   '--auth-profile=marcus defer mark=-' "$(imported two '1\n2\nsk-ant-api03-x\n' --as=marcus)"
 eq_t '...and create is NOT told it waits (NEGATIVE CONTROL)' 0 "$(cat "$TMP/two.argv.awaits")"
@@ -204,7 +204,7 @@ eq_t "init's shared login: its seat, as DIVE-7118 made it (NEGATIVE CONTROL)" \
   '(shared login) now mark=-' "$(imported shared '1\n' --as=marcus)"
 box; TTY=1
 eq_t 'an explicit --auth-profile is never second-guessed' \
-  '--auth-profile=konst defer mark=-' "$(imported explicit '1\n' --as=marcus --auth-profile=konst)"
+  '--auth-profile=rio defer mark=-' "$(imported explicit '1\n' --as=marcus --auth-profile=rio)"
 
 echo "== 2b. create's self-check gives a waiting seat the right advice =="
 # The real line cmd_create's self-check prints for a deferred-auth seat (it
@@ -258,12 +258,12 @@ eq_t "5dive init's shared login: every waiting seat moves onto it" \
 eq_t '...and stops waiting' '' "$(marks)"
 eq_t '...with no account binding (the shared login)' '-' "$(jq -r '.agents.marcus.authProfile // "-"' "$REGISTRY")"
 
-box "$KONST"; waiting marcus:claude:marcus
-adopt_ai_waiting_agents konst >/dev/null 2>&1
-eq_t 'an account signed in (`account login konst`): the seat moves onto it' \
-  'marcus set auth-profile=konst;' "$(moves)"
+box "$RIO"; waiting marcus:claude:marcus
+adopt_ai_waiting_agents rio >/dev/null 2>&1
+eq_t 'an account signed in (`account login rio`): the seat moves onto it' \
+  'marcus set auth-profile=rio;' "$(moves)"
 
-box "$KONST" "$MP"; waiting marcus:claude:marcus
+box "$RIO" "$MP"; waiting marcus:claude:marcus
 adopt_ai_waiting_agents mp >/dev/null 2>&1
 eq_t 'two accounts: the one that just landed wins' 'marcus set auth-profile=mp;' "$(moves)"
 
@@ -273,17 +273,17 @@ adopt_ai_waiting_agents marcus >/dev/null 2>&1
 eq_t 'the seat signed in on its own account (the old per-agent line): no move' '' "$(moves)"
 eq_t '...and it stops waiting' '' "$(marks)"
 
-box "$KONST"; waiting pat:codex:pat
-adopt_ai_waiting_agents konst >/dev/null 2>&1
+box "$RIO"; waiting pat:codex:pat
+adopt_ai_waiting_agents rio >/dev/null 2>&1
 eq_t 'a Codex seat is never moved onto a Claude login (NEGATIVE CONTROL)' '' "$(moves)"
 eq_t '...it keeps waiting' 'pat' "$(marks)"
 
-box "$KONST"; waiting marcus:claude:marcus
+box "$RIO"; waiting marcus:claude:marcus
 r=$(registry_read); jq '.agents.ada = {type:"claude", authProfile:"ada"}' <<<"$r" | registry_write
 mkdir -p "$AUTH_PROFILES_DIR/ada"
-adopt_ai_waiting_agents konst >/dev/null 2>&1
+adopt_ai_waiting_agents rio >/dev/null 2>&1
 eq_t 'a seat not marked (deferred on purpose elsewhere) is never moved (NEGATIVE CONTROL)' \
-  'marcus set auth-profile=konst;' "$(moves)"
+  'marcus set auth-profile=rio;' "$(moves)"
 
 echo '== 4. every sign-in path reaches the move =='
 box; waiting marcus:claude:marcus
@@ -294,12 +294,12 @@ systemctl() { :; }
 restart_profile_agents "" >/dev/null 2>&1
 eq_t 'a sign-in landing (restart_profile_agents, every login path) moves the waiting seat' \
   'marcus set auth-profile=default;' "$(moves)"
-box "$KONST"; waiting marcus:claude:marcus
-restart_profile_agents konst >/dev/null 2>&1
-eq_t '...and an account sign-in landing moves it onto that account' 'marcus set auth-profile=konst;' "$(moves)"
+box "$RIO"; waiting marcus:claude:marcus
+restart_profile_agents rio >/dev/null 2>&1
+eq_t '...and an account sign-in landing moves it onto that account' 'marcus set auth-profile=rio;' "$(moves)"
 eq_t '`agent auth set <type> --auth-profile=x` names x' 'x' "$(_ai_arg_account claude --api-key=- --auth-profile=x)"
 eq_t '`agent auth set <type>` names the shared login, not the type' '' "$(_ai_arg_account claude --api-key=-)"
-eq_t '`account set <name>` names the account' 'konst' "$(_ai_arg_account --positional konst --type=claude --api-key=-)"
+eq_t '`account set <name>` names the account' 'rio' "$(_ai_arg_account --positional rio --type=claude --api-key=-)"
 grep -qF 'cmd_auth_set "$@" && adopt_ai_waiting_agents "$(_ai_arg_account "$@")"' src/main.sh \
   && ok_t '`agent auth set` (a key, init'"'"'s key step) runs the move' || bad_t '`agent auth set` does not run the move' ''
 grep -qF 'with_registry_lock cmd_account_set "$@" && adopt_ai_waiting_agents "$(_ai_arg_account --positional "$@")"' src/main.sh \

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # DIVE-6713: `account usage` had no current number for an account with no busy
-# seat (konst and mp read `- (remembered)`, 2026-10-22). The heartbeat now polls
+# seat (rio and mp read `- (remembered)`, 2026-10-22). The heartbeat now polls
 # every Claude account (account_poll_one) and the reading competes on age in
 # account_usage_rows. Arms:
 #   1  an account with NO bound seat gets a live `poll` reading, written where

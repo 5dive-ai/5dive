@@ -69,10 +69,10 @@ t "this box: and the coordinator the row proposed is NOT main (the discriminator
 # One root, nothing tagged: the notifier falls back to the coordinator, which is
 # exactly the resolution the row asked for. No seat named `main` anywhere.
 chart
-db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-aleks','founder',NULL);"
-db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ivan','engineer','claude-aleks');"
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ava','founder',NULL);"
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ivan','engineer','claude-ava');"
 t "lone-root customer chart: resolves the root, with no seat named main present" \
-  "claude-aleks" "$(_sup_alert_recipient)"
+  "claude-ava" "$(_sup_alert_recipient)"
 
 # ...and the narrow override, which is the whole reason the notifier knob is the
 # right one: tagging a seat moves the ALERTS alone, where tagging a coordinator
@@ -82,16 +82,16 @@ db "UPDATE agents_org SET role='engineer — gate notifier' WHERE name='claude-i
 t "lone-root customer chart: an explicit tag overrides the root" \
   "claude-ivan" "$(_sup_alert_recipient)"
 t "...and moves ONLY the alerts — the queue coordinator is untouched" \
-  "claude-aleks" "$(_task_resolve_coordinator)"
+  "claude-ava" "$(_task_resolve_coordinator)"
 
 # ── 3. the teal-fox chart as reported: THREE roots, none tagged ──────────────
 # Nothing resolves, and that is not a bug in the resolver — it is the state the
 # box is in. What must not happen is a silent drop.
 chart
-db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-aleks','founder',NULL);"
-db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-alena','ops',NULL);"
-db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-jane','eng',NULL);"
-db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ivan','engineer','claude-aleks');"
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ava','founder',NULL);"
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-cleo','ops',NULL);"
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-nell','eng',NULL);"
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ivan','engineer','claude-ava');"
 t "three untagged roots: nothing resolves (ambiguous, never a guess)" \
   "" "$(_sup_alert_recipient)"
 
@@ -122,7 +122,7 @@ t "...and both legs are distinguishable in the row" \
 # undeliverable row at all. Without it every arm above is satisfied by an
 # implementation that files one unconditionally.
 chart
-db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-aleks','founder',NULL);"
+db "INSERT INTO agents_org (name, role, reports_to) VALUES ('claude-ava','founder',NULL);"
 db "DELETE FROM supervisor_events;"
 5dive() { MACHINE_FIRED=1; return 0; }
 _SUP_ALERTS_UNDELIVERABLE=0; MACHINE_FIRED=0
@@ -165,7 +165,7 @@ _sup_snapshot() {
 }
 ( tasks_db_init ) >/dev/null 2>&1 || true
 # The teal-fox chart: three roots, none tagged, no seat named main.
-for a in claude-aleks claude-alena claude-jane; do
+for a in claude-ava claude-cleo claude-nell; do
   ( db "INSERT INTO agents_org (name, role, reports_to) VALUES ('$a','root',NULL);" ) >/dev/null 2>&1 || true
 done
 summary=$(cmd_supervisor_tick 2>/dev/null); rc=$?

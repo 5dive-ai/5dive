@@ -10,6 +10,8 @@
 # output and the wiki page written for this fix, both on disk in the same
 # commit as the detector), and a MUTANT arm proving the anchor under test is
 # load-bearing — relax it and the population control must go red.
+# Since DIVE-9269 the two population files are word-scrubbed: every word outside
+# a pane signature is same-length filler, line geometry unchanged.
 # Run: bash tests/supervisor_limit_picker_unit.sh (no root, no network).
 set -uo pipefail
 . "$(dirname "${BASH_SOURCE[0]}")/lib/grading_tree.sh" \

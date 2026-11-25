@@ -1060,18 +1060,18 @@ want='{"names":["github","old-item"],"items":[{"name":"github","fields":["login"
 [[ "$(jq -c '.data' <<<"$ls_out")" == "$want" ]] \
   && ok_t "L17i saved ls --json: names kept, items carry fields, the login, the site and last use (none yet)" \
   || bad_t "L17i ls shape" "$ls_out"
-r=$( (JSON_MODE=0; _secret_reveal --agent=kostya --host=github.com github.login github.password github.2fa old-item) 2>"$TMP/rv.err" ); rc=$?
+r=$( (JSON_MODE=0; _secret_reveal --agent=tess --host=github.com github.login github.password github.2fa old-item) 2>"$TMP/rv.err" ); rc=$?
 [[ $rc -eq 0 && "$(jq -r '."github.login"' <<<"$r")" == "$PL" && "$(jq -r '."github.password"' <<<"$r")" == "$PP" \
    && "$(jq -r '."github.2fa"' <<<"$r")" == "$SEED" && "$(jq -r '."old-item"' <<<"$r")" == plain-old-1 && "$(jq -r 'keys|length' <<<"$r")" == 4 ]] \
   && ok_t "L17j _reveal answers each ref with its plaintext; an old one-value item still answers by its bare name" \
   || bad_t "L17j reveal" "rc=$rc err=$(cat "$TMP/rv.err")"
 [[ "$(wc -l < "$USAGE")" == 2 && "$(stat -c %a "$USAGE")" == 600 ]] \
-  && grep -qE '^github github\.com kostya [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$USAGE" \
-  && grep -qE '^old-item github\.com kostya ' "$USAGE" \
+  && grep -qE '^github github\.com tess [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$USAGE" \
+  && grep -qE '^old-item github\.com tess ' "$USAGE" \
   && ok_t "L17k _reveal writes ONE usage line per item (<name> <host> <agent> <utc>), 600" \
   || bad_t "L17k usage" "$(cat "$USAGE" 2>&1)"
 before=$(wc -l < "$USAGE")
-r=$( (JSON_MODE=1; _secret_reveal --agent=kostya --host=github.com github.password nope.password) 2>"$TMP/rv2.err" ); rc=$?
+r=$( (JSON_MODE=1; _secret_reveal --agent=tess --host=github.com github.password nope.password) 2>"$TMP/rv2.err" ); rc=$?
 [[ $rc -eq 4 && -z "$r" && "$(wc -l < "$USAGE")" == "$before" ]] && grep -q 'nope.password' "$TMP/rv2.err" \
   && ! grep -qF -- "$PP" "$TMP/rv2.err" \
   && ok_t "L17l NEGATIVE CONTROL: a missing ref -> exit 4 naming it, NOTHING on stdout (even --json) and no usage line" \
@@ -1082,13 +1082,13 @@ for v in "$PP" "$SEED" plain-old-1 'Pa55'; do
   grep -qF -- "$v" <<<"$ls_out$ls_h" && bad+="[ls:$v] "
   grep -qF -- "$v" "$USAGE" && bad+="[usage:$v] "
 done
-[[ -z "$bad" && "$(jq -r '.data.items[0].lastUsedBy' <<<"$ls_out")" == kostya && "$(jq -r '.data.items[0].lastUsedAt' <<<"$ls_out")" =~ Z$ ]] \
-  && grep -qx 'github (owner@example.com), used by kostya just now' <<<"$ls_h" \
-  && ok_t "L17m NEGATIVE CONTROL: ls (json and human) and the usage file never hold a password, 2FA key or value; ls shows 'used by kostya just now'" \
+[[ -z "$bad" && "$(jq -r '.data.items[0].lastUsedBy' <<<"$ls_out")" == tess && "$(jq -r '.data.items[0].lastUsedAt' <<<"$ls_out")" =~ Z$ ]] \
+  && grep -qx 'github (owner@example.com), used by tess just now' <<<"$ls_h" \
+  && ok_t "L17m NEGATIVE CONTROL: ls (json and human) and the usage file never hold a password, 2FA key or value; ls shows 'used by tess just now'" \
   || bad_t "L17m no value in ls/usage" "bad=$bad ls=$ls_out human=$ls_h"
 # A store copied to a box with another key: names stay, values are refused, never garbage.
 cp -p "$VK" "$TMP/vk.bak"; chmod 600 "$VK"; openssl rand -hex 32 > "$VK"
-r=$( (_secret_reveal --agent=kostya --host=github.com github.password) 2>"$TMP/rv3.err" ); rc=$?
+r=$( (_secret_reveal --agent=tess --host=github.com github.password) 2>"$TMP/rv3.err" ); rc=$?
 [[ $rc -eq 5 && -z "$r" ]] && grep -q 'save it again' "$TMP/rv3.err" \
   && ok_t "L17n under another box's key a value is refused ('save it again'), nothing on stdout" \
   || bad_t "L17n wrong key" "rc=$rc out=[$r] err=$(cat "$TMP/rv3.err")"
@@ -1114,8 +1114,8 @@ openssl rand -hex 32 > "$TMP/other.key"
 v1other="v1:$(printf 'other-box' | openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -md sha256 -salt -a -A -pass "file:$TMP/other.key" 2>/dev/null)"
 printf 'V1_ITEM=%s\nV1_OTHER=%s\n' "$v1line" "$v1other" >> "$SAVED"
 ( (JSON_MODE=1; _secret_saved ls) >/dev/null 2>&1 )
-r=$( (_secret_reveal --agent=kostya --host=github.com v1-item) 2>/dev/null ); rc=$?
-r2=$( (_secret_reveal --agent=kostya --host=github.com v1-other) 2>"$TMP/rv4.err" ); rc2=$?
+r=$( (_secret_reveal --agent=tess --host=github.com v1-item) 2>/dev/null ); rc=$?
+r2=$( (_secret_reveal --agent=tess --host=github.com v1-other) 2>"$TMP/rv4.err" ); rc2=$?
 [[ "$(sed -n 's/^V1_ITEM=//p' "$SAVED")" == v2:* && "$(saved_val V1_ITEM)" == "$PP" && $rc -eq 0 && "$(jq -r '."v1-item"' <<<"$r")" == "$PP" ]] \
   && grep -qxF "V1_OTHER=$v1other" "$SAVED" && [[ $rc2 -eq 5 && -z "$r2" ]] && grep -q 'save it again' "$TMP/rv4.err" \
   && ok_t "L17u migration v1 -> v2: a readable v1 line is rewritten v2 and reveals the same value; another box's v1 line is kept as is and refused" \
@@ -1206,10 +1206,10 @@ bad=""; for v in "$CND" "$CN" "$CEN" "$CC" "$CH" "${CND:0:12}"; do grep -qF -- "
   && grep -qx 'visa (card ending 4242), not used yet' <<<"$ls_h" \
   && ok_t "L18f NEGATIVE CONTROL: saved ls lists the card by name and last 4 only ('visa (card ending 4242)'); no number, expiry, code or name, json or human" \
   || bad_t "L18f card in ls" "bad=$bad json=$(jq -c '.data.items' <<<"$ls_out") human=$ls_h"
-r=$( (JSON_MODE=0; _secret_reveal --agent=kostya --host=checkout.test visa.number visa.exp visa.cvc visa.holder) 2>"$TMP/rv8.err" ); rc=$?
-( _secret_reveal --agent=kostya --host=x visa.pin ) >/dev/null 2>&1; rc2=$?
+r=$( (JSON_MODE=0; _secret_reveal --agent=tess --host=checkout.test visa.number visa.exp visa.cvc visa.holder) 2>"$TMP/rv8.err" ); rc=$?
+( _secret_reveal --agent=tess --host=x visa.pin ) >/dev/null 2>&1; rc2=$?
 [[ $rc -eq 0 && $rc2 -ne 0 && "$(jq -r '[."visa.number", ."visa.exp", ."visa.cvc", ."visa.holder"] | join("|")' <<<"$r")" == "$CND|$CEN|$CC|$CH" ]] \
-  && grep -qE '^visa checkout\.test kostya ' "$USAGE" \
+  && grep -qE '^visa checkout\.test tess ' "$USAGE" \
   && ok_t "L18g _reveal answers visa.number, .exp, .cvc, .holder with their values and logs the use; an unknown field (.pin) is refused" \
   || bad_t "L18g card reveal" "rc=$rc rc2=$rc2 err=$(cat "$TMP/rv8.err")"
 printf '1/40' | ( _secret_write VISA__EXP --connector=saved ) >/dev/null 2>&1; rc=$?
