@@ -53,10 +53,7 @@ Agents:
   5dive plugin add|list|remove|upgrade <plugin>      # install a plugin; see '5dive plugin --help'
   5dive hire <role> --from-market [--as=<name>]  # hire from the open market; see '5dive hire --help'
   5dive helper ensure|status                         # the 5dive "Help & setup" seat (new boxes get none) and the handover
-  5dive partner hire <pack> [--as=<name>]            # on a PARTNER box: hire a colleague from the partner's
-                                                     # catalogue through the partner path (5dive-api records it
-                                                     # on the partner's account). No root: any seat that can read
-                                                     # the box identity. See '5dive partner --help'
+  5dive partner hire <pack> [--as=<name>]            # partner boxes: from the hosted plugin (hosted@5dive-plugins)
   5dive agent list
   5dive agent info <name>                            # type, CLI version, model, channel, state + OUTPUT (DIVE-3274:
                                                      # whether the seat is transacting, not only whether it is up)
@@ -1171,6 +1168,7 @@ _moved_verb_repo() {
     ui) printf '5dive-ai/5dive-ui\n' ;;
     council) printf '5dive-ai/5dive-council\n' ;;   # DIVE-4893
     sysadmin) printf '5dive-ai/5dive-partner\n' ;;  # DIVE-5247: partner boxes only
+    partner) printf 'hosted@5dive-plugins\n' ;;    # DIVE-9324: 5dive-built boxes only
     *)  return 1 ;;
   esac
 }
@@ -1216,6 +1214,12 @@ _moved_verb_notice() {
   # partner's approvals, so the line says it is not installed, not how to add it.
   if [[ "$1" == sysadmin ]]; then
     printf "note: 'sysadmin' is not installed on this box. It is a partner-box feature, installed by the partner box profile (plugin %s).\n" "$repo" >&2
+    return 0
+  fi
+  # DIVE-9324: `partner hire` talks to the 5dive API as the box, so it is only
+  # any use on a box 5dive built. The upgrade installs the plugin there.
+  if [[ "$1" == partner ]]; then
+    printf "note: 'partner' is not installed on this box. It comes with a 5dive-built box (plugin %s); on your own server use '5dive hire'.\n" "$repo" >&2
     return 0
   fi
   printf "note: '%s' moved out of the core CLI and is now a plugin.\n      Install it once, and '5dive %s' works exactly as before:\n\n        5dive plugin add %s\n\n" \
@@ -1446,17 +1450,6 @@ main() {
         AUDIT_CMD="hire"; AUDIT_ARGS=("$@")
         with_registry_lock cmd_hire "$@"
       fi ;;
-    partner)
-      # DIVE-5168: a partner client's agent hires a colleague THROUGH THE PARTNER
-      # PATH — a box-token-authenticated call to 5dive-api, which checks the
-      # partner's catalogue, records the hire on the partner's account and installs
-      # the pack back onto this box. Creates nothing locally, so no registry lock
-      # and NO require_root: it runs as any seat that can read the box identity
-      # (/etc/5dive/connectord.env, 0640 root:claude). Audited — it is a hire.
-      case "${1:-}" in
-        hire) AUDIT_CMD="partner hire"; AUDIT_ARGS=("${@:2}") ;;
-      esac
-      cmd_partner "$@" ;;
     helper)
       # DIVE-8819: the 5dive helper seat. DIVE-8946: `ensure` no longer builds it;
       # it is still audited, as a root verb.

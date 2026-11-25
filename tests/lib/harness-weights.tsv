@@ -539,7 +539,6 @@ tests/pack_skill_files_unit.sh	2753	2656
 tests/pack_skill_source_roundtrip_unit.sh	265	262
 tests/pack_skills_dir_owner_unit.sh	411	361
 tests/pack_sync_unit.sh	9912	9712
-tests/partner_hire_unit.sh	676	755
 tests/people_unit.sh	6902	6650
 tests/per_model_effort_unit.sh	427	523
 tests/persona_per_harness_path_unit.sh	138	105

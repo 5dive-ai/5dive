@@ -190,8 +190,8 @@ _team_premium_update_online() {
   if declare -F local_only_on >/dev/null && local_only_on; then
     fail "$E_VALIDATION" "this server works offline, so it cannot ask 5dive for a newer $team. Bring the newer file and run: 5dive team import <file>"
   fi
-  lazy_need _partner_box_token
-  tok=$(_partner_box_token) || trc=$?
+  lazy_need _box_token
+  tok=$(_box_token) || trc=$?
   (( trc == 0 )) && [[ -n "$tok" ]] || fail "$E_PERMISSION" "this server has no 5dive sign-in to ask with. Import the newer file by hand: 5dive team import <file>"
   url="$(five_api_base)/server/premium-teams/$team/latest?have=${have}"
   out=$(mktemp --suffix=.gz) || fail "$E_GENERIC" "could not stage the download"

@@ -250,7 +250,7 @@ if (( rc != 0 )) && grep -q 'same buyer' "$TMP/b1.out" && [[ "$(label_ver)" == 1
 else bad_t 'B1 other buyer not refused' "rc=$rc $(tail -3 "$TMP/b1.out")"; fi
 
 # ============ O. team update (online) ========================================
-_partner_box_token() { printf 'tok-SECRET'; }
+_box_token() { printf 'tok-SECRET'; }
 five_api_base() { printf 'https://api.example.test'; }
 CURL_CODE=204
 curl() { # records argv; serves the 1.1.0 file on 200

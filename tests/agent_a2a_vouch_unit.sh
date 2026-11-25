@@ -35,7 +35,7 @@ mkdir -p "$TMP/reqs" "$TMP/home/agent-ada/.openagent"
 export CONNECTORD_TOKEN="fake-box-token-0000" FIVE_A2A_VOUCH_TIMEOUT=5 AGENT_HOME_ROOT="$TMP/home"
 
 # shellcheck disable=SC1090
-for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh cmd_partner.sh cmd_agent_a2a_vouch.sh; do
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/box_token.sh cmd_agent_a2a_vouch.sh; do
   source "src/$f"
 done
 set +e
@@ -105,7 +105,7 @@ rm -f "$TMP/status"
 
 # ── 4. no box token: not a managed box, nothing sent ──────────────────────────
 n0=$(nreq)
-( unset CONNECTORD_TOKEN; _partner_connectord_env() { printf '%s' "$TMP/no-such-env"; }; _a2a_vouch_post "$WANT" ); chk "no box token -> rc 3" 3 "$?"
+( unset CONNECTORD_TOKEN; _box_connectord_env() { printf '%s' "$TMP/no-such-env"; }; _a2a_vouch_post "$WANT" ); chk "no box token -> rc 3" 3 "$?"
 chk "...and nothing reached the endpoint" "$n0" "$(nreq)"
 
 # ── 5. the verb ───────────────────────────────────────────────────────────────

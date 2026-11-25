@@ -62,8 +62,8 @@ EOF
 chmod +x "$FAKE"/*
 export PATH="$FAKE:$PATH" CALLS
 export FIVEDIVE_SELF_BIN="$FAKE/5dive" CONNECTORD_TOKEN="box-token-fixture"
-_partner_box_token() { printf '%s' "$CONNECTORD_TOKEN"; }
-_partner_api_base() { printf 'https://api.example.test'; }
+_box_token() { printf '%s' "$CONNECTORD_TOKEN"; }
+_box_api_base() { printf 'https://api.example.test'; }
 RUNNING=1
 _helper_running() { (( RUNNING )); }
 # The app rail: one line per post into $CALLS. FAKE_POST_CODE answers a plain

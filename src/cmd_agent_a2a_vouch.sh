@@ -51,11 +51,11 @@ _A2A_VOUCH_HTTP=""; _A2A_VOUCH_ADDED=""
 _a2a_vouch_post() {
   local did="$1" tok="" trc=0 out="" body
   _A2A_VOUCH_HTTP=""; _A2A_VOUCH_ADDED=""
-  tok=$(_partner_box_token) || trc=$?
+  tok=$(_box_token) || trc=$?
   (( trc == 0 )) || { _A2A_VOUCH_HTTP="no-token"; return 3; }
   body=$(jq -cn --arg d "$did" '{did:$d}')
   out=$(printf 'Authorization: Bearer %s\n' "$tok" \
-          | curl -sS --max-time "${FIVE_A2A_VOUCH_TIMEOUT:-20}" -X POST "$(_partner_api_base)/server/a2a/vouch" -H @- \
+          | curl -sS --max-time "${FIVE_A2A_VOUCH_TIMEOUT:-20}" -X POST "$(_box_api_base)/server/a2a/vouch" -H @- \
               -H 'Content-Type: application/json' --data-binary "$body" \
               -w '\n%{http_code}' 2>/dev/null) || true
   _A2A_VOUCH_HTTP="${out##*$'\n'}"

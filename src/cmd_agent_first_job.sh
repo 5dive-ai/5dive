@@ -215,9 +215,9 @@ _first_job_post() { # <path> <body> → 0 2xx · 2 refused (4xx) · 1 not reache
   local path="$1" body="$2" tok="" trc=0 url http="" i=0
   local -a pauses=()
   read -r -a pauses <<<"${FIRST_JOB_POST_BACKOFF:-5 20}"
-  tok=$(_partner_box_token) || trc=$?
+  tok=$(_box_token) || trc=$?
   (( trc == 0 )) || { _FJ_HTTP="no-token"; return 1; }
-  url="$(_partner_api_base)$path"
+  url="$(_box_api_base)$path"
   while :; do
     # The bearer goes in on STDIN (`-H @-`), never argv — DIVE-5168's rule.
     http=$(printf 'Authorization: Bearer %s\n' "$tok" \

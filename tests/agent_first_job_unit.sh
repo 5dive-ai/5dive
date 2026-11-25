@@ -47,7 +47,7 @@ export STATE_DIR="$TMP/state" AGENT_HOME_ROOT="$TMP/home"
 export TASKS_DIR="$TMP/state/tasks" TASKS_DB="$TMP/state/tasks/tasks.db"
 mkdir -p "$STATE_DIR" "$TASKS_DIR" "$AGENT_HOME_ROOT/agent-ada" "$AGENT_HOME_ROOT/agent-bob" "$TMP/bin"
 # shellcheck disable=SC1090
-for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/tasks_db.sh cmd_partner.sh cmd_agent_first_job.sh; do
+for f in header.sh lib/error_codes.sh lib/output.sh lib/validation.sh lib/tasks_db.sh lib/box_token.sh cmd_agent_first_job.sh; do
   # shellcheck source=/dev/null
   source "src/$f"
 done
