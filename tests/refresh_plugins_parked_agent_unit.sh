@@ -299,6 +299,14 @@ bounced katya && ok_t "U7 an explicit null desiredState restarts" \
 # exits at step=init first). The seat is one the script created a moment earlier
 # with `5dive init` inside a throwaway CI container, so there is no park to honour.
 #
+# `src/cmd_onboarder.sh` (DIVE-9253, DIVE-9254) is GUARDED: `onboarder box wake`
+# and the minute `onboarder box tick` start a firm's seat on a visitor's message,
+# with no operator in the loop, so `_onboarder_start` reads the registry
+# desiredState first and leaves a seat the operator stopped down (wake says so
+# and fails), and tick neither starts nor removes it —
+# tests/dive9254_onboarder_door_unit.sh P arms. It stops no seat: a seat quiet
+# 2 h is REMOVED (the firm's files stay), and the next visit adopts a fresh one.
+#
 # A1 asserts the inventory is EXACT in both directions. A new restart path
 # anywhere in the repo turns it red — because what DIVE-4033 shipped was not a
 # wrong verdict, it was a file nobody looked at.
@@ -310,6 +318,7 @@ declare -A RESTART_PATHS=(
   [src/cmd_host.sh]=GUARDED
   [src/cmd_agent_switch.sh]=GUARDED
   [src/cmd_account_custom.sh]=GUARDED
+  [src/cmd_onboarder.sh]=GUARDED
   [src/cmd_doctor.sh]=CANNOT-RESURRECT
   [scripts/init-smoke.sh]=CANNOT-RESURRECT
   [src/cmd_agent_lifecycle.sh]=OPERATOR-VERB

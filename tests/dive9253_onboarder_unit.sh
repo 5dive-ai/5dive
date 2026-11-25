@@ -10,8 +10,9 @@
 #   L5 the inner shell exports DASHBOARD_ONBOARDER=1 for the plugin (lock 2)
 #   W1 write_agent_env stamps AGENT_ONBOARDER=1 and keeps it across a rewrite
 #   B* the brief: public facts only (fields, email, phone, contact)
-# The verbs (box create/rm/ls/wake/tick and the client add/rm/ls/mark) moved
-# to tests/dive9254_onboarder_door_unit.sh with DIVE-9254.
+# The verbs (box create/rm/ls/wake/tick, client add/rm/ls/mark) and their
+# parked-seat and shell-injection arms moved to
+# tests/dive9254_onboarder_door_unit.sh with DIVE-9254.
 #
 # Run: bash tests/dive9253_onboarder_unit.sh (no root, no network).
 set -uo pipefail
@@ -51,7 +52,7 @@ t 'L1 ...dashboard is the one channel' "plugin:dashboard@5dive-plugins" "$(sed -
 t 'L1 ...the skip-permissions, autonomy text and Chrome args are gone' 0 "$(grep -c -e skip-permissions -e 'AUTONOMY MODE' -e '^--chrome$' -e telegram <<<"$out")"
 t 'L1 ...no resume of an older session' 'RESUME=' "$(grep '^RESUME=' <<<"$out")"
 t 'L5 the inner shell exports DASHBOARD_ONBOARDER=1' 'OVERRIDE=export DASHBOARD_ONBOARDER=1; ' "$(grep '^OVERRIDE=' <<<"$out")"
-t 'L5 ...and INNER carries it' 1 "$(grep -c '^INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${ONBOARDER_OVERRIDE}' bin/5dive-agent-start)"
+t 'L5 ...and INNER carries it, after STAGE_GUARD' 1 "$(grep -c '^INNER="unset CLAUDE_CONFIG_DIR ${UNSET_CREDS}; ${STAGE_GUARD}${ONBOARDER_OVERRIDE}' bin/5dive-agent-start)"
 t 'L5 the block sits after every ARGS+= and before CMD_STR' yes "$(
   b=$(grep -n '^# DIVE-9253: an onboarder seat\. An outsider' bin/5dive-agent-start | cut -d: -f1)
   c=$(grep -n "^CMD_STR=\$(printf '%q ' \"\$BIN\" \"\${ARGS\[@\]}\")" bin/5dive-agent-start | cut -d: -f1)
@@ -79,16 +80,16 @@ _ONBOARDER_OVERRIDE='' write_agent_env onb-acme claude dashboard "" "" sandboxed
 t 'W1 ...an unrelated rewrite keeps it' 1 "$(grep -cx 'AGENT_ONBOARDER=1' "$ENV_DIR/onb-acme.env")"
 write_agent_env theo claude telegram
 t 'W1 ...an ordinary seat never gets it' 0 "$(grep -c ONBOARDER "$ENV_DIR/theo.env")"
+_stopped_blk=$(awk '/DIVE-9253: an onboarder seat is created STOPPED/,/^  fi$/' src/cmd_agent_create.sh)
 t 'W1 create leaves a _CREATE_STOPPED seat stopped and not enabled' yes "$(
-  awk '/DIVE-9253: an onboarder seat is created STOPPED/,/^  fi$/' src/cmd_agent_create.sh \
-    | grep -q 'if \[\[ "${_CREATE_STOPPED:-}" == 1 \]\]; then' && echo yes || echo no)"
+  grep -q 'if \[\[ "${_CREATE_STOPPED:-}" == 1 \]\]; then' <<<"$_stopped_blk" && echo yes || echo no)"
 
 # --- the verb, sourced with stubs ----------------------------------------------------
 LOG="$TMP/calls.log"; : > "$LOG"
 fail() { echo "FAIL[$1] ${*:2}" >&2; exit "$1"; }
 step() { :; }; warn() { :; }
 require_root() { :; }
-E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_GENERIC=1
+E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_CONFLICT=5 E_GENERIC=1
 JSON_MODE=0
 REG='{"agents":{}}'
 registry_read() { printf '%s' "$REG"; }

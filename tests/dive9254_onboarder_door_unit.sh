@@ -8,6 +8,7 @@
 #      instructions + "## The chat so far"; an empty pool makes a locked seat
 #   T* box tick removes a seat quiet 2 h, starts one with a queued message, refills
 #      the warm pool one seat per tick, never two ticks at once
+#   P* a seat the operator stopped (desiredState=stopped) is neither started nor removed
 #   L/R box ls --json (with facts) and box rm
 #   A* client add: contact.email stays in sqlite, never in the POST; bearer on stdin
 #   S* client ls writes counts, marks a vanished slug removed; rm; mark
@@ -33,7 +34,7 @@ ex() { [[ -e "$1" ]] && echo yes || echo no; }
 LOG="$TMP/calls.log"; : > "$LOG"
 fail() { echo "FAIL[$1] ${*:2}" >&2; exit "$1"; }
 step() { :; }; warn() { :; }; require_root() { :; }; lazy_need() { :; }
-E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_GENERIC=1 E_PERMISSION=6
+E_USAGE=2 E_VALIDATION=3 E_NOT_FOUND=4 E_CONFLICT=5 E_GENERIC=1 E_PERMISSION=6
 JSON_MODE=0
 REGF="$TMP/registry.json"; echo '{"agents":{}}' > "$REGF"
 registry_read() { cat "$REGF"; }
@@ -100,6 +101,11 @@ t 'C2 the minute timer runs box tick' 1 "$(grep -c '^\* \* \* \* \* root /usr/lo
 (echo '{"brief":{"firm":"Beta","domains":["beta.example"]}}' | cmd_onboarder_box create beta >/dev/null 2>&1)
 t 'C3 no instructions: the generated rules + fact sheet + brief' 2 "$(grep -c -e "^# You are 5dive's AI assistant for Beta" -e '5dive runs a team of AI agents' "$TMP/state/beta/instructions.md")"
 t 'C4 a brief with an email is refused, nothing stored' "3 no" "$( (echo '{"brief":{"firm":"O","domains":["o.com"],"facts":["user@example.com"]}}' | cmd_onboarder_box create other) >/dev/null 2>&1; echo "$? $(ex "$TMP/state/other.json")")"
+# The firm name and the fact sheet are data: shell in them is written, never run.
+inj_sheet="$TMP/inj-sheet.md"; printf 'Price: $(touch %s/pwned-sheet) `id`\n' "$TMP" > "$inj_sheet"
+inj_md=$(_onboarder_claude_md '{"firm":"Evil $(touch '"$TMP"'/pwned-firm) `id` ${HOME}","domains":["e.com"],"band":"%s Team"}' "$inj_sheet")
+t 'C5 shell in the firm name or fact sheet never runs' no "$([[ -e "$TMP/pwned-firm" || -e "$TMP/pwned-sheet" ]] && echo yes || echo no)"
+t 'C5 ...and lands in the instructions verbatim' 3 "$(grep -cF -e '# You are 5dive'"'"'s AI assistant for Evil $(touch' -e 'Price: $(touch' -e 'the %s Team plan is already picked' <<<"$inj_md")"
 
 # --- L: box ls -----------------------------------------------------------------------------------
 t 'L1 box ls --json: no agent yet, facts carried' '{"slug":"acme","firm":"Acme Law","domains":["example.com"],"band":"Team","setup":"cloud","facts":["120 lawyers"],"agent":null,"running":false}' \
@@ -157,6 +163,16 @@ touch -d '-121 minutes' "$TMP/state/beta.active" "$inbox/1.json" "$inbox"
 : > "$LOG"; cmd_onboarder_box tick 2>/dev/null
 t 'T5 a stopped seat with a queued message is started, not removed' "1 0" "$(grep -c "systemctl start 5dive-agent@$b.service" "$LOG") $(grep -c '^rm ' "$LOG")"
 
+# --- P: a seat the operator stopped stays down (refresh_plugins_parked_agent_unit A1) ---------
+park() { jq --arg n "$1" --arg d "$2" '.agents[$n].desiredState = $d' "$REGF" > "$REGF.n" && mv "$REGF.n" "$REGF"; }
+park "$b" stopped; touch -d '-121 minutes' "$TMP/state/beta.active"
+: > "$LOG"; cmd_onboarder_box tick 2>/dev/null
+t 'P1 tick neither starts nor removes a parked seat' "0 0" "$(grep -c "systemctl start 5dive-agent@$b" "$LOG") $(grep -c "^rm $b" "$LOG")"
+: > "$LOG"
+t 'P2 wake on a parked seat fails as a conflict and starts nothing' "5 0" "$( (cmd_onboarder_box wake beta </dev/null) >/dev/null 2>&1; echo $?) $(grep -c 'systemctl start' "$LOG")"
+park "$b" running; : > "$LOG"; cmd_onboarder_box tick 2>/dev/null
+t 'P3 once the operator starts it again, a queued message wakes it' 1 "$(grep -c "systemctl start 5dive-agent@$b.service" "$LOG")"
+
 # --- R: box rm -------------------------------------------------------------------------------------------
 : > "$LOG"; out=$(cmd_onboarder_box rm beta --json)
 t 'R1 box rm answers {ok,slug,removed}' '{"ok":true,"slug":"beta","removed":true}' "$out"
@@ -200,7 +216,7 @@ CURL_BODY='{"onboarders":[{"slug":"acme","firm":"Acme Law","domains":["example.c
 out=$(cmd_onboarder ls --json)
 t 'S1 ls writes the counts and awake' '[3,2,7,1,0,"awake"]' "$(jq -c '.[] | select(.slug == "acme") | [.opened,.joined,.messages,.buy_clicked,.bought,.agent_status]' <<<"$out")"
 t 'S1 ...a slug 5dive no longer has is removed' '"removed"' "$(jq -c '.[] | select(.slug == "old") | .agent_status' <<<"$out")"
-t 'S1 ...counts_at is stamped' yes "$(jq -r '.[] | select(.slug == "acme") | .counts_at' <<<"$out" | grep -q '^20' && echo yes || echo no)"
+t 'S1 ...counts_at is stamped' yes "$(ca=$(jq -r '.[] | select(.slug == "acme") | .counts_at' <<<"$out"); grep -q '^20' <<<"$ca" && echo yes || echo no)"
 out=$(cmd_onboarder ls)
 t 'S2 the table: slug, firm, counts, status, sent' yes "$(grep -Eq '^acme +Acme Law +3 +2 +7 +1 +0 +awake +-$' <<<"$out" && echo yes || echo no)"
 CURL_BODY='{"onboarders":[{"slug":"acme","firm":"Acme Law","agent":null,"running":false,"counts":{"opened":3,"joined":2,"messages":7,"buyClicked":1,"bought":1}}]}'
