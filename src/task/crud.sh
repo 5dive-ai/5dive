@@ -619,7 +619,8 @@ cmd_task_add() {
 REFUSED TITLE (recorded in policy_refusals, not lost): ${title}
 This is a budget on NEW ROWS, not on noticing things. Put it where it already has context:
   · a finding on work you are doing  →  append it to the BODY of the row you found it on
-  · durable, reusable knowledge      →  your team's notes or wiki, not the board
+  · durable, reusable knowledge      →  your team's notes or wiki, not the board; a plain
+    fact from this session needs no row, 5dive memory consolidate already keeps it
   · someone must ACT and it is serious →  --priority=high (high and urgent are never capped)
 There is no bypass flag. If it is serious enough to need one, it is serious enough to be high."
       fi
