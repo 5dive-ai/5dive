@@ -17,6 +17,7 @@
 #      with `task done --empty`. ${_LOOP_EMPTY_TELL_AT} empty runs in a row, on a
 #      loop that messages its owner, send the owner ONE plain line from that
 #      seat's own bot. A run with something in it resets the count.
+#      Proactive check-ins are exempt: their quiet is the designed result (DIVE-9261).
 #   3. WEEKLY SELF-IMPROVING. Owner-facing loops get DIVE-8692's improver once a
 #      week instead of after every run: one model turn reads the week's runs and
 #      makes at most ONE change, which may only merge or drop a line, never grow
@@ -91,7 +92,10 @@ _loop_heal_retry() {  # <run id> <template id> <template ident>
 # Called by _loop_score_request for a run that closed done.
 _loop_heal_empty_tick() {  # <template id> <template ident> <run ident>
   local tid="$1" tident="$2" rident="$3" st n ttitle seat text told=0
-  if [[ -z "$(_loop_pref_get "loop.empty.run.${rident}")" ]]; then
+  # DIVE-9261: a proactive check-in that sent nothing did its job ("a quiet day
+  # is a good day"), so quiet runs never build a "may be broken" streak. Its
+  # signal is the owner's reaction score; retry and the weekly turn still run.
+  if [[ -z "$(_loop_pref_get "loop.empty.run.${rident}")" || -n "$(_loop_pref_get "proactive.tpl.${tident}")" ]]; then
     # Something for the owner: the streak is over.
     _loop_pref_del "loop.empty.${tident}"; return 0
   fi
