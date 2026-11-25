@@ -7,6 +7,8 @@
 #   E. people get an email: invite stores it, PUT .../email sets/clears, 409 on a clash.
 #   G. signIn: a Team-list email admits (200 HTML hop + cookie), unknown is refused,
 #      allowNew makes a member with no agents, a REMOVED person's email never signs in.
+#   I. an invited email (not yet joined) signs in: the invite is spent with its role and
+#      agents, in team and domain mode; expired invites do not; no duplicate after.
 #   A. /api/proxy/signin/*: 401 signed out, 403 member, owner reaches admin.
 #   T. signIn counts against the code-try budget.
 #   L. no module / no app / a module that throws on import: feature absent, server up.
@@ -68,14 +70,19 @@ OWNER_CODE=ABCD2345
 LC_STATE="$STATE" "$BUN" "$T/server.ts" admin pair-add "$(printf %s "$OWNER_CODE" | sha256sum | cut -d' ' -f1)" "$(( $(date +%s) + 600 ))" owner Boss >/dev/null
 
 LAN=$((20000 + RANDOM % 20000)); LOOP=$((LAN + 1))
-LC_STATE="$STATE" LC_LAN_ADDR=127.0.0.1 LC_LAN_PORT=$LAN LC_LOOP_PORT=$LOOP LC_CERT="$T/cert.pem" LC_KEY="$T/key.pem" \
-  LC_TOKEN_FILE="$T/connectord.env" LC_AGENTS_FILE="$T/agents.json" LC_UPLOADS="$T/uploads" LC_PANEL_SOCK="$T/none.sock" \
-  LC_APP_DIR="$T/apps/current" "$BUN" "$T/server.ts" serve >"$T/server.log" 2>&1 & SRV_PID=$!
-for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$LOOP/" && break; sleep 0.1; done
+# A restart keeps the db and resets the in-memory code-try budget (10 a minute).
+start_srv(){
+  LC_STATE="$STATE" LC_LAN_ADDR=127.0.0.1 LC_LAN_PORT=$LAN LC_LOOP_PORT=$LOOP LC_CERT="$T/cert.pem" LC_KEY="$T/key.pem" \
+    LC_TOKEN_FILE="$T/connectord.env" LC_AGENTS_FILE="$T/agents.json" LC_UPLOADS="$T/uploads" LC_PANEL_SOCK="$T/none.sock" \
+    LC_APP_DIR="$T/apps/current" "$BUN" "$T/server.ts" serve >>"$T/server.log" 2>&1 & SRV_PID=$!
+  for _ in $(seq 1 50); do curl -s -o /dev/null "http://127.0.0.1:$LOOP/" && break; sleep 0.1; done
+}
+start_srv
 
 W="https://127.0.0.1:$LAN"; X="$W/api/proxy"
 as_(){ local j="$1"; shift; curl -sSk -b "$T/$j" -c "$T/$j" -H "origin: $W" -H 'content-type: application/json' "$@"; }
 code_(){ local j="$1"; shift; curl -sk -o /dev/null -w '%{http_code}' -b "$T/$j" -c "$T/$j" -H "origin: $W" -H 'content-type: application/json' "$@"; }
+sqlw(){ "$BUN" -e 'import { Database } from "bun:sqlite"; const d = new Database(process.argv[1]); d.query(process.argv[2]).run(...process.argv.slice(3));' "$STATE/chat.db" "$@"; }
 sql(){ "$BUN" -e 'import { Database } from "bun:sqlite"; const d = new Database(process.argv[1], { readonly: true }); console.log(d.query(process.argv[2]).all(...process.argv.slice(3)).map((r) => Object.values(r).join("|")).join("\n"));' "$STATE/chat.db" "$@"; }
 as_ boss -H 'x-local-chat: 1' -X POST -d "{\"code\":\"$OWNER_CODE\",\"name\":\"Boss\"}" "$W/api/pair" >/dev/null
 check 'S0 the owner is signed in' '[[ "$(as_ boss "$X/me" | jq -r .role)" == owner ]]'
@@ -128,6 +135,23 @@ check 'G4 allowNew:true makes a member with NO agents' '[[ "$(code_ sso2 "$W/sig
 as_ boss -X DELETE "$X/team/members/$LEO" >/dev/null
 check "G5 a REMOVED person's email is refused, even with allowNew:true" '[[ "$(code_ sso3 "$W/signin/fake/as?email=leo@example.com&new=1")" == 403 && "$(code_ sso3 "$X/me")" == 401 && "$(sql "SELECT COUNT(*) FROM people WHERE email = ?" leo@example.com)" == 1 ]]'
 check "G6 people(): the Team list's emails, the leaver marked removed" '[[ "$(curl -sk "$W/signin/fake/people" | jq -c "sort_by(.email)")" == "[{\"email\":\"leo@example.com\",\"removed\":true},{\"email\":\"mia@example.com\",\"removed\":false},{\"email\":\"newbie@example.com\",\"removed\":false}]" ]]'
+
+# ── I. an invited, not-yet-joined email signs in by work account ─────────────
+kill "$SRV_PID" 2>/dev/null; wait "$SRV_PID" 2>/dev/null; start_srv
+inv(){ as_ boss -X POST -d "{\"email\":\"$1\",\"agents\":$2}" "$X/team/invite"; }
+r=$(inv Ana@example.com '["alice"]'); ANA_ID=$(jq -r .id <<<"$r")
+check 'I1 team mode (allowNew:false): an invited email is admitted, as the invite made her (member, its agents)' '[[ "$(code_ sso4 "$W/signin/fake/as?email=ana@example.com")" == 200 && "$(as_ sso4 "$X/me" | jq -c "[.name,.role]")" == "[\"Ana\",\"member\"]" && "$(as_ sso4 "$X/team" | jq -c .agents)" == "[\"alice\"]" ]]'
+ANA=$(as_ sso4 "$X/me" | jq -r .id)
+check 'I1a ...the invite is spent: off the invited list, joined with her work email' '[[ "$(as_ boss "$X/team" | jq -c "[.members[] | select(.id == \"$ANA_ID\")] | length")" == 0 && "$(as_ boss "$X/team" | jq -c "[.members[] | select(.workEmail == \"ana@example.com\") | [.id,.state]]")" == "[[\"$ANA\",\"joined\"]]" && "$(sql "SELECT used FROM pair_codes WHERE email = ?" ana@example.com)" == 1 ]]'
+check 'I1b ...signing in again later is the same person, no second one' '[[ "$(code_ sso5 "$W/signin/fake/as?email=ana@example.com")" == 200 && "$(as_ sso5 "$X/me" | jq -r .id)" == "$ANA" && "$(sql "SELECT COUNT(*) FROM people WHERE email = ?" ana@example.com)" == 1 ]]'
+r=$(inv Ben@example.com '["bob"]'); TOKEN=$(jq -r .link <<<"$r"); TOKEN=${TOKEN#*#}
+check 'I2 domain mode (allowNew:true): the invite wins, one person carrying its agents' '[[ "$(code_ sso6 "$W/signin/fake/as?email=ben@example.com&new=1")" == 200 && "$(as_ sso6 "$X/team" | jq -c .agents)" == "[\"bob\"]" && "$(sql "SELECT COUNT(*) FROM people WHERE email = ?" ben@example.com)" == 1 ]]'
+check 'I2a ...opening the join link afterwards is refused and makes no duplicate' '[[ "$(code_ ben2 -X POST -d "{\"token\":\"$TOKEN\"}" "$X/team/accept")" == 404 && "$(sql "SELECT COUNT(*) FROM people WHERE email = ? OR name = ?" ben@example.com Ben)" == 1 && "$(as_ boss "$X/team" | jq "[.members[] | select(.name == \"Ben\")] | length")" == 1 ]]'
+inv Cy@example.com '["alice"]' >/dev/null
+sqlw "UPDATE pair_codes SET expires = ? WHERE email = ?" "$(( $(date +%s) - 10 ))" cy@example.com
+check 'I3 an EXPIRED email invite does not admit in team mode (the owner invites again)' '[[ "$(code_ x "$W/signin/fake/as?email=cy@example.com")" == 403 && "$(sql "SELECT COUNT(*) FROM people WHERE email = ?" cy@example.com)" == 0 ]]'
+inv leo@example.com '[]' >/dev/null
+check 'I4 a leaver the owner re-invites by email signs in as a NEW person; the removed one stays removed' '[[ "$(code_ sso7 "$W/signin/fake/as?email=leo@example.com")" == 200 && "$(as_ sso7 "$X/me" | jq -r .id)" != "$LEO" && "$(sql "SELECT COUNT(*) FROM people WHERE email = ? AND removed = 0" leo@example.com)" == 1 && "$(code_ leo "$X/me")" == 401 ]]'
 
 # ── A. the module's admin door ───────────────────────────────────────────────
 check 'A1 /api/proxy/signin/* signed out is 401' '[[ "$(code_ x "$X/signin/settings")" == 401 ]]'

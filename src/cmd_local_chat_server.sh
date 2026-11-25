@@ -1777,7 +1777,10 @@ function signinCtx(url: URL) {
   };
 }
 // "A trusted sign-in service says this person is <email>." Admits a new device
-// for that live person, or (allowNew, room left) a new member with NO agents.
+// for that live person; else spends an open invite that names this email
+// (the invite's role and agents, exactly as its join link would, and the link
+// is then used); else (allowNew, room left) a new member with NO agents.
+// An invite still lives INVITE_TTL: past it the owner invites again.
 function signIn(email: string, opts: { allowNew?: boolean; via?: string } = {}): Response | null {
   if (pairThrottled()) return json({ error: "too many tries, wait a minute" }, 429);
   const em = String(email ?? "").trim().toLowerCase();
@@ -1787,6 +1790,9 @@ function signIn(email: string, opts: { allowNew?: boolean; via?: string } = {}):
     const live = rows.find((r) => r.removed === 0);
     let person = live?.id ?? "", role: "owner" | "member" = live?.role ?? "member";
     if (!live) {
+      const invite = db.query("SELECT hash, role, name, person, agents, email FROM pair_codes WHERE email = ? AND person = '' AND used = 0 AND expires >= ? ORDER BY expires DESC LIMIT 1")
+        .get(em, now()) as CodeRow | null;
+      if (invite) return admitDevice(invite, "");
       if (rows.length || opts?.allowNew !== true || livePeople().length + inviteViews().length >= TEAM_MAX) return null;
       person = randomBytes(6).toString("hex");
       db.query("INSERT INTO people (id, name, role, created, email) VALUES (?, ?, 'member', ?, ?)").run(person, cleanName(String(email).trim().split("@")[0]) || "member", now(), em);
