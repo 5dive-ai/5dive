@@ -177,7 +177,7 @@ grep -qE -- '--type=decision\|approval\|secret\|manual[^;]*--recommend' src/cmd_
 # PART 3 — the budget. This is the arm that reds when prose creeps back in.
 # =============================================================================
 # Ceilings are set just above the measured post-change sizes (base 890, typical
-# 1363, knowledge 1785 bytes on 2026-09-13 — scripts/dispatch-bytes.sh prints
+# 1363, knowledge 1785 bytes on 2026-09-13 — the devteam plugin's scripts/dispatch-bytes.sh prints
 # them). They are a TRIPWIRE, not a target: a legitimate growth moves the number
 # here deliberately, with the reason in the commit.
 base_bytes=$(printf '%s' "$(_hb_nudge_text dev "$P" "DIVE-$P")" 2>/dev/null | wc -c)
