@@ -2025,6 +2025,11 @@ inject_and_submit() {
   [[ "${_WAKE_VOUCH:-0}" == "1" && -n "$(_hb_claude_pid "$name")" ]] && _wake_split "$payload"
   local -a _parts=("$_WAKE_BODY"); local _pi
   [[ -n "$_WAKE_HEAD" ]] && _parts=("$_WAKE_HEAD" "$_WAKE_BODY")
+  # DIVE-9373: mark the seat's newest transcript (path + bytes) BEFORE the
+  # payload keystroke, so an unconfirmed submit below can ask the transcript —
+  # the second witness — whether THIS payload landed anyway. Never fails the send.
+  _AGENT_SEND_LANDED=""
+  _hb_landed_mark "$name"
   for _pi in "${!_parts[@]}"; do
     (( _pi == 0 )) || sleep "${_WAKE_TYPED_GAP_SEC:-0.3}"
     sudo -u "$user" tmux send-keys -t "agent-${name}" -l -- "${_parts[_pi]}"
@@ -2059,6 +2064,19 @@ inject_and_submit() {
   sleep "${_HB_SUBMIT_RETRY_SEC:-0.5}"
   sudo -u "$user" tmux send-keys -t "agent-${name}" Enter
   _hb_submit_settled "$name" && { _wedge_clear "$name"; return 0; }
+  # DIVE-9373: the pane is ONE witness, and it misfires. Measured 2026-11-26 on a
+  # box: `agent send` exited 12 at 03:18:06Z while the target's transcript opened
+  # with that exact message at 03:18:05.290Z and the run went ahead — so an
+  # exit-code caller re-sends and the seat runs the job twice. Before calling
+  # this a miss, ask the transcript. Checked BEFORE the residual handling below,
+  # so a composer clear cannot run against a message that landed and the wedge
+  # mark is only ever written for a real miss. A longer settle timer would only
+  # move the race (the message landed 1 s before the verdict).
+  if _agent_send_landed "$name" "$payload"; then
+    step "the pane did not confirm the submit, but the seat's transcript shows it landed: ${_AGENT_SEND_LANDED} (DIVE-9373)"
+    _wedge_clear "$name"
+    return 0
+  fi
   # DIVE-4642 — THE SECOND TYPED-SEND SITE OWES THE SAME TWO THINGS. A composer
   # -hygiene claim is graded per SITE (the DIVE-4246 addendum), and the symptom
   # cannot enumerate them: the pane looks identical either way. This site is left
@@ -2071,6 +2089,56 @@ inject_and_submit() {
   _wedge_mark "$name" "${#_ias_left}" "$_ias_left" "residual"
   if _hb_composer_clear "$name"; then _wedge_mark "$name" "${#_ias_left}" "$_ias_left" "cleared"; fi
   return 1
+}
+
+# DIVE-9373 — did THIS payload land, whatever the pane said? 0 = yes, with the
+# evidence in _AGENT_SEND_LANDED; 1 = no, or could not tell (never a guess).
+# Two receipts, both keyed on the payload's own text (DIVE-4279's needle), never
+# on "some user record appeared":
+#   1. same transcript, grown since the mark, with a non-tool_result user record
+#      carrying the payload — `_hb_landed_check`, the heartbeat's own receipt;
+#   2. the session ROTATED and the NEW file's first real user record (meta and
+#      /clear records skipped) carries the payload: the payload is what opened
+#      that session. The box report's transcript "opens with that exact message",
+#      which receipt 1 reads as not-landed by design (a new file is a new
+#      session). A new file that opens with anything else — a /clear followed by
+#      nothing, a restart, another message, the payload only quoted in a
+#      tool_result — is not this receipt and stays a miss (exit 12).
+# No mark (unreadable store, no transcript yet) = cannot tell = rc 1.
+_AGENT_SEND_LANDED=""
+_agent_send_landed() {
+  local name="$1" text="$2" needle now_file mark_file first="" i tries="${_AGENT_SEND_LANDED_TRIES:-3}"
+  _AGENT_SEND_LANDED=""
+  declare -F _hb_landed_check >/dev/null 2>&1 || return 1
+  # Read the mark through cmd_heartbeat's accessors, never its globals by name:
+  # a cross-module variable read is a load-time dependency edge in the lazy
+  # bundle, and this one pulled the heartbeat cluster into every verb (DIVE-9373).
+  mark_file=$(_hb_landed_file)
+  [[ -n "$mark_file" ]] || return 1
+  # _hb_landed_check logs in heartbeat words ("counting the wake…"); this verb
+  # prints its own line, so its log is not part of this command's output.
+  if _hb_landed_check "$name" "$text" 2>/dev/null; then
+    _AGENT_SEND_LANDED=$(_hb_landed_evidence)
+    return 0
+  fi
+  needle=$(_hb_landed_needle "$text") || return 1
+  # The new file's first record can trail its creation by a beat (as in
+  # DIVE-8269's /clear receipt): retry while it is empty, never once it is not.
+  for (( i = 0; i < tries; i++ )); do
+    (( i > 0 )) && sleep "${_AGENT_SEND_LANDED_SEC:-0.5}"
+    now_file=$(_hb_transcript_newest "$name")
+    [[ -n "$now_file" && "$now_file" != "$mark_file" ]] || return 1
+    first=$(sudo -n -u "agent-${name}" head -n "${_AGENT_SEND_LANDED_LINES:-40}" "$now_file" 2>/dev/null \
+      | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
+      | grep -av -e '"isMeta"[[:space:]]*:[[:space:]]*true' \
+                 -e '"type"[[:space:]]*:[[:space:]]*"tool_result"' -e '"tool_use_id"' \
+                 -e '<command-name>/clear</command-name>' \
+      | head -n 1) || first=""
+    [[ -n "$first" ]] && break
+  done
+  [[ -n "$first" && "$first" == *"$needle"* ]] || return 1
+  _AGENT_SEND_LANDED="the session rotated to $(basename "$now_file") (was $(basename "$mark_file")) and its first user record carries this payload ('${needle:0:40}')"
+  return 0
 }
 
 # rc=1 from inject_and_submit means the payload was typed, but the pane still
