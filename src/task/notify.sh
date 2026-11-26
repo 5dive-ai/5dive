@@ -757,6 +757,11 @@ _task_gate_bot_token() { # <agent-name> -> token on stdout
   if [[ -n "$name" && "$name" != "none" ]]; then
     f="${CONNECTORS_DIR}/telegram-${name}.env"
     [[ -r "$f" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$f" | head -1)
+    # DIVE-9345: present but unreadable is <name>'s bot, not ours. Falling back to
+    # the caller's own env token would edit a message id in the WRONG bot's id
+    # space, read "not found" and mark a still-live card gone. Return empty so the
+    # caller hands the card to root instead.
+    [[ -z "$token" && -e "$f" && ! -r "$f" ]] && return 0
   fi
   [[ -n "$token" ]] || token="${TELEGRAM_BOT_TOKEN:-}"
   printf '%s' "$token"
@@ -972,13 +977,26 @@ _task_gate_card_apply() { # <ident> <mode: die|settle> <why> [answered_by]
     return 0
   fi
   local cid chat mid via token resp ok desc result detail newstate text
+  local -a _root_cards=()
   while IFS=$'\t' read -r cid chat mid via; do
     [[ -n "$cid" && -n "$chat" && -n "$mid" ]] || continue
     token=$(_task_gate_bot_token "$via")
+    if [[ -z "$token" ]] && ! _gate_is_root && _task_gate_via_present "$via"; then
+      # DIVE-9345: AN UNREADABLE TOKEN IS NOT A TORN-DOWN AGENT. The connector
+      # file is root:claude-keys 0640, readable by the delivering seat and admin
+      # seats only, so a standard seat that closes a gate delivered on another
+      # seat's bot lands here with the bot alive and well. Marking that 'orphaned'
+      # was terminal — nothing ever picks an orphan up again — so the card stayed
+      # live in the owner's chat forever. Leave it live and hand it to root, once
+      # for the whole task, after this loop.
+      _root_cards+=("$cid")
+      continue
+    fi
     if [[ -z "$token" ]]; then
-      # The delivering agent was torn down, so NOBODY can edit this card. That is
-      # an orphan, and it is reported — a live-looking phantom nobody names is the
-      # defect this ticket exists to remove.
+      # The delivering agent was torn down (or root itself finds no token for its
+      # bot), so NOBODY can edit this card. That is an orphan, and it is reported
+      # — a live-looking phantom nobody names is the defect this ticket exists to
+      # remove.
       db "UPDATE gate_cards SET state='orphaned', updated_at=datetime('now'),
            last_error='no bot token for delivering agent ${via}' WHERE id=${cid};" >/dev/null 2>&1 || true
       _task_store_audit_log "gate card retire" "error" 1 -- \
@@ -1037,7 +1055,101 @@ _task_gate_card_apply() { # <ident> <mode: die|settle> <why> [answered_by]
       "mode=$mode" "why=$why" "detail=${detail:-unconfirmed Bot API call}" || true
     [[ "$result" == "ok" ]] || warn "$ident: could not retire the gate card on message $mid in chat $chat (${detail}) — it may still read as a live gate there."
   done <<<"$rows"
+  (( ${#_root_cards[@]} )) && _task_gate_card_handoff "$ident" "$mode" "$why" "${_root_cards[@]}"
   return 0
+}
+
+# DIVE-9345: does the seat that carried a card still exist? Asked only when its
+# token came back empty, to tell "torn down" (orphan, nobody can edit it) from
+# "alive, but this uid may not read its token" (root can). Either signal counts:
+# the connector file is still there (present-but-unreadable is the forbidden
+# case, not the absent one), or the seat's user still exists. `claude` is the
+# one seat whose user carries no agent- prefix.
+_task_gate_via_present() { # <agent-name>
+  local name="${1:-}"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || return 1
+  [[ -e "${CONNECTORS_DIR}/telegram-${name}.env" ]] && return 0
+  id -u "agent-${name}" >/dev/null 2>&1 && return 0
+  [[ "$name" == "claude" ]] && id -u claude >/dev/null 2>&1 && return 0
+  return 1
+}
+
+# DIVE-9345: run the retire for <ident> from the root side. Same shape as the
+# DIVE-7128 secret-link send: exact installed path, no args, the request on
+# stdin, the seat derived from SUDO_UID there. The cards stay 'live' whatever
+# happens here, so a failed hand-off is still retirable by a later pass —
+# 'orphaned' is reserved for a bot that is really gone.
+_task_gate_card_root_retire() { # <ident> <mode> <why>  (seam: harnesses override)
+  command -v sudo >/dev/null 2>&1 || { printf 'sudo is not installed'; return 1; }
+  local cli=/usr/local/bin/5dive
+  [[ -x "$cli" ]] || { printf '%s is not installed' "$cli"; return 1; }
+  printf '%s\n%s\n%s\n' "$1" "$2" "$3" | sudo -n "$cli" _gate_card_retire 2>&1 >/dev/null
+}
+
+_task_gate_card_handoff() { # <ident> <mode> <why> <card-id>...
+  local ident="$1" mode="$2" why="$3"; shift 3
+  local err="" rc=0 cid
+  err=$(_task_gate_card_root_retire "$ident" "$mode" "$why") || rc=$?
+  err="${err//$'\n'/ }"; err="${err:0:300}"
+  if (( rc == 0 )); then
+    _task_store_audit_log "gate card retire" "ok" 0 -- "task=$ident" "mode=$mode" \
+      "path=privileged-retire" "cards=$*" "detail=handed to the root side (delivering bot's token unreadable here)" || true
+    return 0
+  fi
+  for cid in "$@"; do
+    db "UPDATE gate_cards SET updated_at=datetime('now'),
+         last_error=$(sqlq "token unreadable here; root retire failed: ${err:-rc=$rc}") WHERE id=${cid};" >/dev/null 2>&1 || true
+  done
+  _task_store_audit_log "gate card retire" "error" 1 -- "task=$ident" "mode=$mode" \
+    "path=privileged-retire" "cards=$*" "detail=root retire failed (${err:-rc=$rc}); card left live, not orphaned" || true
+  warn "$ident: its gate card went out on another seat's bot and the root-side retire failed (${err:-rc=$rc}) — it is still showing in the owner's chat."
+  return 0
+}
+
+# DIVE-9345: `5dive _gate_card_retire` — internal, root-only, reached by a
+# standard seat through its exact-path NOPASSWD line. stdin: ident, mode
+# (die|settle), why. It edits nothing a seat names: the messages come from the
+# gate's own gate_cards rows, the receipt text from the task row. A seat may
+# retire a gate's cards once the gate is closed, or while it is open only if it
+# filed it (the re-file path retires the old card before writing the new gate).
+# `settle` needs a human answer on the row and takes the answerer from the row.
+cmd_gate_card_retire_delegated() {
+  _gate_is_root || fail "$E_PERMISSION" "_gate_card_retire is a privileged internal primitive (reachable only through the exact-path NOPASSWD grant)."
+  [[ $# -eq 0 ]] || fail "$E_USAGE" "_gate_card_retire takes no arguments (the request is read from stdin, the seat from the sudo caller)."
+  local ruid="${SUDO_UID:-}" seat ident="" mode="" why=""
+  [[ "$ruid" =~ ^[0-9]+$ && "$ruid" != 0 ]] \
+    || fail "$E_AUTH_REQUIRED" "_gate_card_retire requires sudo from an agent seat."
+  seat=$(_gate_uid_to_agent "$ruid")
+  [[ -n "$seat" ]] || fail "$E_AUTH_REQUIRED" "_gate_card_retire caller uid ${ruid} is not an agent seat."
+  IFS= read -r ident || true
+  IFS= read -r mode || true
+  IFS= read -r why || true
+  [[ "$ident" =~ ^[A-Za-z]+-[0-9]+$ ]] || fail "$E_VALIDATION" "_gate_card_retire: expected a task ident on stdin."
+  [[ "$mode" == "die" || "$mode" == "settle" ]] || fail "$E_VALIDATION" "_gate_card_retire: mode must be die or settle."
+  # The reason is shown in the owner's chat on a struck card: printable, short.
+  why="${why//[^[:print:]]/}"; why="${why:0:160}"
+  ident="${ident^^}"
+  tasks_db_init
+  local row
+  row=$(db "SELECT CASE WHEN need_type IS NOT NULL AND need_answered_at IS NULL
+                          AND status NOT IN ('done','cancelled') THEN 1 ELSE 0 END||x'1f'||
+                   COALESCE(NULLIF(gate_filed_by,''),NULLIF(created_by,''),assignee,'')||x'1f'||
+                   COALESCE(need_answered_by,'')
+            FROM tasks WHERE ident=$(sqlq "$ident") LIMIT 1;" 2>/dev/null) || row=""
+  [[ -n "$row" ]] || fail "$E_NOT_FOUND" "no task $ident."
+  local open filer by
+  IFS=$'\x1f' read -r open filer by <<<"$row"
+  if [[ "$open" == "1" && "$filer" != "$seat" ]]; then
+    _task_store_audit_log "gate card retire" refused 1 -- "task=$ident" "seat=$seat" "detail=gate still open and filed by ${filer:-nobody on record}" || true
+    fail "$E_PERMISSION" "$ident's gate is still open and was filed by ${filer:-nobody on record}, not ${seat}: its card stays."
+  fi
+  if [[ "$mode" == "settle" ]]; then
+    [[ "$by" == human:* ]] || fail "$E_CONFLICT" "$ident carries no human answer, so its card cannot become a receipt."
+  else
+    by=""
+  fi
+  _task_gate_card_apply "$ident" "$mode" "${why:-gate closed}" "$by"
+  printf 'retired %s\n' "$ident"
 }
 
 _task_gate_retire_buttons_legacy() { # <ident> <why>

@@ -641,6 +641,7 @@ classify_sudo_grant() {
         "/usr/local/bin/5dive _merge_do"*|\
         "/usr/local/bin/5dive _route_do"|"/usr/local/bin/5dive _pkg_do"|\
         "/usr/local/bin/5dive _secret_link_notify"|\
+        "/usr/local/bin/5dive _gate_card_retire"|\
         "/usr/local/bin/5dive agent _peek *"|"/usr/local/bin/5dive agent _skill_give *"|\
         "/usr/local/bin/5dive heartbeat _self on"|"/usr/local/bin/5dive heartbeat _self off"|\
         "/usr/local/bin/5dive sysadmin _broker"|"/usr/local/bin/5dive --json sysadmin _broker") has_a2a=1 ;;
@@ -883,6 +884,13 @@ ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _merge_do
 # and while a link for it is live. Root mints and sends the alert itself and
 # prints only that it was sent, so nothing the seat can read carries the link.
 ${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _secret_link_notify
+# DIVE-9345: let a gate this seat closed take its card out of the owner chat.
+# The card went out on another seat's bot, whose token this seat cannot read, so
+# without this the card stayed live with working-looking buttons forever. EXACT
+# path, NO args, NO wildcard: the task ident travels on stdin and the seat is
+# derived from SUDO_UID. Root refuses while the gate is still open unless this
+# seat filed it, and edits only the messages the gate itself recorded.
+${user} ALL=(root) NOPASSWD: /usr/local/bin/5dive _gate_card_retire
 # DIVE-5396: every hired agent can publish its own app and install a system
 # package, without holding root. EXACT paths, NO args, NO wildcard: the
 # operation travels on stdin and the caller is derived from SUDO_UID. The route
