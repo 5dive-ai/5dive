@@ -1,8 +1,7 @@
 # -------- the box's identity to the 5dive API (DIVE-5168, DIVE-9324) --------
 #
 # Every box->API caller that authenticates as the BOX (bug reports, the a2a
-# vouch, the first-job intro, the helper handover, premium-team updates) reads
-# the same CONNECTORD_TOKEN the same way. These three lived in cmd_partner.sh
+# vouch) reads the same CONNECTORD_TOKEN the same way. These three lived in cmd_partner.sh
 # until `5dive partner hire` moved to the hosted plugin (DIVE-9324); the
 # callers stayed in core, so the reads did too.
 

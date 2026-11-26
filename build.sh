@@ -130,7 +130,6 @@ LAZY_FILES=(
   src/cmd_agent_runtime.sh
   src/cmd_cos.sh
   src/cmd_agent_avatar.sh
-  src/cmd_helper.sh
   src/cmd_agent_a2a_vouch.sh
   src/cmd_acp.sh
   src/cmd_skill.sh

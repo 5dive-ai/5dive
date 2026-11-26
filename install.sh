@@ -1977,20 +1977,23 @@ fi
 # provisioning.env and a box token, so it gets that plugin in the SAME run that
 # removed the built-in: no partner client's hire goes missing for a night. A box
 # whose `partner` already answers skips, so a failed add is retried next run. A
-# self-hosted box (no provisioning.env) is never touched. Best-effort: it never
-# blocks an install or an upgrade.
+# self-hosted box (no provisioning.env) is never touched, unless (DIVE-9330) it
+# holds a box token and a premium team bought from 5dive: `team update` lives in
+# that plugin now, so the team keeps updating. Only a built box gets the
+# push-notify stage. Best-effort: it never blocks an install or an upgrade.
 _hosted_plugin_ensure() {
   local prov="${FIVEDIVE_PROVISIONING_ENV:-/etc/5dive/provisioning.env}"
-  local tok="${FIVEDIVE_CONNECTORD_ENV:-/etc/5dive/connectord.env}"
+  local tok="${FIVEDIVE_CONNECTORD_ENV:-/etc/5dive/connectord.env}" built=0
   offline_update && return 0
-  [[ -f "$prov" ]] || return 0
   grep -q '^CONNECTORD_TOKEN=.' "$tok" 2>/dev/null || return 0
+  if [[ -f "$prov" ]]; then built=1
+  elif ! compgen -G "$STATE_DIR/premium-teams/*.json" >/dev/null; then return 0; fi
   if ! "$BIN_DIR/5dive" partner --help >/dev/null 2>&1; then
     say "Installing the hosted plugin (this box was built by 5dive)"
     "$BIN_DIR/5dive" plugin add hosted@5dive-plugins --yes 2>&1 | tail -3 \
-      || echo "warn: hosted plugin not installed — '5dive partner hire' is down until the next upgrade retries" >&2
+      || echo "warn: hosted plugin not installed — '5dive partner hire' and 'team update' are down until the next upgrade retries" >&2
   fi
-  _hosted_push_notify_stage
+  (( built )) && _hosted_push_notify_stage
   return 0
 }
 
