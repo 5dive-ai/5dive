@@ -16,7 +16,9 @@
 # (c) a non-owner tap is refused and logged; (d) a replayed tap is refused;
 # (e) MUTANT: the owner check removed -> (c)'s detector goes red; (f) the listener
 # routes bap/bdn to `owner-ask tap`; (g) with the human registry in use only the
-# seat's owner counts; CI control: no sudo, no /usr/local/bin/5dive; LIVE: a request
+# seat's owner counts; (r) DIVE-9347: a phone-routine save ask renders its own verb
+# and kept-yes footer (never "once"/"30 minutes") and its tap wakes the seat to
+# replay; CI control: no sudo, no /usr/local/bin/5dive; LIVE: a request
 # the real browser plugin wrote on this box resolves through the real passwd.
 #
 # Run: bash tests/owner_ask_browser_unit.sh (no root, no network).
@@ -208,6 +210,46 @@ out=$(tap "bdn:${H3}:${N3}" "$OWNER"); rc=$?
 [[ $rc == 0 && "$(jq -r '.data.result' <<<"$out")" == declined && "$(approves)" == "browser approve $SEAT-$H3 --human-proof=$N3 --deny" && ! -e "$R3" ]] \
   && ok_t "b5 bdn from the owner -> browser approve --deny, and the ask is gone" || bad_t "b5 deny" "rc=$rc $out approves=$(approves)"
 grep -q "DECLINED.*$SEAT-$H3" <<<"$(wakes)" && ok_t "b6 the seat is told it was declined" || bad_t "b6 decline wake" "$(wakes)"
+
+echo "# (r) DIVE-9347: a phone routine's save ask says the yes is KEPT, never 'once, within 30 minutes'"
+# The phone (5dive-phone 0.3.0) writes its save ask in the browser's request format
+# with source:"phone-routine". The grant is kept and cron replays it, so the owner
+# must read what they are actually granting. Red on main: main renders every ask
+# with the one-off footer and the "do something only you can allow" verb.
+mkroutine() { # <seat> <hex> -> path
+  local d; d=$(_owner_ask_dir_of "$1")
+  jq -n --arg id "$1-$2" --arg s "$1" --argjson at "$(date +%s)" \
+    '{id:$id, seat:$s, site:"your phone (Pixel 7)", hash:"def", steps:[{op:"tap"},{op:"tap"},{op:"type"}],
+      class:"save a routine", label:"routine morning-post", step:"save", page:"routine morning-post",
+      asked_at:$at, source:"phone-routine",
+      payload:{"saves the routine":"morning-post: 3 steps, repeated with no AI", "step 1":"open Instagram",
+               "step 2":"tap \"New post\"", "step 3":"tap \"Share\""}}' > "$d/$1-$2.json"
+  printf '%s' "$d/$1-$2.json"
+}
+RT=$(_owner_ask_text "$(cat "$(mkroutine "$SEAT" cccccccccccc)")" "${SEAT#agent-}")
+[[ "$RT" != *once* && "$RT" != *"30 minutes"* && "$RT" != *"minutes"* ]] \
+  && ok_t "r1 the routine ask never says 'once' or '30 minutes'" || bad_t "r1 one-off words in a routine ask" "$RT"
+grep -qx 'Approve keeps this routine: it runs these steps, any send, post or payment among them, whenever it is replayed, until the steps change. Decline drops it.' <<<"$RT" \
+  && ok_t "r2 its footer says the yes is kept, replays it until the steps change, and covers send/post/pay steps" || bad_t "r2 routine footer" "$RT"
+head -1 <<<"$RT" | grep -qx "📱 ${SEAT#agent-} asks: save a phone routine on your phone (Pixel 7)" \
+  && ok_t "r3 its verb line says save a phone routine, not 'do something only you can allow'" || bad_t "r3 routine verb" "$(head -1 <<<"$RT")"
+[[ "$RT" != *"only you can allow"* && "$RT" != *'button "routine'* && "$RT" == *"step 2: tap"* && "$RT" == *"repeated with no AI"* ]] \
+  && ok_t "r4 it lists the routine's steps and drops the browser's 'step N: button' line" || bad_t "r4 routine body" "$RT"
+BT=$(_owner_ask_text "$(cat "$(mkreq "$SEAT" dddddddddddd)")" "${SEAT#agent-}")
+[[ "$(tail -1 <<<"$BT")" == "Approve runs exactly these steps, once, within 30 minutes. Decline drops the ask." && "$BT" == "🌐 "*"asks: send a message on mail.google.com"* ]] \
+  && ok_t "r5 control: a browser ask keeps its one-off footer and verb" || bad_t "r5 browser ask changed" "$BT"
+# The owner's tap on a routine ask wakes the seat with what to do next — there is
+# no waiting act to re-run with --approved.
+HR=eeeeeeeeeeee; RR=$(mkroutine "$SEAT" "$HR"); browser "$RR" >/dev/null
+NR=$(cb 0); NR="${NR##*:}"
+[[ "$(last_send | jq -r .text)" == *"Approve keeps this routine"* ]] \
+  && ok_t "r6 the routine ask the owner is SENT carries the routine footer" || bad_t "r6 sent text" "$(last_send | jq -r .text)"
+: > "$TMP/run.log"
+out=$(tap "bap:${HR}:${NR}" "$OWNER"); rc=$?
+[[ $rc == 0 && "$(jq -r '.data.result' <<<"$out")" == approved ]] \
+  && grep -q "APPROVED phone routine ask $SEAT-$HR.*replay" <<<"$(wakes)" && ! grep -q -- "--approved=" <<<"$(wakes)" \
+  && ok_t "r7 an approved routine wakes the seat to replay, not to re-run an act with --approved" || bad_t "r7 routine wake" "rc=$rc $out wakes=$(wakes)"
+: > "$TMP/run.log"
 
 echo "# (d) replays and stale buttons"
 : > "$TMP/run.log"

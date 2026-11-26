@@ -175,19 +175,28 @@ _owner_ask_route() {
 # The ask as the owner reads it: who, what, on which site, and the payload the
 # page showed. Every value is the seat's, so control and format characters go and
 # each line is capped; the message is sent as plain text (no parse_mode).
+# DIVE-9347: a phone routine's save ask (source "phone-routine") is not a one-off
+# step. Its yes is KEPT: the phone replays the routine on every call, a recurring
+# task included, until its steps change, and any send/post/pay step in it runs
+# under that yes. So it gets its own verb and footer; "once, within 30 minutes"
+# would have the owner approve one thing and grant another.
 _owner_ask_text() { # <request json> <agent name>
   jq -r --arg n "$2" --argjson ttl "$OWNER_ASK_TTL" '
     def c: tostring | gsub("[\\p{Cc}\\p{Cf}]"; " ") | if length > 200 then .[0:200] + "…" else . end;
     (.payload // {}) as $p
-    | ({send: "send a message", pay: "pay or place an order", publish: "post or publish", delete: "delete something"}[.class // ""]
-       // "do something only you can allow") as $verb
-    | [ "🌐 \($n | c) asks: \($verb) on \(.site // "?" | c)" ]
+    | ((.source // "") == "phone-routine") as $routine
+    | (if $routine then "save a phone routine"
+       else ({send: "send a message", pay: "pay or place an order", publish: "post or publish", delete: "delete something"}[.class // ""]
+             // "do something only you can allow") end) as $verb
+    | [ "\(if $routine then "📱" else "🌐" end) \($n | c) asks: \($verb) on \(.site // "?" | c)" ]
       + [ ($p | to_entries[] | select(.value != null and .value != "")
              | "\({first_line: "first line"}[.key] // .key | c): \(.value | if type == "array" then map(tostring) | join(", ") else . end | c)") ]
       + (if ($p | length) == 0 then ["(the page did not show what it will do — see the screenshot)"] else [] end)
-      + [ "step \(.step // "?" | c): button \"\(.label // "" | c)\"",
-          "id: \(.id)",
-          "Approve runs exactly these steps, once, within \($ttl / 60 | floor) minutes. Decline drops the ask." ]
+      + (if $routine then [] else [ "step \(.step // "?" | c): button \"\(.label // "" | c)\"" ] end)
+      + [ "id: \(.id)" ]
+      + (if $routine
+         then [ "Approve keeps this routine: it runs these steps, any send, post or payment among them, whenever it is replayed, until the steps change. Decline drops it." ]
+         else [ "Approve runs exactly these steps, once, within \($ttl / 60 | floor) minutes. Decline drops the ask." ] end)
     | join("\n")' <<<"$1" 2>/dev/null
 }
 
@@ -367,7 +376,10 @@ _owner_ask_tap() {
     # Spent: the grant is written, so this proof must not grant twice.
     _owner_ask_rewrite 'del(.nonce_hash) + {owner_answer: $a, owner_answered_at: $at}' \
       --arg a "$answer" --argjson at "$(date +%s)" || warn "ask ${OA_ID}: could not mark the proof spent"
-    _owner_ask_wake "$name" "The owner APPROVED browser ask ${OA_ID} on Telegram. Re-run the waiting act with --approved=${OA_ID}." \
+    local woke="The owner APPROVED browser ask ${OA_ID} on Telegram. Re-run the waiting act with --approved=${OA_ID}."
+    [[ "$(jq -r '.source // ""' "$req" 2>/dev/null)" == phone-routine ]] \
+      && woke="The owner APPROVED phone routine ask ${OA_ID} on Telegram. The routine is kept: 5dive phone replay <name> runs it now."
+    _owner_ask_wake "$name" "$woke" \
       || warn "could not wake ${name}"
   else
     # --deny removes the request, and the proof with it.
