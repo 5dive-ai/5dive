@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# The --help remainder of PR-1000/PR-1019, `task set-body --body-file=`, and
-# `task need --owner=` in the help.
+# The --help remainder of PR-1000/PR-1019, `task set-body --body-file=`,
+# `task need --owner=` in the help, and (DIVE-9374) --help on the host, route,
+# pkg and usage leaves — section D.
 #
 # THE DEFECTS (measured on 0.54.0):
 #
@@ -104,6 +105,109 @@ n=$(grep -c -- '--owner' "$TMP/out")
 grep -q -- '--owner=<human>.*route' "$TMP/out" \
   && ok_t "O3: ...with one line saying it routes the gate to that person" \
   || bad_t "O3: the --owner line says what it does" "$(grep -- '--owner' "$TMP/out")"
+
+# --- D) DIVE-9374: --help on the host, route, pkg and usage leaves ---------------
+# The DIVE-569 follow-up. Measured on 0.142.3 (reported 5 times from 2 boxes):
+#   host unit repoint --help|-h, route add --help, usage loops --help -> unknown flag, rc 2
+#   host --help, host unit --help   -> a one-line `error: usage: …`, rc 2
+#   pkg install --help              -> "takes package names only", rc 3
+#   usage --help (non-root)         -> must run as root, before any argument is read
+# main() now answers --help for these four verbs before the leaf runs: host and
+# usage from the top-level usage block (_verb_path_help), route and pkg from their
+# own usage block. The mutant deletes that intercept from a copy of the bundle.
+MUTANT="$TMP/5dive-mutant"
+grep -v -e '\$top == usage ]]; then _verb_path_help' -e '\$top == pkg ]] && _verb_help_wanted' "$BUNDLE" >"$MUTANT"
+chmod +x "$MUTANT"
+removed=$(( $(wc -l <"$BUNDLE") - $(wc -l <"$MUTANT") ))
+[[ "$removed" == 2 ]] && ok_t "D1: the mutant drops exactly the two intercept lines" \
+  || bad_t "D1: mutant removed $removed lines (want 2)" ""
+
+# arm 1: each leaf answers, rc 0, a block naming that leaf's flags.
+# "<args>|<needle>|<needle>..." — every needle must be on stdout.
+CASES=(
+  "host unit repoint --help|usage: 5dive host unit repoint|--unit=|--workdir="
+  "host unit repoint -h|usage: 5dive host unit repoint|--unit=|--workdir="
+  "host unit repoint --unit=x.service --help|usage: 5dive host unit repoint|--workdir="
+  "route add --help|5dive route add|--port="
+  "route add myapp --help|5dive route add|--port="
+  "pkg install --help|5dive pkg install <package>"
+  "usage --help|usage: 5dive usage|--7d|--by=account|5dive usage loops"
+  "usage loops --help|usage: 5dive usage loops|--by-loop|--all"
+  "usage someagent --help|usage: 5dive usage|--7d"
+)
+check_cases() {   # <bundle> <label> → writes how many cases answered to $TMP/answered
+  local b="$1" label="$2" c args needles n nd rc good answered=0
+  for c in "${CASES[@]}"; do
+    args="${c%%|*}"; needles="${c#*|}"
+    # shellcheck disable=SC2086
+    rc=$(run "$b" $args)
+    good=1; [[ "$rc" == 0 ]] || good=0
+    IFS='|' read -r -a n <<<"$needles"
+    for nd in "${n[@]}"; do has "$(out)" "$nd" || good=0; done
+    has "$(err)" "error:" && good=0
+    if [[ "$label" == fixed ]]; then
+      (( good )) && ok_t "A1: 5dive $args -> rc 0, names: ${needles//|/, } (uid $EUID)" \
+        || bad_t "A1: 5dive $args" "rc=$rc out=$(out | head -5) err=$(err)"
+    fi
+    (( good )) && answered=$((answered+1))
+  done
+  printf '%s' "$answered" >"$TMP/answered"
+}
+check_cases "$BUNDLE" fixed
+
+# arm 2: the surfaces print their usage, not a one-line `error:` message.
+for args in "host --help" "host unit --help" "host unit -h"; do
+  # shellcheck disable=SC2086
+  rc=$(run "$BUNDLE" $args)
+  lines=$(out | grep -c '5dive host')
+  [[ "$rc" == 0 ]] && (( lines >= 3 )) && ! has "$(err)" "error:" && has "$(out)" "5dive host unit repoint" \
+    && ok_t "A2: 5dive $args -> rc 0, $lines '5dive host' usage lines, no error:" \
+    || bad_t "A2: 5dive $args" "rc=$rc lines=$lines out=$(out | head -3) err=$(err)"
+done
+run "$BUNDLE" host --help >/dev/null
+has "$(out)" "5dive host journal" && has "$(out)" "5dive host timezone" \
+  && ok_t "A2b: 5dive host --help covers every host verb (journal, timezone)" \
+  || bad_t "A2b: host --help covers every verb" "$(out | head -5)"
+
+# arm 3: negative controls — a non-help call behaves exactly as the base (mutant) does.
+same_as_mutant() {   # <label> <args...>
+  local label="$1"; shift
+  local r1 o1 e1 r2
+  r1=$(run "$BUNDLE" "$@"); o1=$(out); e1=$(err)
+  r2=$(run "$MUTANT" "$@")
+  [[ "$r1" == "$r2" && "$o1" == "$(out)" && "$e1" == "$(err)" ]] \
+    && ok_t "$label (rc $r1, identical to the pre-fix bundle)" \
+    || bad_t "$label" "fixed rc=$r1 err=$e1 | base rc=$r2 err=$(err)"
+}
+same_as_mutant "N1: host unit repoint --bogus is untouched" host unit repoint --bogus
+same_as_mutant "N2: route add --bogus is untouched" route add --bogus
+same_as_mutant "N3: route add --port=--help is a VALUE, not a question" route add x --port=--help
+same_as_mutant "N4: usage loops --bogus is untouched" usage loops --bogus
+same_as_mutant "N5: help after -- is not a question" pkg install -- --help
+if (( EUID == 0 )); then
+  rc=$(run "$BUNDLE" host unit repoint --bogus)
+  [[ "$rc" == 2 ]] && has "$(err)" "unknown flag: --bogus" \
+    && ok_t "N6: as root, host unit repoint --bogus -> rc 2 unknown flag: --bogus" \
+    || bad_t "N6: --bogus as root" "rc=$rc err=$(err)"
+  ok_t "N7: CONTROL skipped under uid 0 (bare usage would read real transcripts)"
+else
+  rc=$(run "$BUNDLE" host unit repoint --bogus)
+  [[ "$rc" != 0 ]] && has "$(err)" "must run as root" \
+    && ok_t "N6: non-root host unit repoint --bogus is still refused for root first (rc $rc)" \
+    || bad_t "N6: --bogus non-root" "rc=$rc err=$(err)"
+  same_as_mutant "N7: bare usage as non-root is still refused for root" usage
+  has "$(err)" "must run as root" && ok_t "N7b: ...and the refusal says must run as root" \
+    || bad_t "N7b: usage refusal text" "$(err)"
+fi
+
+# arm 4: the mutant (intercept removed) answers NONE of the arm-1 cases.
+check_cases "$MUTANT" mutant
+m=$(cat "$TMP/answered")
+[[ "$m" == 0 ]] && ok_t "M1: MUTANT without the intercept answers 0 of ${#CASES[@]} arm-1 cases (red on the base)" \
+  || bad_t "M1: mutant answered $m of ${#CASES[@]}" "the arm cannot tell the fix from the base"
+rc=$(run "$MUTANT" host unit repoint --help)
+[[ "$rc" != 0 ]] && ok_t "M2: MUTANT host unit repoint --help fails (rc $rc: $(err | head -1))" \
+  || bad_t "M2: mutant repoint --help" "rc=$rc"
 
 # --- S) set-body takes --body-file=, the spelling task add takes ------------------
 # shellcheck disable=SC1090
