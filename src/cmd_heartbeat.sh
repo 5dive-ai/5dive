@@ -3252,6 +3252,14 @@ _hb_landed_mark() {
   [[ "$_HB_LANDED_SIZE" =~ ^[0-9]+$ ]] || { _HB_LANDED_SIZE=""; _HB_LANDED_FILE=""; }
   return 0
 }
+# Readers of the mark for OTHER modules (DIVE-9373). scripts/lib/lazy-dispatch.sh
+# turns any cross-module read of a column-0 global into a load-time __MODDEPS
+# edge, transitively closed: cmd_agent_runtime naming the mark's globals dragged
+# the whole heartbeat cluster into every verb that loads it (`task ls` 8 -> 17
+# modules). A function call is lazy (__MODCALLS) and costs nothing until it runs,
+# so callers outside this file read the mark through these, never by name.
+_hb_landed_file()     { printf '%s' "$_HB_LANDED_FILE"; }
+_hb_landed_evidence() { printf '%s' "$_HB_LANDED_EVIDENCE"; }
 # The longest run of the payload that survives JSON encoding byte-for-byte, so a
 # plain fixed-string grep over the raw transcript can match it. Split on every
 # byte a JSON writer may re-spell — anything outside printable ASCII (control

@@ -2107,14 +2107,18 @@ inject_and_submit() {
 # No mark (unreadable store, no transcript yet) = cannot tell = rc 1.
 _AGENT_SEND_LANDED=""
 _agent_send_landed() {
-  local name="$1" text="$2" needle now_file first="" i tries="${_AGENT_SEND_LANDED_TRIES:-3}"
+  local name="$1" text="$2" needle now_file mark_file first="" i tries="${_AGENT_SEND_LANDED_TRIES:-3}"
   _AGENT_SEND_LANDED=""
   declare -F _hb_landed_check >/dev/null 2>&1 || return 1
-  [[ -n "${_HB_LANDED_FILE:-}" ]] || return 1
+  # Read the mark through cmd_heartbeat's accessors, never its globals by name:
+  # a cross-module variable read is a load-time dependency edge in the lazy
+  # bundle, and this one pulled the heartbeat cluster into every verb (DIVE-9373).
+  mark_file=$(_hb_landed_file)
+  [[ -n "$mark_file" ]] || return 1
   # _hb_landed_check logs in heartbeat words ("counting the wake…"); this verb
   # prints its own line, so its log is not part of this command's output.
   if _hb_landed_check "$name" "$text" 2>/dev/null; then
-    _AGENT_SEND_LANDED="${_HB_LANDED_EVIDENCE}"
+    _AGENT_SEND_LANDED=$(_hb_landed_evidence)
     return 0
   fi
   needle=$(_hb_landed_needle "$text") || return 1
@@ -2123,7 +2127,7 @@ _agent_send_landed() {
   for (( i = 0; i < tries; i++ )); do
     (( i > 0 )) && sleep "${_AGENT_SEND_LANDED_SEC:-0.5}"
     now_file=$(_hb_transcript_newest "$name")
-    [[ -n "$now_file" && "$now_file" != "$_HB_LANDED_FILE" ]] || return 1
+    [[ -n "$now_file" && "$now_file" != "$mark_file" ]] || return 1
     first=$(sudo -n -u "agent-${name}" head -n "${_AGENT_SEND_LANDED_LINES:-40}" "$now_file" 2>/dev/null \
       | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
       | grep -av -e '"isMeta"[[:space:]]*:[[:space:]]*true' \
@@ -2133,7 +2137,7 @@ _agent_send_landed() {
     [[ -n "$first" ]] && break
   done
   [[ -n "$first" && "$first" == *"$needle"* ]] || return 1
-  _AGENT_SEND_LANDED="the session rotated to $(basename "$now_file") (was $(basename "$_HB_LANDED_FILE")) and its first user record carries this payload ('${needle:0:40}')"
+  _AGENT_SEND_LANDED="the session rotated to $(basename "$now_file") (was $(basename "$mark_file")) and its first user record carries this payload ('${needle:0:40}')"
   return 0
 }
 
