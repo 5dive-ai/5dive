@@ -116,7 +116,7 @@ grep -q -- '--owner=<human>.*route' "$TMP/out" \
 # usage from the top-level usage block (_verb_path_help), route and pkg from their
 # own usage block. The mutant deletes that intercept from a copy of the bundle.
 MUTANT="$TMP/5dive-mutant"
-grep -v -e 'host|usage) _verb_path_help' -e 'route|pkg)  _verb_help_wanted' "$BUNDLE" >"$MUTANT"
+grep -v -e '\$top == usage ]]; then _verb_path_help' -e '\$top == pkg ]] && _verb_help_wanted' "$BUNDLE" >"$MUTANT"
 chmod +x "$MUTANT"
 removed=$(( $(wc -l <"$BUNDLE") - $(wc -l <"$MUTANT") ))
 [[ "$removed" == 2 ]] && ok_t "D1: the mutant drops exactly the two intercept lines" \
