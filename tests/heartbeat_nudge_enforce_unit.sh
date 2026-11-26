@@ -621,8 +621,14 @@ handed() {  # $1 id, then hand-out offsets ('-10 hours' ...); the last is the cu
     db "INSERT INTO runs (id,task_id,ident,agent,started_at,status)
         VALUES ($(sqlq "run-$id-$i"),$id,'x','dev',datetime('now',$(sqlq "$off")),'abandoned');"
   done
+  # The claim's started_at is the current run's own timestamp, never a second
+  # datetime('now'): live, _hb_claim_task stamps started_at BEFORE run_open, so the
+  # current run is never older than the claim. A fresh 'now' here could land one
+  # second after the run (DIVE-9367: main red when the clock ticked between the two
+  # sqlite calls), which made the CURRENT run read as a previous hand-out.
   db "UPDATE runs SET status='running' WHERE id=$(sqlq "run-$id-$i");
-      UPDATE tasks SET status='in_progress', started_at=datetime('now',$(sqlq "$off")) WHERE id=$id;"
+      UPDATE tasks SET status='in_progress',
+             started_at=(SELECT started_at FROM runs WHERE id=$(sqlq "run-$id-$i")) WHERE id=$id;"
 }
 acted() { [[ "$(col "$1" nudge_parked_at)" != "NULL" && "$(notes "$1")" == "1" ]] && echo 1 || echo 0; }
 stale_rung1() { db "UPDATE tasks SET nudge_escalated_at=datetime('now','-3 days'), nudge_escalated_n=$2 WHERE id=$1;"; }
