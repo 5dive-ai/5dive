@@ -104,7 +104,9 @@ DENY='uninstall self-update self_update update paperclip-seed fire hire'
 # longer in the dispatch table at all.
 # `deploy` came off on 2026-10-26 by leaving the core altogether: it is the devteam
 # plugin's (DIVE-6938), out of the dispatch table, so T5 would call it stale.
-WAIVED='activity cost gate-proof host objective objectives project projects trace usage'
+# `host` and `usage` came off on 2026-11-26 (DIVE-9374): main() answers their
+# --help before the leaf parses flags or (`usage`) checks for root.
+WAIVED='activity cost gate-proof objective objectives project projects trace'
 
 in_list() { local n="$1"; shift; local x; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
 
