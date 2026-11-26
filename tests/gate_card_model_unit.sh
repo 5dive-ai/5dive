@@ -287,6 +287,99 @@ while IFS= read -r fn; do
 done <<<"$egress"
 chk "egress: EVERY Bot API caller in the sourced modules is stubbed" "" "$unstubbed"
 
+# ------------------------------------------------- unreadable (DIVE-9345) ---
+# A standard seat closes a gate whose card went out on ANOTHER live seat's bot.
+# The connector file exists but this uid may not read it (root:claude-keys 0640 on
+# a box). That is not a torn-down agent: the card must stay live and go to root.
+# Root ignores file modes, so under a root runner the unreadable file is modelled
+# by the token reader instead — the arm still grades the hand-off, not chmod.
+printf 'TELEGRAM_BOT_TOKEN=tok-ceo\n' >"$CONNECTORS_DIR/telegram-ceo.env"
+chmod 000 "$CONNECTORS_DIR/telegram-ceo.env"
+if [[ $EUID -eq 0 ]]; then
+  eval "$(declare -f _task_gate_bot_token | sed '1s/_task_gate_bot_token/_real_task_gate_bot_token/')"
+  _task_gate_bot_token() { [[ "${1:-}" == ceo ]] && return 0; _real_task_gate_bot_token "$@"; }
+fi
+eval "$(declare -f _gate_is_root | sed '1s/_gate_is_root/_real_gate_is_root/')"
+_gate_is_root() { return 1; }
+HANDOFF="$TMP/handoff"; : >"$HANDOFF"; HANDOFF_RC=0; HANDOFF_ERR=""
+_task_gate_card_root_retire() { printf '%s|%s|%s\n' "$1" "$2" "$3" >>"$HANDOFF"; printf '%s' "$HANDOFF_ERR"; return "$HANDOFF_RC"; }
+TID9=$(mk_task DIVE-C9)
+_task_gate_card_record "DIVE-C9" "1234567890" "3474" "ceo"
+# The caller's OWN bot token in its env must not stand in for ceo's: a message id
+# edited through the wrong bot reads "not found" and would mark a live card gone.
+export TELEGRAM_BOT_TOKEN=tok-caller
+DELETE_RESP='{"ok":false,"description":"Bad Request: message to delete not found"}'
+reset_io; : >"$AUDIT_CALLS"
+out=$(_task_gate_card_apply DIVE-C9 die "withdrawn" 2>&1)
+unset TELEGRAM_BOT_TOKEN
+DELETE_RESP='{"ok":true}'
+chk "unreadable: no Bot API call from this seat (not even with its own env token)" "0" "$(io_count)"
+chk "unreadable: the card is NOT marked orphaned — it stays live" "live" "$(card_state "$TID9")"
+chk "unreadable: the retire is handed to root, once, with the task and mode" "DIVE-C9|die|withdrawn" "$(cat "$HANDOFF")"
+chk "unreadable: the hand-off is audited on the privileged path" "1" \
+    "$(grep -c 'gate card retire ok .*path=privileged-retire' "$AUDIT_CALLS")"
+chk "unreadable: and NOTHING calls it gone" "0" "$(grep -c 'cannot be edited by anyone' <<<"$out")"
+
+# The root side failed (an old box without the sudoers line, say). The card still
+# stays LIVE — a later pass can retire it — and the miss is reported, not swallowed.
+TID10=$(mk_task DIVE-C10)
+_task_gate_card_record "DIVE-C10" "1234567890" "3475" "ceo"
+: >"$HANDOFF"; HANDOFF_RC=1; HANDOFF_ERR="sudo: a password is required"
+reset_io; : >"$AUDIT_CALLS"
+out=$(_task_gate_card_apply DIVE-C10 die "withdrawn" 2>&1)
+HANDOFF_RC=0; HANDOFF_ERR=""
+chk "hand-off failed: the card stays live, never orphaned" "live" "$(card_state "$TID10")"
+chk "hand-off failed: the row says why" "1" \
+    "$(db "SELECT COUNT(*) FROM gate_cards WHERE task_id=$TID10 AND last_error LIKE '%root retire failed%password%';")"
+chk "hand-off failed: an error audit row" "1" "$(grep -c 'gate card retire error .*path=privileged-retire' "$AUDIT_CALLS")"
+chk "hand-off failed: and a warn" "1" "$(grep -c 'root-side retire failed' <<<"$out")"
+
+# The torn-down case through the SAME non-root caller: no file, no seat user ->
+# still orphaned, and root is NOT asked (it could not do better).
+TID11=$(mk_task DIVE-C11)
+db "INSERT INTO gate_cards (task_id,ident,gate_epoch,chat_id,message_id,via,state)
+    VALUES ($TID11,'DIVE-C11',1,'1234567890','3476','ghostbot','live');" >/dev/null 2>&1
+: >"$HANDOFF"; reset_io
+_task_gate_card_apply DIVE-C11 die "withdrawn" >/dev/null 2>&1
+chk "torn down (non-root caller): still orphaned" "orphaned" "$(card_state "$TID11")"
+chk "torn down (non-root caller): root is not asked" "" "$(cat "$HANDOFF")"
+
+# ---- the root side: cmd_gate_card_retire_delegated ----
+# Run in subshells: `fail` exits. The seat comes from SUDO_UID, never stdin.
+# Numeric idents: the primitive accepts only a real PREFIX-NNN ident, so a
+# DIVE-Cnn fixture would be refused by validation and pass the refusal arms for
+# the wrong reason. Each refusal arm also checks the reason it printed.
+_gate_is_root() { return 0; }
+_gate_uid_to_agent() { [[ "$1" == 2001 ]] && printf lilbro; [[ "$1" == 2002 ]] && printf mallory; }
+mk_open() { # <ident> <filer> -> id   (an OPEN approval gate)
+  db "INSERT INTO tasks (ident,title,status,need_type,tier,ask,ask_shape,gate_filed_by)
+      VALUES ('$1','t','blocked','approval',1,'ship it?','ship it','$2');" >/dev/null 2>&1
+  db "SELECT id FROM tasks WHERE ident='$1';"
+}
+TID12=$(mk_open DIVE-990012 lilbro)
+_task_gate_card_record "DIVE-990012" "1234567890" "3477" "marketing"
+reset_io
+out=$( export SUDO_UID=2002; printf 'DIVE-990012\ndie\nhijack\n' | cmd_gate_card_retire_delegated 2>&1 )
+chk "root side: an OPEN gate's card is refused to a seat that did not file it" "live" "$(card_state "$TID12")"
+chk "root side: refused for THAT reason" "1" "$(grep -c 'still open and was filed by lilbro, not mallory' <<<"$out")"
+chk "root side: and no Bot API call" "0" "$(io_count)"
+( export SUDO_UID=2001; printf 'DIVE-990012\ndie\nsuperseded by a re-filed gate\n' | cmd_gate_card_retire_delegated ) >/dev/null 2>&1
+chk "root side: the FILER may retire its own open gate's card (the re-file path)" "deleted" "$(card_state "$TID12")"
+
+TID13=$(mk_task DIVE-990013)
+db "UPDATE tasks SET need_answered_at=datetime('now'), need_answered_by='lead:main', need_answer='approve' WHERE id=$TID13;" >/dev/null
+_task_gate_card_record "DIVE-990013" "1234567890" "3478" "marketing"
+reset_io
+out=$( export SUDO_UID=2002; printf 'DIVE-990013\nsettle\nanswered\n' | cmd_gate_card_retire_delegated 2>&1 )
+chk "root side: settle with no HUMAN answer on the row is refused" "live" "$(card_state "$TID13")"
+chk "root side: refused for THAT reason" "1" "$(grep -c 'carries no human answer' <<<"$out")"
+( export SUDO_UID=2002; printf 'DIVE-990013\ndie\nanswered by lead:main\n' | cmd_gate_card_retire_delegated ) >/dev/null 2>&1
+chk "root side: any seat may retire a CLOSED gate's card" "deleted" "$(card_state "$TID13")"
+out=$( unset SUDO_UID; printf 'DIVE-990013\ndie\nx\n' | cmd_gate_card_retire_delegated 2>&1 )
+chk "root side: refuses with no sudo caller" "1" "$(grep -c 'requires sudo from an agent seat' <<<"$out")"
+
+eval "$(declare -f _real_gate_is_root | sed '1s/_real_gate_is_root/_gate_is_root/')"
+
 # ---- isolation: nothing from this suite reached the real fleet audit log ----
 # Counted BY THIS SUITE'S OWN FIXTURE IDENTS, not by the file's byte offset.
 # gate_answer_audit_unit's section-5 arm uses an offset on

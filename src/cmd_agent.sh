@@ -1023,6 +1023,7 @@ def classify_sudo(text, measurable):
                   command.startswith("/usr/local/bin/5dive _merge_do") or
                   command in ("/usr/local/bin/5dive _route_do", "/usr/local/bin/5dive _pkg_do") or
                   command == "/usr/local/bin/5dive _secret_link_notify" or
+                  command == "/usr/local/bin/5dive _gate_card_retire" or
                   command == "/usr/local/bin/5dive _seat_secret" or
                   command in ("/usr/local/bin/5dive agent _peek *", "/usr/local/bin/5dive agent _skill_give *",
                               "/usr/local/bin/5dive heartbeat _self on", "/usr/local/bin/5dive heartbeat _self off") or
