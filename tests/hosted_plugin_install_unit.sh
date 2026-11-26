@@ -11,6 +11,8 @@
 #   I4  `partner` already answers                                    -> no add (retried only while missing)
 #   I5  offline update                                               -> nothing
 #   I6  a failed add warns and still returns 0 (never blocks an upgrade)
+#   P1  DIVE-9330: self-hosted, box token, a premium team on the box -> add (team update lives there), no push-notify stage
+#   P2  self-hosted with a premium team but no box token             -> nothing
 #   S1  DIVE-9327: a plugin carrying lib/push-notify.sh -> staged at $LIB_DIR/push-notify.sh, 0755, same bytes
 #   S2  'partner' already answers -> still staged (the add is skipped, the stage is not)
 #   S3  an older plugin (no lib/push-notify.sh) -> the copy already on the box stays
@@ -89,6 +91,16 @@ FIVEDIVE_OFFLINE_UPDATE=1 case_run 1 1
 STUB_ADD_RC=1 case_run 1 1
 added && [[ $RC -eq 0 && "$ERR" == *"hosted plugin not installed"* ]] \
   && ok_t "I6 a failed add warns and returns 0" || bad_t "I6 failed add" "rc=$RC err=$ERR"
+
+# P1-P2 — DIVE-9330: a premium team's buyer keeps `team update` on any box with a token.
+mkdir -p "$STATE/premium-teams"; printf '{"team":"research","version":"1.0.0"}\n' >"$STATE/premium-teams/research.json"
+rm -rf "$LIBD"; case_run 0 1
+added && [[ $RC -eq 0 && ! -e "$LIBD/push-notify.sh" ]] \
+  && ok_t "P1 self-hosted with a box token and a premium team gets the plugin, and no push-notify stage" \
+  || bad_t "P1 premium box gets the plugin" "rc=$RC calls=$CALLS $(ls "$LIBD" 2>&1)"
+case_run 0 0
+[[ -z "$CALLS" && $RC -eq 0 ]] && ok_t "P2 a premium team but no box token -> nothing" || bad_t "P2 no token" "calls=$CALLS"
+rm -rf "$STATE/premium-teams"
 
 # S1-S6 — DIVE-9327: push-notify.sh comes from the plugin, at the granted path.
 staged_is_plugin() { [[ -x "$LIBD/push-notify.sh" && "$(stat -c %a "$LIBD/push-notify.sh")" == 755 ]] && cmp -s "$PN" "$LIBD/push-notify.sh"; }

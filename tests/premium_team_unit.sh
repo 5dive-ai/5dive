@@ -2,14 +2,10 @@
 # DIVE-9109 — a PREMIUM team file: signed by 5dive's team key, stamped with its
 # buyer, checked by `5dive team import <file>`.
 #
-# WHAT IS PINNED, through the real producer (packaging/premium-team/build.sh),
-# the real unwrap/verify (src/cmd_team_pack.sh, src/lib/offline_update.sh's root
-# chain) and the real `team import` → `up` path (agent CLI calls stubbed):
-#   B1  the producer makes ONE .gz: manifest.json, manifest.sig, payload/team.tar.gz;
-#       the buyer is on the signed wrapper AND inside the team's own manifest;
-#   B1e the producer takes the ceremony page's PUBLIC file as --trust;
-#   B2  the producer refuses a key the certificate does not approve, a
-#       certificate for another kind, and a gzip that is not a team bundle;
+# WHAT IS PINNED, with files from a test producer (tests/lib/premium_team_file.sh;
+# the real producer and its B1/B2 arms moved to hosted@5dive-plugins with
+# DIVE-9330, tests/hosted_premium_team_unit.sh there), the real unwrap/verify
+# (src/cmd_team_pack.sh, src/lib/offline_update.sh's root chain) and the real `team import` → `up` path (agent CLI calls stubbed):
 #   V1  a good file imports: every seat comes up, the import names the buyer,
 #       and the box keeps the signed label (version, buyer) without the trust blob;
 #   R1  the team changed after signing                       -> refused
@@ -52,7 +48,7 @@ JSON_MODE=0
 mkdir -p "$TASKS_DIR" "$TMP/tmpd" "$TMP/k" "$TMP/ostate"
 tasks_db_init
 export TMPDIR="$TMP/tmpd" TEAM_AUTH_PROFILE=fixture
-BUILD=packaging/premium-team/build.sh
+BUILD=tests/lib/premium_team_file.sh   # DIVE-9330: the real producer left core
 
 PASS=0; FAIL=0
 ok_t()  { printf 'ok   - %s\n' "$1"; PASS=$((PASS+1)); }
@@ -108,34 +104,7 @@ mk() { # <out> <trust-dir> <key> [extra build args]
     --buyer-account=acct-42 --buyer-name="Acme Research" --version=1.0.0 -o "$o" "$@" >/dev/null 2>"$o.err"
 }
 
-# ============ B1. the producer ===============================================
-mk "$TMP/good.gz" "$TMP/t-good" team; rc=$?
-eq_t 'B1 the producer makes a file' 0 "$rc"
-eq_t 'B1b one .gz: manifest, signature, team' 'manifest.json manifest.sig payload/team.tar.gz ' \
-  "$(tar -tzf "$TMP/good.gz" 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')"
-eq_t 'B1c the signed label names the team, version and buyer' 'research 1.0.0 acct-42 Acme Research' \
-  "$(tar -xzOf "$TMP/good.gz" manifest.json | jq -r '"\(.team) \(.version) \(.buyer.account) \(.buyer.name)"')"
-eq_t 'B1d the team inside carries the buyer too' 'acct-42 Acme Research' \
-  "$(tar -xzOf "$TMP/good.gz" payload/team.tar.gz | tar -xzOf - manifest.json | jq -r '"\(.licensed_to.account) \(.licensed_to.name)"')"
-
-# B1e: the ceremony page's PUBLIC file works as --trust (base64 fields).
-jq -n --arg a "$(base64 -w0 <"$TMP/t-good/team-key.json")" --arg b "$(base64 -w0 <"$TMP/t-good/team-key.sig")" \
-      --arg c "$(base64 -w0 <"$TMP/t-good/revoked.json")" --arg d "$(base64 -w0 <"$TMP/t-good/revoked.sig")" \
-  '{root_pubkey_pem:"x", root_fingerprint:"y", team_key_json_b64:$a, team_key_sig_b64:$b, revoked_json_b64:$c, revoked_sig_b64:$d}' >"$TMP/pub-team.json"
-mk "$TMP/b1e.gz" "$TMP/pub-team.json" team; rc=$?
-eq_t 'B1e the ceremony'"'"'s PUBLIC team file is taken as --trust, giving the same certificate' "0 $(tar -xzOf "$TMP/good.gz" manifest.json | jq -r .trust.team_key)" \
-  "$rc $(tar -xzOf "$TMP/b1e.gz" manifest.json 2>/dev/null | jq -r .trust.team_key)"
-
-# ============ B2. the producer's refusals ====================================
-mk "$TMP/b2a.gz" "$TMP/t-good" office; rc=$?
-if (( rc != 0 )) && grep -q 'not the key the certificate' "$TMP/b2a.gz.err" && [[ ! -e "$TMP/b2a.gz" ]]; then ok_t 'B2a a key the certificate does not approve is refused'
-else bad_t 'B2a wrong key not refused' "rc=$rc $(cat "$TMP/b2a.gz.err")"; fi
-mk "$TMP/b2b.gz" "$TMP/t-office" office; rc=$?
-if (( rc != 0 )) && grep -q 'not for a premium team key' "$TMP/b2b.gz.err"; then ok_t 'B2b a certificate for another kind of key is refused'
-else bad_t 'B2b office certificate not refused' "rc=$rc $(cat "$TMP/b2b.gz.err")"; fi
-bash "$BUILD" --bundle="$B/packs/boss.tar.gz" --key="$K/team.pem" --trust="$TMP/t-good" --buyer-account=a --version=1.0.0 -o "$TMP/b2c.gz" >/dev/null 2>"$TMP/b2c.err"; rc=$?
-if (( rc != 0 )) && grep -q 'not a team bundle' "$TMP/b2c.err"; then ok_t 'B2c one agent pack is not taken for a team'
-else bad_t 'B2c non-team bundle not refused' "rc=$rc $(cat "$TMP/b2c.err")"; fi
+mk "$TMP/good.gz" "$TMP/t-good" team || bad_t 'fixture file built' "$(cat "$TMP/good.gz.err")"
 
 # ============ V1. import a good file =========================================
 REG='{"agents":{}}'
