@@ -1368,6 +1368,13 @@ main() {
       # Never advertised.
       cmd_secret_link_notify_delegated "$@"
       exit $? ;;
+    _gate_card_retire)
+      # DIVE-9345: hidden root half of a gate-card retire whose delivering bot's
+      # token the closing seat cannot read. The seat is derived from SUDO_UID; the
+      # task, mode and reason come on stdin (src/task/notify.sh). Audited root-side
+      # per card. Never advertised.
+      cmd_gate_card_retire_delegated "$@"
+      exit $? ;;
     _lead_account)
       # DIVE-7118: hidden root half of `agent recover`. The caller is re-derived
       # from SUDO_UID and must be an admin seat (src/cmd_account.sh). Not audited
