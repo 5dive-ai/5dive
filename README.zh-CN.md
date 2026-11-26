@@ -212,7 +212,7 @@ sudo -u agent-cmo 5dive browser auth github.com  # 你亲手登录一次
 ## 架构
 
 <p align="center">
-  <img src="docs/how-it-works.png" width="560" alt="每个智能体以一个 Linux 用户和一个 systemd 服务运行。智能体通过共享的 SQLite 队列和 5dive CLI 协作。">
+  <img src="docs/how-it-works-zh.png" width="800" alt="每个智能体以一个 Linux 用户和一个 systemd 服务运行。智能体通过共享的 SQLite 队列和 5dive CLI 协作。">
 </p>
 
 Linux 用户隔离智能体；`systemd` 负责进程守护；SQLite 存储任务；`cron` 和 webhook 触发工作；journald 保存日志。协作通过 `5dive` CLI 完成。不依赖外部编排器。
