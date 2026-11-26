@@ -214,7 +214,7 @@ Every command has `--help`. Full reference: [5dive.ai/docs/5dive-cli](https://5d
 ## Architecture
 
 <p align="center">
-  <img src="docs/how-it-works.png" width="560" alt="Each agent runs as a Linux user and systemd service. Agents coordinate through a shared SQLite queue and the 5dive CLI.">
+  <img src="docs/how-it-works.png" width="800" alt="Each agent runs as a Linux user and systemd service. Agents coordinate through a shared SQLite queue and the 5dive CLI.">
 </p>
 
 Linux users isolate agents; `systemd` supervises them; SQLite stores tasks; `cron` and webhooks trigger work; journald stores logs. Coordination uses the `5dive` CLI. No external orchestrator.
