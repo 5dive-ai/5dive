@@ -783,7 +783,12 @@ jobs:
       # One name per slow harness, comma-separated — the probe's own --only format.
       # Keep this list SHORT and justified; a harness landing here is saying its
       # verdict costs minutes, not that it may go ungraded.
-      SLOW_HARNESSES: gate_channel_session_t2_mutation.sh
+      #
+      # DIVE-9342: harness_rc_corpus_contract_unit.sh RUNS the corpus to count its
+      # markers, so its mutant grows with the corpus: 171s green in installed-s2 at
+      # 5f041b22, then killed at the 180s cap in every s2 lane at 8f916a30 (NEVER
+      # PROBED in the union). Probeable and slow, not unprobeable.
+      SLOW_HARNESSES: gate_channel_session_t2_mutation.sh,harness_rc_corpus_contract_unit.sh
     steps:
       # DIVE-3963: the OTHER HALF of the Codex channel seam. tests/codex_channel_e2e_unit.sh
       # moves a payload the real CLI produced into the real dispatcher that lives in
