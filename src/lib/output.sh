@@ -457,6 +457,31 @@ _verb_subverb_help() {
   printf '%s\n' "$out"
 }
 
+# _verb_path_help <surface> <args…> — 0 when the args asked for help and the
+# top-level usage block answered it (DIVE-9374). For surfaces whose leaves parse
+# their own flags (host, usage), so `--help` would otherwise be an unknown flag
+# or hit require_root before any argument is read. The leading non-flag words
+# are the verb path (`host unit repoint`); the LONGEST prefix the top-level
+# `usage()` documents answers, so a positional (`usage <agent> --help`) falls
+# back to its parent verb and `5dive host --help` prints every `5dive host`
+# entry. Returns 1 — dispatch as normal — when nothing in usage() matches.
+_verb_path_help() {
+  local surface="$1"; shift
+  _verb_help_wanted "$@" || return 1
+  local -a words=("$surface"); local a
+  for a in "$@"; do
+    case "$a" in -*) break ;; esac
+    words+=("$a")
+  done
+  local k path out
+  for (( k = ${#words[@]}; k >= 1; k-- )); do
+    path="5dive"; (( k > 1 )) && path="5dive ${words[*]:0:k-1}"
+    out=$(_verb_surface_help usage "$path" "$path " "${words[k-1]}") || true
+    [[ -n "$out" ]] && { printf '%s\n' "$out"; return 0; }
+  done
+  return 1
+}
+
 # _verb_help_intercept <path> <usage_fn> <dispatch_fn> <lead> <verb> <args…> — 0
 # when the args asked for help and it has been answered. Kept OUT of the
 # dispatch function's body on purpose: _verb_arm reads that body back as text,
