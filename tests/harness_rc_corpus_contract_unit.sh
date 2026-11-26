@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TIER: nightly — 94.8s measured in CI (installed-host shard 1, PR #950 head 56636fe9, 2026-09-15; 86.8s on pristine shard 2). The verdict is BEHAVIOURAL: it RUNS the candidate harnesses to count anchored markers, so the wall-clock IS the property and no fold or trim reclaims it. At ~30% of the 300s core cap one file reds the budget gate for every PR. The argument, the routes not taken and the coverage this costs are under "WHY THIS IS NIGHTLY AND NOT CORE" below.
+# TIER: nightly — 208.3s measured in CI (full-installed-host shard 3, installed-host-s3, full-sweep run 45784235787, 2026-11-26; 104.5-203.3s on 21 other full-sweep jobs, installed-host and pristine, in the header-drift window; widened from the 94.8s claim of PR #950, 2026-09-15). The verdict is BEHAVIOURAL: it RUNS the candidate harnesses to count anchored markers, so the wall-clock IS the property and no fold or trim reclaims it. At ~70% of the 300s core cap one file reds the budget gate for every PR. The argument, the routes not taken and the coverage this costs are under "WHY THIS IS NIGHTLY AND NOT CORE" below.
 #
 # DIVE-2692 corpus contract: every harness in tests/*.sh carries the
 # HARNESS-RC EXIT trap (DIVE-2573 landed the mechanism; DIVE-2692 extended it
