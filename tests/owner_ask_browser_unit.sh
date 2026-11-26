@@ -231,7 +231,7 @@ RT=$(_owner_ask_text "$(cat "$(mkroutine "$SEAT" cccccccccccc)")" "${SEAT#agent-
   && ok_t "r1 the routine ask never says 'once' or '30 minutes'" || bad_t "r1 one-off words in a routine ask" "$RT"
 grep -qx 'Approve keeps this routine: it runs these steps, any send, post or payment among them, whenever it is replayed, until the steps change. Decline drops it.' <<<"$RT" \
   && ok_t "r2 its footer says the yes is kept, replays it until the steps change, and covers send/post/pay steps" || bad_t "r2 routine footer" "$RT"
-head -1 <<<"$RT" | grep -qx "📱 ${SEAT#agent-} asks: save a phone routine on your phone (Pixel 7)" \
+[[ "$(head -1 <<<"$RT")" == "📱 ${SEAT#agent-} asks: save a phone routine on your phone (Pixel 7)" ]] \
   && ok_t "r3 its verb line says save a phone routine, not 'do something only you can allow'" || bad_t "r3 routine verb" "$(head -1 <<<"$RT")"
 [[ "$RT" != *"only you can allow"* && "$RT" != *'button "routine'* && "$RT" == *"step 2: tap"* && "$RT" == *"repeated with no AI"* ]] \
   && ok_t "r4 it lists the routine's steps and drops the browser's 'step N: button' line" || bad_t "r4 routine body" "$RT"
