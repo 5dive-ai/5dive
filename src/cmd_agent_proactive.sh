@@ -11,7 +11,9 @@
 #
 #   5dive agent proactive <name> [--json]                 status (the app's sheet)
 #   5dive agent proactive <name> off|little|more          set the level
-#   5dive agent proactive <name> claim --text="<msg>"     the check-in run asks to send ONE message
+#   5dive agent proactive <name> recent                   what the owner heard from the TEAM, last 24 h
+#   5dive agent proactive <name> claim --text="<msg>" [--new]  the check-in run asks to send ONE message
+#   5dive agent proactive <name> sent                     the run confirms it really sent the last one
 #   5dive agent proactive <name> reaction acted|not-now   how the owner took the last one
 #   5dive agent proactive <name> offer yes|not-now        the owner's answer to a level-up offer
 #
@@ -36,7 +38,7 @@
 # State (task_prefs, no schema change):
 #   proactive.agent.<name>   {"level","tid","loop","set_at","set_by"}
 #   proactive.tpl.<ident>    <name>   (the reverse map the grader reads)
-#   proactive.log.<name>     [ {"at","day","text","reaction","reaction_at"} … ]  last 30
+#   proactive.log.<name>     [ {"at","day","text","reaction","reaction_at","delivered","delivered_at"} … ]  last 30
 #   proactive.offer.<name>   {"at","from","to","acted","sent","answer","answer_at"}  the latest offer
 #   proactive.seeded.<name>  {"at","atoms","why"}   day-one memory seed, done once
 #
@@ -63,6 +65,24 @@
 #     so memory consolidation can expire or replace it. Never copied: anything
 #     that looks like a secret, task content (an ident like DIVE-12), customer or
 #     client facts, another owner's agents' facts, or a fact that was itself seeded.
+#
+# ONE SENDER PER ISSUE (DIVE-9418, lodar 11-27: the CEO said the stock fix
+# shipped, then another agent told the owner again). The cap and the log stay per
+# agent; what the owner already HEARD is read across the team:
+#   - `recent` lists every message the owner's agents on this box (same owner,
+#     self included) told the owner in the last 24 h.
+#   - `claim` shows that list and asks again before it says yes: while it is not
+#     empty, a claim without --new is answered "wait", with the list. --new is
+#     the run's word that its message is a new issue or a real change.
+#   - a claim whose words match a message already told today (word overlap at or
+#     above _PROACTIVE_DUP_MIN) is refused even with --new.
+#   - CLAIMED IS NOT TOLD. A claim is logged with delivered:false; only `sent`
+#     (the run, after the message really went out) makes it count as told. The
+#     yes says so, so a loop whose learned text predates this still hears it.
+#     An entry with no delivered field predates the split and counts as told.
+#   - Not built: lead-only claiming. A box may have no lead, and a lead would
+#     have to relay every finding; the shared read covers the repeat without
+#     silencing the agent that found the issue.
 # A "day" is the box's local calendar day (the zone the loop's schedule reads).
 
 _PROACTIVE_TITLE="Check in with you"
@@ -71,6 +91,8 @@ _PROACTIVE_OFFER_DAYS=30
 _PROACTIVE_OFFER_MIN_ACTED=8
 _PROACTIVE_SEED_MAX=12
 _PROACTIVE_SEED_KEEP_DAYS=60
+_PROACTIVE_TEAM_HOURS=24
+_PROACTIVE_DUP_MIN=0.8   # word overlap (shared / all distinct words) that counts as the same news
 
 _proactive_is_root() { [[ "$EUID" == "0" ]]; }   # seam: harnesses drive it
 _proactive_rank() { case "$1" in more) echo 2 ;; little) echo 1 ;; *) echo 0 ;; esac; }
@@ -130,6 +152,41 @@ _proactive_sent_today() {
   jq --arg d "$(_proactive_today)" '[.[] | select(.day == $d)] | length' <<<"$(_proactive_log "$1")"
 }
 
+# What the owner already HEARD from <name>'s team in the last 24 h, oldest
+# first: [{agent, at, text}]. The team is every agent on this box with the same
+# owner (self included); only messages told (delivered, or logged before the
+# claim/delivery split) count, never a claim that was not sent.
+_proactive_team_recent() {
+  local name="$1" owner since key seat rows='[]' log
+  owner=$(_proactive_owner_of "$name")
+  since=$(db "SELECT datetime('now', '-${_PROACTIVE_TEAM_HOURS} hours');")
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    seat="${key#proactive.log.}"
+    [[ "$(_proactive_owner_of "$seat")" == "$owner" ]] || continue
+    log=$(_proactive_log "$seat")
+    rows=$(jq -c --arg a "$seat" --arg s "$since" --argjson r "$rows" \
+      '$r + [.[] | select((.at // "") >= $s and .delivered != false) | {agent:$a, at, text}]' <<<"$log" 2>/dev/null) || continue
+  done < <(db "SELECT key FROM task_prefs WHERE key LIKE 'proactive.log.%' ORDER BY key;" 2>/dev/null)
+  jq -c 'sort_by(.at)' <<<"$rows"
+}
+# The told message <text> repeats, as {agent, at, text, overlap}, or '' when none
+# reaches _PROACTIVE_DUP_MIN. Words: lower case, letters and digits, 3+ long.
+_proactive_dup_of() { # <text> <team-recent json>
+  jq -c --arg t "$1" --argjson min "$_PROACTIVE_DUP_MIN" '
+    def words: ascii_downcase | [scan("[a-z0-9]{3,}")] | unique;
+    ($t | words) as $w
+    | [ .[] | (.text | words) as $o
+        | ([$w[] | select(. as $x | $o | index([$x]))] | length) as $both
+        | (($w + $o) | unique | length) as $all
+        | select($all > 0 and ($both / $all) >= $min)
+        | . + {overlap: (($both / $all) * 100 | floor)} ]
+    | first // empty' <<<"$2"
+}
+_proactive_team_lines() { # <team-recent json> -> one "- <agent> (<at> UTC): <text>" line each
+  jq -r '.[] | "- \(.agent) (\(.at) UTC): \(.text)"' <<<"$1"
+}
+
 # Only the agent itself or root (the app runs over the exec rail as root) may
 # change the level or claim a send for it. A teammate cannot spend another
 # agent's messages, and cannot switch another agent on.
@@ -151,9 +208,13 @@ Check in with your owner. Look at what you know: your memory, your open tasks an
 
 First, if your owner answered your last check-in message, record how they took it: 5dive agent proactive ${name} reaction acted (they used it) or 5dive agent proactive ${name} reaction not-now (they waved it off).
 
-Then decide if ONE thing is worth their attention now: a result they were waiting for, a problem you found, or one useful idea that fits what they care about. Their asks and approvals already reach them, so never repeat one here. If nothing is worth it, send nothing. A quiet day is a good day.
+Then see what your owner already heard from your whole team today: 5dive agent proactive ${name} recent. Never tell them any of that again. A teammate's news is told, even if you found it too.
 
-If something is worth it, ask first: 5dive agent proactive ${name} claim --text="<the message>". Only if it says yes, send that message to your owner where you normally talk to them. If it refuses, send nothing.
+Then decide if ONE thing is worth their attention now: a result they were waiting for, a problem you found, or one useful idea that fits what they care about. Their asks and approvals already reach them, so never repeat one here. Only a new issue, or a real change on one already told, counts. If nothing is worth it, send nothing. A quiet day is a good day.
+
+If something is worth it, ask first: 5dive agent proactive ${name} claim --text="<the message>" --new (--new says it is not in that list). Only if it says yes, send that message to your owner where you normally talk to them, then record it: 5dive agent proactive ${name} sent. If it refuses or says wait, send nothing.
+
+If you promise your owner to check or do something later, file it in this run: 5dive task add "<what to check>" --assignee=${name} --park="<why>" --park-wake=<when>. The task wakes you then; message your owner from it.
 
 Only when that yes gives you an offer line, end the message with it, word for word. Never offer to message more on your own, and never raise your own level: only your owner's Yes tap can. If your owner said no to an offer, record it: 5dive agent proactive ${name} offer not-now.
 
@@ -303,11 +364,12 @@ _proactive_set() {
 # send that then fails still spends it: the cap errs toward fewer messages).
 _proactive_claim() {
   local name="$1"; shift
-  local text=""
+  local text="" is_new=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --text=*) text="${1#*=}" ;;
-      *) fail "$E_USAGE" "usage: 5dive agent proactive ${name} claim --text=\"<the message>\"" ;;
+      --new) is_new=1 ;;
+      *) fail "$E_USAGE" "usage: 5dive agent proactive ${name} claim --text=\"<the message>\" [--new]" ;;
     esac
     shift
   done
@@ -330,6 +392,21 @@ _proactive_claim() {
     [[ -n "${_pfd:-}" ]] && exec {_pfd}>&-
     fail "$E_VALIDATION" "no: ${name} already sent ${sent} of ${cap} today. Send nothing."
   fi
+  # One sender per issue (DIVE-9418): what the team already told the owner.
+  local team dup
+  team=$(_proactive_team_recent "$name")
+  dup=$(_proactive_dup_of "$text" "$team")
+  if [[ -n "$dup" ]]; then
+    [[ -n "${_pfd:-}" ]] && exec {_pfd}>&-
+    fail "$E_VALIDATION" "no: your owner already heard this from $(jq -r .agent <<<"$dup") at $(jq -r .at <<<"$dup") UTC: \"$(jq -r .text <<<"$dup")\". Send nothing. Only a real change on it is news; then say what changed."
+  fi
+  if [[ "$(jq length <<<"$team")" != "0" ]] && (( ! is_new )); then
+    [[ -n "${_pfd:-}" ]] && exec {_pfd}>&-
+    local lines; lines=$(_proactive_team_lines "$team")
+    ok "wait: your owner already heard this from your team in the last ${_PROACTIVE_TEAM_HOURS} hours:"$'\n'"${lines}"$'\n'"If yours repeats any of it, send nothing. Only if it is a new issue or a real change, ask again with --new added." \
+       '{agent:$n, allowed:false, wait:true, team_recent:$tr}' --arg n "$name" --argjson tr "$team"
+    return 0
+  fi
   # The offer is decided on the 10 messages BEFORE this one, and rides it.
   local now to line="" acted=0
   now=$(db "SELECT datetime('now');")
@@ -343,13 +420,13 @@ _proactive_claim() {
   fi
   local log; log=$(_proactive_log "$name")
   log=$(jq -c --arg at "$now" --arg d "$(_proactive_today)" --arg t "$text" --argjson k "$_PROACTIVE_LOG_KEEP" \
-        --arg o "$to" '. + [{at:$at, day:$d, text:$t, reaction:null} + (if $o == "" then {} else {offer:$o} end)] | .[-$k:]' <<<"$log")
+        --arg o "$to" '. + [{at:$at, day:$d, text:$t, reaction:null, delivered:false} + (if $o == "" then {} else {offer:$o} end)] | .[-$k:]' <<<"$log")
   _proactive_pref_set "proactive.log.${name}" "$log"
   [[ -n "${_pfd:-}" ]] && exec {_pfd}>&-
-  local say="yes: send it now, where you normally talk to your owner ($((sent + 1)) of ${cap} today)"
+  local say="yes: send it now, where you normally talk to your owner ($((sent + 1)) of ${cap} today). Once it is sent, record it: 5dive agent proactive ${name} sent (until then your team does not count it as told)"
   [[ -n "$line" ]] && say+=$'\n'"End the message with this line, word for word (your owner answers Yes or Not now): ${line}"
   ok "$say" \
-     '{agent:$n, allowed:true, sent_today:($s|tonumber), cap:($c|tonumber),
+     '{agent:$n, allowed:true, wait:false, sent_today:($s|tonumber), cap:($c|tonumber),
        offer:(if $line == "" then null else {line:$line, to:$to, label:$lb} end)}' \
      --arg n "$name" --arg s "$((sent + 1))" --arg c "$cap" --arg line "$line" --arg to "$to" \
      --arg lb "$(_proactive_label "${to:-off}")"
@@ -551,6 +628,36 @@ _proactive_seed() {
       --argjson n "$seeded" --arg w "$why" '{at:$at, atoms:$n, why:$w}')"
 }
 
+# The run confirms the last claimed message really went out (DIVE-9418): only
+# then does the team's `recent` count it as told. Idempotent.
+_proactive_sent() {
+  local name="$1"
+  _proactive_authorize "$name"
+  local log; log=$(_proactive_log "$name")
+  [[ "$(jq 'length' <<<"$log")" != "0" ]] || fail "$E_VALIDATION" "${name} has not claimed a check-in message yet"
+  log=$(jq -c --arg at "$(db "SELECT datetime('now');")" \
+        'if .[-1].delivered == true then . else .[-1].delivered = true | .[-1].delivered_at = $at end' <<<"$log")
+  _proactive_pref_set "proactive.log.${name}" "$log"
+  ok "${name}: recorded the last check-in message as sent; your team now counts it as told" \
+     '{agent:$n, delivered:true, text:$t}' --arg n "$name" --arg t "$(jq -r '.[-1].text' <<<"$log")"
+}
+
+# What the owner already heard from the team in the last 24 h (read-only).
+_proactive_recent() {
+  local name="$1" team
+  team=$(_proactive_team_recent "$name")
+  if (( JSON_MODE )); then
+    jq -c --arg n "$name" --argjson h "$_PROACTIVE_TEAM_HOURS" '{ok:true, data:{agent:$n, hours:$h, told:.}}' <<<"$team"
+    return 0
+  fi
+  if [[ "$(jq length <<<"$team")" == "0" ]]; then
+    printf 'Your owner heard nothing from your team on Proactive in the last %s hours.\n' "$_PROACTIVE_TEAM_HOURS"
+  else
+    printf 'Your owner already heard this from your team in the last %s hours. Never tell it again:\n' "$_PROACTIVE_TEAM_HOURS"
+    _proactive_team_lines "$team"
+  fi
+}
+
 # How the owner took the latest message. The app's buttons call it (Draft it =
 # acted, Not now = not-now), and so does the next check-in run.
 _proactive_reaction() {
@@ -588,7 +695,12 @@ cmd_agent_proactive() {
                                                       1 message a day. more = Very high: 4 checks a day, at
                                                       most 3 messages. High or Very high = one self-improving
                                                       loop, "Check in with you"; off pauses it (kept).
-5dive agent proactive <name> claim --text="<msg>"     a check-in run asks before it sends; refused at the cap
+5dive agent proactive <name> recent                   what the owner heard from the team (same owner) in 24 h
+5dive agent proactive <name> claim --text="<msg>" [--new]
+                                                      a check-in run asks before it sends; refused at the cap
+                                                      or on a repeat of team news; "wait" with the team's
+                                                      24 h list until --new says the message is not in it
+5dive agent proactive <name> sent                     the message really went out: now it counts as told
 5dive agent proactive <name> reaction acted|not-now   how the owner took the last message (feeds its score)
 5dive agent proactive <name> offer yes|not-now        the owner's answer to "message you a bit more?" (offered
                                                       once 8 of the last 10 were acted on; at most every 30
@@ -608,7 +720,9 @@ HELP
     little|a-little)    _proactive_set "$name" little ;;
     claim)              _proactive_claim "$name" "${rest[@]}" ;;
     reaction)           _proactive_reaction "$name" "${rest[@]}" ;;
+    sent)               _proactive_sent "$name" ;;
+    recent)             _proactive_recent "$name" ;;
     offer)              _proactive_offer "$name" "${rest[@]}" ;;
-    *) fail "$E_USAGE" "unknown: $verb (try: off|little|more|claim|reaction|offer, or nothing for the status)" ;;
+    *) fail "$E_USAGE" "unknown: $verb (try: off|little|more|recent|claim|sent|reaction|offer, or nothing for the status)" ;;
   esac
 }
