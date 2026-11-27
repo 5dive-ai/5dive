@@ -1,26 +1,20 @@
 {
-  "date": "2026-11-26",
-  "generatedAtUtc": "2026-11-26T02:01:50Z",
+  "date": "2026-11-27",
+  "generatedAtUtc": "2026-11-27T02:01:43Z",
   "window": {
     "days": 30,
-    "from": "2026-10-27",
-    "to": "2026-11-25",
+    "from": "2026-10-28",
+    "to": "2026-11-26",
     "basis": "each task counts once, on the UTC day of its last task.done; the window is the whole days before the publish date"
   },
   "totals": {
-    "shipped": 2211,
-    "reviewed": 1124,
-    "firstTry": 580,
-    "sentBack": 544,
-    "sendBacks": 790
+    "shipped": 2205,
+    "reviewed": 1117,
+    "firstTry": 574,
+    "sentBack": 543,
+    "sendBacks": 795
   },
   "days": [
-    {
-      "date": "2026-10-27",
-      "reviewed": 47,
-      "firstTry": 26,
-      "sentBack": 21
-    },
     {
       "date": "2026-10-28",
       "reviewed": 19,
@@ -194,31 +188,37 @@
       "reviewed": 57,
       "firstTry": 19,
       "sentBack": 38
+    },
+    {
+      "date": "2026-11-26",
+      "reviewed": 40,
+      "firstTry": 20,
+      "sentBack": 20
     }
   ],
   "reasons": {
     "basis": "one fixed category per send-back, by rule from the reviewer's finding; no match or no preserved finding = other. Sums to totals.sendBacks.",
-    "total": 790,
+    "total": 795,
     "categories": [
       {
         "key": "conflict",
         "label": "Clashes with newer work",
-        "count": 38
+        "count": 29
       },
       {
         "key": "safety",
         "label": "Safety or privacy",
-        "count": 47
+        "count": 45
       },
       {
         "key": "writing",
         "label": "Unclear writing",
-        "count": 176
+        "count": 181
       },
       {
         "key": "tests",
         "label": "Failing tests",
-        "count": 357
+        "count": 363
       },
       {
         "key": "proof",
@@ -228,12 +228,12 @@
       {
         "key": "ask",
         "label": "Not what was asked",
-        "count": 26
+        "count": 28
       },
       {
         "key": "other",
         "label": "Other",
-        "count": 94
+        "count": 97
       }
     ]
   },
