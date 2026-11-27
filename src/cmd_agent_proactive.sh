@@ -80,6 +80,13 @@
 #     (the run, after the message really went out) makes it count as told. The
 #     yes says so, so a loop whose learned text predates this still hears it.
 #     An entry with no delivered field predates the split and counts as told.
+#   - A TEAMMATE'S PENDING CLAIM BLOCKS, BRIEFLY. Every agent's check-in fires at
+#     the same box hours, so two runs can claim the same news before either says
+#     `sent`. `claim` therefore also counts a teammate's claim from the last
+#     _PROACTIVE_PENDING_MIN minutes that is not yet sent (shown "being sent"),
+#     and claims are serialized per OWNER (one lock for all their agents), so
+#     the second of two racing runs reads the first one's claim. A claim that is
+#     never sent stops blocking after those minutes: it never silences the team.
 #   - Not built: lead-only claiming. A box may have no lead, and a lead would
 #     have to relay every finding; the shared read covers the repeat without
 #     silencing the agent that found the issue.
@@ -92,6 +99,7 @@ _PROACTIVE_OFFER_MIN_ACTED=8
 _PROACTIVE_SEED_MAX=12
 _PROACTIVE_SEED_KEEP_DAYS=60
 _PROACTIVE_TEAM_HOURS=24
+_PROACTIVE_PENDING_MIN=15   # a teammate's claim not yet sent blocks a repeat this long
 _PROACTIVE_DUP_MIN=0.8   # word overlap (shared / all distinct words) that counts as the same news
 
 _proactive_is_root() { [[ "$EUID" == "0" ]]; }   # seam: harnesses drive it
@@ -156,17 +164,23 @@ _proactive_sent_today() {
 # first: [{agent, at, text}]. The team is every agent on this box with the same
 # owner (self included); only messages told (delivered, or logged before the
 # claim/delivery split) count, never a claim that was not sent.
+# With [pending-minutes] (claim passes it), a TEAMMATE's claim from that many
+# minutes back that is not sent yet is added too, as {agent, at, text, pending:true}.
 _proactive_team_recent() {
-  local name="$1" owner since key seat rows='[]' log
+  local name="$1" pmin="${2:-0}" owner since psince="9999" key seat rows='[]' log
   owner=$(_proactive_owner_of "$name")
   since=$(db "SELECT datetime('now', '-${_PROACTIVE_TEAM_HOURS} hours');")
+  [[ "$pmin" =~ ^[0-9]+$ ]] && (( pmin > 0 )) && psince=$(db "SELECT datetime('now', '-${pmin} minutes');")
   while IFS= read -r key; do
     [[ -n "$key" ]] || continue
     seat="${key#proactive.log.}"
     [[ "$(_proactive_owner_of "$seat")" == "$owner" ]] || continue
     log=$(_proactive_log "$seat")
-    rows=$(jq -c --arg a "$seat" --arg s "$since" --argjson r "$rows" \
-      '$r + [.[] | select((.at // "") >= $s and .delivered != false) | {agent:$a, at, text}]' <<<"$log" 2>/dev/null) || continue
+    rows=$(jq -c --arg a "$seat" --arg s "$since" --arg ps "$psince" --argjson mate "$([[ "$seat" != "$name" ]] && echo true || echo false)" --argjson r "$rows" \
+      '$r + [.[] | select((.at // "") >= $s)
+             | if .delivered != false then {agent:$a, at, text}
+               elif $mate and (.at // "") >= $ps then {agent:$a, at, text, pending:true}
+               else empty end]' <<<"$log" 2>/dev/null) || continue
   done < <(db "SELECT key FROM task_prefs WHERE key LIKE 'proactive.log.%' ORDER BY key;" 2>/dev/null)
   jq -c 'sort_by(.at)' <<<"$rows"
 }
@@ -184,7 +198,7 @@ _proactive_dup_of() { # <text> <team-recent json>
     | first // empty' <<<"$2"
 }
 _proactive_team_lines() { # <team-recent json> -> one "- <agent> (<at> UTC): <text>" line each
-  jq -r '.[] | "- \(.agent) (\(.at) UTC): \(.text)"' <<<"$1"
+  jq -r '.[] | "- \(.agent) (\(.at) UTC\(if .pending then ", being sent" else "" end)): \(.text)"' <<<"$1"
 }
 
 # Only the agent itself or root (the app runs over the exec rail as root) may
@@ -376,8 +390,13 @@ _proactive_claim() {
   [[ -n "${text//[[:space:]]/}" ]] || fail "$E_USAGE" "usage: 5dive agent proactive ${name} claim --text=\"<the message>\""
   _proactive_authorize "$name"
   local level cap sent
-  # One claim at a time per box: two runs racing must not both get the last slot.
-  local lock="${TASKS_DIR:-/tmp}/.proactive-${name}.lock"
+  # One claim at a time per OWNER: two runs racing must not both get the last
+  # slot, and two of the owner's agents must not both claim the same news (each
+  # must read the other's claim). No owner: the agent's own lock.
+  local owner lock
+  owner=$(_proactive_owner_of "$name")
+  if [[ -n "$owner" ]]; then lock="${TASKS_DIR:-/tmp}/.proactive-owner-${owner//[^A-Za-z0-9_.-]/_}.lock"
+  else lock="${TASKS_DIR:-/tmp}/.proactive-${name}.lock"; fi
   # (A bare `exec {fd}>>f 2>/dev/null` would also send this shell's stderr to
   # /dev/null for good, and every refusal below would print nothing.)
   local _pfd=""
@@ -394,8 +413,12 @@ _proactive_claim() {
   fi
   # One sender per issue (DIVE-9418): what the team already told the owner.
   local team dup
-  team=$(_proactive_team_recent "$name")
+  team=$(_proactive_team_recent "$name" "$_PROACTIVE_PENDING_MIN")
   dup=$(_proactive_dup_of "$text" "$team")
+  if [[ -n "$dup" && "$(jq -r '.pending // false' <<<"$dup")" == "true" ]]; then
+    [[ -n "${_pfd:-}" ]] && exec {_pfd}>&-
+    fail "$E_VALIDATION" "no: $(jq -r .agent <<<"$dup") is telling your owner this right now (claimed at $(jq -r .at <<<"$dup") UTC): \"$(jq -r .text <<<"$dup")\". Send nothing. Only a real change on it is news; then say what changed."
+  fi
   if [[ -n "$dup" ]]; then
     [[ -n "${_pfd:-}" ]] && exec {_pfd}>&-
     fail "$E_VALIDATION" "no: your owner already heard this from $(jq -r .agent <<<"$dup") at $(jq -r .at <<<"$dup") UTC: \"$(jq -r .text <<<"$dup")\". Send nothing. Only a real change on it is news; then say what changed."
@@ -423,7 +446,7 @@ _proactive_claim() {
         --arg o "$to" '. + [{at:$at, day:$d, text:$t, reaction:null, delivered:false} + (if $o == "" then {} else {offer:$o} end)] | .[-$k:]' <<<"$log")
   _proactive_pref_set "proactive.log.${name}" "$log"
   [[ -n "${_pfd:-}" ]] && exec {_pfd}>&-
-  local say="yes: send it now, where you normally talk to your owner ($((sent + 1)) of ${cap} today). Once it is sent, record it: 5dive agent proactive ${name} sent (until then your team does not count it as told)"
+  local say="yes: send it now, where you normally talk to your owner ($((sent + 1)) of ${cap} today). Once it is sent, record it: 5dive agent proactive ${name} sent (until then your team counts it only as being sent, for ${_PROACTIVE_PENDING_MIN} minutes)"
   [[ -n "$line" ]] && say+=$'\n'"End the message with this line, word for word (your owner answers Yes or Not now): ${line}"
   ok "$say" \
      '{agent:$n, allowed:true, wait:false, sent_today:($s|tonumber), cap:($c|tonumber),

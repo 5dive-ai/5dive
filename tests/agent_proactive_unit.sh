@@ -354,6 +354,35 @@ B=$(db "SELECT body FROM tasks WHERE ident='$(PA sales --json | jq -r .data.loop
 t "T18 body: recent, --new, sent, parked promise" "1|1|1|1" \
   "$(grep -c 'proactive sales recent' <<<"$B")|$(grep -c 'claim --text="<the message>" --new' <<<"$B")|$(grep -c 'proactive sales sent' <<<"$B")|$(grep -c -- '--assignee=sales --park="<why>" --park-wake=<when>' <<<"$B")"
 
+# T18 (it2) — the race quinn found: every check-in fires at the same box hour, so
+# two of one owner's agents can claim the same news before either says `sent`.
+# A teammate's pending claim blocks a repeat for _PROACTIVE_PENDING_MIN minutes,
+# and claims are serialized per owner.
+db "DELETE FROM task_prefs WHERE key LIKE 'proactive.log.%';"
+out=$(PA ceo claim --text="$NEWS" --new); t "T18 race: first agent claims, not sent yet" "true" "$(jq -r .data.allowed <<<"$out")"
+PA sales claim --text="$NEWS" --new >/dev/null; rc=$?
+t "T18 race: second agent, same news, no sent between: refused, names the first" "1|1" \
+  "$([[ $rc -ne 0 ]] && echo 1)|$(grep -c 'ceo is telling your owner this right now' "$TMP/err")"
+_sl=$(db "SELECT value FROM task_prefs WHERE key='proactive.log.sales';" | jq 'length')
+t "T18 race: the refused claim is not logged" "0" "${_sl:-0}"
+t "T18 race: pending is not told (recent still empty)" "0" "$(PA sales recent | jq '.data.told | length')"
+t "T18 race: a different message without --new waits, the list says being sent" "true|1" \
+  "$(PA sales claim --text="Bulk prices question" | jq -r .data.wait)|$( (JSON_MODE=0; cmd_agent_proactive sales claim --text=y) | grep -c "ceo (.*, being sent): $NEWS")"
+# Never sent: after the window it stops blocking (claimed is still not told).
+_old=$(db "SELECT datetime('now','-$((_PROACTIVE_PENDING_MIN + 1)) minutes');")
+db "UPDATE task_prefs SET value='$(db "SELECT value FROM task_prefs WHERE key='proactive.log.ceo';" | jq -c --arg o "$_old" '.[-1].at = $o')' WHERE key='proactive.log.ceo';"
+out=$(PA sales claim --text="$NEWS" --new); t "T18 race: a pending claim older than the window no longer blocks" "true" "$(jq -r .data.allowed <<<"$out")"
+t "T18 race: an agent's own pending claim never blocks itself (other owner, twice)" "true" \
+  "$(db "DELETE FROM task_prefs WHERE key='proactive.log.other';"; PA other claim --text="$NEWS" >/dev/null; PA other claim --text="$NEWS" | jq -r .data.allowed)"
+# The lock is the OWNER's: a run holding it makes a teammate's claim wait for it.
+db "DELETE FROM task_prefs WHERE key LIKE 'proactive.log.%';"
+( exec 8>>"$TASKS_DIR/.proactive-owner-h1.lock"; flock 8; sleep 2 ) & _lp=$!
+sleep 0.3; _t0=$(date +%s%N); PA sales claim --text="Owner lock check" --new >/dev/null; _t1=$(date +%s%N); wait "$_lp"
+( exec 8>>"$TASKS_DIR/.proactive-sales.lock"; flock 8; sleep 2 ) & _lp=$!
+sleep 0.3; _t2=$(date +%s%N); PA ceo claim --text="Old per-agent lock check" --new >/dev/null; _t3=$(date +%s%N); wait "$_lp"
+t "T18 race: claim waits on the owner's lock, not the old per-agent one" "1|1" \
+  "$(( (_t1 - _t0) >= 1000000000 ))|$(( (_t3 - _t2) < 1000000000 ))"
+
 # T19 — DIVE-9418 a promise becomes a parked task. The rule is in every seat's
 # instructions (Claude team block, Codex baseline), and the command it names
 # files a parked row with an owner and a wake time.
