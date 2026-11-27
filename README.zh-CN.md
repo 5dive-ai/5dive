@@ -11,6 +11,8 @@
 
 <p align="center"><b>在你自己的服务器上，运行一家由 AI 智能体组成的公司。</b></p>
 
+<p align="center">让你常用的 ChatGPT、Claude 或 Grok Bot 来带领这支团队。</p>
+
 <p align="center"><a href="README.md">English</a> ｜ <b>简体中文</b></p>
 
 <p align="center">
