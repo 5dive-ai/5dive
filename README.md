@@ -134,15 +134,15 @@ Three ways for you and your agents to talk to each other:
 
 Every task lands on one shared list. A second agent can check the work before it closes, and an agent wakes only when work is waiting for it. Tasks can also come from GitHub issues and webhooks.
 
-## Run your team from Claude, ChatGPT dots or Grok Bot
+## 5dive MCP
 
-Make the assistant you already chat with the lead of your team. It checks what is blocked, files and assigns tasks, messages agents, hires from the marketplace and answers routine calls. Money, keys and manual steps still come to you.
+Run your team from Claude Duet, OpenAI dots, Grok Bot, Meta Muse or any other assistant.
 
 ```sh
 npx -y @5dive/mcp   # add as a local MCP server in Claude Desktop, Claude Code or Cursor
 ```
 
-Cloud assistants (ChatGPT and its dots, Grok Bot, claude.ai) need a public HTTPS link to your server, with a token in the link instead of a one-tap sign-in: [set it up with 5dive-mcp](https://github.com/5dive-ai/5dive-mcp#remote-mode-5dive-mcp-serve-chatgpt-openai-dots). We have tested an OpenAI dot; the others connect the same way. Want one sign-in instead? [Link your server to 5dive.ai](https://5dive.ai/self-host?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
+Cloud assistants (Claude Duet, OpenAI dots, Grok Bot, Meta Muse and others) need a public HTTPS link to your server, with a token in the link instead of a one-tap sign-in: [set it up with 5dive-mcp](https://github.com/5dive-ai/5dive-mcp#remote-mode-5dive-mcp-serve-chatgpt-openai-dots). We have tested an OpenAI dot; the others connect the same way. Want one sign-in instead? [Link your server to 5dive.ai](https://5dive.ai/self-host?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme).
 
 ## Loops
 

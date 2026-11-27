@@ -132,15 +132,15 @@ sudo 5dive team import startup --auth-profile=<account>     # 雇用一支团队
 
 所有任务都会进入同一个共享列表。任务关闭前可以由第二个智能体检查，智能体只在有工作等着它时才会被唤醒。任务也可以来自 GitHub issue 和 webhook。
 
-## 用 Claude、ChatGPT dots 或 Grok Bot 管理你的团队
+## 5dive MCP
 
-让你平时聊天的助手来当团队的负责人。它会查看哪里卡住了、创建和分配任务、给智能体发消息、从市场雇用智能体，并回答日常的决定。涉及钱、密钥和需要人工操作的事，仍然交给你。
+用 Claude Duet、OpenAI dots、Grok Bot、Meta Muse 或其他助手管理你的团队。
 
 ```sh
 npx -y @5dive/mcp   # 在 Claude Desktop、Claude Code 或 Cursor 中添加为本地 MCP 服务器
 ```
 
-云端助手（ChatGPT 及其 dots、Grok Bot、claude.ai）需要一个指向你服务器的公网 HTTPS 链接，链接里带令牌，而不是一键登录：[用 5dive-mcp 设置](https://github.com/5dive-ai/5dive-mcp#remote-mode-5dive-mcp-serve-chatgpt-openai-dots)。我们已测试过 OpenAI dot，其他助手的连接方式相同。想要一键登录？[把你的服务器关联到 5dive.ai](https://5dive.ai/self-host?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme)。
+云端助手（Claude Duet、OpenAI dots、Grok Bot、Meta Muse 等）需要一个指向你服务器的公网 HTTPS 链接，链接里带令牌，而不是一键登录：[用 5dive-mcp 设置](https://github.com/5dive-ai/5dive-mcp#remote-mode-5dive-mcp-serve-chatgpt-openai-dots)。我们已测试过 OpenAI dot，其他助手的连接方式相同。想要一键登录？[把你的服务器关联到 5dive.ai](https://5dive.ai/self-host?utm_source=github&utm_medium=owned&utm_campaign=5dive-readme)。
 
 ## 循环（Loops）
 
