@@ -103,9 +103,12 @@ _freedom_label() {
 
 _freedom_rank() { case "$1" in ask) echo 0 ;; balanced) echo 1 ;; yolo) echo 2 ;; esac; }
 
+# The board is opened once per status (DIVE-9448: each read opened it again,
+# ~0.17 s apiece); everywhere else each read opens it, as before.
+_freedom_db_init() { [[ -n "${_FREEDOM_DB_READY:-}" ]] || tasks_db_init >/dev/null 2>&1 || true; }
 _freedom_pref() {  # <key> -> the stored {"level",...} object, or {}
   local s
-  tasks_db_init >/dev/null 2>&1 || true
+  _freedom_db_init
   s=$(db "SELECT value FROM task_prefs WHERE key=$(sqlq "$1");" 2>/dev/null)
   jq -e 'type=="object" and (.level|type=="string")' <<<"$s" >/dev/null 2>&1 && printf '%s' "$s" || printf '{}'
 }
@@ -129,8 +132,10 @@ _freedom_used() {
   [[ "$(db "SELECT count(*) FROM task_prefs WHERE key='freedom.team' OR key LIKE 'freedom.agent.%';" 2>/dev/null)" =~ ^[1-9] ]]
 }
 
-# The team: name<TAB>type, one per line.
+# The team: name<TAB>type, one per line. A status primes _FREEDOM_TEAM_MEMO
+# once (DIVE-9448): the registry does not move while one status is read.
 _freedom_team() {
+  [[ -n "${_FREEDOM_TEAM_MEMO+x}" ]] && { printf '%s\n' "$_FREEDOM_TEAM_MEMO"; return 0; }
   registry_read 2>/dev/null | jq -r '.agents // {} | to_entries[]
     | select((.value.system // "") == "" and .key != "sysadmin")
     | "\(.key)\t\(.value.type // "claude")"' 2>/dev/null
@@ -156,62 +161,85 @@ _freedom_email_now() {
     | "\(if .approve_inbound == false then "off" else "on" end) \(if .approve_new == false then "off" else "on" end)"' "$cfg" 2>/dev/null
 }
 
+# Read in this process when the proactive verb is loaded (DIVE-9448): a nested
+# `5dive agent proactive` paid a whole CLI start for one stored word. Same rule
+# as that verb's status: an agent off the roster has no level to read.
 _freedom_proactive_now() {  # <name>
+  if declare -F _proactive_level >/dev/null 2>&1; then
+    if [[ -z "${FIVEDIVE_PROACTIVE_NO_ROSTER:-}" ]] && declare -F _task_roster_has >/dev/null 2>&1; then
+      _task_roster_has "$1" || return 0
+    fi
+    _proactive_level "$1" 2>/dev/null
+    return 0
+  fi
   _freedom_run agent proactive "$1" --json 2>/dev/null | jq -r '.data.level // empty' 2>/dev/null
 }
 
 # The browser's four answers as JSON, or nothing (no browser, or one too old).
+# The browser plugin owns its policy file and its rules (owner uid, defaults),
+# so this stays its verb. A status asks it ONCE (DIVE-9448: it was asked twice,
+# ~0.7 s each): _freedom_browser_prime stores the answer, later reads reuse it.
 _freedom_browser_now() {
+  if [[ -n "${_FREEDOM_BROWSER_MEMO+x}" ]]; then printf '%s' "$_FREEDOM_BROWSER_MEMO"; return 0; fi
   local out
   out=$(_freedom_run browser approvals policy --json 2>/dev/null) || return 0
   out=$(printf '%s' "$out" | sed -n '/{/,$p')
   jq -ce 'select(.pay and .publish and .send and .delete) | {pay, publish, send, delete}' <<<"$out" 2>/dev/null || true
 }
+_freedom_browser_prime() { _FREEDOM_BROWSER_MEMO=$(_freedom_browser_now); }
 
 # One agent's own switches, as JSON lines {switch, agent, now}.
+# One jq for all of them (DIVE-9448: it was one jq fork per switch).
 _freedom_snapshot_agent() {  # <name> <type>
-  local n="$1" t="$2" v e_in e_send
+  local n="$1" t="$2" v au="" e_in e_send
   v=$(_freedom_proactive_now "$n")
-  [[ -n "$v" ]] && jq -cn --arg a "$n" --arg v "$v" '{switch:"proactive", agent:$a, now:$v}'
-  [[ "$t" == claude ]] && jq -cn --arg a "$n" --arg v "$(_freedom_autonomy_now "$n")" '{switch:"autonomy", agent:$a, now:$v}'
+  [[ "$t" == claude ]] && au=$(_freedom_autonomy_now "$n")
   read -r e_in e_send <<<"$(_freedom_email_now "$n")"
-  if [[ -n "$e_in" ]]; then
-    jq -cn --arg a "$n" --arg v "$e_in" '{switch:"email.inbound", agent:$a, now:$v}'
-    jq -cn --arg a "$n" --arg v "$e_send" '{switch:"email.send", agent:$a, now:$v}'
-  fi
-  return 0
+  jq -cn --arg a "$n" --arg p "$v" --arg au "$au" --arg ei "${e_in:-}" --arg es "${e_send:-}" '
+    (if $p  != "" then {switch:"proactive", agent:$a, now:$p} else empty end),
+    (if $au != "" then {switch:"autonomy", agent:$a, now:$au} else empty end),
+    (if $ei != "" then {switch:"email.inbound", agent:$a, now:$ei}, {switch:"email.send", agent:$a, now:$es} else empty end)'
 }
 # The browser's switches, as JSON lines {switch, agent:null, now}. <browser json>
 _freedom_snapshot_browser() {
-  local k
   [[ -n "$1" ]] || return 0
-  for k in $_FREEDOM_BROWSER_KINDS; do
-    jq -cn --arg s "browser.$k" --arg v "$(jq -r --arg k "$k" '.[$k]' <<<"$1")" '{switch:$s, agent:null, now:$v}'
-  done
+  jq -c --arg ks "$_FREEDOM_BROWSER_KINDS" '. as $b | ($ks | split(" ")[]) as $k
+    | {switch:("browser." + $k), agent:null, now:($b[$k] | if type == "string" then . else tostring end)}' <<<"$1"
 }
 
+# <level> -> {switch: want} for every switch, from _freedom_want (the one table).
+_freedom_wants() {
+  local s out=""
+  for s in proactive autonomy email.inbound email.send browser.send browser.publish browser.pay browser.delete; do
+    out+="${out:+,}\"$s\":\"$(_freedom_want "$1" "$s")\""
+  done
+  printf '{%s}' "$out"
+}
 # <level> <snapshot> -> JSON array of {switch, agent, want, now} that differ.
 _freedom_differs() {
-  local level="$1" line s want out=()
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    s=$(jq -r .switch <<<"$line")
-    want=$(_freedom_want "$level" "$s")
-    out+=("$(jq -c --arg w "$want" '. + {want:$w} | select(.want != .now)' <<<"$line")")
-  done <<<"$2"
-  printf '%s\n' "${out[@]}" | jq -cs 'map(select(. != null))'
+  jq -cs --argjson w "$(_freedom_wants "$1")" \
+    'map(. + {want: ($w[.switch] // "")} | select(.want != .now))' <<<"$2"
 }
 
 # The level the box-wide browser follows: the most careful level any agent is
-# on, or nothing when no agent has one.
+# on, or nothing when no agent has one. One read of every stored level and one
+# jq (DIVE-9448: it was two sqlite reads and a jq per agent). Same fallback as
+# _freedom_saved: an agent's own key, else DIVE-8853's team level.
 _freedom_browser_level() {
-  local n t l best=""
-  while IFS=$'\t' read -r n t; do
-    [[ -n "$n" ]] || continue
-    l=$(_freedom_level "$n"); [[ -n "$l" ]] || continue
-    [[ -z "$best" || "$(_freedom_rank "$l")" -lt "$(_freedom_rank "$best")" ]] && best="$l"
-  done <<<"$(_freedom_team)"
-  printf '%s' "$best"
+  local prefs team
+  team=$(_freedom_team | cut -f1)
+  [[ -n "$team" ]] || return 0
+  _freedom_db_init
+  prefs=$(db "SELECT json_group_object(key, json(value)) FROM task_prefs
+              WHERE (key='freedom.team' OR key LIKE 'freedom.agent.%') AND json_valid(value);" 2>/dev/null)
+  jq -e 'type == "object"' <<<"$prefs" >/dev/null 2>&1 || prefs='{}'
+  jq -rn --argjson p "$prefs" --arg team "$team" '
+    def lv: if type == "object" and (.level | type == "string") then .level else null end;
+    ($p["freedom.team"] | lv) as $tl
+    | [ $team | split("\n")[] | select(length > 0)
+        | (($p["freedom.agent." + .] | lv) // $tl) | select(. == "ask" or . == "balanced" or . == "yolo") ]
+    | (map({ask:0, balanced:1, yolo:2}[.]) | min) as $m
+    | if $m == null then "" else ["ask","balanced","yolo"][$m] end'
 }
 
 # One agent's status as JSON {agent, level, label, set_level, set_at, set_by, differs}.
@@ -249,6 +277,24 @@ _freedom_browser_status() {
 
 _freedom_status() {  # [<agent>]
   local only="$1" n t agents=() a browser
+  # Read once per status (DIVE-9448), never on the set path: a set changes them.
+  local _FREEDOM_TEAM_MEMO _FREEDOM_BROWSER_MEMO _FREEDOM_DB_READY="" bfile="" bpid=""
+  # The browser verb is the slowest read (~0.4 s), so it runs while the board
+  # opens and the registry is read, and is collected before anything uses it.
+  if bfile=$(mktemp "${TMPDIR:-/tmp}/5dive-freedom.XXXXXX" 2>/dev/null); then
+    ( _freedom_browser_now >"$bfile" 2>/dev/null ) & bpid=$!
+  fi
+  # In this shell, so every read below inherits it. Not in a subshell guard: a
+  # board this seat cannot open fails here with the board's own reason, where
+  # before it surfaced later as an invalid-JSON error from jq.
+  tasks_db_init >/dev/null && _FREEDOM_DB_READY=1
+  _FREEDOM_TEAM_MEMO=$(_freedom_team)
+  if [[ -n "$bpid" ]]; then
+    wait "$bpid" 2>/dev/null || true
+    _FREEDOM_BROWSER_MEMO=$(<"$bfile"); rm -f -- "$bfile"
+  else
+    _freedom_browser_prime
+  fi
   if [[ -n "$only" ]]; then
     t=$(_freedom_type_of "$only")
     [[ -n "$t" ]] || fail "$E_NOT_FOUND" "'$only' is not on the team (system seats and sysadmin have no Team freedom): 5dive agent list"

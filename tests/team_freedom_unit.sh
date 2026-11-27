@@ -213,5 +213,47 @@ t "T17 legacy team key read per agent" "ask|ask" "$(F --agent=ann --json | jq -r
 F yolo >/dev/null
 t "T17 set-everyone writes per-agent keys, drops the team key" "freedom.agent.ann,freedom.agent.bob" "$(db "SELECT group_concat(key) FROM (SELECT key FROM task_prefs WHERE key LIKE 'freedom.%' ORDER BY key);")"
 
+# T18 — DIVE-9448: a status is one browser read and no nested proactive run.
+# The app's agent sheet waits on `team freedom --agent=<n> --json`; it took
+# ~2.5 s on a box, mostly nested CLI starts and the browser asked twice.
+# An agent never set reads the browser for its own match AND for the browser line.
+db "DELETE FROM task_prefs WHERE key LIKE 'freedom.%';"
+calls_since; F --agent=ann --json >/dev/null
+t "T18 per-agent status asks the browser once" "1" "$(grep -c '^browser approvals policy --json$' "$TMP/calls")"
+calls_since; F --json >/dev/null
+t "T18 team status asks the browser once" "1" "$(grep -c '^browser approvals policy --json$' "$TMP/calls")"
+t "T18 a status writes nothing" "0" "$(writes)"
+# The set path is NOT memoised: it re-reads the browser after changing it.
+F ask >/dev/null; calls_since; F yolo --agent=ann >/dev/null
+t "T18 set re-reads the browser (no stale memo)" "1" "$(( $(grep -c '^browser approvals policy --json$' "$TMP/calls") > 1 ))"
+# Proactive is read in this process once its verb is loaded: the stored level,
+# no `agent proactive` run. Off the roster = no level (that verb's own rule).
+(
+  _proactive_level() { jq -r '.level // "off"' <<<"$(db "SELECT value FROM task_prefs WHERE key='proactive.agent.$1';")"; }
+  _task_roster_has() { [[ "$1" != bob ]]; }
+  db "INSERT INTO task_prefs (key, value, updated_at) VALUES ('proactive.agent.ann', '{\"level\":\"more\"}', datetime('now'))
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+  calls_since
+  printf '%s|%s|%s\n' "$(_freedom_proactive_now ann)" "$(_freedom_proactive_now bob)" "$(grep -c '^agent proactive' "$TMP/calls")"
+) >"$TMP/t18"
+t "T18 proactive read in-process: ann more, bob off-roster empty, no nested run" "more||0" "$(cat "$TMP/t18")"
+db "DELETE FROM task_prefs WHERE key='proactive.agent.ann';"
+# The browser follows the most careful stored level, read in one query, with
+# DIVE-8853's team key as the fallback for an agent with no key of its own.
+db "DELETE FROM task_prefs WHERE key LIKE 'freedom.%';"
+t "T18 browser level: nobody set = none" "" "$(_freedom_browser_level)"
+_freedom_save ann yolo t; _freedom_save bob balanced t
+t "T18 browser level: yolo + balanced = balanced" "balanced" "$(_freedom_browser_level)"
+db "DELETE FROM task_prefs WHERE key='freedom.agent.bob';"
+db "INSERT INTO task_prefs (key, value, updated_at) VALUES ('freedom.team', '{\"level\":\"ask\"}', datetime('now'));"
+t "T18 browser level: bob falls back to the team key (ask)" "ask" "$(_freedom_browser_level)"
+db "INSERT INTO task_prefs (key, value, updated_at) VALUES ('freedom.agent.bob', 'not json', datetime('now'));"
+t "T18 browser level: a broken key falls back too" "ask" "$(_freedom_browser_level)"
+db "DELETE FROM task_prefs WHERE key LIKE 'freedom.%';"
+_freedom_save ann yolo t
+_freedom_save 5dive-helper ask t
+t "T18 browser level: system seats do not count" "yolo" "$(_freedom_browser_level)"
+db "DELETE FROM task_prefs WHERE key LIKE 'freedom.%';"
+
 echo "PASS=$PASS FAIL=$FAIL"
 (( FAIL == 0 ))
