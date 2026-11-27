@@ -308,5 +308,90 @@ ROOT=0; NR=nr; mkdir -p "$AGENT_HOME_ROOT/agent-$NR/.claude/projects/-w/memory"
 t "T17 the agent raising itself: refused, nothing seeded" "1|null" "$([[ $rc -ne 0 ]] && echo 1)|$( ( cmd_agent_proactive "$NR" --json ) | jq -r .data.seeded)"
 ROOT=1
 
+# T18 — DIVE-9418 one sender per issue. Two agents of one owner on Proactive: the
+# second's check-in does not repeat what the first already TOLD the owner today.
+# ROOT=1 plays each agent's own run (the "itself or root" rule lets root claim).
+db "DELETE FROM task_prefs WHERE key LIKE 'proactive.log.%';"
+db "INSERT INTO humans (id, display_name, role) VALUES ('h1','Ann','owner'), ('h2','Bob','member');
+    INSERT INTO human_agents (human_id, agent) VALUES ('h1','ceo'), ('h1','sales'), ('h2','other');"
+PA() { local a="$1"; shift; ( cmd_agent_proactive "$a" "$@" ) 2>"$TMP/err" | tee "$TMP/out"; }
+PA ceo little >/dev/null; PA sales more >/dev/null; PA other more >/dev/null
+NEWS="The stock fix shipped: the shop shows real stock again."
+out=$(PA ceo claim --text="$NEWS")
+t "T18 first agent, empty team: yes" "true|false|1" "$(jq -r '.data | "\(.allowed)|\(.wait)|\(.sent_today)"' <<<"$out")"
+t "T18 claimed, not sent: the team has heard nothing" "0" "$(PA sales recent | jq '.data.told | length')"
+t "T18 claimed, not sent: logged delivered:false" "false" "$(db "SELECT value FROM task_prefs WHERE key='proactive.log.ceo';" | jq -r '.[-1].delivered')"
+out=$(PA ceo sent); t "T18 sent marks it told" "true" "$(jq -r .data.delivered <<<"$out")"
+at1=$(db "SELECT value FROM task_prefs WHERE key='proactive.log.ceo';" | jq -r '.[-1].delivered_at')
+PA ceo sent >/dev/null
+t "T18 sent is idempotent (delivered_at kept)" "$at1" "$(db "SELECT value FROM task_prefs WHERE key='proactive.log.ceo';" | jq -r '.[-1].delivered_at')"
+t "T18 recent, from the second agent: the first's message" "ceo|$NEWS" "$(PA sales recent | jq -r '.data.told | map("\(.agent)|\(.text)") | join(",")')"
+t "T18 recent, text view says never tell it again" "1" "$( (JSON_MODE=0; cmd_agent_proactive sales recent) | grep -c 'Never tell it again')"
+# A repeat in other words is refused even with --new, and spends nothing.
+PA sales claim --text="Stock fix shipped, the shop shows the real stock again" --new >/dev/null; rc=$?
+t "T18 second agent repeats the news (--new): refused, names who told it" "1|1" "$([[ $rc -ne 0 ]] && echo 1)|$(grep -c 'already heard this from ceo' "$TMP/err")"
+_sl=$(db "SELECT value FROM task_prefs WHERE key='proactive.log.sales';" | jq 'length')
+t "T18 the refused repeat is not logged" "0" "${_sl:-0}"
+# Anything else: first a wait with the team's list, then a yes only with --new.
+out=$(PA sales claim --text="Two customers asked about bulk prices this week. Want me to draft a price list?")
+t "T18 different message without --new: wait, with the list, nothing spent" "false|true|1|0" \
+  "$(jq -r '.data | "\(.allowed)|\(.wait)|\(.team_recent | length)"' <<<"$out")|$(PA sales --json | jq -r .data.sent_today)"
+t "T18 the wait's text lists the told message" "1" "$( (JSON_MODE=0; cmd_agent_proactive sales claim --text=y) | grep -c "ceo (.*): $NEWS")"
+txt=$( (JSON_MODE=0; cmd_agent_proactive sales claim --text="Two customers asked about bulk prices this week. Want me to draft a price list?" --new) 2>&1)
+t "T18 with --new: yes, 1 of 3, and it says to record the send" "1|1" "$(grep -c 'yes: send it now.*(1 of 3 today)' <<<"$txt")|$(grep -c 'record it: 5dive agent proactive sales sent' <<<"$txt")"
+# Another owner's agent never sees, and is never blocked by, this owner's news.
+t "T18 another owner's agent: nothing told" "0" "$(PA other recent | jq '.data.told | length')"
+out=$(PA other claim --text="$NEWS"); t "T18 another owner's agent may say the same thing" "true" "$(jq -r .data.allowed <<<"$out")"
+# Window and legacy: a log entry with no delivered field counts as told; one older
+# than 24 h does not.
+db "INSERT OR REPLACE INTO task_prefs (key,value,updated_at) VALUES ('proactive.log.old',
+    '$(jq -cn --arg now "$(db "SELECT datetime('now','-1 hour');")" '[{at:"2000-01-01 00:00:00",day:"2000-01-01",text:"ancient"},{at:$now,day:"x",text:"legacy told"}]')', datetime('now'));
+    INSERT INTO human_agents (human_id, agent) VALUES ('h1','old');"
+t "T18 legacy entry (no delivered) counts, a 24 h+ one does not" "legacy told" "$(PA sales recent | jq -r '.data.told | map(select(.agent == "old")) | map(.text) | join(",")')"
+t "T18 sent with nothing claimed: refused" "1" "$( ( cmd_agent_proactive nobody2 sent ) >/dev/null 2>&1 || echo 1)"
+# The loop's text, for new loops: read the team first, --new, sent, and the promise rule.
+B=$(db "SELECT body FROM tasks WHERE ident='$(PA sales --json | jq -r .data.loop)';")
+t "T18 body: recent, --new, sent, parked promise" "1|1|1|1" \
+  "$(grep -c 'proactive sales recent' <<<"$B")|$(grep -c 'claim --text="<the message>" --new' <<<"$B")|$(grep -c 'proactive sales sent' <<<"$B")|$(grep -c -- '--assignee=sales --park="<why>" --park-wake=<when>' <<<"$B")"
+
+# T18 (it2) — the race quinn found: every check-in fires at the same box hour, so
+# two of one owner's agents can claim the same news before either says `sent`.
+# A teammate's pending claim blocks a repeat for _PROACTIVE_PENDING_MIN minutes,
+# and claims are serialized per owner.
+db "DELETE FROM task_prefs WHERE key LIKE 'proactive.log.%';"
+out=$(PA ceo claim --text="$NEWS" --new); t "T18 race: first agent claims, not sent yet" "true" "$(jq -r .data.allowed <<<"$out")"
+PA sales claim --text="$NEWS" --new >/dev/null; rc=$?
+t "T18 race: second agent, same news, no sent between: refused, names the first" "1|1" \
+  "$([[ $rc -ne 0 ]] && echo 1)|$(grep -c 'ceo is telling your owner this right now' "$TMP/err")"
+_sl=$(db "SELECT value FROM task_prefs WHERE key='proactive.log.sales';" | jq 'length')
+t "T18 race: the refused claim is not logged" "0" "${_sl:-0}"
+t "T18 race: pending is not told (recent still empty)" "0" "$(PA sales recent | jq '.data.told | length')"
+t "T18 race: a different message without --new waits, the list says being sent" "true|1" \
+  "$(PA sales claim --text="Bulk prices question" | jq -r .data.wait)|$( (JSON_MODE=0; cmd_agent_proactive sales claim --text=y) | grep -c "ceo (.*, being sent): $NEWS")"
+# Never sent: after the window it stops blocking (claimed is still not told).
+_old=$(db "SELECT datetime('now','-$((_PROACTIVE_PENDING_MIN + 1)) minutes');")
+db "UPDATE task_prefs SET value='$(db "SELECT value FROM task_prefs WHERE key='proactive.log.ceo';" | jq -c --arg o "$_old" '.[-1].at = $o')' WHERE key='proactive.log.ceo';"
+out=$(PA sales claim --text="$NEWS" --new); t "T18 race: a pending claim older than the window no longer blocks" "true" "$(jq -r .data.allowed <<<"$out")"
+t "T18 race: an agent's own pending claim never blocks itself (other owner, twice)" "true" \
+  "$(db "DELETE FROM task_prefs WHERE key='proactive.log.other';"; PA other claim --text="$NEWS" >/dev/null; PA other claim --text="$NEWS" | jq -r .data.allowed)"
+# The lock is the OWNER's: a run holding it makes a teammate's claim wait for it.
+db "DELETE FROM task_prefs WHERE key LIKE 'proactive.log.%';"
+( exec 8>>"$TASKS_DIR/.proactive-owner-h1.lock"; flock 8; sleep 2 ) & _lp=$!
+sleep 0.3; _t0=$(date +%s%N); PA sales claim --text="Owner lock check" --new >/dev/null; _t1=$(date +%s%N); wait "$_lp"
+( exec 8>>"$TASKS_DIR/.proactive-sales.lock"; flock 8; sleep 2 ) & _lp=$!
+sleep 0.3; _t2=$(date +%s%N); PA ceo claim --text="Old per-agent lock check" --new >/dev/null; _t3=$(date +%s%N); wait "$_lp"
+t "T18 race: claim waits on the owner's lock, not the old per-agent one" "1|1" \
+  "$(( (_t1 - _t0) >= 1000000000 ))|$(( (_t3 - _t2) < 1000000000 ))"
+
+# T19 — DIVE-9418 a promise becomes a parked task. The rule is in every seat's
+# instructions (Claude team block, Codex baseline), and the command it names
+# files a parked row with an owner and a wake time.
+t "T19 team block carries the rule" "1" "$(grep -c -- '--park="<why>" --park-wake=<when>' prompts/team-CLAUDE.md)"
+t "T19 Codex baseline carries the rule" "1" "$(_codex_operating_baseline_doc sales | grep -c -- '--assignee=sales --park="<why>" --park-wake=<when>')"
+( cmd_task_add "Check the Acme invoice was paid" --assignee=sales --priority=low \
+    --park="told the owner I would check tomorrow" --park-wake=+1d ) >"$TMP/add" 2>&1
+r=$(db "SELECT assignee||'|'||status||'|'||(parked_at IS NOT NULL)||'|'||(wake_at > datetime('now','+23 hours'))||'|'||park_reason FROM tasks WHERE title='Check the Acme invoice was paid';")
+t "T19 parked reminder: owner, parked, wakes in a day, why" "sales|blocked|1|1|told the owner I would check tomorrow" "$r"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

@@ -709,6 +709,15 @@ closes. Then send your owner the result itself at once, the file attached, in
 one message, without waiting to be asked. Grades and verification notes stay on
 the board, never in the owner's chat.
 
+## A promise to come back later is a parked task
+
+Told your owner you will check or do something later ("I'll look again
+tomorrow", "before month-end")? File it in the same turn, or the promise lives
+only in chat:
+\`5dive task add "<what to check>" --assignee=${name} --park="<why>" --park-wake=<when>\`
+(\`+2h\`, \`+1d\`, or \`YYYY-MM-DD HH:MM\`). It wakes you then; message your owner
+from it.
+
 ## Model tiering
 
 Keep planning, judgment, verification, and user communication in the main
