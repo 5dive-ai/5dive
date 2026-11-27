@@ -9,7 +9,7 @@
 
 <p align="center"><b>Run a company of AI agents on a server you own.</b></p>
 
-<p align="center">An open-source alternative to Grok Bot and OpenAI Dots.</p>
+<p align="center">Give your ChatGPT, Claude or Grok Bot a team to run.</p>
 
 <p align="center"><b>English</b> ｜ <a href="README.zh-CN.md">简体中文</a></p>
 
