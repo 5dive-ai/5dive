@@ -486,10 +486,14 @@ _verb_path_help() {
 # generic arm (_verb_leaf_help) leaves them alone: agent, account and task through
 # _verb_help_intercept (DIVE-569), hire and team in their own leaf parsers (each
 # team leaf prints its own line), doctor and self-update before their root
-# check, host/usage/route/pkg in main()'s DIVE-9374 branch. Every other verb gets
-# the generic arm. tests/verb_help_every_verb_unit.sh walks the whole verb table,
-# so a verb on this list that stops answering, or a new verb, is red there.
-_VERB_HELP_SELF=' agent account task hire team doctor self-update self_update update host usage route pkg '
+# check, host/usage/route/pkg in main()'s DIVE-9374 branch, and push (the devteam
+# plugin's cmd_push answers -h/--help in any position, before its task store).
+# push is listed so its own intercept stays the ONLY answer: covered twice, the
+# devteam harness's mutant (tests/devteam/verb_help_remainder_unit.sh M1, push's
+# intercept cut out) could no longer go red. Every other verb gets the generic
+# arm. tests/verb_help_every_verb_unit.sh walks the whole verb table, so a verb on
+# this list that stops answering, or a new verb, is red there.
+_VERB_HELP_SELF=' agent account task hire team doctor self-update self_update update host usage route pkg push '
 # Verbs that ACT whatever argv says (scripts/install-contract.sh DENY says why):
 # the generic arm answers them from the top-level usage() text only and never
 # runs `5dive <verb> --help` to find their block.
