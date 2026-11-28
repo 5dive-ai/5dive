@@ -30,7 +30,7 @@ cd "$(dirname "$0")/.."
 TMP=$(mktemp -d /tmp/tg-other-seat.XXXXXX)
 trap 'rc=$?; chmod -R u+rw "${TMP:-/nonexistent}" 2>/dev/null; rm -rf "${TMP:-}"; echo "HARNESS-RC=$rc"' EXIT
 
-PASS=0 FAIL=0
+PASS=0; FAIL=0
 eq() { if [[ "$2" == "$3" ]]; then PASS=$((PASS+1)); echo "ok   $1"; else FAIL=$((FAIL+1)); echo "FAIL $1"; echo "     want: $2"; echo "     got:  $3"; fi; }
 
 # ---- the box: seat "self" (the caller; sorts AFTER "other", and jq keys[] sorts, so other is always tried first) and seat "other" ------------------------
