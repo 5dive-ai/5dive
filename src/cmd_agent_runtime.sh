@@ -2028,7 +2028,7 @@ inject_and_submit() {
   # DIVE-9373: mark the seat's newest transcript (path + bytes) BEFORE the
   # payload keystroke, so an unconfirmed submit below can ask the transcript —
   # the second witness — whether THIS payload landed anyway. Never fails the send.
-  _AGENT_SEND_LANDED=""
+  _AGENT_SEND_LANDED=""; _AGENT_SEND_MISS=""
   _hb_landed_mark "$name"
   for _pi in "${!_parts[@]}"; do
     (( _pi == 0 )) || sleep "${_WAKE_TYPED_GAP_SEC:-0.3}"
@@ -2077,6 +2077,10 @@ inject_and_submit() {
     _wedge_clear "$name"
     return 0
   fi
+  # DIVE-9484: an exit 12 names the receipt arm that missed (no mark, no bytes,
+  # a new session, no matching record), so the next one diagnoses itself
+  # instead of needing the transcript read by hand.
+  step "the pane did not confirm the submit and neither did the seat's transcript: ${_AGENT_SEND_MISS:-<no reason recorded>} (DIVE-9484)"
   # DIVE-4642 — THE SECOND TYPED-SEND SITE OWES THE SAME TWO THINGS. A composer
   # -hygiene claim is graded per SITE (the DIVE-4246 addendum), and the symptom
   # cannot enumerate them: the pane looks identical either way. This site is left
@@ -2106,28 +2110,30 @@ inject_and_submit() {
 #      tool_result — is not this receipt and stays a miss (exit 12).
 # No mark (unreadable store, no transcript yet) = cannot tell = rc 1.
 _AGENT_SEND_LANDED=""
+_AGENT_SEND_MISS=""
 _agent_send_landed() {
   local name="$1" text="$2" needle now_file mark_file first="" i tries="${_AGENT_SEND_LANDED_TRIES:-3}"
-  _AGENT_SEND_LANDED=""
-  declare -F _hb_landed_check >/dev/null 2>&1 || return 1
+  _AGENT_SEND_LANDED=""; _AGENT_SEND_MISS=""
+  declare -F _hb_landed_check >/dev/null 2>&1 || { _AGENT_SEND_MISS="the transcript receipt is not loaded"; return 1; }
   # Read the mark through cmd_heartbeat's accessors, never its globals by name:
   # a cross-module variable read is a load-time dependency edge in the lazy
   # bundle, and this one pulled the heartbeat cluster into every verb (DIVE-9373).
   mark_file=$(_hb_landed_file)
-  [[ -n "$mark_file" ]] || return 1
+  [[ -n "$mark_file" ]] || { _AGENT_SEND_MISS="no readable transcript was marked before typing"; return 1; }
   # _hb_landed_check logs in heartbeat words ("counting the wake…"); this verb
   # prints its own line, so its log is not part of this command's output.
   if _hb_landed_check "$name" "$text" 2>/dev/null; then
     _AGENT_SEND_LANDED=$(_hb_landed_evidence)
     return 0
   fi
+  _AGENT_SEND_MISS=$(_hb_landed_miss)
   needle=$(_hb_landed_needle "$text") || return 1
   # The new file's first record can trail its creation by a beat (as in
   # DIVE-8269's /clear receipt): retry while it is empty, never once it is not.
   for (( i = 0; i < tries; i++ )); do
     (( i > 0 )) && sleep "${_AGENT_SEND_LANDED_SEC:-0.5}"
     now_file=$(_hb_transcript_newest "$name")
-    [[ -n "$now_file" && "$now_file" != "$mark_file" ]] || return 1
+    [[ -n "$now_file" && "$now_file" != "$mark_file" ]] || return 1   # same file: receipt 1's miss stands
     first=$(sudo -n -u "agent-${name}" head -n "${_AGENT_SEND_LANDED_LINES:-40}" "$now_file" 2>/dev/null \
       | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
       | grep -av -e '"isMeta"[[:space:]]*:[[:space:]]*true' \
@@ -2136,7 +2142,10 @@ _agent_send_landed() {
       | head -n 1) || first=""
     [[ -n "$first" ]] && break
   done
-  [[ -n "$first" && "$first" == *"$needle"* ]] || return 1
+  if [[ -z "$first" || "$first" != *"$needle"* ]]; then
+    _AGENT_SEND_MISS="the session rotated to $(basename "$now_file") and its first user record $([[ -n "$first" ]] && printf 'is not this payload' || printf 'had not been written after %d reads' "$tries")"
+    return 1
+  fi
   _AGENT_SEND_LANDED="the session rotated to $(basename "$now_file") (was $(basename "$mark_file")) and its first user record carries this payload ('${needle:0:40}')"
   return 0
 }

@@ -1300,6 +1300,13 @@ cmd_heartbeat_wake_task() {
     # The note is already in the heartbeat log; this is the line on the terminal
     # that ran the verb.
     warn "$(_hb_parked_skip_note "$name" "$task_ident")"
+  elif (( _fw_rc == _HB_WAKE_RC_REFUSED )); then
+    # DIVE-9484: same verdict as the tick — landed, refused by the model, parked.
+    if _hb_park_refused_wake "$name" "$task_id"; then
+      _hb_log "[$name] forced wake onto ${task_ident}: the goal LANDED but the model refused it (\"${_HB_SEND_REFUSED_LINE:0:160}\") — PARKED until ${_HB_REFUSED_PARK_WAKE} (DIVE-9484)"
+    else
+      _hb_log "[$name] forced wake FAILED at ${_HB_WAKE_FAIL_REASON:-<no reason>} — the park on the model refusal did not land (DIVE-9484)"
+    fi
   elif (( _fw_rc != 0 )); then
     _hb_log "[$name] forced wake FAILED at ${_HB_WAKE_FAIL_REASON:-<step not recorded — a wake exit is missing its _hb_wake_fail>}"
   fi
@@ -3196,6 +3203,8 @@ _HB_SENDKEYS_ERR=""
 # its rc, and the first line of whatever the underlying tool said. Set by every
 # failing exit of `_hb_send_line`; cleared at its entry so it is never stale.
 _HB_SEND_FAIL_REASON=""
+_HB_SEND_REFUSED_LINE=""   # DIVE-9484: set by _hb_send_line when the line landed and the model refused it
+_HB_SEND_REFUSED_PANE=""
 _hb_send_keys_step() {
   local name="$1" step="$2"; shift 2
   local err rc=0
@@ -3291,42 +3300,67 @@ _hb_landed_needle() {
 # means the text was never typed, so nothing appended in the window can be a
 # receipt for it and a match there could only be somebody else's record.
 _hb_landed_check() {
-  local name="$1" text="$2" now_file now_size needle tail_rc=0
-  _HB_LANDED_EVIDENCE=""
+  local name="$1" text="$2" now_file now_size needle tail_rc i
+  local retries="${_HB_LANDED_RETRIES:-4}"
+  _HB_LANDED_EVIDENCE=""; _HB_LANDED_MISS=""
   if ! needle=$(_hb_landed_needle "$text"); then
-    _hb_log "[$name] could not tell whether the line landed: the payload has no ${_HB_LANDED_NEEDLE_MIN}-char run distinctive enough to match in the transcript, so nothing is claimed either way (DIVE-4279/DIVE-2159)" 2>/dev/null || true
+    _HB_LANDED_MISS="the payload has no ${_HB_LANDED_NEEDLE_MIN}-char run distinctive enough to match in the transcript"
+    _hb_log "[$name] could not tell whether the line landed: ${_HB_LANDED_MISS}, so nothing is claimed either way (DIVE-4279/DIVE-2159)" 2>/dev/null || true
     return 1
   fi
   if [[ -z "$_HB_LANDED_FILE" || -z "$_HB_LANDED_SIZE" ]]; then
-    _hb_log "[$name] could not tell whether the line landed: no readable transcript to compare against (DIVE-4279)" 2>/dev/null || true
+    _HB_LANDED_MISS="no readable transcript to compare against"
+    _hb_log "[$name] could not tell whether the line landed: ${_HB_LANDED_MISS} (DIVE-4279)" 2>/dev/null || true
     return 1
   fi
+  # DIVE-9484: the record reaches DISK late. Its timestamp is the submit time,
+  # but Claude Code writes it after the seat's UserPromptSubmit hooks: measured
+  # on a box 2026-11-27, the payload record was followed by `api-request` 1.1 s
+  # and 2.1 s later, and the ONE read at +1 s lost that race both times (agent
+  # send exit 12 for a message that landed). So re-read on a bounded deadline:
+  # +1 s, then every _HB_LANDED_POLL_SEC up to _HB_LANDED_RETRIES more times
+  # (defaults: ~3 s in all). Only a miss pays it — this runs after the pane has
+  # already failed to confirm, never on the healthy path. A NEW newest file ends
+  # the wait at once: a rotation does not un-rotate, and it is not this receipt.
   sleep "${_HB_LANDED_WAIT_SEC:-1}"
-  now_file=$(_hb_transcript_newest "$name")
-  if [[ "$now_file" != "$_HB_LANDED_FILE" ]]; then
-    _hb_log "[$name] line did NOT land: the seat's newest transcript changed to '${now_file:-<none>}' (a new session), which is not evidence for this payload (DIVE-4279)" 2>/dev/null || true
-    return 1
-  fi
-  now_size=$(sudo -n -u "agent-${name}" stat -c %s "$_HB_LANDED_FILE" 2>/dev/null) || now_size=""
-  if ! [[ "$now_size" =~ ^[0-9]+$ ]] || (( now_size <= _HB_LANDED_SIZE )); then
-    _hb_log "[$name] line did NOT land: transcript $(basename "$_HB_LANDED_FILE") gained no bytes since the send (DIVE-4279)" 2>/dev/null || true
-    return 1
-  fi
-  # user record AND not tool_result-shaped AND carrying this payload's own text.
-  # The tool_result exclusion is a whole-RECORD drop, not a field test: a tool
-  # result that quotes the payload back must not read as the seat receiving it.
-  sudo -n -u "agent-${name}" tail -c "+$(( _HB_LANDED_SIZE + 1 ))" "$_HB_LANDED_FILE" 2>/dev/null \
-    | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
-    | grep -av -e '"type"[[:space:]]*:[[:space:]]*"tool_result"' -e '"tool_use_id"' \
-    | grep -aqF -- "$needle" || tail_rc=1
-  if (( tail_rc != 0 )); then
-    _hb_log "[$name] line did NOT land: transcript $(basename "$_HB_LANDED_FILE") grew, but no non-tool_result user record since byte ${_HB_LANDED_SIZE} carries this payload ('${needle:0:40}') (DIVE-4279)" 2>/dev/null || true
-    return 1
-  fi
-  _HB_LANDED_EVIDENCE="$(basename "$_HB_LANDED_FILE") gained a user record carrying this payload ('${needle:0:40}') after byte ${_HB_LANDED_SIZE}"
-  _hb_log "[$name] the keystroke failed but the line DID land — ${_HB_LANDED_EVIDENCE}; counting the wake as delivered (DIVE-4279)" 2>/dev/null || true
-  return 0
+  for (( i = 0; ; i++ )); do
+    (( i > 0 )) && sleep "${_HB_LANDED_POLL_SEC:-0.5}"
+    now_file=$(_hb_transcript_newest "$name")
+    if [[ "$now_file" != "$_HB_LANDED_FILE" ]]; then
+      _HB_LANDED_MISS="the seat's newest transcript changed to '$(basename "${now_file:-<none>}")' (a new session), which is not evidence for this payload"
+      break
+    fi
+    now_size=$(sudo -n -u "agent-${name}" stat -c %s "$_HB_LANDED_FILE" 2>/dev/null) || now_size=""
+    if ! [[ "$now_size" =~ ^[0-9]+$ ]] || (( now_size <= _HB_LANDED_SIZE )); then
+      _HB_LANDED_MISS="transcript $(basename "$_HB_LANDED_FILE") gained no bytes since byte ${_HB_LANDED_SIZE}"
+    else
+      # user record AND not tool_result-shaped AND carrying this payload's own
+      # text. The tool_result exclusion is a whole-RECORD drop, not a field
+      # test: a tool result that quotes the payload back must not read as the
+      # seat receiving it.
+      tail_rc=0
+      sudo -n -u "agent-${name}" tail -c "+$(( _HB_LANDED_SIZE + 1 ))" "$_HB_LANDED_FILE" 2>/dev/null \
+        | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
+        | grep -av -e '"type"[[:space:]]*:[[:space:]]*"tool_result"' -e '"tool_use_id"' \
+        | grep -aqF -- "$needle" || tail_rc=1
+      if (( tail_rc == 0 )); then
+        _HB_LANDED_MISS=""
+        _HB_LANDED_EVIDENCE="$(basename "$_HB_LANDED_FILE") gained a user record carrying this payload ('${needle:0:40}') after byte ${_HB_LANDED_SIZE}$( (( i > 0 )) && printf ' (on re-read %d)' "$i")"
+        _hb_log "[$name] the keystroke failed but the line DID land — ${_HB_LANDED_EVIDENCE}; counting the wake as delivered (DIVE-4279)" 2>/dev/null || true
+        return 0
+      fi
+      _HB_LANDED_MISS="transcript $(basename "$_HB_LANDED_FILE") grew, but no non-tool_result user record since byte ${_HB_LANDED_SIZE} carries this payload ('${needle:0:40}')"
+    fi
+    (( i >= retries )) && break
+  done
+  _HB_LANDED_MISS="${_HB_LANDED_MISS} ($(( i + 1 )) read(s))"
+  _hb_log "[$name] line did NOT land: ${_HB_LANDED_MISS} (DIVE-4279/DIVE-9484)" 2>/dev/null || true
+  return 1
 }
+# DIVE-9484: which receipt arm missed, for callers in other modules (read through
+# a function for the same lazy-bundle reason as the two accessors above).
+_HB_LANDED_MISS=""
+_hb_landed_miss() { printf '%s' "$_HB_LANDED_MISS"; }
 
 # DIVE-8269 — a /clear that ROTATED THE SESSION was submitted, whatever the pane
 # still showed. Measured 2026-11-11: vesper 09:00:19Z and quinn 02:40:08Z were
@@ -3511,6 +3545,7 @@ _hb_wedge_probe() {
 _hb_send_line() {
   local name="$1" text="$2" tries=0
   _HB_SEND_FAIL_REASON=""   # DIVE-4310: never report a previous attempt's cause
+  _HB_LANDED_MISS=""; _HB_SEND_REFUSED_LINE=""; _HB_SEND_REFUSED_PANE=""   # DIVE-9484: same
   # DIVE-4642: FIRST, before the inbox route and before anything is typed — the
   # payload becomes ONE line or it can never be submitted by an Enter. See
   # _hb_flatten_payload for why this is the transport's contract and not a
@@ -3633,6 +3668,43 @@ _hb_send_line() {
       _wedge_clear "$name"
       return 0
     fi
+    # DIVE-9484: before calling it a wedge, ask the TRANSCRIPT and then the
+    # PANE. Measured on a box 2026-11-27: a claude seat on a quota-walled token
+    # plan answered every wake with `API Error: Request rejected (429) · … quota
+    # has been exhausted`, Claude Code put the prompt back in the composer
+    # (`Resend your message to try again`), and this branch read that as a
+    # composer wedge 50 times in 4.6 h — prescribing a restart that cannot fix a
+    # wall and re-waking the same 429 every tick. Each of those prompts HAD
+    # landed. So: no landed record → the real wedge below, unchanged (a model
+    # error on the pane never masks a submit that failed). Landed and the last
+    # turn ended on a model error → "submitted, model refused": the restored
+    # draft is cleared so it cannot fire later, the seat is NOT marked wedged,
+    # and _hb_wake returns $_HB_WAKE_RC_REFUSED so the tick parks the row on the
+    # error line (DIVE-5624's park, on the wake path). Landed and no error → it
+    # was delivered; the pane just did not say so.
+    _HB_SEND_REFUSED_LINE=""; _HB_SEND_REFUSED_PANE=""
+    if [[ "${text//[[:space:]]/}" != "/clear" ]] && _hb_landed_check "$name" "$_hb_body"; then
+      local _hb_rpane _hb_rline
+      _hb_rpane=$(_hb_pane_capture "$name" 2>/dev/null) || _hb_rpane=""
+      if _hb_rline=$(_hb_pane_model_error "$_hb_rpane" claude); then
+        _HB_SEND_REFUSED_LINE="$_hb_rline"
+        _HB_SEND_REFUSED_PANE=$(grep -v '^[[:space:]]*$' <<<"$_hb_rpane" | tail -n 15) || _HB_SEND_REFUSED_PANE=""
+        _hb_composer_clear "$name" >/dev/null 2>&1 || true
+        _wedge_clear "$name"
+        _HB_SEND_FAIL_REASON="submitted, model refused (rc 1): the line landed (${_HB_LANDED_EVIDENCE}) and the seat's turn ended on \"${_hb_rline:0:160}\" — not a composer wedge; the restored draft was cleared (DIVE-9484)"
+        _hb_log "[$name] ${_HB_SEND_FAIL_REASON}" 2>/dev/null || true
+        return 1
+      fi
+      # Whatever the pane still shows is not this payload's submit, but it may be
+      # a remainder (DIVE-4242's tail) that would fire at the next turn boundary
+      # (DIVE-4642). C-u + scrub only: the seat may be mid-turn now, and the
+      # clear's Up arm could recall a queued message (DIVE-4355).
+      sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
+      _hb_composer_scrub "$name" >/dev/null 2>&1 || true
+      _hb_log "[$name] submit ACCEPTED although the pane still read '${_HB_COMPOSER_UNSENT:0:60}' after 2 Enters — the transcript shows it landed: ${_HB_LANDED_EVIDENCE}; composer scrubbed (DIVE-9484)" 2>/dev/null || true
+      _wedge_clear "$name"
+      return 0
+    fi
     # DIVE-4642: the submit failed and we KNOW it. Two things follow, and today
     # neither happened: the seat is marked unhealthy so `5dive supervisor` names
     # it within one tick instead of reporting it busy forever, and the text we
@@ -3643,9 +3715,9 @@ _hb_send_line() {
     _wedge_mark "$name" "${#_hb_wedged}" "$_hb_wedged" "residual"
     if _hb_composer_clear "$name"; then
       _wedge_mark "$name" "${#_hb_wedged}" "$_hb_wedged" "cleared"
-      _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still held ${#_hb_wedged} chars of non-ghost text after 2 Enters ('${_hb_wedged:0:60}') — the draft has been CLEARED and the seat marked wedged, so nothing of it fires later (DIVE-4642; was DIVE-4242)"
+      _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still held ${#_hb_wedged} chars of non-ghost text after 2 Enters ('${_hb_wedged:0:60}') — the draft has been CLEARED and the seat marked wedged, so nothing of it fires later (DIVE-4642; was DIVE-4242)${_HB_LANDED_MISS:+; transcript: ${_HB_LANDED_MISS}}"
     else
-      _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}') AND the clear did not take — the seat is wedged with a residual draft that may fire at its next turn boundary; it needs 'sudo 5dive agent restart ${name}' (DIVE-4642)"
+      _HB_SEND_FAIL_REASON="submit unverified (rc 1): the composer still holds ${#_HB_COMPOSER_UNSENT} chars of non-ghost text after 2 Enters ('${_HB_COMPOSER_UNSENT:0:60}') AND the clear did not take — the seat is wedged with a residual draft that may fire at its next turn boundary; it needs 'sudo 5dive agent restart ${name}' (DIVE-4642)${_HB_LANDED_MISS:+; transcript: ${_HB_LANDED_MISS}}"
     fi
     _hb_log "[$name] submit UNVERIFIED — ${_HB_SEND_FAIL_REASON}; returning failure so nothing is claimed on it" 2>/dev/null || true
     return 1
@@ -6142,6 +6214,34 @@ _hb_parked_skip_note() {
 # row in_progress for a seat that never received the goal; returning 1 would
 # count a deliberate, operator-authored skip as a wake FAILURE to retry.
 _HB_WAKE_RC_PARKED=4
+# DIVE-9484: the goal LANDED but the seat's model refused the turn (the pane's
+# last turn ended on a model error, e.g. a quota wall's 429). Not a wake (no
+# claim: nothing is working the row) and not a wedge (the composer took it): the
+# caller parks the row on _HB_SEND_REFUSED_LINE instead of re-waking it.
+_HB_WAKE_RC_REFUSED=5
+# Park <task_id> on the refusal the last _hb_send_line recorded. Wake = the
+# reset the error line prints (read by the supervisor's own deadline parser,
+# forward from now: the line was printed by the turn this wake just started),
+# else +1h, DIVE-5624's interval. 0 = parked (wake in _HB_REFUSED_PARK_WAKE).
+_HB_REFUSED_PARK_WAKE=""
+_hb_park_refused_wake() {
+  local name="$1" id="$2" line="${_HB_SEND_REFUSED_LINE:-}" full="" dl=unknown ep="" now wake="+1h"
+  _HB_REFUSED_PARK_WAKE=""
+  [[ -n "$line" && -n "$id" ]] || return 1
+  # The matcher caps its line at 200 chars; the reset sits at the END of a long
+  # banner, so the parser reads the full pane line the excerpt came from.
+  full=$(grep -aF -- "${line:0:60}" <<<"${_HB_SEND_REFUSED_PANE:-}" | tail -n 1) || full=""
+  now=$(date +%s)
+  if declare -F _sup_quota_deadline >/dev/null 2>&1; then
+    IFS=$'\x1f' read -r dl ep <<<"$(_sup_quota_deadline "${full:-$line}" "$now" "$now" 2>/dev/null)"
+  fi
+  if [[ "$dl" == live && "$ep" =~ ^[0-9]+$ ]] && (( ep > now )); then
+    wake=$(date -u -d "@${ep}" '+%Y-%m-%d %H:%M' 2>/dev/null) || wake="+1h"
+  fi
+  ( cmd_task_park "$id" --reason="model refused the wake on ${name}: the goal landed and the turn ended on \"${line:0:160}\" — not a wedge; auto-retries when the park wakes (DIVE-9484)" --wake="$wake" ) >/dev/null 2>&1 || return 1
+  _HB_REFUSED_PARK_WAKE="$wake"
+  return 0
+}
 
 # The start half of _hb_wake, as its own function so the guard and the start it
 # guards are one testable unit — a fix that ships dormant is DIVE-1095's shape,
@@ -6211,7 +6311,11 @@ _hb_wake() {
   nudge=$(_hb_nudge_text "$name" "$task_id" "$task_ident") || nudge=""
   [[ -n "$nudge" ]] || { _hb_wake_fail "$name" "nudge assembly (/goal ${task_ident})" 1 "_hb_nudge_text produced no text"; return 1; }
 
-  _hb_send_line "$name" "$nudge" || { _hb_wake_fail "$name" "nudge injection (/goal ${task_ident})" 1 "${_HB_SEND_FAIL_REASON:-<injector reported no reason>}"; return 1; }
+  if ! _hb_send_line "$name" "$nudge"; then
+    _hb_wake_fail "$name" "nudge injection (/goal ${task_ident})" 1 "${_HB_SEND_FAIL_REASON:-<injector reported no reason>}"
+    [[ -n "${_HB_SEND_REFUSED_LINE:-}" ]] && return "$_HB_WAKE_RC_REFUSED"   # DIVE-9484
+    return 1
+  fi
   return 0
 }
 
@@ -11523,6 +11627,20 @@ cmd_heartbeat_tick() {
       # this counter is what keeps the state visible on every tick.
       sk_parked=$((sk_parked + 1))
       continue
+    fi
+    if (( _wake_rc == _HB_WAKE_RC_REFUSED )); then
+      # DIVE-9484: the goal landed and the model refused it. Re-waking it next
+      # tick only buys the same refusal (50 wakes in 4.6 h on a quota wall), so
+      # the row is parked on the error. Not claimed: nobody is working it, and
+      # it counts as parked, not failed. If the park does not land, the reason
+      # says so and control falls through to the ONE wake-failure line below
+      # (agent_list_overdue_liveness pins that it stays a single code line).
+      if _hb_park_refused_wake "$name" "$task_id"; then
+        sk_parked=$((sk_parked + 1))
+        _hb_log "[$name] due + todo ${task_ident} — the goal LANDED but the model refused it (\"${_HB_SEND_REFUSED_LINE:0:160}\") — PARKED until ${_HB_REFUSED_PARK_WAKE}, seat not marked wedged (DIVE-9484)"
+        continue
+      fi
+      _HB_WAKE_FAIL_REASON="${_HB_WAKE_FAIL_REASON:-<no reason>} — WARN: the park on the model refusal did not land (DIVE-9484)"
     fi
     if (( _wake_rc == 0 )); then
       # DIVE-8512: a row the pacing floor admitted BLIND names that on this line.
