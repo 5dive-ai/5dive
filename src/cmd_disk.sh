@@ -439,12 +439,22 @@ cmd_disk_sweep() {
 
 # The owner's normal channel: the paired chat of the first telegram-enabled seat,
 # the same resolution `digest tick` uses. Returns 0 only on a Bot API receipt.
+# DIVE-9491: "telegram-enabled" = the token file EXISTS. Run by a seat (not the
+# root cron), every other seat's file is unreadable once the group read is gone;
+# a -r test skipped them all and logged "no paired chat answered". Now a blind
+# seat is counted in _DISK_ALARM_BLIND and the alarm stays un-stamped, so the
+# hourly ROOT tick (cron.d/5dive-disk) tells the owner — and the log says so.
+_DISK_ALARM_BLIND=0
 _disk_alarm_deliver() {
   local msg="$1" name names
+  _DISK_ALARM_BLIND=0
   names=$(jq -r '.agents | keys[]' "$REGISTRY" 2>/dev/null)   # captured: the loop returns early
   while IFS= read -r name; do
-    [[ -n "$name" && -r "${CONNECTORS_DIR}/telegram-${name}.env" ]] || continue
-    _task_agent_channel "$name" || continue
+    [[ -n "$name" && -e "${CONNECTORS_DIR}/telegram-${name}.env" ]] || continue
+    if ! _task_agent_channel "$name"; then
+      [[ "${TASK_CH_BLIND:-0}" == 1 ]] && _DISK_ALARM_BLIND=$((_DISK_ALARM_BLIND + 1))
+      continue
+    fi
     _task_send_owner "$msg"
     [[ "${TASK_SEND_DELIVERED:-0}" == 1 ]] && return 0
   done <<<"$names"
@@ -477,7 +487,11 @@ cmd_disk_alarm() {
     _disk_state_set '.alarm_told=true | .alarm_told_at=$t | .alarm_free_pct=($p|tonumber)' --arg t "$(date -u +%FT%TZ)" --arg p "$pct"
     _disk_log "disk-alarm told owner free_pct=$pct"
   else
-    _disk_log "disk-alarm UNDELIVERED free_pct=$pct (no paired chat answered; retrying next tick)"
+    if (( ${_DISK_ALARM_BLIND:-0} > 0 )); then
+      _disk_log "disk-alarm UNDELIVERED free_pct=$pct (${_DISK_ALARM_BLIND} seat bot(s) readable only by root; handed to the root tick, cron.d/5dive-disk)"
+    else
+      _disk_log "disk-alarm UNDELIVERED free_pct=$pct (no paired chat answered; retrying next tick)"
+    fi
   fi
 }
 

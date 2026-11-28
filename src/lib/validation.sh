@@ -637,6 +637,23 @@ _secret_project_file() {
 
 SECRETS_GROUP="${FIVEDIVE_SECRETS_GROUP:-claude-keys}"
 
+# DIVE-9491 (DIVE-7974 step 3): the group read on telegram-<x>.env is going away
+# (`setfacl -m g::---`), leaving root, `claude` (u:claude:r) and seat <x> itself
+# (u:agent-<x>:r). So a verb a seat runs WITHOUT root, asked for ANOTHER seat's
+# bot token, finds the file present and unreadable. That must never read as "no
+# bot": hand the verb to root instead — require_root re-runs it under the seat's
+# sudo grant when it has one, and otherwise refuses naming who on the box can.
+# Absent file: no-op, the caller's own "no telegram connector" answer is right.
+# _tg_token_unreadable is the one present-but-forbidden test every reader below
+# asks FIRST, before it reads; a harness overrides it to model the post-setfacl
+# box under a root runner (root ignores file modes).
+_tg_token_unreadable() { [[ -e "$1" && ! -r "$1" ]]; }
+tg_token_need_root() { # <token file> <verb words for require_root...>
+  local f="$1"; shift
+  _tg_token_unreadable "$f" || return 0
+  require_root "$@"
+}
+
 # The workspace group the keys are moving OFF (create_agent_user's seam).
 _sp_shared_group()   { printf '%s' "${AGENT_SHARED_GROUP:-claude}"; }
 _sp_connectord_env() { printf '%s' "${FIVEDIVE_CONNECTORD_ENV:-/etc/5dive/connectord.env}"; }
