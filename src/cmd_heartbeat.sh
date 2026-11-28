@@ -3695,7 +3695,13 @@ _hb_send_line() {
         _hb_log "[$name] ${_HB_SEND_FAIL_REASON}" 2>/dev/null || true
         return 1
       fi
-      _hb_log "[$name] submit ACCEPTED although the pane still read '${_HB_COMPOSER_UNSENT:0:60}' after 2 Enters — the transcript shows it landed: ${_HB_LANDED_EVIDENCE} (DIVE-9484)" 2>/dev/null || true
+      # Whatever the pane still shows is not this payload's submit, but it may be
+      # a remainder (DIVE-4242's tail) that would fire at the next turn boundary
+      # (DIVE-4642). C-u + scrub only: the seat may be mid-turn now, and the
+      # clear's Up arm could recall a queued message (DIVE-4355).
+      sudo -u "agent-${name}" tmux send-keys -t "agent-${name}" C-u 2>/dev/null || true
+      _hb_composer_scrub "$name" >/dev/null 2>&1 || true
+      _hb_log "[$name] submit ACCEPTED although the pane still read '${_HB_COMPOSER_UNSENT:0:60}' after 2 Enters — the transcript shows it landed: ${_HB_LANDED_EVIDENCE}; composer scrubbed (DIVE-9484)" 2>/dev/null || true
       _wedge_clear "$name"
       return 0
     fi

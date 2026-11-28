@@ -150,6 +150,10 @@ wake yes "$P_PLAIN"
 is   "L1 landed, no model error: delivered (rc 0) although the pane misread" 0 "$WRC"
 is   "L2 ...no wedge mark" no "$(wedged)"
 is   "L3 ...row left todo for the caller to claim (not parked)" "todo|unparked" "$(row "$TID")"
+is   "L4 ...and the composer is C-u'd AFTER the last Enter (no remainder left to fire later)" yes \
+     "$( (( $(grep -n -x 'C-u' "$KEYS" | tail -1 | cut -d: -f1) > $(grep -n -x 'Enter' "$KEYS" | tail -1 | cut -d: -f1) )) && echo yes || echo no)"
+grep -qx 'Up' "$KEYS" && bad_t "L5 ...without the Up recall (the seat may be mid-turn)" "Up sent" \
+                      || ok_t "L5 ...without the Up recall (the seat may be mid-turn)"
 
 # ---- N: nothing landed = today's wedge, model error or not ---------------------
 wake no "$P_PLAIN"
