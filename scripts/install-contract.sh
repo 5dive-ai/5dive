@@ -106,7 +106,10 @@ DENY='uninstall self-update self_update update paperclip-seed fire hire'
 # plugin's (DIVE-6938), out of the dispatch table, so T5 would call it stale.
 # `host` and `usage` came off on 2026-11-26 (DIVE-9374): main() answers their
 # --help before the leaf parses flags or (`usage`) checks for root.
-WAIVED='activity cost gate-proof objective objectives project projects trace'
+# `activity`, `cost`, `objective(s)`, `project(s)` and `trace` came off on
+# 2026-11-28 (DIVE-9485): main()'s generic help arm answers any verb whose own
+# --help fails from the top-level usage block, which documents all seven.
+WAIVED='gate-proof'
 
 in_list() { local n="$1"; shift; local x; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
 
