@@ -2026,6 +2026,61 @@ _hosted_push_notify_stage() {
 }
 # <<< DIVE-9324 hosted plugin
 
+# >>> DIVE-4128 shared wiki (extracted verbatim by tests/shared_wiki_upgrade_unit.sh)
+# ── the per-box shared team wiki ────────────────────────────────────────────
+# Knowledge sharing between seats had NO on-box home. `5dive memory` resolved
+# its "shared wiki" to the product repo's community/wiki, a path that exists
+# only on our own fleet — so on a customer box every seat's atoms stayed
+# 0600-private, `memory add --store=wiki` refused, and
+# `agent create --inherit-memory=wiki` seeded 0 files while reporting success.
+#
+# DIVE-9481: this used to run on the FULL install only. The --upgrade branch
+# (what nightly `self-update` runs) exits before reaching it, so every box
+# installed before 2026-09-10 never got a wiki — 13 of 54 prod boxes, and the
+# MCP wiki tool always answered "This team has no shared wiki yet." Both paths
+# call this now. It is idempotent: `install -d` on an existing dir, the index
+# seeded only when missing, pages never touched.
+#
+# 2775 root:claude, and each bit is load-bearing:
+#   setgid (2)  a page written by agent-alex keeps group `claude`, so agent-bo
+#               can still edit it. Without it the group follows the writer's
+#               primary group and the wiki de-shares itself one page at a time.
+#   g=rwx       every seat PUBLISHES, not just reads. A read-only shared wiki
+#               is a broadcast channel, not a team wiki.
+#   o=rx        readable by seats outside the claude group — `sandboxed`
+#               agents are deliberately not in it (DIVE-1033) and would
+#               otherwise boot unable to read team knowledge. Team knowledge is
+#               not a secret; credentials live behind their own 0600 elsewhere.
+#
+# NOT provisioned on a box that already has the product repo checked out: there
+# the wiki IS community/wiki, git-tracked and reviewed, and minting a second
+# untracked root would silently split the fleet's wiki in two the moment this
+# upgrade landed. The resolver prefers the box root when it exists, so its
+# ABSENCE here is what keeps the fleet publishing into git.
+# FIVEDIVE_FLEET_WIKI_DIR is a test seam only (this host is a fleet box).
+_shared_wiki_ensure() {
+  local fleet_wiki="${FIVEDIVE_FLEET_WIKI_DIR:-/home/claude/projects/5dive/community/wiki}"
+  local wiki="$STATE_DIR/wiki"
+  if [[ -d "$fleet_wiki" ]]; then
+    ok "shared wiki: using the product repo's community/wiki (fleet box)"
+    return 0
+  fi
+  install -d -m 2775 -o root -g claude "$wiki" || return 1
+  chmod 2775 "$wiki" || return 1   # install -m does not always set setgid
+  # An index the first publisher can append to. `memory add` deliberately never
+  # invents an index file (it will not fabricate a store's table of contents),
+  # so without this seed the first page on a fresh box is written and then
+  # never listed — present, unfindable by anyone browsing.
+  if [[ ! -f "$wiki/index.md" ]]; then
+    printf '# Team wiki\n\nShared, searchable knowledge for every agent on this box.\nPublish with: 5dive memory add --store=wiki --name=<slug> --desc=<one line>\nRead with:    5dive memory search --store=wiki "<topic>"\n\n' \
+      > "$wiki/index.md" || return 1
+    chown root:claude "$wiki/index.md" || return 1
+    chmod 664 "$wiki/index.md" || return 1
+  fi
+  ok "shared wiki ready at $wiki (writable by every seat)"
+}
+# <<< DIVE-4128 shared wiki
+
 if [[ "${1:-}" == "--upgrade" ]]; then
   shift
   # --no-ui used to gate the (since-removed) local dashboard install; the flag
@@ -2117,6 +2172,11 @@ if [[ "${1:-}" == "--upgrade" ]]; then
   fi
   # <<< DIVE-5247 partner plugin migration
   _hosted_plugin_ensure   # DIVE-9324
+  # DIVE-9481: boxes installed before the wiki existed get it here, on the
+  # nightly upgrade. Best-effort: a box without the `claude` group warns and
+  # the upgrade goes on.
+  _shared_wiki_ensure \
+    || echo "warn: shared wiki not provisioned at $STATE_DIR/wiki — 'memory add --store=wiki' stays refused until the next upgrade retries" >&2
 
   echo
   # DIVE-1260: report the version actually swapped in, read from the new bundle.
@@ -2274,46 +2334,7 @@ if [[ ! -f "$STATE_DIR/agents.json" ]]; then
 fi
 ok "directories ready"
 
-# ── DIVE-4128: the per-box shared team wiki ─────────────────────────────────
-# Knowledge sharing between seats had NO on-box home. `5dive memory` resolved
-# its "shared wiki" to the product repo's community/wiki, a path that exists
-# only on our own fleet — so on a customer box every seat's atoms stayed
-# 0600-private, `memory add --store=wiki` refused, and
-# `agent create --inherit-memory=wiki` seeded 0 files while reporting success.
-#
-# 2775 root:claude, and each bit is load-bearing:
-#   setgid (2)  a page written by agent-alex keeps group `claude`, so agent-bo
-#               can still edit it. Without it the group follows the writer's
-#               primary group and the wiki de-shares itself one page at a time.
-#   g=rwx       every seat PUBLISHES, not just reads. A read-only shared wiki
-#               is a broadcast channel, not a team wiki.
-#   o=rx        readable by seats outside the claude group — `sandboxed`
-#               agents are deliberately not in it (DIVE-1033) and would
-#               otherwise boot unable to read team knowledge. Team knowledge is
-#               not a secret; credentials live behind their own 0600 elsewhere.
-#
-# NOT provisioned on a box that already has the product repo checked out: there
-# the wiki IS community/wiki, git-tracked and reviewed, and minting a second
-# untracked root would silently split the fleet's wiki in two the moment this
-# upgrade landed. The resolver prefers the box root when it exists, so its
-# ABSENCE here is what keeps the fleet publishing into git.
-if [[ -d /home/claude/projects/5dive/community/wiki ]]; then
-  ok "shared wiki: using the product repo's community/wiki (fleet box)"
-else
-  install -d -m 2775 -o root -g claude "$STATE_DIR/wiki"
-  chmod 2775 "$STATE_DIR/wiki"   # install -m does not always set setgid
-  # An index the first publisher can append to. `memory add` deliberately never
-  # invents an index file (it will not fabricate a store's table of contents),
-  # so without this seed the first page on a fresh box is written and then
-  # never listed — present, unfindable by anyone browsing.
-  if [[ ! -f "$STATE_DIR/wiki/index.md" ]]; then
-    printf '# Team wiki\n\nShared, searchable knowledge for every agent on this box.\nPublish with: 5dive memory add --store=wiki --name=<slug> --desc=<one line>\nRead with:    5dive memory search --store=wiki "<topic>"\n\n' \
-      > "$STATE_DIR/wiki/index.md"
-    chown root:claude "$STATE_DIR/wiki/index.md"
-    chmod 664 "$STATE_DIR/wiki/index.md"
-  fi
-  ok "shared wiki ready at $STATE_DIR/wiki (writable by every seat)"
-fi
+_shared_wiki_ensure   # DIVE-4128, DIVE-9481
 
 # Install / refresh CLI binaries, systemd unit, hooks, and skills.
 # preseed_claude_agent references the hooks by absolute path under
