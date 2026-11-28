@@ -319,6 +319,48 @@ c5m=$(grep -bo '^## Memory' "$TMP/c5" | cut -d: -f1)
   && grep -q '5dive:carried-instructions:end' "$TMP/c5" \
   && ok_t "C5 multibyte instructions are cut by BYTES: block ${c5b} B < 24 KiB, '## Memory' at byte ${c5m}, valid UTF-8" \
   || bad_t "C5 byte budget" "block=${c5b} memory-at=${c5m:-absent}"
+# C6-C8 (DIVE-9497): the memory INDEX is cut by bytes too, and the cut landed
+# mid-character on a Russian seat: a strict decode raised UnicodeDecodeError
+# 'byte 0xd0 in position 7999: unexpected end of data', set -e killed the switch
+# after the unit was stopped and before the registry write.
+python3 - "$TMP/idxcyr.md" <<'PY'
+import sys
+line = "- [атом-владельца](a.md) — факт о владельце и его делах\n"
+for pad in range(4):
+    b = (("x" * pad) + line * 400).encode()
+    if 0xC0 <= b[7999] <= 0xDF:   # byte 8000 is the lead byte of a 2-byte char
+        open(sys.argv[1], "wb").write(b); break
+else:
+    sys.exit("no padding put byte 8000 mid-character")
+PY
+head -c 8000 "$TMP/idxcyr.md" | python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' 2>/dev/null \
+  && bad_t "C6 fixture: byte 8000 must split a character (a strict decode of the cut must fail)" \
+  || ok_t "C6 fixture: the 8000-byte cut of the Cyrillic index splits a character (strict decode fails, as on the live seat)"
+printf 'Отвечай по-русски.\n' >"$TMP/short-ru.md"
+rc=$(run switch_carry_doc "$TMP/short-ru.md" "$TMP/none.md" claude codex "$TMP/idxcyr.md"); cp "$TMP/out" "$TMP/c6"
+[[ "$rc" == 0 ]] && grep -q '5dive:carried-instructions:end' "$TMP/c6" \
+  && grep -q '(index cut at 8000 bytes; search for the rest)' "$TMP/c6" \
+  && ! grep -q 'UnicodeDecodeError' "$TMP/err" \
+  && ok_t "C7 a Cyrillic index cut mid-character carries (rc 0, block closes, cut noted)" \
+  || bad_t "C7 Cyrillic index crashed the carry" "rc=$rc err=$(tail -3 "$TMP/err")"
+c8=$(python3 - "$TMP/c6" <<'PY'
+import sys
+t = open(sys.argv[1], encoding="utf-8").read()       # raises on invalid UTF-8
+idx = t.split("`5dive memory get <slug>`.\n\n", 1)[1].split("\n(index cut at", 1)[0]
+full = "- [атом-владельца](a.md) — факт о владельце и его делах"
+lines = idx.rstrip("\n").split("\n")
+print(len(lines) if all(l.lstrip("x") == full for l in lines) else "half:" + repr(lines[-1]))
+PY
+)
+[[ "$c8" =~ ^[0-9]+$ ]] && (( c8 >= 80 )) \
+  && ok_t "C8 the carried index is valid UTF-8 and ends on a whole line (${c8} whole lines, no half line)" \
+  || bad_t "C8 index text" "$c8"
+# C9 (DIVE-9497): instructions over 64 KB, under set -e + pipefail as the CLI
+# runs. A `| head -c` cut closed the pipe on printf: SIGPIPE, rc 141, switch dead.
+rc=$(run switch_carry_doc "$TMP/cyr.md" "$TMP/none.md" claude codex "")
+[[ "$rc" == 0 ]] && grep -q "cut at 15000 bytes for Codex's 32 KiB limit" "$TMP/out" \
+  && ok_t "C9 a $(LC_ALL=C wc -c <"$TMP/cyr.md")-byte CLAUDE.md is cut under set -e + pipefail without a SIGPIPE (rc 0)" \
+  || bad_t "C9 big instructions under set -e" "rc=$rc"
 switch_carry_doc "$TMP/big.md" "$TMP/none.md" codex claude "" >"$TMP/c4"
 [[ $(wc -c <"$TMP/c4") -gt 30000 ]] && ok_t "C4 nothing is cut going to Claude (no such limit)" || bad_t "C4" "$(wc -c <"$TMP/c4")"
 # L1-L3: the conversion runs as root in a dir the seat owns. A link the agent
@@ -861,6 +903,41 @@ switch_source_ai "$P" hermes
   && ok_t "K10 a symlinked auth.json is not followed (root reads only the seat's own files)" \
   || bad_t "K10 symlink" "$SWITCH_SRC_KEY"
 TYPE_AUTH[claude]="$DEFAULT_CLAUDE_CRED"
+
+# =========================================================== E: a Russian seat moved by the cabinet (DIVE-9497)
+# A Russian claude seat whose key is dead (it never answers the handoff ask) and
+# whose CLAUDE.md (>64 KB) and memory index (>8000 bytes, byte 8000 mid-character)
+# are Cyrillic, moved by the cabinet's form: set-account --switch-harness, under
+# set -e as the CLI runs. Before the fix: the index decode crashed after the stop,
+# and the 90s handoff wait alone filled the partner API's 90s exec window.
+NH="$SWITCH_HOME_ROOT/agent-ruseat"; NMEM="$NH/.claude/projects/-home-claude-projects/memory"
+mkdir -p "$NH/.claude/channels/telegram" "$NMEM"
+cp "$TMP/cyr.md" "$NH/.claude/CLAUDE.md"; cp "$TMP/idxcyr.md" "$NMEM/MEMORY.md"
+printf '{}\n' >"$NH/.claude/settings.json"
+printf 'TELEGRAM_BOT_TOKEN=%s\n' '7000000002:AAcccccccccccccccccccccccccccccccc' >"$NH/.claude/channels/telegram/.env"
+printf '{"dmPolicy":"allowlist","allowFrom":["555"],"groups":{},"pending":{}}\n' >"$NH/.claude/channels/telegram/access.json"
+jq '.agents.ruseat = {"type":"claude","channels":"telegram","authProfile":"claudeacct","isolation":"standard"}' "$TMP/reg" >"$TMP/reg.n" && mv "$TMP/reg.n" "$TMP/reg"
+: >"$TMP/active"; : >"$TMP/sleeps"
+rc=$( FIVEDIVE_SELF=/bin/true                    # the ask is delivered; nobody answers
+      sleep() { printf '%s\n' "$1" >>"$TMP/sleeps"; }
+      run agent_account_move_switch set-account ruseat chatgpt --switch-harness )
+waited=$(( $(grep -c . "$TMP/sleeps") * 3 ))
+[[ "$rc" == 0 && "$(jq -r .agents.ruseat.type "$TMP/reg")" == codex && "$(jq -r .agents.ruseat.authProfile "$TMP/reg")" == chatgpt ]] \
+  && ok_t "E1 a Cyrillic seat (64 KB+ CLAUDE.md, index cut mid-character) moves to ChatGPT via set-account --switch-harness under set -e" \
+  || bad_t "E1 Russian seat move" "rc=$rc reg=$(jq -c .agents.ruseat "$TMP/reg") err=$(tail -3 "$TMP/err")"
+[[ "$waited" == 30 && "$(jq -r '.data.handoff // .handoff' "$TMP/out" 2>/dev/null)" == timeout ]] \
+  && ok_t "E2 a seat that never answers costs the cabinet's move 30s of handoff wait, not 90s (handoff: timeout)" \
+  || bad_t "E2 handoff wait" "waited=${waited}s out=$(head -c 300 "$TMP/out")"
+python3 -c 'import sys; open(sys.argv[1], encoding="utf-8").read()' "$NH/.codex/AGENTS.md" 2>/dev/null \
+  && grep -q '(index cut at 8000 bytes; search for the rest)' "$NH/.codex/AGENTS.md" \
+  && grep -q "cut at 15000 bytes for Codex's 32 KiB limit" "$NH/.codex/AGENTS.md" \
+  && ok_t "E3 the Russian seat's AGENTS.md is valid UTF-8 with both cuts noted" \
+  || bad_t "E3 AGENTS.md" "$(head -c 300 "$NH/.codex/AGENTS.md" 2>&1)"
+rc=$( FIVEDIVE_SWITCH_MOVE_HANDOFF_WAIT=6; cmd_agent_switch() { printf '%s\n' "$*" >"$TMP/sw-args"; }
+      run agent_account_move_switch set-account theo chatgpt --switch-harness )
+grep -q -- '--handoff-wait=6$' "$TMP/sw-args" 2>/dev/null \
+  && ok_t "E4 the move's handoff wait follows FIVEDIVE_SWITCH_MOVE_HANDOFF_WAIT" \
+  || bad_t "E4 override" "rc=$rc args=$(cat "$TMP/sw-args" 2>&1)"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

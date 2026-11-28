@@ -233,13 +233,15 @@ print("\n".join(out))
   if [[ -n "$body" ]]; then
     if [[ "$to" == codex ]] && (( $(printf '%s' "$body" | LC_ALL=C wc -c) > SWITCH_INSTR_BUDGET )); then
       # Slice the bytes, then back off to the last whole line (never half a
-      # multibyte character).
-      body=$(printf '%s' "$body" | LC_ALL=C head -c "$SWITCH_INSTR_BUDGET" | python3 -c '
+      # multibyte character). DIVE-9497: python reads ALL of it and slices; a
+      # `| head -c` here closed the pipe on printf, and past 64 KB of text the
+      # SIGPIPE (141) under pipefail + set -e killed the switch mid-way.
+      body=$(printf '%s' "$body" | python3 -c '
 import sys
-t = sys.stdin.buffer.read().decode("utf-8", "ignore")
+t = sys.stdin.buffer.read()[: int(sys.argv[1])].decode("utf-8", "ignore")
 if "\n" in t:
     t = t[: t.rfind("\n")]
-sys.stdout.write(t)')
+sys.stdout.write(t)' "$SWITCH_INSTR_BUDGET")
       body+=$'\n\n'"(cut at ${SWITCH_INSTR_BUDGET} bytes for Codex's 32 KiB limit; the full text is in ~/.claude/CLAUDE.md)"
     fi
     printf '\n## Standing instructions\n\n%s\n' "$body"
@@ -247,13 +249,17 @@ sys.stdout.write(t)')
   if [[ -n "$memidx" && -s "$memidx" ]]; then
     printf '\n## Memory\n\nYour memory stays in the 5dive store. Search it with\n'
     printf '`5dive memory search --index "<topic>"`, then `5dive memory get <slug>`.\n\n'
-    head -c "$SWITCH_INDEX_BUDGET" "$memidx" | python3 -c '
+    # DIVE-9497: the cut is in BYTES, so it can land mid-character (Cyrillic is
+    # two bytes each). Decode the raw bytes and drop the half character, as the
+    # instructions cut above does — a strict decode crashed the switch after the
+    # unit was already stopped.
+    python3 -c '
 import sys
-t = sys.stdin.read()
+t = open(sys.argv[1], "rb").read()[: int(sys.argv[2])].decode("utf-8", "ignore")
 # never end on half a line: the cut is at the budget, the text at a line end
 if not t.endswith("\n") and "\n" in t:
     t = t[: t.rfind("\n") + 1]
-sys.stdout.write(t)'
+sys.stdout.write(t)' "$memidx" "$SWITCH_INDEX_BUDGET"
     [[ $(wc -c <"$memidx") -gt "$SWITCH_INDEX_BUDGET" ]] \
       && printf '\n(index cut at %s bytes; search for the rest)\n' "$SWITCH_INDEX_BUDGET"
   fi
@@ -1483,7 +1489,12 @@ agent_account_move_switch() { # config|set-account <args...>
   [[ -n "$type" ]] || fail "$E_NOT_FOUND" "no agent named '$name'"
   target=$(switch_target_for_account "$type" "$acct")
   if [[ -n "$target" ]]; then
-    cmd_agent_switch "$name" --to="$target" --account="${acct:-default}"
+    # DIVE-9497: a short handoff wait. A surface calls this inside its own exec
+    # window (the partner API's is 90s), and the seat being moved is often one
+    # that cannot answer at all (out of allowance, dead key): the 90s default
+    # burned the whole window before the stop, and nothing switched.
+    cmd_agent_switch "$name" --to="$target" --account="${acct:-default}" \
+      --handoff-wait="${FIVEDIVE_SWITCH_MOVE_HANDOFF_WAIT:-30}"
   else
     with_registry_lock cmd_config "$name" set "auth-profile=${acct}"
   fi
