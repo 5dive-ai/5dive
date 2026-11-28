@@ -1,26 +1,20 @@
 {
-  "date": "2026-11-27",
-  "generatedAtUtc": "2026-11-27T02:01:43Z",
+  "date": "2026-11-28",
+  "generatedAtUtc": "2026-11-28T02:01:34Z",
   "window": {
     "days": 30,
-    "from": "2026-10-28",
-    "to": "2026-11-26",
+    "from": "2026-10-29",
+    "to": "2026-11-27",
     "basis": "each task counts once, on the UTC day of its last task.done; the window is the whole days before the publish date"
   },
   "totals": {
-    "shipped": 2205,
-    "reviewed": 1117,
-    "firstTry": 574,
-    "sentBack": 543,
-    "sendBacks": 795
+    "shipped": 2203,
+    "reviewed": 1114,
+    "firstTry": 575,
+    "sentBack": 539,
+    "sendBacks": 790
   },
   "days": [
-    {
-      "date": "2026-10-28",
-      "reviewed": 19,
-      "firstTry": 5,
-      "sentBack": 14
-    },
     {
       "date": "2026-10-29",
       "reviewed": 50,
@@ -194,31 +188,37 @@
       "reviewed": 40,
       "firstTry": 20,
       "sentBack": 20
+    },
+    {
+      "date": "2026-11-27",
+      "reviewed": 16,
+      "firstTry": 6,
+      "sentBack": 10
     }
   ],
   "reasons": {
     "basis": "one fixed category per send-back, by rule from the reviewer's finding; no match or no preserved finding = other. Sums to totals.sendBacks.",
-    "total": 795,
+    "total": 790,
     "categories": [
       {
         "key": "conflict",
         "label": "Clashes with newer work",
-        "count": 29
+        "count": 27
       },
       {
         "key": "safety",
         "label": "Safety or privacy",
-        "count": 45
+        "count": 43
       },
       {
         "key": "writing",
         "label": "Unclear writing",
-        "count": 181
+        "count": 184
       },
       {
         "key": "tests",
         "label": "Failing tests",
-        "count": 363
+        "count": 356
       },
       {
         "key": "proof",
@@ -228,12 +228,12 @@
       {
         "key": "ask",
         "label": "Not what was asked",
-        "count": 28
+        "count": 29
       },
       {
         "key": "other",
         "label": "Other",
-        "count": 97
+        "count": 99
       }
     ]
   },
