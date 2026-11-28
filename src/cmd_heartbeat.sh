@@ -10626,13 +10626,18 @@ Restart $1 to start a new conversation: ask your lead agent, or run 5dive agent 
 # One message through the owner's normal channel: the paired chat of the first
 # telegram seat, preferring one that is not stuck itself (its bot works either
 # way: a bot does not use the AI login). 0 only on a Bot API receipt.
+# DIVE-9491: root-run — its one caller is `heartbeat tick` (require_root). A seat
+# is "telegram-enabled" when its token file EXISTS, never when this uid can read
+# it: a -r test here made the selection depend on the group read, so dropping it
+# would have skipped every seat with no error. Readability is _task_agent_channel's
+# call (blind -> 1, the next pass retries).
 _hb_stuck_login_deliver() { # <text> <stuck seats, comma-joined>
   local text="$1" stuck=",${2// /}," name pass
   declare -F _task_agent_channel >/dev/null 2>&1 || return 1
   declare -F _task_send_owner >/dev/null 2>&1 || return 1
   for pass in other stuck; do
     while IFS= read -r name; do
-      [[ -n "$name" && -r "${CONNECTORS_DIR}/telegram-${name}.env" ]] || continue
+      [[ -n "$name" && -e "${CONNECTORS_DIR}/telegram-${name}.env" ]] || continue
       if [[ "$pass" == other ]]; then [[ "$stuck" != *",$name,"* ]] || continue
       else [[ "$stuck" == *",$name,"* ]] || continue; fi
       _task_agent_channel "$name" || continue

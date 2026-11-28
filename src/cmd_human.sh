@@ -351,9 +351,12 @@ cmd_human_recipient() {
 # chat? One read-only getChat through that bot; nothing is sent to the person.
 # Prints `reachable`, `chat not found` (they never started that bot), `no bot`
 # (no token on record for the seat), or `unknown: <why>`. Never fails.
+# DIVE-9491: a seat reads only its own token file. Another seat's, present but
+# unreadable, is NOT "no bot" — say only root can probe it.
 _human_bot_reach() {
   local agent="$1" chat="$2" token="" resp desc
   local f="${CONNECTORS_DIR}/telegram-${agent}.env"
+  if _tg_token_unreadable "$f"; then printf "unknown: only root can read %s's bot token (sudo 5dive human recipient)" "$agent"; return 0; fi
   [[ -r "$f" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$f" | head -1)
   [[ -n "$token" ]] || { printf 'no bot'; return 0; }
   resp=$(curl -sS -m 5 --get --data-urlencode "chat_id=${chat}" \

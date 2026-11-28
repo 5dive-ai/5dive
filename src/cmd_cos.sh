@@ -447,6 +447,7 @@ cmd_agent_cos() {
     valid_name "$agent" || fail "$E_VALIDATION" "invalid --agent (lowercase letters/digits/hyphens, start letter, <=16 chars)"
     [[ -r "$avatar" ]] || fail "$E_NOT_FOUND" "--avatar not readable: $avatar"
     local tok_env="$(dirname "$cos_env")/telegram-${agent}.env" atok
+    tg_token_need_root "$tok_env" agent cos set-avatar   # DIVE-9491: another seat's token is root's
     [[ -r "$tok_env" ]] || fail "$E_NOT_FOUND" "no telegram token for agent '$agent' at $tok_env (is it a telegram agent?)"
     atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]') || atok=""
     [[ -n "$atok" ]] || fail "$E_NOT_FOUND" "TELEGRAM_BOT_TOKEN empty/missing in $tok_env"
@@ -475,6 +476,7 @@ cmd_agent_cos() {
       valid_name "$r_agent" || fail "$E_VALIDATION" "invalid --agent (lowercase letters/digits/hyphens, start letter, <=16 chars)"
       [[ -r "$cos_env" ]] || fail "$E_NOT_FOUND" "no CoS token at $cos_env — run: 5dive agent cos set --token=<token>"
       local tok_env="$(dirname "$cos_env")/telegram-${r_agent}.env" atok
+      tg_token_need_root "$tok_env" agent cos rotate   # DIVE-9491
       [[ -r "$tok_env" ]] || fail "$E_NOT_FOUND" "no telegram token for agent '$r_agent' at $tok_env (is it a telegram agent?)"
       atok=$(sudo grep -m1 -oP '(?<=^TELEGRAM_BOT_TOKEN=).*' "$tok_env" 2>/dev/null | tr -d '"'"'"'' | tr -d '[:space:]') || atok=""
       [[ -n "$atok" ]] || fail "$E_NOT_FOUND" "TELEGRAM_BOT_TOKEN empty/missing in $tok_env"

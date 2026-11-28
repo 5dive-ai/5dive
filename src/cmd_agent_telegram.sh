@@ -34,6 +34,7 @@ cmd_telegram_discover() {
     [[ -z "$token" ]] \
       || fail "$E_USAGE" "--agent and --token are mutually exclusive"
     local env_file="${CONNECTORS_DIR}/telegram-${agent}.env"
+    tg_token_need_root "$env_file" agent telegram-discover "--agent=${agent}"   # DIVE-9491
     [[ -r "$env_file" ]] \
       || fail "$E_NOT_FOUND" "no telegram connector for agent '$agent' (looked at $env_file)"
     token=$(grep -E '^TELEGRAM_BOT_TOKEN=' "$env_file" 2>/dev/null \
@@ -238,6 +239,9 @@ cmd_telegram_info() {
 
   local token_env="${CONNECTORS_DIR}/telegram-${name}.env"
   local token
+  # DIVE-9491: the cache answered above for any seat; a cache miss on ANOTHER
+  # seat's bot needs its token, which only root reads now.
+  tg_token_need_root "$token_env" agent telegram-info "$name"
   token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_env" 2>/dev/null | head -1 || true)
   [[ -n "$token" ]] \
     || fail "$E_AUTH_REQUIRED" "no telegram bot token for agent '$name' (expected ${token_env})"

@@ -145,6 +145,10 @@ _digest_onoff() {
 # AS that agent so the owner-channel resolution applies (solo boxes: "first" ==
 # the agent). Best-effort: always returns 0 so a miss never spams cron mail.
 _digest_tick() {
+  # DIVE-9491: root-run. It sudo's to ANOTHER seat's user, which only root can,
+  # and it selects seats by their token file — refuse (or re-run under the seat's
+  # grant) up front rather than walk the fleet and deliver nothing.
+  [[ $EUID -eq 0 ]] || require_root "digest tick"
   _digest_pref_enabled || return 0                       # OFF by default
   [ "$(date +%-H)" = "$(_digest_pref_hour)" ] || return 0  # not the configured hour
   local f today last; f="$(_digest_pref_file)"; today="$(date +%F)"
@@ -162,7 +166,7 @@ _digest_tick() {
   names=$(jq -r '.agents | keys[]' "$REGISTRY" 2>/dev/null) || names=""
   while IFS= read -r name; do
     [ -n "$name" ] || continue
-    [ -r "${CONNECTORS_DIR}/telegram-${name}.env" ] || continue
+    [ -e "${CONNECTORS_DIR}/telegram-${name}.env" ] || continue   # exists, not -r (DIVE-9491)
     if sudo -u "agent-${name}" "$self" digest --send >/dev/null 2>&1; then
       echo "digest tick: delivered via agent ${name}" >&2
       sent=1; break

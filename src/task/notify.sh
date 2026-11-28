@@ -24,6 +24,13 @@ TASK_NOTIFY_FAIL_REASON=""
 # DIVE-1968: the privileged re-send's stderr, kept so the parent can name WHY it
 # failed instead of only THAT it did. Empty when it succeeded or was never run.
 TASK_GATE_ESCALATE_ERR=""
+# DIVE-9491: set by _task_agent_channel when <name>'s token file is there but this
+# uid may not read it (another seat's, once the group read is gone). "Blind", not
+# "unpaired": a caller that cares hands the send to root instead of going quiet.
+TASK_CH_BLIND=0
+# The present-but-forbidden test (canonical in lib/validation.sh). Defined here
+# too, guarded, for the harnesses that source this module without that lib.
+declare -F _tg_token_unreadable >/dev/null 2>&1 || _tg_token_unreadable() { [[ -e "$1" && ! -r "$1" ]]; }
 # DIVE-891: the by-NAME half of the resolution, split out so the heartbeat's
 # gate-TTL sweep (which runs as root from cron — no sudo chain, no agent-* USER)
 # can resolve a FILING AGENT's channel per gate row instead of from the caller.
@@ -36,10 +43,14 @@ _task_agent_channel() {
   # holds its OWN conversation with the same human, ids from different bots are
   # not comparable. That is exactly why DIVE-1927's residual 2 could not be
   # discharged from the log alone.
-  TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE="" TASK_CH_AGENT=""
+  TASK_CH_TOKEN="" TASK_CH_ACCESS="" TASK_CH_TYPE="" TASK_CH_AGENT="" TASK_CH_BLIND=0
   local name="$1"
   [[ -n "$name" ]] || return 1
   local token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"
+  # DIVE-9491: present but unreadable is <name>'s bot, not ours — the same rule
+  # as _task_gate_bot_token (DIVE-9345). Falling through to the caller's own env
+  # token below would pair OUR bot with <name>'s chat. Say "blind" and stop.
+  if _tg_token_unreadable "$token_file"; then TASK_CH_BLIND=1; return 1; fi
   [[ -r "$token_file" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_file" | head -1)
   [[ -z "$token" ]] && token="${TELEGRAM_BOT_TOKEN:-}"
   [[ -n "$token" ]] || return 1
@@ -81,8 +92,9 @@ _task_owner_channel() {
 # its access.json? Every agent's channel dir is 0700 and its access.json 0600, so
 # a sibling agent can NEVER read a peer's pairing state; the parent .../channels
 # dir is 0755 root:root, so a bare -d probe still answers. Pairing = a resolvable
-# bot token (connector files are group-claude readable) AND an existing per-type
-# channel dir. This is the only honest way to tell "nobody is reachable" (the gate
+# bot token AND an existing per-type channel dir. A seat reads only its OWN token
+# file (u:agent-<x>:r; the group read is gone, DIVE-9491), so for any other seat
+# the token is "blind" below, never "absent". This is the only honest way to tell "nobody is reachable" (the gate
 # must then fail LOUDLY) apart from "reachable, but I lack the privilege to read
 # the target" (re-run the send as root). Getting that distinction wrong is exactly
 # how DIVE-1243's lead fallback degraded into a silent no-op: it probed
@@ -95,9 +107,9 @@ _task_owner_channel() {
 #
 # The three-valued return is the whole point. A boolean here would reintroduce the
 # absent-vs-forbidden conflation ONE LAYER OVER: the connector env is currently
-# 0640 root:claude and every agent is in group claude, so a plain `-r` works today
-# — but the day a connector file is tightened to 0600, or an agent lands outside
-# group claude, an unreadable token would read as "unpaired". Before this fix that
+# no longer group-readable (DIVE-5690 moved it to claude-keys, DIVE-9491 drops even
+# that group), so a plain `-r` on another seat's file is FALSE — and a boolean would
+# read that unreadable token as "unpaired". Before this fix that
 # would have cost a delayed gate. WITH the fail-closed `task need` it would REFUSE
 # a gate on a chain that is perfectly fine. Absence and denial must never share an
 # answer in a probe whose false-negative refuses work. (Found by main reviewing
@@ -107,12 +119,12 @@ _task_owner_channel() {
 _task_agent_paired() {
   local name="${1:-}"; [[ -n "$name" ]] || return 1
   local blind=0 token="" token_file="${CONNECTORS_DIR}/telegram-${name}.env"
-  if [[ -r "$token_file" ]]; then
+  if _tg_token_unreadable "$token_file"; then
+    blind=1                                   # exists, forbidden -> not evidence
+  elif [[ -r "$token_file" ]]; then
     # Readable and genuinely tokenless is the one case that PROVES unpaired.
     token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$token_file" | head -1)
     [[ -n "$token" ]] || return 1
-  elif [[ -e "$token_file" ]]; then
-    blind=1                                   # exists, forbidden -> not evidence
   elif [[ ! -d "$CONNECTORS_DIR" || ! -x "$CONNECTORS_DIR" ]]; then
     blind=1                                   # can't even search the dir -> ditto
   else
@@ -746,9 +758,10 @@ _task_gate_delivery_log() { # <ok|error> <task_ids> <chat> <message_id> <detail>
 # The token for the bot that CARRIED a delivery. Deliberately NOT
 # _task_agent_channel: that clobbers TASK_CH_* (token, access, type, agent),
 # which live callers are mid-flight on — _task_close_notify sends through those
-# globals and retirement can run beside it. We need only the token, and
-# connector files are the same group-claude-readable source _task_agent_channel
-# reads, so read it directly and leave the globals alone.
+# globals and retirement can run beside it. We need only the token, from the
+# same connector file _task_agent_channel reads, so read it directly and leave
+# the globals alone. Those files are NOT group-readable (DIVE-5690, DIVE-9491): a
+# seat reads only its own, so another seat's card goes to root below.
 # via=<agent> matters and is not decorative: message_id is scoped to a bot-chat
 # PAIR, so editing 15491 with the wrong bot's token edits a different message or
 # nothing (DIVE-2073 is why the delivery row carries `via` at all).
@@ -756,12 +769,12 @@ _task_gate_bot_token() { # <agent-name> -> token on stdout
   local name="${1:-}" token="" f
   if [[ -n "$name" && "$name" != "none" ]]; then
     f="${CONNECTORS_DIR}/telegram-${name}.env"
-    [[ -r "$f" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$f" | head -1)
     # DIVE-9345: present but unreadable is <name>'s bot, not ours. Falling back to
     # the caller's own env token would edit a message id in the WRONG bot's id
     # space, read "not found" and mark a still-live card gone. Return empty so the
     # caller hands the card to root instead.
-    [[ -z "$token" && -e "$f" && ! -r "$f" ]] && return 0
+    _tg_token_unreadable "$f" && return 0
+    [[ -r "$f" ]] && token=$(sed -n 's/^TELEGRAM_BOT_TOKEN=//p' "$f" | head -1)
   fi
   [[ -n "$token" ]] || token="${TELEGRAM_BOT_TOKEN:-}"
   printf '%s' "$token"
