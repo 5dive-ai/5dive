@@ -322,7 +322,7 @@ c5m=$(grep -bo '^## Memory' "$TMP/c5" | cut -d: -f1)
 # C6-C8 (DIVE-9497): the memory INDEX is cut by bytes too, and the cut landed
 # mid-character on a Russian seat: a strict decode raised UnicodeDecodeError
 # 'byte 0xd0 in position 7999: unexpected end of data', set -e killed the switch
-# after the unit was stopped and before the registry write (zen-kestrel nika).
+# after the unit was stopped and before the registry write.
 python3 - "$TMP/idxcyr.md" <<'PY'
 import sys
 line = "- [атом-владельца](a.md) — факт о владельце и его делах\n"
@@ -335,7 +335,7 @@ else:
 PY
 head -c 8000 "$TMP/idxcyr.md" | python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' 2>/dev/null \
   && bad_t "C6 fixture: byte 8000 must split a character (a strict decode of the cut must fail)" \
-  || ok_t "C6 fixture: the 8000-byte cut of the Cyrillic index splits a character (strict decode fails, as on nika)"
+  || ok_t "C6 fixture: the 8000-byte cut of the Cyrillic index splits a character (strict decode fails, as on the live seat)"
 printf 'Отвечай по-русски.\n' >"$TMP/short-ru.md"
 rc=$(run switch_carry_doc "$TMP/short-ru.md" "$TMP/none.md" claude codex "$TMP/idxcyr.md"); cp "$TMP/out" "$TMP/c6"
 [[ "$rc" == 0 ]] && grep -q '5dive:carried-instructions:end' "$TMP/c6" \
@@ -904,34 +904,34 @@ switch_source_ai "$P" hermes
   || bad_t "K10 symlink" "$SWITCH_SRC_KEY"
 TYPE_AUTH[claude]="$DEFAULT_CLAUDE_CRED"
 
-# =========================================================== E: the nika case (DIVE-9497)
+# =========================================================== E: a Russian seat moved by the cabinet (DIVE-9497)
 # A Russian claude seat whose key is dead (it never answers the handoff ask) and
 # whose CLAUDE.md (>64 KB) and memory index (>8000 bytes, byte 8000 mid-character)
 # are Cyrillic, moved by the cabinet's form: set-account --switch-harness, under
 # set -e as the CLI runs. Before the fix: the index decode crashed after the stop,
 # and the 90s handoff wait alone filled the partner API's 90s exec window.
-NH="$SWITCH_HOME_ROOT/agent-nika"; NMEM="$NH/.claude/projects/-home-claude-projects/memory"
+NH="$SWITCH_HOME_ROOT/agent-ruseat"; NMEM="$NH/.claude/projects/-home-claude-projects/memory"
 mkdir -p "$NH/.claude/channels/telegram" "$NMEM"
 cp "$TMP/cyr.md" "$NH/.claude/CLAUDE.md"; cp "$TMP/idxcyr.md" "$NMEM/MEMORY.md"
 printf '{}\n' >"$NH/.claude/settings.json"
 printf 'TELEGRAM_BOT_TOKEN=%s\n' '7000000002:AAcccccccccccccccccccccccccccccccc' >"$NH/.claude/channels/telegram/.env"
 printf '{"dmPolicy":"allowlist","allowFrom":["555"],"groups":{},"pending":{}}\n' >"$NH/.claude/channels/telegram/access.json"
-jq '.agents.nika = {"type":"claude","channels":"telegram","authProfile":"claudeacct","isolation":"standard"}' "$TMP/reg" >"$TMP/reg.n" && mv "$TMP/reg.n" "$TMP/reg"
+jq '.agents.ruseat = {"type":"claude","channels":"telegram","authProfile":"claudeacct","isolation":"standard"}' "$TMP/reg" >"$TMP/reg.n" && mv "$TMP/reg.n" "$TMP/reg"
 : >"$TMP/active"; : >"$TMP/sleeps"
 rc=$( FIVEDIVE_SELF=/bin/true                    # the ask is delivered; nobody answers
       sleep() { printf '%s\n' "$1" >>"$TMP/sleeps"; }
-      run agent_account_move_switch set-account nika chatgpt --switch-harness )
+      run agent_account_move_switch set-account ruseat chatgpt --switch-harness )
 waited=$(( $(grep -c . "$TMP/sleeps") * 3 ))
-[[ "$rc" == 0 && "$(jq -r .agents.nika.type "$TMP/reg")" == codex && "$(jq -r .agents.nika.authProfile "$TMP/reg")" == chatgpt ]] \
+[[ "$rc" == 0 && "$(jq -r .agents.ruseat.type "$TMP/reg")" == codex && "$(jq -r .agents.ruseat.authProfile "$TMP/reg")" == chatgpt ]] \
   && ok_t "E1 a Cyrillic seat (64 KB+ CLAUDE.md, index cut mid-character) moves to ChatGPT via set-account --switch-harness under set -e" \
-  || bad_t "E1 nika move" "rc=$rc reg=$(jq -c .agents.nika "$TMP/reg") err=$(tail -3 "$TMP/err")"
+  || bad_t "E1 Russian seat move" "rc=$rc reg=$(jq -c .agents.ruseat "$TMP/reg") err=$(tail -3 "$TMP/err")"
 [[ "$waited" == 30 && "$(jq -r '.data.handoff // .handoff' "$TMP/out" 2>/dev/null)" == timeout ]] \
   && ok_t "E2 a seat that never answers costs the cabinet's move 30s of handoff wait, not 90s (handoff: timeout)" \
   || bad_t "E2 handoff wait" "waited=${waited}s out=$(head -c 300 "$TMP/out")"
 python3 -c 'import sys; open(sys.argv[1], encoding="utf-8").read()' "$NH/.codex/AGENTS.md" 2>/dev/null \
   && grep -q '(index cut at 8000 bytes; search for the rest)' "$NH/.codex/AGENTS.md" \
   && grep -q "cut at 15000 bytes for Codex's 32 KiB limit" "$NH/.codex/AGENTS.md" \
-  && ok_t "E3 nika's AGENTS.md is valid UTF-8 with both cuts noted" \
+  && ok_t "E3 the Russian seat's AGENTS.md is valid UTF-8 with both cuts noted" \
   || bad_t "E3 AGENTS.md" "$(head -c 300 "$NH/.codex/AGENTS.md" 2>&1)"
 rc=$( FIVEDIVE_SWITCH_MOVE_HANDOFF_WAIT=6; cmd_agent_switch() { printf '%s\n' "$*" >"$TMP/sw-args"; }
       run agent_account_move_switch set-account theo chatgpt --switch-harness )
