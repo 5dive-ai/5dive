@@ -324,7 +324,9 @@ _memory_own_roots() {
 #                         and reporting one that isn't there is the defect this
 #                         row exists to remove.
 #   /var/lib/5dive/wiki   THE per-box shared wiki, provisioned by install.sh at
-#                         install and upgrade as 2775 root:claude — setgid so a
+#                         install and upgrade (upgrade since DIVE-9481; before
+#                         it, boxes installed pre-09-10 never got one) as
+#                         2775 root:claude — setgid so a
 #                         page written by any seat keeps the shared group, and
 #                         group-writable so every seat can publish, not just
 #                         read. This is the root customer boxes have.
