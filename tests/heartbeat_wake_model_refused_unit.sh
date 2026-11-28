@@ -116,7 +116,7 @@ wake() {
   : >"$KEYS"; : >"$LOG"; rm -f "$CLEARED" "$TMP/landed"; reset_store; _wedge_clear seatx
   LAND="$1"; PANE="$2"; TID=$(mk_todo); WRC=0
   _hb_wake seatx false "$TID" "DIVE-$TID" || WRC=$?
-  local name=seatx task_id="$TID" task_ident="DIVE-$TID" _wake_rc="$WRC" sk_fail=0
+  local name=seatx task_id="$TID" task_ident="DIVE-$TID" _wake_rc="$WRC" sk_fail=0 sk_parked=0
   for _ in 1; do . "$BLOCK"; done
 }
 
@@ -179,7 +179,7 @@ eval "$(declare -f _hb_send_line | awk '
   /_HB_SEND_REFUSED_LINE="";/ {n++; if (n == 2) skip=1}
   skip && /local _hb_wedged=/ {skip=0}
   !skip {print}')"
-declare -f _hb_send_line | grep -q '_HB_SEND_REFUSED_LINE="\$_hb_rline"' \
+grep -q '_HB_SEND_REFUSED_LINE="\$_hb_rline"' <<<"$(declare -f _hb_send_line)" \
   && bad_t "M0 the base-tree arm was carved out of the injector" "still present" \
   || ok_t "M0 the base-tree arm was carved out of the injector (the M arm grades the old branch)"
 CLEAR_TAKES=0; wake yes "$P_REFUSED"; CLEAR_TAKES=1

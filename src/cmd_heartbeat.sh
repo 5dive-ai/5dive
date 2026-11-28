@@ -3688,7 +3688,7 @@ _hb_send_line() {
       _hb_rpane=$(_hb_pane_capture "$name" 2>/dev/null) || _hb_rpane=""
       if _hb_rline=$(_hb_pane_model_error "$_hb_rpane" claude); then
         _HB_SEND_REFUSED_LINE="$_hb_rline"
-        _HB_SEND_REFUSED_PANE=$(grep -v '^[[:space:]]*$' <<<"$_hb_rpane" | tail -n 15)
+        _HB_SEND_REFUSED_PANE=$(grep -v '^[[:space:]]*$' <<<"$_hb_rpane" | tail -n 15) || _HB_SEND_REFUSED_PANE=""
         _hb_composer_clear "$name" >/dev/null 2>&1 || true
         _wedge_clear "$name"
         _HB_SEND_FAIL_REASON="submitted, model refused (rc 1): the line landed (${_HB_LANDED_EVIDENCE}) and the seat's turn ended on \"${_hb_rline:0:160}\" — not a composer wedge; the restored draft was cleared (DIVE-9484)"
@@ -11631,15 +11631,16 @@ cmd_heartbeat_tick() {
     if (( _wake_rc == _HB_WAKE_RC_REFUSED )); then
       # DIVE-9484: the goal landed and the model refused it. Re-waking it next
       # tick only buys the same refusal (50 wakes in 4.6 h on a quota wall), so
-      # the row is parked on the error. Not claimed: nobody is working it. If
-      # the park does not land, fall through to the plain failure line.
-      sk_fail=$((sk_fail + 1))
+      # the row is parked on the error. Not claimed: nobody is working it, and
+      # it counts as parked, not failed. If the park does not land, the reason
+      # says so and control falls through to the ONE wake-failure line below
+      # (agent_list_overdue_liveness pins that it stays a single code line).
       if _hb_park_refused_wake "$name" "$task_id"; then
+        sk_parked=$((sk_parked + 1))
         _hb_log "[$name] due + todo ${task_ident} — the goal LANDED but the model refused it (\"${_HB_SEND_REFUSED_LINE:0:160}\") — PARKED until ${_HB_REFUSED_PARK_WAKE}, seat not marked wedged (DIVE-9484)"
-      else
-        _hb_log "[$name] due + todo ${task_ident} — wake failed at ${_HB_WAKE_FAIL_REASON:-<no reason>} — WARN: the park on the model refusal did not land; will retry next tick (DIVE-9484)"
+        continue
       fi
-      continue
+      _HB_WAKE_FAIL_REASON="${_HB_WAKE_FAIL_REASON:-<no reason>} — WARN: the park on the model refusal did not land (DIVE-9484)"
     fi
     if (( _wake_rc == 0 )); then
       # DIVE-8512: a row the pacing floor admitted BLIND names that on this line.
