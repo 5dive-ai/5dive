@@ -1322,6 +1322,9 @@ main() {
   # SECOND 2-space `case "$top" in` of main() as the verb table.
   if [[ $top == host || $top == usage ]]; then _verb_path_help "$top" "$@" && exit 0
   elif [[ $top == route || $top == pkg ]] && _verb_help_wanted "$@"; then "cmd_$top" --help; exit $?; fi
+  # DIVE-9485: every other verb, one generic arm (src/lib/output.sh). Its own
+  # statement, so the DIVE-9374 mutant (both lines above deleted) still parses.
+  _verb_leaf_help "$top" "$@" && exit 0
   # Mutating commands run under with_registry_lock so adduser/registry_write
   # can't race across concurrent dashboard clicks. Read-only commands (list,
   # logs, stats, types, auth status/poll) bypass the lock and the audit log.

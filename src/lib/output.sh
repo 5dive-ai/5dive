@@ -482,6 +482,57 @@ _verb_path_help() {
   return 1
 }
 
+# DIVE-9485: the verbs that answer `--help` on their own leaves, so main()'s
+# generic arm (_verb_leaf_help) leaves them alone: agent, account and task through
+# _verb_help_intercept (DIVE-569), hire and team in their own leaf parsers (each
+# team leaf prints its own line), doctor and self-update before their root
+# check, host/usage/route/pkg in main()'s DIVE-9374 branch. Every other verb gets
+# the generic arm. tests/verb_help_every_verb_unit.sh walks the whole verb table,
+# so a verb on this list that stops answering, or a new verb, is red there.
+_VERB_HELP_SELF=' agent account task hire team doctor self-update self_update update host usage route pkg '
+# Verbs that ACT whatever argv says (scripts/install-contract.sh DENY says why):
+# the generic arm answers them from the top-level usage() text only and never
+# runs `5dive <verb> --help` to find their block.
+_VERB_HELP_NO_RUN=' uninstall paperclip-seed fire '
+
+# _verb_leaf_help <verb> <args…> — 0 when the args asked for help and it has been
+# answered. The answer, first that has text:
+#   1. the verb's own usage block: `5dive <verb> --help`, run in a subshell and
+#      kept only when it exits 0 — the block the verb's author keeps, naming
+#      every leaf and its flags (never run for a _VERB_HELP_NO_RUN verb);
+#   2. the top-level usage() entry for this leaf (`5dive <verb> <sub>`), longest
+#      documented prefix first;
+#   3. the top-level usage() lines for the bare verb.
+# Returns 1 when none has text, and the verb then runs as before. The leaf
+# itself never runs: before this, `secret link --help` was an unknown flag,
+# `tool ls --help` listed the tools and `wall <seat> --help` opened a terminal.
+_verb_leaf_help() {
+  local top="$1"; shift
+  [[ $top != _* && $_VERB_HELP_SELF != *" $top "* && -z ${_VERB_LEAF_HELP_INNER:-} ]] || return 1
+  _verb_help_wanted "$@" || return 1
+  local -a words=("$top"); local a k path out
+  # Some blocks go to stderr (secret's); a question asked for an answer gets it
+  # on stdout. The guard stops the inner run from re-entering this arm.
+  if [[ $_VERB_HELP_NO_RUN != *" $top "* ]] \
+     && out=$(_VERB_LEAF_HELP_INNER=1 main "$top" --help 2>&1 </dev/null) && [[ -n "$out" ]]; then
+    printf '%s\n' "$out"; return 0
+  fi
+  # usage() documents a verb under its first spelling: `objectives` is listed as
+  # `5dive objective`. Read the spelling out of main()'s own arm (_verb_arm).
+  local arm; arm=$(_verb_arm main "$top") || true
+  [[ -n "${arm%% *}" ]] && words=("${arm%% *}")
+  for a in "$@"; do
+    case "$a" in -*) break ;; esac
+    words+=("$a")
+  done
+  for (( k = ${#words[@]}; k >= 1; k-- )); do
+    path="5dive"; (( k > 1 )) && path="5dive ${words[*]:0:k-1}"
+    out=$(_verb_surface_help usage "$path" "$path " "${words[k-1]}") || true
+    [[ -n "$out" ]] && { printf '%s\n' "$out"; return 0; }
+  done
+  return 1
+}
+
 # _verb_help_intercept <path> <usage_fn> <dispatch_fn> <lead> <verb> <args…> — 0
 # when the args asked for help and it has been answered. Kept OUT of the
 # dispatch function's body on purpose: _verb_arm reads that body back as text,
