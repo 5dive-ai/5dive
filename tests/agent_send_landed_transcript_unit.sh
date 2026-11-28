@@ -52,7 +52,7 @@ PAYLOAD='DAILY-REPORT trigger 9373: run the nightly QA sweep over every seat and
 
 # ---- the fake transcript store ------------------------------------------------
 ROOT="$TMP/projects"; PROJ="$ROOT/-home-seatx"
-_HB_TRANSCRIPT_ROOT="$ROOT"; _HB_LANDED_WAIT_SEC=0; _AGENT_SEND_LANDED_SEC=0
+_HB_TRANSCRIPT_ROOT="$ROOT"; _HB_LANDED_WAIT_SEC=0; _HB_LANDED_POLL_SEC=0; _AGENT_SEND_LANDED_SEC=0
 OLD="$PROJ/aaaa-old.jsonl"; NEW="$PROJ/bbbb-new.jsonl"
 rec_user()   { jq -cn --arg t "$1" '{type:"user",message:{role:"user",content:$t}}'; }
 rec_tool()   { jq -cn --arg t "$1" '{type:"user",message:{role:"user",content:[{type:"tool_result",tool_use_id:"toolu_1",content:$t}]}}'; }
@@ -218,6 +218,81 @@ inject_and_submit() {
 r=$(run send same); rc="${r%%$'\t'*}"
 is "M pre-fix tree, transcript shows the payload landed: exits 12 (the defect)" 12 "$rc"
 eval "$_REAL_IAS"
+
+# ---- DIVE-9484: the record reaches disk LATE ----------------------------------
+# Measured on a box 2026-11-27: the payload's user record was followed by
+# `api-request` 1.1 s / 2.1 s later, and exit 12 fired at the same second. The
+# record is written after the seat's prompt hooks, so ONE read at +1 s loses the
+# race. Here the store is appended LATE_AT virtual seconds after the second Enter
+# failed: a fake `sleep` advances a clock that only runs once both Enters are
+# spent, so timing is exact and the arm costs no wall time. Real defaults:
+# first read at +1 s, then every 0.5 s, 4 re-reads (~3 s in all).
+VCLK="$TMP/vclk"; LATE_DONE="$TMP/late-done"; LATE_AT=99
+sleep() {
+  [[ "$(cat "$ENTERS" 2>/dev/null || echo 0)" -ge 2 ]] || return 0
+  local t; t=$(awk -v a="$(cat "$VCLK" 2>/dev/null || echo 0)" -v b="$1" 'BEGIN{print a+b}')
+  echo "$t" >"$VCLK"
+  if [[ ! -f "$LATE_DONE" ]] && awk -v t="$t" -v at="$LATE_AT" 'BEGIN{exit !(t>=at)}'; then
+    rec_user "$(cat "$TYPED")" >>"$OLD"; touch "$LATE_DONE"
+  fi
+}
+late() { # <LATE_AT> -> "<rc>\t<json>"; stderr in $TMP/err
+  rm -f "$VCLK" "$LATE_DONE"; LATE_AT="$1"
+  _HB_LANDED_WAIT_SEC=1 _HB_LANDED_POLL_SEC=0.5 _HB_LANDED_RETRIES=4 run send nothing
+}
+r=$(late 1.5); rc="${r%%$'\t'*}"; out="${r#*$'\t'}"
+is "F1 record lands 1.5 s after the 2nd Enter failed: exits 0" 0 "$rc"
+is "F1 ...receipt sent:true" true "$(jq -r '.data.sent' <<<"$out")"
+is "F1 ...no wedge mark for a message that landed" no "$(wedged)"
+grep -q 'transcript shows it landed:.*on re-read' "$TMP/err" \
+  && ok_t "F1 ...the step names the receipt, and that it came on a re-read" \
+  || bad_t "F1 ...the step names the receipt, and that it came on a re-read" "$(cat "$TMP/err")"
+r=$(late 2.5); rc="${r%%$'\t'*}"
+is "F2 record lands 2.5 s after (inside the ~3 s deadline): exits 0" 0 "$rc"
+# negative controls: the deadline is BOUNDED and a real miss still exits 12
+r=$(late 99); rc="${r%%$'\t'*}"; out="${r#*$'\t'}"
+is "F3 a payload that never reaches the transcript: still exits 12" 12 "$rc"
+is "F3 ...sent:false with the machine-stable DIVE-4246 reason" "$REASON" "$(jq -r '.data.reason' <<<"$out")"
+is "F3 ...the wait is bounded: 1 s + 4 x 0.5 s = 3 s of re-reads, then it gives up" 3 "$(cat "$VCLK")"
+grep -q 'neither did the seat.s transcript: transcript aaaa-old.jsonl gained no bytes since byte [0-9]* (5 read(s))' "$TMP/err" \
+  && ok_t "F3 ...exit 12 names the receipt arm that missed (no bytes since byte N, 5 reads)" \
+  || bad_t "F3 ...exit 12 names the receipt arm that missed (no bytes since byte N, 5 reads)" "$(cat "$TMP/err")"
+rm -f "$VCLK" "$LATE_DONE"; LATE_AT=99
+r=$(_HB_LANDED_WAIT_SEC=1 _HB_LANDED_POLL_SEC=0.5 run send noise); rc="${r%%$'\t'*}"
+is "F4 transcript grew with no payload record: exits 12" 12 "$rc"
+grep -q 'no non-tool_result user record since byte [0-9]* carries this payload' "$TMP/err" \
+  && ok_t "F4 ...exit 12 names the 'no matching user record since byte N' arm" \
+  || bad_t "F4 ...exit 12 names the 'no matching user record since byte N' arm" "$(cat "$TMP/err")"
+r=$(_HB_LANDED_WAIT_SEC=1 _HB_LANDED_POLL_SEC=0.5 run send rotate); rc="${r%%$'\t'*}"
+is "F5 a new session that is not this payload: exits 12" 12 "$rc"
+grep -q 'the session rotated to bbbb-new.jsonl and its first user record is not this payload' "$TMP/err" \
+  && ok_t "F5 ...exit 12 names the rotation arm" \
+  || bad_t "F5 ...exit 12 names the rotation arm" "$(cat "$TMP/err")"
+# M: the base tree's _hb_landed_check (origin/main a6ff36e6: ONE read at +1 s,
+# carried verbatim minus comments and logs) on the F1 input exits 12.
+_REAL_LC="$(declare -f _hb_landed_check)"
+_hb_landed_check() {
+  local name="$1" text="$2" now_file now_size needle tail_rc=0
+  _HB_LANDED_EVIDENCE=""
+  needle=$(_hb_landed_needle "$text") || return 1
+  [[ -z "$_HB_LANDED_FILE" || -z "$_HB_LANDED_SIZE" ]] && return 1
+  sleep "${_HB_LANDED_WAIT_SEC:-1}"
+  now_file=$(_hb_transcript_newest "$name")
+  [[ "$now_file" != "$_HB_LANDED_FILE" ]] && return 1
+  now_size=$(sudo -n -u "agent-${name}" stat -c %s "$_HB_LANDED_FILE" 2>/dev/null) || now_size=""
+  if ! [[ "$now_size" =~ ^[0-9]+$ ]] || (( now_size <= _HB_LANDED_SIZE )); then return 1; fi
+  sudo -n -u "agent-${name}" tail -c "+$(( _HB_LANDED_SIZE + 1 ))" "$_HB_LANDED_FILE" 2>/dev/null \
+    | grep -a '"type"[[:space:]]*:[[:space:]]*"user"' \
+    | grep -av -e '"type"[[:space:]]*:[[:space:]]*"tool_result"' -e '"tool_use_id"' \
+    | grep -aqF -- "$needle" || tail_rc=1
+  (( tail_rc != 0 )) && return 1
+  _HB_LANDED_EVIDENCE="$(basename "$_HB_LANDED_FILE") gained a user record carrying this payload ('${needle:0:40}') after byte ${_HB_LANDED_SIZE}"
+  return 0
+}
+r=$(late 1.5); rc="${r%%$'\t'*}"
+is "M2 base-tree landed check (one read at +1 s) on the F1 input: exits 12 (the defect)" 12 "$rc"
+eval "$_REAL_LC"
+unset -f sleep
 
 printf 'agent_send_landed_transcript_unit: %d passed, %d failed\n' "$PASS" "$FAIL"
 [[ "$FAIL" -eq 0 ]]
