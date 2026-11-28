@@ -124,8 +124,10 @@ fi
 UPG=$(awk '/^if \[\[ "\$\{1:-\}" == "--upgrade" \]\]; then$/{f=1} f{print} f&&/^fi$/{exit}' install.sh)
 call_line=$(grep -n '^  _shared_wiki_ensure' <<<"$UPG" | head -1 | cut -d: -f1)
 exit_line=$(grep -n '^  exit 0$' <<<"$UPG" | tail -1 | cut -d: -f1)
+call_win=""
+[[ -n "$call_line" ]] && call_win=$(sed -n "$((call_line)),$((call_line+1))p" <<<"$UPG")
 if [[ -n "$call_line" && -n "$exit_line" && $call_line -lt $exit_line ]] \
-   && sed -n "$((call_line)),$((call_line+1))p" <<<"$UPG" | grep -q '|| echo "warn: shared wiki'; then
+   && grep -q '|| echo "warn: shared wiki' <<<"$call_win"; then
   ok_t "[D] W1 the --upgrade branch calls it before exit 0, warn-only on failure"
 else
   bad_t "[D] W1 the --upgrade branch calls it before exit 0" "call_line=${call_line:-none} exit_line=${exit_line:-none}"
