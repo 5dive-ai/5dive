@@ -118,6 +118,12 @@ nh=$(jq -r '.nonce_hash // ""' "$(reqf "$A2")"); nonce=$(jq -r '.nonce // ""' "$
 [[ "$nh" =~ ^[0-9a-f]{64}$ && "$(_human_nonce_sha "$nonce")" == "$nh" && "$(stat -c %a "$B2")" == 600 && "$out" == *"is on this gate"* ]] \
   && ok_t "Y2 the request carries the proof's hash; the proof is kept root-only beside the row" \
   || bad_t "Y2 proof bound" "nh=$nh mode=$(stat -c %a "$B2" 2>&1) out=$out"
+# DIVE-9502: the line the seat reads says which yes counts — the tap — and what to
+# do with a typed one, so "the owner's yes" is not read as a yes in chat.
+[[ "$out" == *"the owner approves by pressing Approve (or Yes) on the card"* && "$out" == *"A typed yes in chat does not approve."* \
+   && "$out" == *"5dive task answer DIVE-2 yes --channel-msg=<message_id> --channel-proof=<chat_id>"* && "$out" != *"the owner's yes approves it"* ]] \
+  && ok_t "Y2b the gate line says a tap approves, a typed yes does not, and how to cite one" \
+  || bad_t "Y2b typed-yes wording" "out=$out"
 
 : > "$RUNLOG"
 out=$( (cmd_task_answer DIVE-2 --value=approve --human --from=fixture) 2>&1); rc=$?

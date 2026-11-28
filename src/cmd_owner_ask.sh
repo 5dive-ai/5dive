@@ -461,7 +461,11 @@ _owner_ask_gate_bind() {
       && jq -nc --arg a "$OA_ID" --arg s "$OA_SEAT" --arg n "$nonce" --arg i "$ident" \
            '{ask:$a, seat:$s, nonce:$n, ident:$i}' > "$dir/$id.json" ) \
     || fail "$E_GENERIC" "could not record the browser ask on $ident"
-  printf 'browser ask %s is on this gate: the owner'"'"'s yes approves it, once, and you are told to re-run with --approved=%s\n' "$OA_ID" "$OA_ID"
+  # A TYPED YES APPROVES NOTHING (DIVE-9502, Y9): "the owner's yes approves it" was
+  # read as a yes in chat, so the owner typed one, the gate stayed pending and nobody
+  # told them to tap. Say which yes counts, and what to do with a typed one (DIVE-8643).
+  printf 'browser ask %s is on this gate: the owner approves by pressing Approve (or Yes) on the card, once, and you are told to re-run with --approved=%s\n' "$OA_ID" "$OA_ID"
+  printf 'A typed yes in chat does not approve. If they answer in chat, cite that message on the gate (5dive task answer %s yes --channel-msg=<message_id> --channel-proof=<chat_id>) and they are sent the buttons again.\n' "$ident"
 }
 
 # DIVE-8643 — AN ANSWER THAT CANNOT APPROVE THE ASK STILL REACHES THE OWNER.
